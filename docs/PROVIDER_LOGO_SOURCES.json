@@ -1,0 +1,78 @@
+[
+  {
+    "file": "public/logos/gemini.svg",
+    "source": "https://commons.wikimedia.org/wiki/File:Gemini_sparkle_v002.svg",
+    "download": "https://upload.wikimedia.org/wikipedia/commons/5/51/Gemini_sparkle_v002.svg",
+    "creator": "Google",
+    "commons_copyright_terms": "Public domain (PD-shape)",
+    "license_url": "https://creativecommons.org/publicdomain/mark/1.0/",
+    "changes": "None; displayed at UI size with aspect ratio preserved.",
+    "sha256": "01821494593b81ffd7da0e08287d4735304ff6292a6903453328b9d17cf38799",
+    "bytes": 1144
+  },
+  {
+    "file": "public/logos/deepseek.svg",
+    "source": "https://commons.wikimedia.org/wiki/File:DeepSeek-icon.svg",
+    "download": "https://upload.wikimedia.org/wikipedia/commons/9/95/DeepSeek-icon.svg",
+    "creator": "DeepSeek; Commons upload by Heroblineg",
+    "commons_copyright_terms": "MIT",
+    "license_url": "https://opensource.org/license/mit/",
+    "changes": "None; displayed at UI size with aspect ratio preserved.",
+    "sha256": "5afe2e9fb26acff7359763b694eb3577f7a9098dec1257a3fc6da1a4d52c050f",
+    "bytes": 3605
+  },
+  {
+    "file": "public/logos/claude.svg",
+    "source": "https://commons.wikimedia.org/wiki/File:Claude_AI_symbol.svg",
+    "download": "https://upload.wikimedia.org/wikipedia/commons/b/b0/Claude_AI_symbol.svg",
+    "creator": "Anthropic; Commons uploads by Katoirc and Giga Bang",
+    "commons_copyright_terms": "CC0-1.0",
+    "license_url": "https://creativecommons.org/publicdomain/zero/1.0/",
+    "changes": "None; displayed at UI size with aspect ratio preserved.",
+    "sha256": "5de1221c77cc91e748066fd642ad0eee1c1fa65328814f5178166f901e599709",
+    "bytes": 1155
+  },
+  {
+    "file": "public/logos/openai.svg",
+    "source": "https://commons.wikimedia.org/wiki/File:OpenAI_logo_2025_(symbol).svg",
+    "download": "https://upload.wikimedia.org/wikipedia/commons/6/66/OpenAI_logo_2025_%28symbol%29.svg",
+    "creator": "OpenAI",
+    "commons_copyright_terms": "Public domain (PD-textlogo)",
+    "license_url": "https://creativecommons.org/publicdomain/mark/1.0/",
+    "changes": "None; displayed at UI size with aspect ratio preserved.",
+    "sha256": "ca35a5723163b6a766b8b37de9bedd24c2b3ae81d3caa4b9429ccb91ef873cc7",
+    "bytes": 1894
+  },
+  {
+    "file": "public/logos/xai.svg",
+    "source": "https://commons.wikimedia.org/wiki/File:XAI.svg",
+    "download": "https://upload.wikimedia.org/wikipedia/commons/2/25/XAI.svg",
+    "creator": "xAI; Commons upload by Kashmiri",
+    "commons_copyright_terms": "Public domain (PD-textlogo)",
+    "license_url": "https://creativecommons.org/publicdomain/mark/1.0/",
+    "changes": "None; displayed at UI size with aspect ratio preserved.",
+    "sha256": "33b5435c53ee0b7a3f95ad88c01c9cd4ddb52db88e40686bec67fc2347d67fa6",
+    "bytes": 591
+  },
+  {
+    "file": "public/logos/zai.svg",
+    "source": "https://commons.wikimedia.org/wiki/File:Z.ai_(company_logo).svg",
+    "download": "https://upload.wikimedia.org/wikipedia/commons/f/f4/Z.ai_%28company_logo%29.svg",
+    "creator": "Z.ai",
+    "commons_copyright_terms": "Public domain (PD-textlogo)",
+    "license_url": "https://creativecommons.org/publicdomain/mark/1.0/",
+    "changes": "None; displayed at UI size with aspect ratio preserved.",
+    "sha256": "07a45e8e35b0b631ed2c68cd1cb041f9721b1ceeb0bd0e34f1459b0304a741c7",
+    "bytes": 11037
+  },
+  {
+    "file": "public/logos/cohere.svg",
+    "source": "https://github.com/cohere-ai/cohere-toolkit/blob/fdd4371edf164f2c1726a884e421049093c0128e/src/interfaces/assistants_web/src/components/UI/Logo.tsx",
+    "creator": "Cohere",
+    "copyright_terms": "MIT",
+    "license_url": "https://github.com/cohere-ai/cohere-toolkit/blob/fdd4371edf164f2c1726a884e421049093c0128e/LICENSE",
+    "changes": "Exported the icon-only grayscale variant as standalone SVG. Path geometry is unchanged; fill is black.",
+    "sha256": "53714a2847d2edd3b7c360d70bed9a1dfae58e8ca0d3c93b3eaafc26b0307113",
+    "bytes": 939
+  }
+]

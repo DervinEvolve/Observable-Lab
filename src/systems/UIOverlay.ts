@@ -3,7 +3,7 @@ import { OrbitControls } from 'three/addons/controls/OrbitControls.js'
 import gsap from 'gsap'
 import { Scientist, ModelId } from '../entities/Scientist'
 import { StationRole } from '../scene/colors'
-import { MODEL_PROVIDER_NAMES } from '../shared/types'
+import { MODEL_PROVIDER_NAMES, MODEL_PROVIDER_LOGOS, PROVIDER_LOGOS } from '../shared/types'
 
 // Model display info
 const MODEL_INFO: Record<ModelId, { name: string; personality: string }> = {
@@ -293,16 +293,17 @@ export class UIOverlay {
           padding: 4px;
         }
 
-        /* Plain provider name in the avatar slot; no provider logos are shipped. */
-        .tooltip-avatar.provider-name {
-          width: auto;
-          min-width: 32px;
-          padding: 0 8px;
-          font-size: 10px;
-          font-weight: 700;
-          letter-spacing: 0.2px;
-          white-space: nowrap;
+        .tooltip-avatar.provider-logo {
+          flex: 0 0 32px;
+          background: #fff;
+          padding: 5px;
           box-sizing: border-box;
+        }
+
+        .tooltip-avatar.provider-logo img {
+          width: 100%;
+          height: 100%;
+          object-fit: contain;
         }
 
         .tooltip-title {
@@ -993,7 +994,7 @@ export class UIOverlay {
   private onGlmLabelHover(label: HTMLElement, accent: string): void {
     this.tooltipElement.innerHTML = `
       <div class="tooltip-header">
-        <div class="tooltip-avatar provider-name" style="background: ${accent}20; color: ${accent};">Z.ai</div>
+        <div class="tooltip-avatar provider-logo"><img src="${PROVIDER_LOGOS['z-ai']}" alt="Z.ai logo" width="22" height="22"></div>
         <div class="tooltip-title">
           <div class="tooltip-name">GLM</div>
           <div class="tooltip-provider">glm-5.2</div>
@@ -1045,7 +1046,7 @@ export class UIOverlay {
   private onRobotLabelHover(label: HTMLElement, accent: string): void {
     this.tooltipElement.innerHTML = `
       <div class="tooltip-header">
-        <div class="tooltip-avatar provider-name" style="background: ${accent}20; color: ${accent};">Cohere</div>
+        <div class="tooltip-avatar provider-logo"><img src="${PROVIDER_LOGOS.cohere}" alt="Cohere logo" width="22" height="22"></div>
         <div class="tooltip-title">
           <div class="tooltip-name">North</div>
           <div class="tooltip-provider">north-mini-code</div>
@@ -1687,7 +1688,7 @@ export class UIOverlay {
 
     this.tooltipElement.innerHTML = `
       <div class="tooltip-header">
-        <div class="tooltip-avatar provider-name" style="background: ${color}20; color: ${color};">${MODEL_PROVIDER_NAMES[modelId]}</div>
+        <div class="tooltip-avatar provider-logo"><img src="${MODEL_PROVIDER_LOGOS[modelId]}" alt="${MODEL_PROVIDER_NAMES[modelId]} logo" width="22" height="22"></div>
         <div class="tooltip-title">
           <div class="tooltip-name">${info.name}</div>
         </div>

@@ -1,5 +1,5 @@
 import type { Epoch, CommentatorOutput, ChallengerOutput, ReviewerOutput } from '../shared/types'
-import { MODEL_DISPLAY_NAMES, BACKEND_TO_FRONTEND_MODEL, MODEL_PROVIDER_NAMES, type ModelId } from '../shared/types'
+import { MODEL_DISPLAY_NAMES, BACKEND_TO_FRONTEND_MODEL, MODEL_PROVIDER_NAMES, providerLogoForModel, type ModelId } from '../shared/types'
 import { COLORS } from '../scene/colors'
 
 // Accent color for a model (matches the scientist/desk accents) so observers can
@@ -281,6 +281,8 @@ export class TranscriptPanel {
           font-size: 9px; font-weight: 700; letter-spacing: 0.2px; white-space: nowrap;
           box-shadow: 0 1px 4px rgba(0,0,0,0.3);
         }
+        .chat-avatar--logo { width: 28px; padding: 4px; background: #fff; }
+        .chat-avatar--logo img { width: 100%; height: 100%; object-fit: contain; }
         .chat-bubble {
           max-width: 84%;
           background: rgba(255, 255, 255, 0.055);
@@ -720,6 +722,7 @@ export class TranscriptPanel {
 
       const color = modelColorHex(modelId)
       const provider = this.modelProvider(modelId)
+      const logo = providerLogoForModel(modelId)
       const obj = role.output as unknown as Record<string, unknown>
       const remark = typeof obj.remark === 'string' ? obj.remark : ''
       const reasoning = typeof obj.reasoning === 'string' ? obj.reasoning : ''
@@ -728,7 +731,7 @@ export class TranscriptPanel {
 
       return `
         <div class="chat-msg ${side}">
-          <span class="chat-avatar" style="background:${color}22;color:${color}" title="${this.escapeHtml(modelName)} · ${this.escapeHtml(provider)}">${this.escapeHtml(provider)}</span>
+          <span class="chat-avatar${logo ? ' chat-avatar--logo' : ''}"${logo ? '' : ` style="background:${color}22;color:${color}"`} title="${this.escapeHtml(modelName)} · ${this.escapeHtml(provider)}">${logo ? `<img src="${logo}" alt="${this.escapeHtml(provider)} logo" width="20" height="20">` : this.escapeHtml(provider)}</span>
           <div class="chat-bubble">
             <div class="chat-head">
               <span class="chat-name" style="color:${color}">${this.escapeHtml(modelName)}</span>
@@ -745,7 +748,7 @@ export class TranscriptPanel {
     }).join('')
   }
 
-  // Plain provider name shown in the chat avatar's place (no provider logos are shipped).
+  // Keep provider names available for accessible labels and unknown-provider fallbacks.
   private modelProvider(modelId: ModelId): string {
     const frontendId = BACKEND_TO_FRONTEND_MODEL[modelId]
     return (frontendId && MODEL_PROVIDER_NAMES[frontendId]) || String(modelId).split('/')[0]

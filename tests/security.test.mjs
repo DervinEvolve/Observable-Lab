@@ -379,9 +379,14 @@ test('a fallback answer records and shows the model that actually answered', asy
   })
   assert.match(html, /class="chat-name"[^>]*>Claude</)
   assert.match(html, /fallback for Grok/)
-  // The avatar slot shows the answering model's provider as text, not a logo image.
-  assert.match(html, /class="chat-avatar"[^>]*>Anthropic</)
-  assert.doesNotMatch(html, /<img|\/logos\//)
+  // The avatar identifies the actual fallback provider with a local, credited mark.
+  assert.match(html, /<img src="\/logos\/claude\.svg" alt="Anthropic logo"/)
+  assert.doesNotMatch(html, /src="\/logos\/xai\.svg"/)
+  const { providerLogoForModel } = await load('src/shared/types.js')
+  assert.equal(providerLogoForModel('anthropic/a-versioned-fallback'), '/logos/claude.svg')
+  for (const unknown of [undefined, null, {}, '__proto__/x', 'constructor/x', 'https://attacker.example/icon.svg', 'unknown/model']) {
+    assert.equal(providerLogoForModel(unknown), undefined)
+  }
 })
 
 test('research records carry the unverified label, dataset and harness hash', async () => {

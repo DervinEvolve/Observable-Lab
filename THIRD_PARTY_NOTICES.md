@@ -9,9 +9,24 @@ The root MIT license applies to original contributions by Dervin Dimanche. It do
 - The spaceship named Spaceship_BarbaraTheBee is from Quaternius's [Ultimate Space Kit](https://quaternius.com/packs/ultimatespacekit.html), CC0 1.0.
 - The subagent drone in `src/entities/Drone.ts` uses original procedural geometry. The former imported `public/models/drone/drone.glb` has been removed from this draft because its source could not be established. The old drone and historical MachineMan/GLM asset must also be removed from the published history unless their redistribution terms can be confirmed. The root MIT license does not cover those old assets.
 
-No model-provider logos are included. The interface names providers in plain text (Google, DeepSeek, Anthropic, OpenAI, xAI, Z.ai, Cohere); those names are their owners' trademarks and are used only to say which provider serves a model, without implying endorsement. The logo images used earlier (`public/logos/`) were removed because their sources could not be confirmed.
+## Provider logos
 
-The three still captures in `docs/assets/` show the current app with text provider labels. The earlier composed figures, which contained an unconfirmed provider avatar and the old imported drone, are excluded from this snapshot. The room GIF is a labelled local simulation, not a recording of connected model or sandbox activity.
+The hover cards and transcript use local logo assets to identify the model's provider. The names and marks belong to their respective owners; their use here implies no affiliation or endorsement. Each asset retains the terms listed below. The root MIT license covers my code.
+
+| File | Source and creator | Recorded terms |
+|---|---|---|
+| `public/logos/gemini.svg` | [Gemini sparkle](https://commons.wikimedia.org/wiki/File:Gemini_sparkle_v002.svg), Google; original source is Google's gstatic asset | Commons PD-shape declaration |
+| `public/logos/deepseek.svg` | [DeepSeek icon](https://commons.wikimedia.org/wiki/File:DeepSeek-icon.svg), DeepSeek; uploaded by Heroblineg from chat.deepseek.com | MIT; complete notice in [DeepSeek-logo-MIT.txt](docs/licenses/DeepSeek-logo-MIT.txt) |
+| `public/logos/claude.svg` | [Claude symbol](https://commons.wikimedia.org/wiki/File:Claude_AI_symbol.svg), Anthropic website source; Commons uploads by Katoirc and Giga Bang | Commons CC0-1.0 declaration |
+| `public/logos/openai.svg` | [OpenAI blossom](https://commons.wikimedia.org/wiki/File:OpenAI_logo_2025_(symbol).svg), OpenAI | Commons PD-textlogo declaration |
+| `public/logos/xai.svg` | [xAI logo](https://commons.wikimedia.org/wiki/File:XAI.svg), xAI; Commons upload by Kashmiri | Commons PD-textlogo declaration |
+| `public/logos/zai.svg` | [Z.ai logo](https://commons.wikimedia.org/wiki/File:Z.ai_(company_logo).svg), Z.ai, sourced from chat.z.ai | Commons PD-textlogo declaration |
+| `public/logos/cohere.svg` | [Cohere's official toolkit logo component](https://github.com/cohere-ai/cohere-toolkit/blob/fdd4371edf164f2c1726a884e421049093c0128e/src/interfaces/assistants_web/src/components/UI/Logo.tsx), copyright 2024 Cohere | MIT; full notice in [Cohere-Toolkit-MIT.txt](docs/licenses/Cohere-Toolkit-MIT.txt). Exported the icon-only grayscale variant to SVG, with unchanged paths and black fill |
+
+[Source records](docs/PROVIDER_LOGO_SOURCES.json) preserve download URLs, file hashes and any conversion notes. The six Commons SVG files are unchanged. The copyright declarations above are those recorded by the source pages; trademark rights remain with the providers. The former unverified logo files remain excluded.
+
+
+The three still captures in `docs/assets/` were recorded with text provider labels, before the sourced logos were restored. The earlier composed figures, which contained an unconfirmed provider avatar and the old imported drone, are excluded from this snapshot. The room GIF is a labelled local simulation, not a recording of connected model or sandbox activity.
 
 ## Software and research
 

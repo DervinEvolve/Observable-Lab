@@ -39,14 +39,41 @@ export const BACKEND_TO_FRONTEND_MODEL: Record<ModelId, FrontendModelId> = {
   'x-ai/grok-4.3': 'grok',
 }
 
-// Plain provider names. The UI shows these as text where it identifies a
-// model's provider; it ships no provider logos.
+// Provider names remain available beside the credited local logo assets.
 export const MODEL_PROVIDER_NAMES: Record<FrontendModelId, string> = {
   gemini: 'Google',
   deepseek: 'DeepSeek',
   claude: 'Anthropic',
   gpt: 'OpenAI',
   grok: 'xAI',
+}
+
+export const PROVIDER_LOGOS = {
+  google: '/logos/gemini.svg',
+  deepseek: '/logos/deepseek.svg',
+  anthropic: '/logos/claude.svg',
+  openai: '/logos/openai.svg',
+  'x-ai': '/logos/xai.svg',
+  'z-ai': '/logos/zai.svg',
+  cohere: '/logos/cohere.svg',
+} as const
+
+export const MODEL_PROVIDER_LOGOS: Record<FrontendModelId, string> = {
+  gemini: PROVIDER_LOGOS.google,
+  deepseek: PROVIDER_LOGOS.deepseek,
+  claude: PROVIDER_LOGOS.anthropic,
+  gpt: PROVIDER_LOGOS.openai,
+  grok: PROVIDER_LOGOS['x-ai'],
+}
+
+// Resolve the actual responding provider, including versioned fallback models.
+// Only the local allowlist can supply an image URL.
+export function providerLogoForModel(modelId: unknown): string | undefined {
+  if (typeof modelId !== 'string') return undefined
+  const provider = modelId.split('/')[0]
+  return Object.hasOwn(PROVIDER_LOGOS, provider)
+    ? PROVIDER_LOGOS[provider as keyof typeof PROVIDER_LOGOS]
+    : undefined
 }
 
 // ============================================
