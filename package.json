@@ -1,0 +1,32 @@
+{
+  "name": "observable-lab",
+  "version": "1.0.0",
+  "description": "Browser-based 3D research environment for observing AI model collaboration",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test:security": "node --test tests/security.test.mjs",
+    "check:api": "tsc --project tsconfig.api.json",
+    "test:bundle": "node --test tests/bundle.test.mjs"
+  },
+  "keywords": [
+    "threejs",
+    "ai",
+    "visualization"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@vercel/postgres": "^0.10.0",
+    "gsap": "^3.14.2",
+    "three": "^0.182.0"
+  },
+  "devDependencies": {
+    "@types/three": "^0.182.0",
+    "@vercel/node": "^5.5.23",
+    "typescript": "^5.9.3",
+    "vite": "^7.3.1"
+  }
+}

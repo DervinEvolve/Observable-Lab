@@ -1,0 +1,185 @@
+{
+  "research_repository": "DervinEvolve/Research-Lab",
+  "research_revision": "938bfce294803b2ba811167b8077dbca91d9b61d",
+  "ledger": {
+    "path": "results.tsv",
+    "blob": "8e1e68a21dc64becf876f52adfd2a48a8b3917ae",
+    "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d"
+  },
+  "findings": [
+    {
+      "epoch": 1,
+      "path": "wiki/findings/epoch-001.md",
+      "blob": "51cbc9cb83928c4749bbe41e44b7c71cf6553789",
+      "bytes": 2133,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "d895d87f95c9ebd504c6ff61cdadfeaff12801e24adf0b336183c2167dce4713"
+    },
+    {
+      "epoch": 2,
+      "path": "wiki/findings/epoch-002.md",
+      "blob": "7eb51589f2cc35a49f2a662a813a11512d6163cc",
+      "bytes": 1619,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "18a971624ab6dcb78ca36652d54fd77c3880b15969b098a8a5028fd814cabfe4"
+    },
+    {
+      "epoch": 3,
+      "path": "wiki/findings/epoch-003.md",
+      "blob": "429bec7ac7231fcb1cd3d5c418478b14a7e77c98",
+      "bytes": 1763,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "80775dc1257b7cc4b5ff8e9bedab7beb2b8f43ad134eb4286943b8ebec930830"
+    },
+    {
+      "epoch": 4,
+      "path": "wiki/findings/epoch-004.md",
+      "blob": "f8068f3f3705393844dbf143b89cfabdbcafe9ca",
+      "bytes": 1569,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "786815c0f92fc3d5a368158eeec95862dd9382aeb9968a53968f862e51abf140"
+    },
+    {
+      "epoch": 5,
+      "path": "wiki/findings/epoch-005.md",
+      "blob": "17750ad40c638e09f859f2b528c776c87365dde5",
+      "bytes": 1604,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "71980d4f2d09aa2dc97a047d8a4406bfdcda1fece61e828af06eded2fc3d36c0"
+    },
+    {
+      "epoch": 6,
+      "path": "wiki/findings/epoch-006.md",
+      "blob": "08285aea3985b7382871457246f71a1aacd51aea",
+      "bytes": 1393,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "daac7cacce428b9b2fc71b7dccb034e9cb11997ba184873cb183660590b0c685"
+    },
+    {
+      "epoch": 7,
+      "path": "wiki/findings/epoch-007.md",
+      "blob": "d534fd70e311e137ffcb57edcfb4b489b759fc3d",
+      "bytes": 1826,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "481b367b51486033c95ef27e96fba570de7ab0fa4acbe6de4019c80590aef6fa"
+    },
+    {
+      "epoch": 8,
+      "path": "wiki/findings/epoch-008.md",
+      "blob": "413599dc672a5c86ef60077bfd2e4d7db8c7720e",
+      "bytes": 1550,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "95e7fb9ac0d9f3944ee4004ba417ad1a45567271db53925d6656236e612be6a2"
+    },
+    {
+      "epoch": 9,
+      "path": "wiki/findings/epoch-009.md",
+      "blob": "4f4048d4d2c939f14089960fb8f7a7c153779f25",
+      "bytes": 1599,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "0a7a34b1671cd2aa7646638176d1b5d82711450d77d4fd4d24f829358abd3e23"
+    },
+    {
+      "epoch": 10,
+      "path": "wiki/findings/epoch-010.md",
+      "blob": "5a40a59b5a6e264a0651b5a06568b62236c68a6d",
+      "bytes": 2062,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "dca0314d320972d594f06188fd51089788aa49bb1cd606daaf58a1cb3aeaf5d3"
+    },
+    {
+      "epoch": 11,
+      "path": "wiki/findings/epoch-011.md",
+      "blob": "5175361a64a4d41aa01918b59821bab1fb9c00d8",
+      "bytes": 1461,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "6f6d63f17bcb78cb81ebc8a3925fc0baa4fcb65f4a7707d9dbc455a59dd743b9"
+    },
+    {
+      "epoch": 12,
+      "path": "wiki/findings/epoch-012.md",
+      "blob": "2001a3873b234d555c5346de147c658aeda0381e",
+      "bytes": 1284,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "ae18545b07060099ef11707349770241f2baee1eb69acde40db66c857f6c20ad"
+    },
+    {
+      "epoch": 13,
+      "path": "wiki/findings/epoch-013.md",
+      "blob": "b355fee6255107a4898737a8ec069554a4829d38",
+      "bytes": 1793,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "4e825ae1d41ef407aad50bb59d8eb3637985866a90eeb5de922f5989bfcb922e"
+    },
+    {
+      "epoch": 14,
+      "path": "wiki/findings/epoch-014.md",
+      "blob": "181074e4ebc075f23710f16ba758c9be60b77171",
+      "bytes": 3099,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "536f0c7d087fafcb29c94cfaaa2142407005f0bac091032474af26f58ba4b160"
+    },
+    {
+      "epoch": 15,
+      "path": "wiki/findings/epoch-015.md",
+      "blob": "05217a1c3dda49c36f6046df6f5bf859fcb88b1c",
+      "bytes": 1605,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "f4f5d2a6224bb9f9830c89a192c6d840f6270f1b7b6ffb208fda1a6bb9280f8c"
+    },
+    {
+      "epoch": 16,
+      "path": "wiki/findings/epoch-016.md",
+      "blob": "2515f5b7cc8fac95d7350c1ce7e129b1c5ab1e0c",
+      "bytes": 2109,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "8b2d97b1db4cd0f91a2026fcee7819d4fad65de4368d479be68d8b2abb7cca1a"
+    },
+    {
+      "epoch": 17,
+      "path": "wiki/findings/epoch-017.md",
+      "blob": "41c5407af7568f304090d0f23acdd7223c68dbab",
+      "bytes": 1757,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "88dc2ac9b139f12c90f28438158cd7df573e32f3c463fc7d33f858c43af594dc"
+    },
+    {
+      "epoch": 18,
+      "path": "wiki/findings/epoch-018.md",
+      "blob": "23de931625a82365f1abae7c1f5e9da8823d249c",
+      "bytes": 2750,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "a2b537ead96422b72cb04a50cac7040db4694c5a4d422222800d3d03974deada"
+    },
+    {
+      "epoch": 19,
+      "path": "wiki/findings/epoch-019.md",
+      "blob": "c3b69784bbc0fb84283b8bb0207454e04c877cc5",
+      "bytes": 1284,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "459950c5de3dd976df6f9630c7349b05872488bb8a68a0786fe2a5107ad7d164"
+    },
+    {
+      "epoch": 20,
+      "path": "wiki/findings/epoch-020.md",
+      "blob": "1f0adb72b65a547aa64af7d16fc2ba5c70f2fd25",
+      "bytes": 1472,
+      "source_commit": "938bfce294803b2ba811167b8077dbca91d9b61d",
+      "published_file_sha256": "81bba54619f42ed1c6077282e9d502e87448eac2653fd5a00b069795fb5fc284"
+    }
+  ],
+  "role_output_source": "https://observable-lab.vercel.app/api/experiment",
+  "role_output_epochs": [
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "exported_role_outputs_sha256": "3ff3257a55507215a3468ea816beb9c901488126939d0d856354356290f1724a",
+  "export_note": "Role messages, generated training code and run results are preserved. Account identifiers, experiment UUIDs, costs, call IDs, specification snapshots and plant geometry are omitted.",
+  "source_response_digest": {
+    "algorithm": "SHA-256",
+    "hex": "65ace8f92076b290cb5ff596634b73ccbd5d659e2be7fd25eb05b68193aa29eb"
+  }
+}

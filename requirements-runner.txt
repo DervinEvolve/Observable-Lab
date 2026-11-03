@@ -1,0 +1,4 @@
+# Deploy the runner with a supported Sandbox filesystem client.
+modal==1.6.3
+# Imported while the deployment module is loaded locally.
+fastapi==0.162.0

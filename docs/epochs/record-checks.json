@@ -1,0 +1,41 @@
+{
+  "ledger_rows": 2322,
+  "unique_epoch_numbers": 20,
+  "rows_per_epoch": {
+    "1": 1,
+    "2": 1,
+    "3": 1,
+    "4": 1,
+    "5": 1,
+    "6": 1,
+    "7": 1,
+    "8": 1,
+    "9": 1,
+    "10": 1,
+    "11": 1,
+    "12": 1,
+    "13": 1,
+    "14": 1,
+    "15": 1,
+    "16": 1,
+    "17": 1,
+    "18": 1,
+    "19": 1,
+    "20": 2303
+  },
+  "exact_duplicate_rows": 2301,
+  "findings_note_count": 20,
+  "turn_transcript_epochs": [
+    16,
+    17,
+    18,
+    19,
+    20
+  ],
+  "partial_transcript_epochs": [
+    20
+  ],
+  "source_blob_checks": "all notes and ledger match the pinned source",
+  "score_reconciliation": "findings notes and available role outputs agree with rounded ledger scores",
+  "independent_model_evaluation": "unfinished"
+}

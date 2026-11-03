@@ -1,0 +1,5 @@
+# Python test dependencies for tests/test_modal_security.py.
+# The tests load only function definitions from the Modal files, so Modal,
+# torch and the training stack are not needed here.
+fastapi==0.162.0
+httpx==0.28.1

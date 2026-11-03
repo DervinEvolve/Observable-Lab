@@ -1,0 +1,53 @@
+/* Derived from Stageshow's static-card / overlap: one focal surface,
+   a deliberate crop, and an optional supporting surface. Captures are real. */
+.rc {
+ & .ss-stage {overflow:hidden;border-radius:16px;background:#f6f8fa;--g:28px;}
+ & .rc-heading {position:absolute;left:var(--g);top:26px;right:var(--g);display:flex;flex-direction:column;gap:6px;}
+ & .rc-title {white-space:normal;max-width:100%;font:600 28px/1.25 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;letter-spacing:-.5px;color:#172131;}
+ & .rc-detail {white-space:normal;max-width:100%;font:400 15px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;color:#5c697b;}
+ & .rc-product {position:absolute;left:28px;top:116px;width:1024px;height:552px;overflow:hidden;border-radius:12px;background:#fff;box-shadow:var(--ss-shadow-hero);}
+ & .rc-image {display:block;width:100%;height:auto;}
+ & .rc-note {position:absolute;left:28px;bottom:19px;color:#657184;font:400 13px/1.4 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
+ & .rc-input {position:absolute;left:28px;top:330px;width:245px;background:#192431;border-radius:12px;box-shadow:var(--ss-shadow-satellite);overflow:hidden;}
+ & .rc-input-label {padding:12px 14px;color:#e8edf3;font:500 13px/1.3 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;}
+ & .rc-input-crop {position:relative;overflow:hidden;width:245px;height:235px;}
+ & .rc-input-crop img {position:absolute;width:1074px;left:-405px;top:-108px;max-width:none;}
+ & [data-layout='compact'] {--g:16px;border-radius:12px;}
+ & [data-layout='compact'] .rc-heading {left:16px;right:16px;top:18px;gap:8px;}
+ & [data-layout='compact'] .rc-title {font-size:23px;line-height:1.2;letter-spacing:-.35px;}
+ & [data-layout='compact'] .rc-detail {font-size:12px;line-height:1.4;max-width:310px;}
+ & [data-layout='compact'] .rc-product {left:16px;top:126px;width:326px;height:309px;border-radius:9px;}
+ & [data-layout='compact'] .rc-image {position:absolute;width:688px;height:auto;max-width:none;}
+ & [data-layout='compact'] .rc-trading {width:660px;left:-222px;top:-96px;}
+ & [data-layout='compact'] .rc-lab {width:1250px;left:-465px;top:-135px;}
+ & [data-layout='compact'] .rc-scene {width:580px;left:-127px;top:-2px;}
+ & [data-layout='compact'] .rc-input {left:26px;top:340px;width:140px;border-radius:8px;}
+ & [data-layout='compact'] .rc-input-label {font-size:11px;padding:8px;}
+ & [data-layout='compact'] .rc-input-crop {width:140px;height:140px;}
+ & [data-layout='compact'] .rc-input-crop img {width:620px;left:-234px;top:-61px;}
+ & [data-layout='compact'] .rc-note {left:16px;bottom:15px;font-size:11px;}
+}
+.rc-observable .ss-stage {background:#181a1c;}
+.rc-observable .rc-title,.rc-hon .rc-title {color:#f1f4f7;}
+.rc-observable .rc-detail,.rc-hon .rc-detail {color:#b8c1ca;}
+.rc-observable .rc-note,.rc-hon .rc-note {color:#a5afba;}
+.rc-observable .rc-product {background:#2d2924;}
+.rc-hon .ss-stage {background:#0c1420;}
+.rc-hon .rc-product {background:#132033;}
+
+.rc-tradingos .rc-product {height:646px;}
+.rc-tradingos .rc-trading {position:absolute;width:1609px;left:-498px;top:-88px;max-width:none;}
+.rc-observable .rc-product {height:515px;}
+.rc-tradingos [data-layout=compact] .rc-product {top:232px;height:223px;}
+.rc-observable [data-layout=compact] .rc-product {height:309px;}
+
+.rc .rc-speaker {position:absolute;left:16px;top:126px;width:326px;height:22px;overflow:hidden;background:white;border-radius:5px;}
+.rc .rc-speaker img {position:absolute;width:1723px;max-width:none;left:-627px;top:-112px;}
+.rc .rc-record {position:absolute;left:49px;top:392px;width:260px;height:120px;overflow:hidden;border-radius:10px;box-shadow:var(--ss-shadow-satellite);background:#222;}
+.rc .rc-record img {position:absolute;width:1413px;max-width:none;left:-1104px;top:-449px;}
+.rc-hon .rc-product {height:442px;}
+.rc-hon .rc-image {position:relative;top:-24px;}
+.rc-hon [data-layout=compact] .rc-product {height:309px;}
+
+.rc .rc-message {position:absolute;left:16px;top:158px;width:326px;padding:10px 12px;background:white;border-radius:6px;color:#354255;font:400 13px/1.4 -apple-system,BlinkMacSystemFont,sans-serif;}
+.rc .rc-message .ss-text {white-space:normal;}

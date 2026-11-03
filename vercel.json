@@ -1,0 +1,27 @@
+{
+  "framework": "vite",
+  "devCommand": "vite",
+  "functions": {
+    "api/epoch/tick.ts": {
+      "maxDuration": 800
+    },
+    "api/epoch/run.ts": {
+      "maxDuration": 800
+    },
+    "api/epoch/clear.ts": {
+      "maxDuration": 60
+    },
+    "api/north/run.ts": {
+      "maxDuration": 800
+    },
+    "api/sprites/exec.ts": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/epoch/tick",
+      "schedule": "0 * * * *"
+    }
+  ]
+}
