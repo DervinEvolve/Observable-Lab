@@ -1,5 +1,5 @@
 import type { Epoch, CommentatorOutput, ChallengerOutput, ReviewerOutput } from '../shared/types'
-import { MODEL_DISPLAY_NAMES, BACKEND_TO_FRONTEND_MODEL, MODEL_PROVIDER_NAMES, providerLogoForModel, type ModelId } from '../shared/types'
+import { MODEL_DISPLAY_NAMES, BACKEND_TO_FRONTEND_MODEL, MODEL_PROVIDER_NAMES, WILDCARD_ACCENTS, WILDCARD_DISPLAY_NAMES, providerLogoForModel, type ModelId } from '../shared/types'
 import { COLORS } from '../scene/colors'
 
 // Accent color for a model (matches the scientist/desk accents) so observers can
@@ -296,6 +296,7 @@ export class TranscriptPanel {
           display: flex; align-items: center; gap: 6px; margin-bottom: 3px;
         }
         .chat-name { font-size: 11px; font-weight: 700; letter-spacing: -0.1px; }
+        .chat-provider { font-size: 10px; color: rgba(255,255,255,0.72); }
         .chat-chip {
           font-size: 8px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.4px;
           padding: 1px 6px; border-radius: 6px;
@@ -669,7 +670,13 @@ export class TranscriptPanel {
   private renderWildcard(epoch: Epoch): string {
     const turns = this.wildcardTurns.filter(t => t.epoch_number === epoch.epoch_number)
     if (!turns.length) return ''
-    const accents: Record<string, string> = { North: '#39d98a', GLM: '#b07cff' }
+    // Speakers are stored by display name; older rows may use the bare family name.
+    const hex = (n: number) => '#' + n.toString(16).padStart(6, '0')
+    const accents: Record<string, string> = {
+      North: hex(WILDCARD_ACCENTS.north), GLM: hex(WILDCARD_ACCENTS.glm),
+      [WILDCARD_DISPLAY_NAMES.north]: hex(WILDCARD_ACCENTS.north),
+      [WILDCARD_DISPLAY_NAMES.glm]: hex(WILDCARD_ACCENTS.glm),
+    }
     // Rows come newest-first from the API; show them oldest-first, capped so
     // a chatty experiment doesn't swallow the epoch entry.
     const shown = [...turns].reverse().slice(-6)
@@ -681,7 +688,7 @@ export class TranscriptPanel {
       </div>`
     }).join('')
     return `<div style="font-size:10px;line-height:1.5;margin:8px 0;">
-      <div style="color:rgba(255,255,255,0.5);margin-bottom:2px;">🧪 Wildcard lab — North &amp; GLM</div>
+      <div style="color:rgba(255,255,255,0.5);margin-bottom:2px;">🧪 Wildcard lab: ${this.escapeHtml(WILDCARD_DISPLAY_NAMES.north)} &amp; ${this.escapeHtml(WILDCARD_DISPLAY_NAMES.glm)}</div>
       ${rows}
     </div>`
   }
@@ -735,6 +742,7 @@ export class TranscriptPanel {
           <div class="chat-bubble">
             <div class="chat-head">
               <span class="chat-name" style="color:${color}">${this.escapeHtml(modelName)}</span>
+              <span class="chat-provider">${this.escapeHtml(provider)}</span>
               <span class="chat-chip" style="background:${color}22;color:${color}">${role.label}</span>
               ${fallbackChip}
               <span class="chat-time">${time}</span>
@@ -751,7 +759,11 @@ export class TranscriptPanel {
   // Keep provider names available for accessible labels and unknown-provider fallbacks.
   private modelProvider(modelId: ModelId): string {
     const frontendId = BACKEND_TO_FRONTEND_MODEL[modelId]
-    return (frontendId && MODEL_PROVIDER_NAMES[frontendId]) || String(modelId).split('/')[0]
+    if (frontendId && MODEL_PROVIDER_NAMES[frontendId]) return MODEL_PROVIDER_NAMES[frontendId]
+    // wildcards, fallbacks and older runs: plain-text provider from the id prefix
+    const prefix = String(modelId).split('/')[0]
+    const known: Record<string, string> = { google: 'Google', deepseek: 'DeepSeek', anthropic: 'Anthropic', openai: 'OpenAI', 'x-ai': 'xAI', 'z-ai': 'Z.ai', cohere: 'Cohere' }
+    return Object.hasOwn(known, prefix) ? known[prefix] : prefix
   }
 
   private getClockTime(iso?: string): string {

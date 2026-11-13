@@ -341,7 +341,7 @@ function createExecutorProps(): THREE.Group {
     transparent: true,
     opacity: 0.4,
     roughness: 0.1,
-    transmission: 0.6,
+    clearcoat: 1, // no transmission: it costs a second render of the room
   })
 
   for (let i = 0; i < 3; i++) {

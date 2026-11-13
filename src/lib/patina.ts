@@ -193,9 +193,17 @@ export class PatinaSystem {
     })
   }
 
+  // Spores replace the dust as the room overgrows (0 = dust as usual, 1 = gone)
+  private dustSuppression = 0
+  public setDustSuppression(amount: number): void {
+    this.dustSuppression = Math.min(1, Math.max(0, amount))
+  }
+
   // Update dust particles (call in animation loop)
   public update(deltaTime: number): void {
     if (!this.dustParticles) return
+    ;(this.dustParticles.material as THREE.PointsMaterial).size = 0.008 * (1 - this.dustSuppression)
+    this.dustParticles.visible = this.dustSuppression < 0.98
 
     const positions = this.dustParticles.geometry.attributes.position.array as Float32Array
     const count = positions.length / 3

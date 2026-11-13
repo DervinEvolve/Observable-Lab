@@ -12,6 +12,7 @@ import subprocess
 import time
 import math
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -138,7 +139,7 @@ class ResearchIsolationTests(unittest.TestCase):
             creates.append(kwargs)
             return sb
         cache = Cache()
-        namespace = functions("modal/research_runner.py", {"run_experiment"}, {
+        namespace = functions("modal/research_runner.py", {"run_experiment", "_check_train_py"}, {
             "os": SimpleNamespace(makedirs=lambda *a, **k: None,
                                   environ={"PATH": "/usr/bin", "SECRET_SENTINEL": "must-not-pass"}),
             "time": clock, "subprocess": subprocess, "sys": SimpleNamespace(executable="python"),
@@ -197,6 +198,100 @@ class ResearchIsolationTests(unittest.TestCase):
         result = self.run_sandbox(fail_setup=True)
         self.assertEqual(result["status"], "crash")
         self.assertEqual(result["stage"], "sandbox")
+
+
+class SyntaxCheckTests(unittest.TestCase):
+    """train.py must compile before data preparation or a GPU is touched."""
+
+    def load(self):
+        prepared, created = [], []
+        namespace = functions("modal/research_runner.py", {"run_experiment", "_check_train_py"}, {
+            "os": SimpleNamespace(makedirs=lambda *a, **k: None, environ={"PATH": "/usr/bin"}),
+            "time": Clock(), "subprocess": SimpleNamespace(run=lambda *a, **k: prepared.append(a)),
+            "sys": SimpleNamespace(executable="python"),
+            "modal": SimpleNamespace(Sandbox=SimpleNamespace(create=lambda **k: created.append(k))),
+            "cache": None, "app": "test-app", "image": "reviewed-image", "GPU_KIND": "test-gpu",
+            "DEFAULT_BUDGET_S": 300, "TRAIN_GRACE_S": 120, "PREPARE_TIMEOUT_S": 600,
+            "REPORTED_TRAIN_TOLERANCE_S": 10.0, "hashlib": hashlib, "json": json, "math": math,
+        })
+        return namespace, prepared, created
+
+    def test_syntax_error_is_a_crash_before_any_preparation_or_gpu(self):
+        namespace, prepared, created = self.load()
+        # The shape of run 1's epoch 20 failure: an unterminated string literal.
+        source = "def train():\n    print('RESULT {}\n" + "x = 1\n" * 50
+        result = namespace["run_experiment"](source, 300)
+        self.assertEqual(result["status"], "crash")
+        self.assertEqual(result["stage"], "syntax")
+        self.assertIn("SyntaxError", result["error"])
+        self.assertIn("line 2", result["error"])
+        self.assertNotIn("metrics", result)
+        self.assertEqual(prepared, [])
+        self.assertEqual(created, [])
+
+    def test_smoke_runs_are_checked_too(self):
+        namespace, prepared, created = self.load()
+        result = namespace["run_experiment"]("if True:\nprint('x')\n", 300, smoke=True)
+        self.assertEqual((result["status"], result["stage"]), ("crash", "syntax"))
+        self.assertIn("IndentationError", result["error"])
+        self.assertEqual((prepared, created), ([], []))
+
+    def test_check_accepts_valid_code_and_never_runs_it(self):
+        namespace, _, _ = self.load()
+        check = namespace["_check_train_py"]
+        self.assertIsNone(check("raise SystemExit('this must not run')\n"))
+        self.assertIsNone(check((ROOT / "modal" / "harness" / "prepare.py").read_text()))
+
+    def test_check_reports_compile_errors_beyond_parsing(self):
+        check = self.load()[0]["_check_train_py"]
+        for source in ["return 1\n", "def f():\n    nonlocal x\n", "x = 1\0\n", "(" * 5000 + ")" * 5000]:
+            reason = check(source)
+            self.assertIsInstance(reason, str, source[:20])
+            self.assertLess(len(reason), 600)
+
+
+class StatusTests(unittest.TestCase):
+    def status_for(self, outcome):
+        class Expired(Exception):
+            pass
+        def get(timeout):
+            if isinstance(outcome, BaseException):
+                raise outcome
+            if outcome == "expired":
+                raise Expired()
+            return outcome
+        namespace = functions("modal/research_runner.py", {"_authed", "status"}, {
+            "os": os, "hmac": hmac, "Request": Request, "HTTPException": HTTPException,
+            "OutputExpiredError": Expired,
+            "modal": SimpleNamespace(FunctionCall=SimpleNamespace(from_id=lambda call_id: SimpleNamespace(get=get))),
+        })
+        request = SimpleNamespace(headers={"authorization": "Bearer " + TOKEN})
+        with patch.dict(os.environ, {"RUNNER_TOKEN": TOKEN}):
+            return namespace["status"](request, call_id="test-call")
+
+    def test_running_done_expired_and_failed(self):
+        self.assertEqual(self.status_for(TimeoutError()), {"status": "running"})
+        self.assertEqual(self.status_for({"status": "ok"}), {"status": "done", "result": {"status": "ok"}})
+        self.assertEqual(self.status_for("expired")["status"], "failed")
+        self.assertEqual(self.status_for(RuntimeError("boom"))["status"], "failed")
+
+
+class RunnerPinTests(unittest.TestCase):
+    def test_runner_images_use_the_deploy_client_pins(self):
+        pins = {}
+        for line in (ROOT / "requirements-runner.txt").read_text().splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                name, version = line.split("==")
+                pins[name] = version
+        runner = (ROOT / "modal" / "research_runner.py").read_text()
+        self.assertEqual(set(pins), {"modal", "fastapi"})
+        # Both images install the same FastAPI the deploy client loads locally.
+        self.assertEqual(runner.count(f'fastapi=={pins["fastapi"]}'), 1)
+        self.assertEqual(runner.count(f'fastapi[standard]=={pins["fastapi"]}'), 1)
+        self.assertNotRegex(runner, r"fastapi(\[standard\])?==(?!" + re.escape(pins["fastapi"]) + ")")
+        # Triton needs a C compiler in the training image.
+        self.assertIn('.apt_install("gcc=', runner)
 
 
 class DatasetPinTests(unittest.TestCase):

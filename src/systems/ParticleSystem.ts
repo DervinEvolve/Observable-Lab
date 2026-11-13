@@ -155,9 +155,18 @@ export class ParticleSystem {
     }
   }
 
+  // As the specimen overgrows the room its spores take over from these motes.
+  // 0 = motes as usual, 1 = gone.
+  private suppression = 0
+  public setSuppression(amount: number): void {
+    this.suppression = Math.min(1, Math.max(0, amount))
+  }
+
   // Called every frame
   public update(deltaTime: number): void {
     if (!this.particles || !this.geometry || !this.velocities) return
+    if (this.material) this.material.size = PARTICLE_CONFIGS[this.currentPreset].size * (1 - this.suppression)
+    this.particles.visible = this.suppression < 0.98
 
     this.time += deltaTime
     const config = PARTICLE_CONFIGS[this.currentPreset]

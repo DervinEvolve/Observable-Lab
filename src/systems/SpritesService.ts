@@ -1,22 +1,32 @@
-import { getTaskOrchestrator, Task, TaskType } from './TaskOrchestrator'
+// Sprites in the room.
+//
+// Each model has its own sandbox (a "sprite"). When a model's code
+// contribution is pushed to AI-Agent, its sprite checks out that commit and
+// runs the repository's tests on the server (api/_lib/sprites.ts). This
+// service polls the public contributions endpoint for those results and plays
+// the real output tail, with a pass or fail line, onto the author's desk
+// terminal through the stream events main.ts already wires to TerminalScreen.
+//
+// Nothing is shown unless a real run came back with an exit status: no
+// simulated commands, no placeholder output.
 
-// Backend API endpoint (proxies to Sprites API with auth)
-const BACKEND_API = '/api/sprites'
+// Public, read-only: latest contributions that ran in a sprite.
+const RUNS_API = '/api/experiment/code-contributions?sprite_runs=1'
+// Operator route (needs the operator credential); development helper only.
 const EXEC_API = '/api/sprites/exec'
 
-// Model to Sprite mapping - each AI model gets its own container
+const POLL_MS = 60_000
+const IDLE_POLL_MS = 5 * 60_000   // backend missing or not answering JSON
+const FRESH_DELAY_MS = 20_000     // let the code-writing session on the same screen finish first
+const LINE_MS = 140
+const HOLD_MS = 30_000            // keep the verdict on screen before the scientist leaves
+const MAX_LINES = 14
+
+// Panel models with a desk terminal. North and GLM have sprites too, but no desk.
 export type ModelId = 'claude' | 'gpt' | 'gemini' | 'grok' | 'deepseek'
+const DESK_MODELS: readonly ModelId[] = ['claude', 'gpt', 'gemini', 'grok', 'deepseek']
 
-// Sprite container status
-export type SpriteStatus = 'creating' | 'ready' | 'running' | 'hibernating' | 'not_created' | 'error'
-
-interface SpriteInfo {
-  name: string
-  status: SpriteStatus
-  url?: string
-}
-
-// Sprites activity events
+// Sprites activity events (robot reactions)
 export interface SpritesActivityEvent {
   type: 'writing' | 'reading' | 'testing' | 'committing' | 'idle' | 'error'
   spriteId: string
@@ -31,47 +41,111 @@ export interface StreamOutputEvent {
   modelId: ModelId
   text?: string
   command?: string
-  exitCode?: number
+  exitCode?: number | null
 }
 
-// Stream callbacks
 type StreamCallback = (event: StreamOutputEvent) => void
-
-// Event callbacks
 type ActivityCallback = (event: SpritesActivityEvent) => void
 
+/** One real sprite test run, as the public endpoint reports it. */
+export interface SpriteRun {
+  id: string
+  modelId: ModelId
+  spriteName: string
+  branch: string
+  passed: boolean
+  exitCode: number
+  durationMs: number | null
+  outputTail: string
+  ranAt: string
+}
+
+/** Keep only runs that really happened and belong to a desk model. */
+export function parseSpriteRuns(data: unknown): SpriteRun[] {
+  const list = (data as { sprite_runs?: unknown })?.sprite_runs
+  if (!Array.isArray(list)) return []
+  const runs: SpriteRun[] = []
+  for (const item of list) {
+    if (!item || typeof item !== 'object') continue
+    const row = item as Record<string, unknown>
+    const sprite = row.sprite as Record<string, unknown> | undefined
+    if (!sprite || typeof row.id !== 'string' || typeof row.branch !== 'string') continue
+    const name = sprite.sprite_name
+    const exit = sprite.exit_code
+    const tail = sprite.output_tail
+    const ranAt = sprite.ran_at
+    const match = typeof name === 'string' ? /^observable-([a-z]+)$/.exec(name) : null
+    const modelId = match?.[1] as ModelId | undefined
+    if (!modelId || !DESK_MODELS.includes(modelId)) continue
+    if (typeof exit !== 'number' || !Number.isInteger(exit)) continue
+    if (typeof tail !== 'string' || !tail.trim() || typeof ranAt !== 'string' || Number.isNaN(Date.parse(ranAt))) continue
+    if (sprite.status !== 'passed' && sprite.status !== 'failed') continue
+    runs.push({
+      id: row.id,
+      modelId,
+      spriteName: name as string,
+      branch: row.branch,
+      passed: exit === 0,
+      exitCode: exit,
+      durationMs: typeof sprite.duration_ms === 'number' ? sprite.duration_ms : null,
+      outputTail: tail,
+      ranAt,
+    })
+  }
+  return runs
+}
+
+const seconds = (ms: number | null) => (ms === null ? '' : ` in ${Math.max(1, Math.round(ms / 1000))} s`)
+
+function shortTime(iso: string): string {
+  const d = new Date(iso)
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())} UTC`
+}
+
+/** The lines a terminal shows for one run: where it ran, the real tail, then the verdict. */
+export function terminalLinesForRun(run: SpriteRun): Array<{ text: string; type: 'output' | 'error' }> {
+  const tail = run.outputTail
+    .split('\n')
+    .map(line => line.replace(/\s+$/, ''))
+    .filter(line => line.trim().length > 0)
+    .slice(-MAX_LINES)
+    .map(line => (line.length > 120 ? `${line.slice(0, 119)}…` : line))
+  return [
+    { text: `# ${run.spriteName}  ${run.branch}  ${shortTime(run.ranAt)}`, type: 'output' },
+    ...tail.map(text => ({ text, type: 'output' as const })),
+    run.passed
+      ? { text: `✓ PASS  tests passed${seconds(run.durationMs)}`, type: 'output' }
+      : { text: `✗ FAIL  exit ${run.exitCode}${seconds(run.durationMs)}`, type: 'error' },
+  ]
+}
+
 export class SpritesService {
-  private sprites: Map<ModelId, SpriteInfo> = new Map()
   private activityCallbacks: ActivityCallback[] = []
   private streamCallbacks: StreamCallback[] = []
   private activeStreams: Map<ModelId, AbortController> = new Map()
-  private initialized: boolean = false
   private repoUrl: string = ''
 
-  // Task type to Sprite command mapping
-  private static TASK_COMMANDS: Partial<Record<TaskType, string[]>> = {
-    implement_feature: ['git pull', 'npm run build'],
-    write_test: ['git pull', 'npm test'],
-    fix_bug: ['git pull', 'npm run build', 'npm test'],
-    refactor: ['git pull', 'npm run lint', 'npm run build'],
-  }
-
-  constructor() {
-    // Public viewers carry no operator token. Protected operations require a separate operator client.
-  }
+  private pollTimer: number | null = null
+  private polling = false
+  private firstPoll = true
+  private seenRuns: Set<string> = new Set()
+  private queue: Array<{ run: SpriteRun; notBefore: number }> = []
+  private playing = false
 
   setRepoUrl(url: string): void {
     this.repoUrl = url
-    console.log(`[SpritesService] Repository URL set: ${url}`)
+  }
+
+  getRepoUrl(): string {
+    return this.repoUrl
   }
 
   onActivity(callback: ActivityCallback): () => void {
     this.activityCallbacks.push(callback)
     return () => {
       const index = this.activityCallbacks.indexOf(callback)
-      if (index !== -1) {
-        this.activityCallbacks.splice(index, 1)
-      }
+      if (index !== -1) this.activityCallbacks.splice(index, 1)
     }
   }
 
@@ -79,14 +153,15 @@ export class SpritesService {
     this.activityCallbacks.forEach(cb => cb(event))
   }
 
-  // Subscribe to streaming output events
+  // Subscribe to terminal output. The first subscriber starts polling for
+  // real sprite runs, so the room needs no extra wiring.
   onStreamOutput(callback: StreamCallback): () => void {
     this.streamCallbacks.push(callback)
+    this.startRunPolling()
     return () => {
       const index = this.streamCallbacks.indexOf(callback)
-      if (index !== -1) {
-        this.streamCallbacks.splice(index, 1)
-      }
+      if (index !== -1) this.streamCallbacks.splice(index, 1)
+      if (this.streamCallbacks.length === 0) this.stopRunPolling()
     }
   }
 
@@ -94,26 +169,110 @@ export class SpritesService {
     this.streamCallbacks.forEach(cb => cb(event))
   }
 
-  // Execute a command in a sprite with streaming output
-  async executeCommand(modelId: ModelId, command: string): Promise<void> {
-    const sprite = this.sprites.get(modelId)
-    console.log(`[SpritesService] Executing on ${modelId}: ${command}`)
+  // ---- real sprite runs ----
 
-    // Cancel any existing stream for this model
-    const existingController = this.activeStreams.get(modelId)
-    if (existingController) {
-      existingController.abort()
+  startRunPolling(): void {
+    if (this.polling || typeof window === 'undefined') return
+    this.polling = true
+    document.addEventListener('visibilitychange', this.onVisibility)
+    this.schedulePoll(1500)
+  }
+
+  stopRunPolling(): void {
+    this.polling = false
+    document.removeEventListener('visibilitychange', this.onVisibility)
+    if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
+    this.pollTimer = null
+  }
+
+  private onVisibility = (): void => {
+    if (this.polling && !document.hidden) this.schedulePoll(1000)
+  }
+
+  private schedulePoll(delayMs: number): void {
+    if (this.pollTimer !== null) window.clearTimeout(this.pollTimer)
+    this.pollTimer = window.setTimeout(() => void this.pollRuns(), delayMs)
+  }
+
+  private async pollRuns(): Promise<void> {
+    if (!this.polling) return
+    if (document.hidden) {
+      this.schedulePoll(POLL_MS)
+      return
     }
+    let next = POLL_MS
+    try {
+      const response = await fetch(RUNS_API, { headers: { Accept: 'application/json' } })
+      const isJson = (response.headers.get('content-type') || '').includes('json')
+      if (!response.ok || !isJson) {
+        next = IDLE_POLL_MS // no backend here (for example the plain Vite dev server)
+      } else {
+        this.acceptRuns(parseSpriteRuns(await response.json()))
+      }
+    } catch {
+      next = IDLE_POLL_MS
+    }
+    this.schedulePoll(next)
+  }
 
+  /** Queue runs not shown yet. On the first answer only the newest run plays. */
+  acceptRuns(runs: SpriteRun[]): void {
+    const fresh = runs.filter(run => !this.seenRuns.has(run.id))
+    fresh.forEach(run => this.seenRuns.add(run.id))
+    if (!fresh.length) {
+      this.firstPoll = false
+      return
+    }
+    const now = Date.now()
+    const toPlay = this.firstPoll ? fresh.slice(0, 1) : fresh.slice().reverse() // oldest first
+    for (const run of toPlay) {
+      this.queue.push({ run, notBefore: this.firstPoll ? now : now + FRESH_DELAY_MS })
+    }
+    this.firstPoll = false
+    void this.playQueue()
+  }
+
+  private async playQueue(): Promise<void> {
+    if (this.playing) return
+    this.playing = true
+    try {
+      while (this.queue.length) {
+        const item = this.queue.shift()!
+        const wait = item.notBefore - Date.now()
+        if (wait > 0) await sleep(wait)
+        await this.playRun(item.run)
+      }
+    } finally {
+      this.playing = false
+    }
+  }
+
+  private async playRun(run: SpriteRun): Promise<void> {
+    const { modelId } = run
+    this.emitActivity({ type: 'testing', spriteId: run.spriteName, message: 'npm test' })
+    this.emitStreamOutput({ type: 'start', modelId, command: 'npm test' })
+    for (const line of terminalLinesForRun(run)) {
+      await sleep(LINE_MS)
+      this.emitStreamOutput({ type: line.type, modelId, text: line.text })
+    }
+    this.emitStreamOutput({ type: 'exit', modelId, exitCode: run.exitCode })
+    if (!run.passed) {
+      this.emitActivity({ type: 'error', spriteId: run.spriteName, message: `tests failed (exit ${run.exitCode})` })
+    }
+    await sleep(HOLD_MS)
+    this.emitStreamOutput({ type: 'done', modelId })
+    this.emitActivity({ type: 'idle', spriteId: run.spriteName })
+  }
+
+  // ---- operator helper (development builds only call this) ----
+
+  // Run a command in a sprite through the operator route. Without the
+  // operator credential the route answers 401, which is shown as an error.
+  async executeCommand(modelId: ModelId, command: string): Promise<void> {
+    this.activeStreams.get(modelId)?.abort()
     const controller = new AbortController()
     this.activeStreams.set(modelId, controller)
-
-    // Emit activity event for visualization
-    this.emitActivity({
-      type: 'writing',
-      spriteId: sprite?.name || `observable-${modelId}`,
-      message: command,
-    })
+    const spriteId = `observable-${modelId}`
 
     try {
       const response = await fetch(EXEC_API, {
@@ -123,276 +282,50 @@ export class SpritesService {
         signal: controller.signal,
       })
 
-      if (!response.ok) {
-        const error = await response.json()
-        this.emitStreamOutput({
-          type: 'error',
-          modelId,
-          text: error.error || 'Failed to execute command',
-        })
+      if (!response.ok || !response.body) {
+        const error = await response.json().catch(() => null) as { error?: string } | null
+        this.emitStreamOutput({ type: 'error', modelId, text: error?.error || `Request failed (${response.status})` })
+        this.emitStreamOutput({ type: 'done', modelId })
         return
       }
 
-      // Read the SSE stream
-      const reader = response.body?.getReader()
-      if (!reader) {
-        this.emitStreamOutput({
-          type: 'error',
-          modelId,
-          text: 'No response body',
-        })
-        return
-      }
-
+      const reader = response.body.getReader()
       const decoder = new TextDecoder()
       let buffer = ''
-
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-
         buffer += decoder.decode(value, { stream: true })
-
-        // Parse SSE events from buffer
         const lines = buffer.split('\n')
-        buffer = lines.pop() || '' // Keep incomplete line in buffer
-
+        buffer = lines.pop() || ''
         for (const line of lines) {
-          if (line.startsWith('data: ')) {
-            try {
-              const data = JSON.parse(line.slice(6))
-              this.emitStreamOutput({ ...data, modelId })
-
-              // Update activity based on output
-              if (data.type === 'output' && data.text) {
-                this.emitActivity({
-                  type: 'writing',
-                  spriteId: sprite?.name || `observable-${modelId}`,
-                  output: data.text,
-                })
-              } else if (data.type === 'error' && data.text) {
-                this.emitActivity({
-                  type: 'error',
-                  spriteId: sprite?.name || `observable-${modelId}`,
-                  message: data.text,
-                })
-              } else if (data.type === 'done') {
-                this.emitActivity({
-                  type: 'idle',
-                  spriteId: sprite?.name || `observable-${modelId}`,
-                })
-              }
-            } catch {
-              // Ignore parse errors
-            }
-          }
+          if (!line.startsWith('data: ')) continue
+          let data: { type?: string; text?: string; command?: string; exitCode?: number | null }
+          try { data = JSON.parse(line.slice(6)) } catch { continue }
+          if (data.type !== 'start' && data.type !== 'output' && data.type !== 'error' && data.type !== 'exit' && data.type !== 'done') continue
+          this.emitStreamOutput({ type: data.type, modelId, text: data.text, command: data.command, exitCode: data.exitCode })
+          if (data.type === 'error') this.emitActivity({ type: 'error', spriteId, message: data.text })
+          if (data.type === 'done') this.emitActivity({ type: 'idle', spriteId })
         }
       }
     } catch (error) {
       if ((error as Error).name !== 'AbortError') {
-        console.error(`[SpritesService] Execution error:`, error)
-        this.emitStreamOutput({
-          type: 'error',
-          modelId,
-          text: error instanceof Error ? error.message : 'Unknown error',
-        })
+        this.emitStreamOutput({ type: 'error', modelId, text: error instanceof Error ? error.message : 'Unknown error' })
+        this.emitStreamOutput({ type: 'done', modelId })
       }
     } finally {
       this.activeStreams.delete(modelId)
     }
   }
 
-  // Cancel any active stream for a model
   cancelExecution(modelId: ModelId): void {
-    const controller = this.activeStreams.get(modelId)
-    if (controller) {
-      controller.abort()
-      this.activeStreams.delete(modelId)
-      console.log(`[SpritesService] Cancelled execution for ${modelId}`)
-    }
+    this.activeStreams.get(modelId)?.abort()
+    this.activeStreams.delete(modelId)
   }
+}
 
-  // Check if service is configured (backend handles token)
-  isConfigured(): boolean {
-    return true // Backend will return error if not configured
-  }
-
-  // Initialize sprites by fetching status from backend
-  async initializeSprites(): Promise<void> {
-    try {
-      const response = await fetch(BACKEND_API)
-      if (!response.ok) {
-        const error = await response.json()
-        console.warn('[SpritesService] Backend not configured:', error.error)
-        return
-      }
-
-      const data = await response.json()
-      const spritesData = data.sprites as Record<string, SpriteInfo>
-
-      for (const [modelId, info] of Object.entries(spritesData)) {
-        this.sprites.set(modelId as ModelId, info)
-      }
-
-      this.initialized = true
-      console.log('[SpritesService] Sprites status loaded:', Object.keys(spritesData))
-
-      // Check if any sprites need to be created
-      const notCreated = Object.entries(spritesData).filter(([, info]) => info.status === 'not_created')
-      if (notCreated.length > 0) {
-        console.log(`[SpritesService] ${notCreated.length} sprites need to be created`)
-      }
-    } catch (error) {
-      console.error('[SpritesService] Failed to initialize:', error)
-    }
-  }
-
-  // Create all sprites via backend
-  async createAllSprites(): Promise<boolean> {
-    try {
-      const response = await fetch(BACKEND_API, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ action: 'create_all' }),
-      })
-
-      if (!response.ok) {
-        const error = await response.json()
-        console.error('[SpritesService] Failed to create sprites:', error)
-        return false
-      }
-
-      const data = await response.json()
-      console.log('[SpritesService] Sprites creation result:', data.results)
-
-      // Refresh status
-      await this.initializeSprites()
-      return true
-    } catch (error) {
-      console.error('[SpritesService] Error creating sprites:', error)
-      return false
-    }
-  }
-
-  // Simulate task execution (emits activity events for visualization)
-  // Actual execution happens in backend during epochs
-  simulateTaskExecution(task: Task, modelId: ModelId): void {
-    const sprite = this.sprites.get(modelId)
-    if (!sprite) {
-      console.warn(`[SpritesService] No sprite for model ${modelId}`)
-      return
-    }
-
-    const commands = SpritesService.TASK_COMMANDS[task.type] || ['processing']
-    const orchestrator = getTaskOrchestrator()
-
-    // Start the task
-    orchestrator.startTask(task.id)
-
-    // Emit activity events to drive visualizations
-    let commandIndex = 0
-    const executeNext = () => {
-      if (commandIndex >= commands.length) {
-        // Task completed
-        this.emitActivity({
-          type: 'committing',
-          spriteId: sprite.name,
-          taskId: task.id,
-        })
-
-        setTimeout(() => {
-          this.emitActivity({
-            type: 'idle',
-            spriteId: sprite.name,
-            taskId: task.id,
-          })
-          orchestrator.completeTask(task.id)
-        }, 1500)
-        return
-      }
-
-      const command = commands[commandIndex]
-      const progress = (commandIndex + 1) / commands.length
-      orchestrator.reportProgress(task.id, progress)
-
-      // Determine activity type
-      let activityType: SpritesActivityEvent['type'] = 'writing'
-      if (command.includes('test')) activityType = 'testing'
-      else if (command.includes('git pull')) activityType = 'reading'
-      else if (command.includes('lint')) activityType = 'reading'
-
-      this.emitActivity({
-        type: activityType,
-        spriteId: sprite.name,
-        taskId: task.id,
-        message: command,
-      })
-
-      commandIndex++
-      // Simulate command execution time (2-5 seconds per command)
-      setTimeout(executeNext, 2000 + Math.random() * 3000)
-    }
-
-    // Start execution
-    this.emitActivity({
-      type: 'reading',
-      spriteId: sprite.name,
-      taskId: task.id,
-      message: 'Starting task...',
-    })
-
-    setTimeout(executeNext, 1000)
-  }
-
-  // Fail a task (for error scenarios)
-  failTask(task: Task, modelId: ModelId, error: string): void {
-    const sprite = this.sprites.get(modelId)
-    const orchestrator = getTaskOrchestrator()
-
-    this.emitActivity({
-      type: 'error',
-      spriteId: sprite?.name || `observable-${modelId}`,
-      taskId: task.id,
-      message: error,
-    })
-
-    orchestrator.failTask(task.id, error)
-
-    setTimeout(() => {
-      this.emitActivity({
-        type: 'idle',
-        spriteId: sprite?.name || `observable-${modelId}`,
-        taskId: task.id,
-      })
-    }, 3000)
-  }
-
-  // Get sprite status for UI
-  getSpriteStatus(modelId: ModelId): SpriteStatus {
-    return this.sprites.get(modelId)?.status || 'not_created'
-  }
-
-  // Get all sprite statuses
-  getAllStatuses(): Record<ModelId, SpriteStatus> {
-    const statuses: Partial<Record<ModelId, SpriteStatus>> = {}
-    const models: ModelId[] = ['claude', 'gpt', 'gemini', 'grok', 'deepseek']
-
-    models.forEach(model => {
-      statuses[model] = this.getSpriteStatus(model)
-    })
-
-    return statuses as Record<ModelId, SpriteStatus>
-  }
-
-  // Check if initialized
-  isInitialized(): boolean {
-    return this.initialized
-  }
-
-  // Get repo URL
-  getRepoUrl(): string {
-    return this.repoUrl
-  }
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => window.setTimeout(resolve, ms))
 }
 
 // Singleton instance
@@ -404,4 +337,3 @@ export function getSpritesService(): SpritesService {
   }
   return serviceInstance
 }
-

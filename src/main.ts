@@ -18,17 +18,21 @@ import { ScannerDrone } from './entities/ScannerDrone'
 import { AbstractScreen, ScreenActivity } from './entities/AbstractScreen'
 import { TerminalScreen } from './entities/TerminalScreen'
 import { GlassTerrarium } from './entities/GlassTerrarium'
+import { Overgrowth } from './entities/Overgrowth'
+import { parseGrowth, growthLevel } from './systems/growth'
+import { repoLinksFrom } from './systems/repoLinks'
 import { StationRole, COLORS } from './scene/colors'
 import { UIOverlay } from './systems/UIOverlay'
 import { LightingController } from './systems/LightingController'
 import { ParticleSystem } from './systems/ParticleSystem'
 import { TranscriptPanel } from './systems/TranscriptPanel'
 import { PatinaSystem } from './lib/patina'
+import { batchStatic } from './lib/staticBatch'
 import { getStateManager } from './api/StateManager'
 import { getTaskOrchestrator, Task, TaskType } from './systems/TaskOrchestrator'
 import { getSpritesService, SpritesActivityEvent, StreamOutputEvent, ModelId as SpriteModelId } from './systems/SpritesService'
 import type { ExperimentState, ExperimentStatus } from './shared/types'
-import { BACKEND_TO_FRONTEND_MODEL, ROLES, MODEL_DISPLAY_NAMES } from './shared/types'
+import { BACKEND_TO_FRONTEND_MODEL, ROLES, MODEL_DISPLAY_NAMES, WILDCARD_DISPLAY_NAMES } from './shared/types'
 
 // Map backend role names to station roles
 const ROLE_TO_STATION: Record<string, StationRole> = {
@@ -46,6 +50,15 @@ class ObservableLab {
   private controls: OrbitControls
   private plant: Plant
   private glassTerrarium: GlassTerrarium
+  // The specimen spreading through the room, driven only by the stored growth record
+  private overgrowth: Overgrowth
+  private growthSeen = false // a growth record (or the dev preview) has arrived
+  private growthShattered = false // the record says the glass is broken
+  private growthTarget = 0
+  private devGrowth = false // development preview via ?growth= is in charge
+  private baseExposure = 1.2
+  private baseFog = new THREE.Color(0xf5f2eb)
+  private canopyFog = new THREE.Color(0xdde4cc)
   private scientists: Scientist[]
   private robot: Robot | null = null
   private glm: GlmWildcard | null = null // GLM wildcard (hovers in front of the NN artwork)
@@ -147,6 +160,16 @@ class ObservableLab {
     // Initialize glass terrarium
     this.glassTerrarium = new GlassTerrarium()
 
+    // The overgrowth stays hidden until the backend reports a growth record
+    this.overgrowth = new Overgrowth()
+    {
+      const mq = window.matchMedia?.('(prefers-reduced-motion: reduce)')
+      if (mq) {
+        this.overgrowth.setReducedMotion(mq.matches)
+        mq.addEventListener?.('change', e => this.overgrowth.setReducedMotion(e.matches))
+      }
+    }
+
     // Build scene (async for model loading)
     this.init()
   }
@@ -185,6 +208,7 @@ class ObservableLab {
     // Debug controls - only in development
     if (import.meta.env.DEV) {
       this.setupDebugControls()
+      this.applyDevGrowthPreview()
     }
 
     // Start
@@ -201,7 +225,8 @@ class ObservableLab {
 
     // Additive "AI research lab" set dressing (server rack, bookshelf, plants,
     // corkboards) placed in the empty ring between desks and walls.
-    this.scene.add(createLabDetails())
+    const labDetails = createLabDetails()
+    this.scene.add(labDetails)
 
     // Capability Archive: the wall that fills up as the agent earns real
     // capabilities — specimen jars, merge tally, notebook pile.
@@ -272,11 +297,20 @@ class ObservableLab {
     const stations = createAllStations()
     this.scene.add(stations)
 
+    // The shell, set dressing and desks never move: merge what looks alike
+    for (const root of [lab, labDetails, stations]) {
+      const r = batchStatic(root)
+      if (import.meta.env.DEV) console.log(`batched ${root.name}: ${r.before} -> ${r.after} meshes`)
+    }
+
     // Add the procedural plant
     this.scene.add(this.plant.group)
 
     // Add glass terrarium (dome with breaking mechanic)
     this.scene.add(this.glassTerrarium.group)
+
+    // What grows out of it once the record says so
+    this.scene.add(this.overgrowth.group)
 
     // Set up shatter callback to persist state
     this.glassTerrarium.onShatter = () => {
@@ -468,6 +502,12 @@ class ObservableLab {
       trainingRig: this.trainingRig,
       jspace: this.jspaceLens,
       voices: this.latestVoice,
+      // Frame cost of the last rendered frame (draw calls, triangles)
+      scene: this.scene,
+      renderer: this.renderer,
+      camera: this.camera,
+      overgrowth: this.overgrowth,
+      renderInfo: () => ({ ...this.renderer.info.render, geometries: this.renderer.info.memory.geometries, textures: this.renderer.info.memory.textures }),
       // Replay live per-role activity from a real in-progress/completed epoch object
       liveReplay: (epoch: ExperimentState['recent_epochs'][0]) => { this.liveAnnouncedKeys.clear(); this.streamedBrowsingKeys.clear(); this.driveLiveEpochActivity(epoch) },
       // Preview live browsing on a sprite terminal (real page screenshot) without waiting for an epoch
@@ -602,7 +642,11 @@ class ObservableLab {
   // Any worker in the lab can deploy a subagent: the five model scientists plus
   // the two wildcards (North, GLM). At most MAX_VISIBLE_DRONES are shown at once.
   private static readonly MAX_VISIBLE_DRONES = 3
-  private static readonly DRONE_DEPLOYERS = ['Claude', 'GPT-5.5', 'Gemini', 'Grok', 'DeepSeek-V4', 'North', 'GLM']
+  private static readonly DRONE_DEPLOYERS = [
+    ...Object.values(MODEL_DISPLAY_NAMES).map(n => n.split(' ')[0]),
+    WILDCARD_DISPLAY_NAMES.north,
+    WILDCARD_DISPLAY_NAMES.glm,
+  ]
 
   // Spawn a "subagent" drone over the terrarium. Call when a model deploys a
   // subagent for a task; despawn it when that subagent finishes. Returns the
@@ -1010,9 +1054,17 @@ class ObservableLab {
       this.glassTerrarium.setShatteredState(true)
     }
 
-    // Check plant bounds against terrarium (physics-based breaking)
-    // This happens every state update as the plant may have changed
-    this.glassTerrarium.checkPlantBounds(this.plant.group)
+    // The growth record (stored epochs, merged code, passing tests) decides how
+    // far the specimen has spread, including when the glass cracks and breaks.
+    const extra = state as unknown as { growth?: unknown; repos?: unknown }
+    const growth = parseGrowth(extra.growth)
+    if (growth && !this.devGrowth) {
+      this.applyGrowth(growthLevel(growth), growth.glass_shattered === true || !!state.glass_shattered)
+    }
+    if (extra.repos !== undefined) this.uiOverlay.setRepoLinks(repoLinksFrom(extra.repos))
+
+    // Older records without growth: the glass reacts to the plant's bounds
+    if (!this.growthSeen) this.glassTerrarium.checkPlantBounds(this.plant.group)
 
     // Scanner probes work harder while an epoch is computing
     for (const sd of this.scanners) sd.setBusy(!!state.epoch_in_progress)
@@ -1085,7 +1137,12 @@ class ObservableLab {
     {
       const clock = getWallClock()
       if (clock) {
-        const intervalMin = state.current_spec.meta.experiment_params?.epoch_interval_minutes ?? 60
+        // Run 2 default cadence is one epoch every 180 minutes; the models may
+        // only slow it down. A value reported by the backend wins.
+        const reported = (state as unknown as { epoch_interval_minutes?: unknown }).epoch_interval_minutes
+        const intervalMin = typeof reported === 'number' && reported > 0
+          ? reported
+          : Math.max(180, state.current_spec.meta.experiment_params?.epoch_interval_minutes ?? 0)
         const lastDone = state.recent_epochs.find(e => e.completed_at)?.completed_at
         let nextAt: number | null = null
         if (lastDone) {
@@ -1916,6 +1973,62 @@ class ObservableLab {
     }
   }
 
+  // First record on page load is shown as it stands; later records grow into
+  // place over several seconds (and break the glass on screen if they cross it).
+  private applyGrowth(level: number, shattered: boolean): void {
+    const first = !this.growthSeen
+    this.growthSeen = true
+    this.growthShattered = shattered
+    this.growthTarget = level
+    this.overgrowth.setTarget(level, first)
+    if (first && (shattered || level >= 3)) this.glassTerrarium.setShatteredState(true)
+  }
+
+  // Per-frame: glass pressure, light under the canopy, spores for dust.
+  private updateGrowthEffects(dt: number): void {
+    this.overgrowth.update(dt)
+    if (!this.growthSeen) return
+    const level = this.overgrowth.getLevel()
+    // the glass gives way as the runners reach it (or wherever the record says it broke)
+    const breakAt = this.growthShattered ? Math.min(2.97, this.growthTarget) : 2.97
+    if (level >= breakAt - 1e-3) {
+      this.glassTerrarium.shatter()
+    } else {
+      this.glassTerrarium.setPressure(level < 2 ? 0 : level - 2)
+    }
+    const canopy = this.overgrowth.canopy()
+    this.renderer.toneMappingExposure = this.baseExposure - 0.16 * canopy
+    if (this.scene.fog instanceof THREE.Fog) this.scene.fog.color.copy(this.baseFog).lerp(this.canopyFog, canopy)
+    const air = this.overgrowth.airborne()
+    this.particleSystem?.setSuppression(air)
+    this.patinaSystem?.setDustSuppression(air)
+  }
+
+  // Development only: preview any stage without a backend.
+  //   ?growth=0..6&growthProgress=0..1    window.lab.growth(stage, progress)
+  private applyDevGrowthPreview(): void {
+    if (!import.meta.env.DEV) return // development builds only; the minifier drops the rest
+    const q = new URLSearchParams(window.location.search)
+    const show = (stage: number, progress: number, immediate: boolean) => {
+      const st = Math.max(0, Math.min(6, Math.floor(stage)))
+      const pr = Math.max(0, Math.min(1, progress))
+      this.devGrowth = true
+      if (immediate) this.growthSeen = false
+      this.applyGrowth(st + pr, st >= 3)
+      let badge = document.getElementById('dev-growth-badge')
+      if (!badge) {
+        badge = document.createElement('div')
+        badge.id = 'dev-growth-badge'
+        badge.style.cssText = 'position:fixed;top:12px;right:12px;z-index:400;padding:6px 10px;border-radius:8px;background:#1f1a14;color:#fff;font:600 12px -apple-system,sans-serif;pointer-events:none'
+        document.body.appendChild(badge)
+      }
+      badge.textContent = `Dev preview: growth stage ${st}, progress ${pr.toFixed(2)} (not real data)`
+    }
+    const stage = q.get('growth')
+    if (stage !== null && !Number.isNaN(Number(stage))) show(Number(stage), Number(q.get('growthProgress') ?? 0) || 0, true)
+    ;(window as unknown as { lab?: Record<string, unknown> }).lab!.growth = (st: number, pr = 0) => show(st, pr, false)
+  }
+
   private handleGlassShatter(): void {
     // The animation plays locally. Persisting the shattered state is an
     // operator action (POST /api/experiment/shatter needs the operator
@@ -1932,7 +2045,7 @@ class ObservableLab {
     button.innerHTML = '🧪 Run Epoch'
     button.style.cssText = `
       position: fixed;
-      bottom: 20px;
+      bottom: 76px;
       left: 20px;
       padding: 12px 20px;
       background: linear-gradient(135deg, #7cb342 0%, #558b2f 100%);
@@ -2481,6 +2594,9 @@ class ObservableLab {
 
     // Update glass terrarium animation (for shatter physics)
     this.glassTerrarium.update(deltaTime)
+
+    // The specimen's spread through the room
+    this.updateGrowthEffects(deltaTime)
 
     // Archive wall: jar orbs float; faster while an epoch computes
     this.archive?.update(deltaTime)

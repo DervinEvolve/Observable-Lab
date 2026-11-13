@@ -23,8 +23,9 @@ import {
 import { withModelTrailers } from './commit-identity.js'
 import { MODEL_DISPLAY_NAMES, WILDCARD_MODELS, WILDCARD_DISPLAY_NAMES } from './types.js'
 import { assertContributionPath } from './contribution-policy.js'
+import { checkContributionInSprite, spritesConfigured, type SpriteCheck } from './sprites.js'
 
-const CODER_SYSTEM = `You are a software engineer with real, secure write access to a shared GitHub repository (AI-Agent) through a sandboxed execution environment (Sprites). This is NOT a simulation or writing exercise: the files you return are pushed as a real commit that names you as the model that wrote it, opened as a real pull request, and — once approved — merged into the actual codebase this agent runs on. Other engineers (other models, and their own subagents) are contributing to this same repo alongside you, epoch after epoch, so treat existing files as real prior work to build on, not placeholders you can ignore.
+const CODER_SYSTEM = `You are a software engineer with real write access to a shared GitHub repository (AI-Agent). This is NOT a simulation or writing exercise: the files you return are pushed as a real commit that names you as the model that wrote it, opened as a real pull request, and — once approved — merged into the actual codebase this agent runs on. Other engineers (other models, and their own subagents) are contributing to this same repo alongside you, epoch after epoch, so treat existing files as real prior work to build on, not placeholders you can ignore.
 
 Only write files under src/, test/, tests/, or docs/, or README.md. Never change workflows, package manifests, dependency hooks, or build configuration.
 
@@ -37,6 +38,9 @@ YOUR PR RUNS REAL CI. GitHub Actions executes the ENTIRE vitest suite (every exi
 - If a pre-existing file is genuinely broken and blocking the suite, you may remove it by listing it in "files_to_delete".
 
 Keep the change small, self-contained, and additive — prefer adding new files over editing ones you haven't seen. Return ONLY valid JSON: { "files": [{ "path": string, "content": string }], "files_to_delete": string[], "commit_message": string, "pr_summary": string }. commit_message should be a short conventional-commit-style line. pr_summary is 1-2 sentences for a human reviewer.`
+
+// Only said when the sandboxes are configured, so the prompt stays true.
+const SPRITE_NOTE = `\n\nAfter you push, your own Sprites sandbox checks out your branch at the exact commit and runs \`npm test\` (vitest run). Its output is shown to people watching the lab, next to the CI result.`
 
 const SUBAGENT_SYSTEM = `You are a subagent with the same real write access to the shared AI-Agent repo, deployed by your parent model for one focused follow-up task: add a real, meaningful test that exercises the actual logic your parent just wrote — not a trivial no-op, not a test that only checks a mock returns what you told it to return. Your test RUNS in real CI (vitest, jest-style globals — do NOT use node:test) and the PR dies if it fails, so: only import exports that actually exist in the files you were shown, get the arithmetic in your expectations right, and never assert exact error-message wording you haven't seen. Don't touch the original files. Return ONLY valid JSON: { "files": [{ "path": string, "content": string }], "commit_message": string }. If the code genuinely isn't testable, return { "files": [], "commit_message": "" }.`
 
@@ -73,6 +77,7 @@ export interface ContributionResult {
   web_sources?: WebCitation[] // the real pages it cited (streamed into the terminal)
   ci_passed?: boolean | null  // real CI verdict for this PR (null = no run / timed out; blocks merging)
   ci_excerpt?: string         // failed-run log tail — fed back to the lab so models learn from it
+  sprite?: SpriteCheck        // the author's sprite ran the tests on this branch (extra evidence, not a merge gate)
 }
 
 // Resolves any OpenRouter model id (panel model or wildcard) to the display
@@ -190,7 +195,7 @@ export async function contributeCode(params: {
 
     const { output, cost: codeCost, servedBy: coderServedBy } = await callModel(
       params.authorModelId,
-      CODER_SYSTEM,
+      CODER_SYSTEM + (spritesConfigured() ? SPRITE_NOTE : ''),
       `${params.agentContext ? `You're building: ${params.agentContext}\n\n` : ''}${
         explorerFindings ? `A subagent explored this first and found: ${explorerFindings}\n\n` : ''
       }Implement this: ${params.description}\n\nCurrent repo files (top-level, for context — don't collide):\n${tree.length ? tree.join('\n') : '(empty repo)'}`,
@@ -268,7 +273,7 @@ export async function contributeCode(params: {
 
     const pr = await openPullRequest(params.branchName, params.title, `${coder.pr_summary}\n\n_Opened automatically by the Observable Lab._`)
 
-    const base = {
+    const base: Omit<ContributionResult, 'merged' | 'cost'> = {
       pr_url: pr.html_url, files: coder.files, subagent_files: subagentFiles, author,
       explorer_task: explorerTask, explorer_findings: explorerFindings,
       web_searches: webSearches, web_sources: webSources,
@@ -283,6 +288,20 @@ export async function contributeCode(params: {
     let ciExcerpt = ''
     try {
       headSha = await getBranchHeadSha(params.branchName)
+    } catch (e) {
+      console.warn('[code-contribution] could not read the branch head (merge blocked):', e instanceof Error ? e.message : e)
+    }
+    // The author's sprite checks out this exact commit and runs the tests
+    // while CI runs. It has its own hard time limit and never throws; its
+    // verdict is shown to viewers but does not decide the merge. It has to
+    // finish before the PR is resolved, because closing deletes the branch.
+    const spriteRun: Promise<SpriteCheck> = checkContributionInSprite({
+      authorModelId, branch: params.branchName, headSha,
+    }).catch(e => ({
+      status: 'error' as const, exit_code: null, duration_ms: null, sprite_name: null, ran_at: null,
+      output_tail: `sprite error: ${e instanceof Error ? e.message : 'unknown'}`.slice(0, 300),
+    }))
+    try {
       if (headSha) {
         const ci = await waitForCIRun(headSha)
         if (ci.conclusion === 'success') ciPassed = true
@@ -294,6 +313,8 @@ export async function contributeCode(params: {
     } catch (e) {
       console.warn('[code-contribution] CI check failed (merge blocked):', e instanceof Error ? e.message : e)
     }
+    const sprite = await spriteRun
+    base.sprite = sprite
 
     if (ciPassed !== true || !headSha) {
       await closePullRequest(pr.number, params.branchName).catch(() => {})

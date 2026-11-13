@@ -57,15 +57,41 @@ async function gh(path: string, init: RequestInit = {}): Promise<Response> {
 // Repo I/O
 // ---------------------------------------------------------------------------
 
+// The contents API only inlines files up to 1 MB. Asking for the "object"
+// media type keeps the sha and size in the answer for larger files (content
+// comes back empty with encoding "none"), and those are then read through the
+// git blobs API, which serves up to 100 MB. A file that has bytes but decodes
+// to fewer is an error, never an empty string: an empty ledger read would let
+// appendResultsRow rewrite results.tsv as a single row.
+async function readBlob(path: string, sha: string): Promise<string> {
+  const res = await gh(`${repoPath()}/git/blobs/${encodeURIComponent(sha)}`)
+  if (!res.ok) throw new Error(`getResearchFile(${path}) blob read failed: ${res.status}`)
+  const blob = await res.json()
+  if (blob?.encoding !== 'base64' || typeof blob.content !== 'string') {
+    throw new Error(`getResearchFile(${path}) blob came back without base64 content`)
+  }
+  const bytes = Buffer.from(blob.content, 'base64')
+  if (typeof blob.size === 'number' && bytes.length !== blob.size) {
+    throw new Error(`getResearchFile(${path}) blob read ${bytes.length} of ${blob.size} bytes`)
+  }
+  return bytes.toString('utf-8')
+}
+
 export async function getResearchFile(path: string): Promise<{ content: string; sha: string } | null> {
-  const res = await gh(`${repoPath()}/contents/${path}?ref=${BRANCH}`)
+  const res = await gh(`${repoPath()}/contents/${path}?ref=${BRANCH}`, {
+    headers: { Accept: 'application/vnd.github.object+json' },
+  })
   if (res.status === 404) return null
   if (!res.ok) throw new Error(`getResearchFile(${path}) failed: ${res.status}`)
   const data = await res.json()
-  return {
-    content: Buffer.from(data.content, 'base64').toString('utf-8'),
-    sha: data.sha as string,
+  if (data?.type !== undefined && data.type !== 'file') throw new Error(`getResearchFile(${path}) is not a file`)
+  if (typeof data?.sha !== 'string' || !data.sha) throw new Error(`getResearchFile(${path}) answered without a sha`)
+  const size = typeof data.size === 'number' ? data.size : null
+  const inline = typeof data.content === 'string' && data.encoding !== 'none' ? Buffer.from(data.content, 'base64') : null
+  if (inline && (size === null || inline.length === size)) {
+    return { content: inline.toString('utf-8'), sha: data.sha as string }
   }
+  return { content: await readBlob(path, data.sha), sha: data.sha as string }
 }
 
 export async function putResearchFile(
@@ -127,6 +153,12 @@ const RESULTS_HEADER = `${RESULTS_HEADER_V1}\tmetrics_source\tdataset\tharness_s
 // Append one row to results.tsv (read-modify-write; single writer per epoch).
 // Older ledgers get the provenance columns added to their header; their
 // earlier rows simply have no values in those columns.
+//
+// Idempotent: an epoch that is retried after its repository writes already
+// went through rebuilds exactly the same row from its saved outputs, and that
+// row is not appended twice. Run 1's ledger got 2,326 rows for epoch 20 this
+// way. A ledger whose first line is not a known header is left alone.
+// Returns false when the row was already there.
 export async function appendResultsRow(fields: {
   epoch: number
   commit: string
@@ -138,12 +170,13 @@ export async function appendResultsRow(fields: {
   status: 'keep' | 'discard' | 'crash'
   hypothesis: string
   provenance: ResultProvenance
-}): Promise<void> {
+}): Promise<boolean> {
   const existing = await getResearchFile('results.tsv')
-  let base = existing?.content?.trimEnd() ?? RESULTS_HEADER
+  let base = existing?.content?.trimEnd() || RESULTS_HEADER
   const newline = base.indexOf('\n')
-  const header = newline === -1 ? base : base.slice(0, newline)
+  const header = (newline === -1 ? base : base.slice(0, newline)).replace(/\r$/, '')
   if (header === RESULTS_HEADER_V1) base = RESULTS_HEADER + (newline === -1 ? '' : base.slice(newline))
+  else if (header !== RESULTS_HEADER) throw new Error('results.tsv does not start with a known header; not rewriting it')
   const fmt = (v: number | null, digits = 4) => (v === null || v === undefined ? '-' : v.toFixed(digits))
   const row = [
     fields.epoch,
@@ -160,13 +193,27 @@ export async function appendResultsRow(fields: {
     fields.provenance.harness_sha256 ?? '-',
     fmt(fields.provenance.train_wall_seconds, 1),
   ].join('\t')
+  if (base.split('\n').some(line => line.replace(/\r$/, '') === row)) return false
   const unverified = fields.provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
   await putResearchFile('results.tsv', base + '\n' + row + '\n',
     `results: epoch ${fields.epoch} — ${fields.status} (val_bpb ${fmt(fields.val_bpb)}${unverified})\n\n${provenanceTrailers(fields.provenance)}`,
     existing?.sha)
+  return true
 }
 
+// Marks which experiment wrote a finding page (an HTML comment, invisible
+// when GitHub renders the page).
+const EXPERIMENT_MARKER = /<!-- oblab-experiment: ([A-Za-z0-9_-]{1,64}) -->/
+
 // Auto-generated finding page: the durable record of one experiment.
+//
+// Epoch numbers restart with every experiment, so wiki/findings/epoch-NNN.md
+// can already hold another experiment's page. That page is never overwritten:
+// - the same page again (a retried epoch) is a no-op;
+// - a page marked with this experimentId is updated in place;
+// - anything else sends the new page to epoch-NNN-<first 8 of experimentId>.md,
+//   and if that is taken too, or no experimentId was given, the write is refused.
+// Returns the path written, or null when the page was already there unchanged.
 export async function writeFindingPage(args: {
   epoch: number
   author: string
@@ -179,8 +226,11 @@ export async function writeFindingPage(args: {
   reviewReason: string
   challengerNotes: string[]
   provenance: ResultProvenance
-}): Promise<void> {
-  const path = `wiki/findings/epoch-${String(args.epoch).padStart(3, '0')}.md`
+  experimentId?: string
+}): Promise<string | null> {
+  const experimentId = args.experimentId?.trim() || undefined
+  if (experimentId && !/^[A-Za-z0-9_-]{1,64}$/.test(experimentId)) throw new Error('writeFindingPage: invalid experimentId')
+  const stem = `wiki/findings/epoch-${String(args.epoch).padStart(3, '0')}`
   const delta = args.valBpb !== null ? (args.valBpb - args.bestBpb).toFixed(4) : 'n/a'
   const content = `# Epoch ${args.epoch}: ${args.hypothesis.slice(0, 90)}
 
@@ -206,10 +256,23 @@ ${args.reviewReason}
 
 ${args.challengerNotes.length ? `## Challenger concerns\n${args.challengerNotes.map(c => `- ${c}`).join('\n')}\n` : ''}
 *Ledger: results.tsv, epoch ${args.epoch}.*
-`
-  const existing = await getResearchFile(path)
-  await putResearchFile(path, content,
-    `wiki: finding for epoch ${args.epoch}\n\n${modelTrailers({ name: args.author })}\n${provenanceTrailers(args.provenance)}`, existing?.sha)
+${experimentId ? `\n<!-- oblab-experiment: ${experimentId} -->\n` : ''}`
+  const message = `wiki: finding for epoch ${args.epoch}\n\n${modelTrailers({ name: args.author })}\n${provenanceTrailers(args.provenance)}`
+  const candidates = [`${stem}.md`, ...(experimentId ? [`${stem}-${experimentId.slice(0, 8)}.md`] : [])]
+  for (const path of candidates) {
+    const existing = await getResearchFile(path)
+    if (!existing) {
+      await putResearchFile(path, content, message)
+      return path
+    }
+    if (existing.content === content) return null
+    const owner = existing.content.match(EXPERIMENT_MARKER)?.[1]
+    if (experimentId && owner === experimentId) {
+      await putResearchFile(path, content, message, existing.sha)
+      return path
+    }
+  }
+  throw new Error(`writeFindingPage: ${stem}.md already holds a page from another experiment; not overwriting it`)
 }
 
 // ---------------------------------------------------------------------------

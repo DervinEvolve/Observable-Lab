@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { WILDCARD_ACCENTS, WILDCARD_DISPLAY_NAMES, WILDCARD_MODELS } from '../shared/types'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import type { GLTF } from 'three/addons/loaders/GLTFLoader.js'
 
@@ -35,9 +36,9 @@ function lerpAngle(a: number, b: number, t: number): number {
 export class GlmWildcard {
   public group: THREE.Group
   public labelEl: HTMLElement | null = null
-  public readonly name = 'GLM'
-  public readonly modelId = 'z-ai/glm-5.2'
-  public readonly accent = 0xb07cff
+  public readonly name = WILDCARD_DISPLAY_NAMES.glm
+  public readonly modelId = WILDCARD_MODELS.glm
+  public readonly accent = WILDCARD_ACCENTS.glm
 
   private model: THREE.Group | null = null
   private mixer: THREE.AnimationMixer | null = null
@@ -81,7 +82,8 @@ export class GlmWildcard {
 
     this.model.traverse((o) => {
       if (o instanceof THREE.Mesh) {
-        o.castShadow = true
+        // 6k triangles hovering in mid-air: its shadow pass cost more than it showed
+        o.castShadow = false
         o.receiveShadow = true
       }
     })

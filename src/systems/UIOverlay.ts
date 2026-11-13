@@ -4,14 +4,20 @@ import gsap from 'gsap'
 import { Scientist, ModelId } from '../entities/Scientist'
 import { StationRole } from '../scene/colors'
 import { MODEL_PROVIDER_NAMES, MODEL_PROVIDER_LOGOS, PROVIDER_LOGOS } from '../shared/types'
+import { panelName, panelModelId, shortName, modelSlug, providerName, wildcardName, wildcardModelId } from './modelLabels'
+import { defaultRepoLinks, type RepoLink } from './repoLinks'
 
-// Model display info
-const MODEL_INFO: Record<ModelId, { name: string; personality: string }> = {
-  gemini: { name: 'Gemini 3.5 Flash', personality: 'Exploratory, multimodal' },
-  deepseek: { name: 'DeepSeek-V4', personality: 'Methodical, structured' },
-  claude: { name: 'Claude Opus 4.8', personality: 'Safety-conscious, nuanced' },
-  gpt: { name: 'GPT-5.5', personality: 'Agentic, general-purpose' },
-  grok: { name: 'Grok 4.3', personality: 'Edgy, adversarial' },
+// Personalities stay with the scientist; the model names come from the shared
+// maps so a panel change shows everywhere without editing this file.
+// GitHub mark (the one the room has always used)
+const GITHUB_MARK_PATH = 'M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z'
+
+const MODEL_PERSONALITY: Record<ModelId, string> = {
+  gemini: 'Exploratory, multimodal',
+  deepseek: 'Methodical, structured',
+  claude: 'Safety-conscious, nuanced',
+  gpt: 'Agentic, general-purpose',
+  grok: 'Edgy, adversarial',
 }
 
 const ROLE_INFO: Record<StationRole, { title: string; description: string }> = {
@@ -317,8 +323,8 @@ export class UIOverlay {
         }
 
         .tooltip-provider {
-          font-size: 9px;
-          opacity: 0.5;
+          font-size: 10px;
+          opacity: 0.72;
           text-transform: uppercase;
           letter-spacing: 0.5px;
         }
@@ -369,47 +375,108 @@ export class UIOverlay {
           overflow: hidden;
         }
 
-        #github-link {
+        #github-links {
           position: fixed;
           bottom: 20px;
           left: 20px;
+          display: flex;
+          gap: 10px;
+          pointer-events: auto;
+          z-index: 150;
+        }
+
+        .gh-btn {
+          position: relative;
           width: 44px;
           height: 44px;
           border-radius: 50%;
-          background: rgba(255, 255, 255, 0.9);
+          background: rgba(255, 255, 255, 0.92);
           backdrop-filter: blur(8px);
           -webkit-backdrop-filter: blur(8px);
-          border: 1px solid rgba(0, 0, 0, 0.1);
+          border: 1px solid rgba(0, 0, 0, 0.12);
           display: flex;
           align-items: center;
           justify-content: center;
           box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
-          transition: all 0.2s ease;
-          pointer-events: auto;
-          z-index: 150;
+          transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
           text-decoration: none;
+          -webkit-tap-highlight-color: transparent;
         }
 
-        #github-link:hover {
-          transform: scale(1.05);
-          box-shadow: 0 4px 16px rgba(0, 0, 0, 0.15);
+        .gh-btn:hover,
+        .gh-btn.tip-open {
+          transform: translateY(-2px);
+          border-color: rgba(122, 92, 18, 0.55);
+          box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
         }
 
-        #github-link svg {
+        .gh-btn:focus { outline: none; }
+        .gh-btn:focus-visible {
+          box-shadow: 0 0 0 2px #1f1a14, 0 0 0 5px #f3d98b;
+        }
+
+        .gh-btn svg {
           width: 22px;
           height: 22px;
-          opacity: 0.75;
+          opacity: 0.8;
+        }
+
+        /* Small letter under the mark so the three read apart at a glance */
+        .gh-tag {
+          position: absolute;
+          bottom: 3px;
+          right: 5px;
+          font: 700 9px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          color: #3b2f1e;
+          letter-spacing: 0.2px;
+        }
+
+        .gh-tip {
+          position: absolute;
+          bottom: calc(100% + 10px);
+          left: 0;
+          width: max-content;
+          max-width: min(240px, calc(100vw - 40px));
+          padding: 8px 10px;
+          border-radius: 8px;
+          background: #1f1a14;
+          color: #fff;
+          font: 500 12px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+          opacity: 0;
+          transform: translateY(4px);
+          transition: opacity 0.15s ease, transform 0.15s ease;
+          pointer-events: none;
+          white-space: normal;
+        }
+
+        .gh-tip strong { color: #f3d98b; font-weight: 700; }
+        .gh-tip .gh-tip-hint { display: block; margin-top: 3px; color: #d9d2c5; font-size: 11px; }
+
+        .gh-btn:hover .gh-tip,
+        .gh-btn:focus-visible .gh-tip,
+        .gh-btn.tip-open .gh-tip {
+          opacity: 1;
+          transform: translateY(0);
+        }
+
+        .gh-btn.tip-dismissed .gh-tip { opacity: 0; }
+
+        @media (prefers-reduced-motion: reduce) {
+          .gh-btn, .gh-tip { transition: none; }
+          .gh-btn:hover, .gh-btn.tip-open { transform: none; }
         }
 
         #github-commit-badge {
           position: absolute;
+          pointer-events: none;
           top: -5px;
           right: -5px;
           min-width: 18px;
           height: 18px;
           padding: 0 4px;
           border-radius: 9px;
-          background: #2ea043;
+          background: #1a7f37;
           color: #fff;
           font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
           font-size: 10px;
@@ -980,7 +1047,7 @@ export class UIOverlay {
     label.innerHTML = `
       <div class="label-card">
         <div class="label-indicator"></div>
-        <div class="label-name">GLM</div>
+        <div class="label-name">${this.escapeHtml(wildcardName('glm'))}</div>
         <div class="label-role">WILDCARD</div>
       </div>
     `
@@ -996,8 +1063,8 @@ export class UIOverlay {
       <div class="tooltip-header">
         <div class="tooltip-avatar provider-logo"><img src="${PROVIDER_LOGOS['z-ai']}" alt="Z.ai logo" width="22" height="22"></div>
         <div class="tooltip-title">
-          <div class="tooltip-name">GLM</div>
-          <div class="tooltip-provider">glm-5.2</div>
+          <div class="tooltip-name">${this.escapeHtml(wildcardName('glm'))}</div>
+          <div class="tooltip-provider">${this.escapeHtml(providerName(wildcardModelId('glm')))} · ${this.escapeHtml(modelSlug(wildcardModelId('glm')))}</div>
         </div>
       </div>
       <div class="tooltip-section">
@@ -1008,11 +1075,11 @@ export class UIOverlay {
       </div>
       <div class="tooltip-section">
         <div class="tooltip-section-title">Role Description</div>
-        <div class="tooltip-section-content">Autonomous R&amp;D agent. Runs its own coding experiments in a sandbox on its own branch — accepted work merges to main.</div>
+        <div class="tooltip-section-content">Autonomous R&amp;D agent. Runs its own coding experiments in a sandbox on its own branch; accepted work merges to main.</div>
       </div>
       <div class="tooltip-section">
         <div class="tooltip-section-title">Working with</div>
-        <div class="tooltip-section-content">North</div>
+        <div class="tooltip-section-content">${this.escapeHtml(wildcardName('north'))}</div>
       </div>
     `
     const rect = label.getBoundingClientRect()
@@ -1048,8 +1115,8 @@ export class UIOverlay {
       <div class="tooltip-header">
         <div class="tooltip-avatar provider-logo"><img src="${PROVIDER_LOGOS.cohere}" alt="Cohere logo" width="22" height="22"></div>
         <div class="tooltip-title">
-          <div class="tooltip-name">North</div>
-          <div class="tooltip-provider">north-mini-code</div>
+          <div class="tooltip-name">${this.escapeHtml(wildcardName('north'))}</div>
+          <div class="tooltip-provider">${this.escapeHtml(providerName(wildcardModelId('north')))} · ${this.escapeHtml(modelSlug(wildcardModelId('north')))}</div>
         </div>
       </div>
       <div class="tooltip-section">
@@ -1060,11 +1127,11 @@ export class UIOverlay {
       </div>
       <div class="tooltip-section">
         <div class="tooltip-section-title">Role Description</div>
-        <div class="tooltip-section-content">Autonomous R&amp;D agent. Runs its own coding experiments in a sandbox on its own branch — accepted work sprouts as green leaves.</div>
+        <div class="tooltip-section-content">Autonomous R&amp;D agent. Runs its own coding experiments in a sandbox on its own branch; accepted work sprouts as green leaves.</div>
       </div>
       <div class="tooltip-section">
         <div class="tooltip-section-title">Pairs with</div>
-        <div class="tooltip-section-content">GLM — they write code together</div>
+        <div class="tooltip-section-content">${this.escapeHtml(wildcardName('glm'))}, they write code together</div>
       </div>
     `
 
@@ -1358,23 +1425,91 @@ export class UIOverlay {
     this.liveStatusEl?.classList.remove('visible')
   }
 
-  // Link to the AI-Agent repo — where the scientists', wildcards', and
-  // subagents' real commits actually land. Private for now; will point at
-  // the same URL once the repo goes public.
+  // GitHub buttons for the three repositories: the specimen (AI-Agent, with
+  // the commit-count bubble), the room's own code, and the research record.
+  // Hover or keyboard focus shows what each holds; on touch the first tap
+  // shows it and a second tap opens the repo.
+  private githubGroup: HTMLDivElement | null = null
+  private repoLinksKey = ''
   private createGithubLink(): void {
-    const link = document.createElement('a')
-    link.id = 'github-link'
-    link.href = 'https://github.com/DervinEvolve/AI-Agent'
-    link.target = '_blank'
-    link.rel = 'noopener noreferrer'
-    link.title = 'View the AI-Agent repo'
-    link.innerHTML = `
-      <svg viewBox="0 0 16 16" fill="#1a1a1a">
-        <path fill-rule="evenodd" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/>
-      </svg>
-      <span id="github-commit-badge"></span>
-    `
-    this.container.appendChild(link)
+    const group = document.createElement('div')
+    group.id = 'github-links'
+    group.setAttribute('role', 'group')
+    group.setAttribute('aria-label', 'Source code on GitHub')
+    this.container.appendChild(group)
+    this.githubGroup = group
+    this.setRepoLinks(defaultRepoLinks())
+
+    // a tap anywhere else closes an open tooltip
+    document.addEventListener('pointerdown', (e) => {
+      if (!group.contains(e.target as Node)) this.closeRepoTips()
+    })
+  }
+
+  private closeRepoTips(except?: Element): void {
+    this.githubGroup?.querySelectorAll('.gh-btn.tip-open').forEach(b => {
+      if (b !== except) b.classList.remove('tip-open')
+    })
+  }
+
+  public setRepoLinks(links: RepoLink[]): void {
+    const group = this.githubGroup
+    if (!group) return
+    const key = links.map(l => l.key + l.url).join('|')
+    if (key === this.repoLinksKey) return
+    this.repoLinksKey = key
+    group.textContent = ''
+    const tags: Record<string, string> = { ai_agent: 'A', observable_lab: 'L', research_lab: 'R' }
+    for (const link of links) {
+      const a = document.createElement('a')
+      a.className = 'gh-btn'
+      a.href = link.url
+      a.target = '_blank'
+      a.rel = 'noopener noreferrer'
+      a.dataset.repo = link.key
+      a.setAttribute('aria-label', `${link.name} on GitHub, opens in a new tab`)
+      const tipId = `gh-tip-${link.key}`
+      a.setAttribute('aria-describedby', tipId)
+      a.innerHTML = `
+        <svg viewBox="0 0 16 16" fill="#1a1a1a" aria-hidden="true" focusable="false">
+          <path fill-rule="evenodd" d="${GITHUB_MARK_PATH}"/>
+        </svg>
+        <span class="gh-tag" aria-hidden="true">${tags[link.key] || ''}</span>
+        <span class="gh-tip" role="tooltip" id="${tipId}"></span>
+        ${link.key === 'ai_agent' ? '<span id="github-commit-badge" aria-hidden="true"></span>' : ''}
+      `
+      const tip = a.querySelector('.gh-tip') as HTMLSpanElement
+      const strong = document.createElement('strong')
+      strong.textContent = `${link.name}:`
+      tip.append(strong, ` ${link.blurb} `)
+      const hint = document.createElement('span')
+      hint.className = 'gh-tip-hint'
+      hint.textContent = 'Opens on GitHub'
+      tip.append(hint)
+
+      let lastPointer = ''
+      a.addEventListener('pointerdown', (e) => { lastPointer = e.pointerType })
+      a.addEventListener('click', (e) => {
+        // touch: first tap explains, second tap opens
+        if (lastPointer === 'touch' && !a.classList.contains('tip-open')) {
+          e.preventDefault()
+          this.closeRepoTips(a)
+          a.classList.remove('tip-dismissed')
+          a.classList.add('tip-open')
+        }
+        lastPointer = ''
+      })
+      a.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') a.classList.add('tip-dismissed')
+      })
+      a.addEventListener('blur', () => a.classList.remove('tip-dismissed', 'tip-open'))
+      a.addEventListener('mouseleave', () => a.classList.remove('tip-dismissed'))
+      group.appendChild(a)
+    }
+    // the bubble element was rebuilt; show the last known count again
+    const count = this.commitBadgeCount
+    this.commitBadgeCount = -1
+    if (count >= 0) this.setCommitBadge(count)
   }
 
   // Click-to-inspect card: one reusable panel, positioned near the click,
@@ -1456,7 +1591,10 @@ export class UIOverlay {
           Five AI models from different labs collaborate to design an autonomous agent.
         </p>
         <p class="info-description">
-          Watch the specification grow as a plant—branches are capabilities, roots are constraints.
+          Watch the specification grow as a plant: branches are capabilities, roots are constraints.
+        </p>
+        <p class="info-description">
+          As the stored record grows (epochs, merged code, passing tests), the plant breaks out of its dome and slowly takes over the room. With no experiment connected it stays in the glass.
         </p>
         <p class="info-description">
           The scene shows stored experiment state and polls for updates.
@@ -1480,14 +1618,14 @@ export class UIOverlay {
           <div class="info-section-content">
             Each epoch, models rotate through five roles:
             <ul class="info-list">
-              <li><strong>Planner</strong> — "What direction should we explore next?"</li>
-              <li><strong>Executor</strong> — "Here's how that would work"</li>
-              <li><strong>Challenger</strong> — "Here's how this could fail"</li>
-              <li><strong>Reviewer</strong> — "Approve, reject, or modify"</li>
-              <li><strong>Commentator</strong> — "Here's what happened"</li>
-              <li><strong>Wildcard</strong> — North, an autonomous R&D agent (does not rotate)</li>
+              <li><strong>Planner</strong>: "What direction should we explore next?"</li>
+              <li><strong>Executor</strong>: "Here's how that would work"</li>
+              <li><strong>Challenger</strong>: "Here's how this could fail"</li>
+              <li><strong>Reviewer</strong>: "Approve, reject, or modify"</li>
+              <li><strong>Commentator</strong>: "Here's what happened"</li>
+              <li><strong>Wildcard</strong>: ${this.escapeHtml(wildcardName('north'))}, an autonomous R&amp;D agent (does not rotate)</li>
             </ul>
-            <p class="info-note">Every 5 epochs, each of the five models has played each rotating role exactly once. North always holds the Wildcard role — it never rotates. Labels show roles from the last completed epoch and update when each new epoch finishes.</p>
+            <p class="info-note">Every 5 epochs, each of the five models has played each rotating role exactly once. ${this.escapeHtml(wildcardName('north'))} always holds the Wildcard role; it never rotates. Labels show roles from the last completed epoch and update when each new epoch finishes.</p>
           </div>
         </div>
 
@@ -1640,7 +1778,6 @@ export class UIOverlay {
     this.scientists.forEach((scientist) => {
       const modelId = scientist.getModelId()
       const role = scientist.getRole()
-      const info = MODEL_INFO[modelId]
       const color = MODEL_COLORS_HEX[modelId]
 
       const label = document.createElement('div')
@@ -1649,7 +1786,7 @@ export class UIOverlay {
       label.innerHTML = `
         <div class="label-card">
           <div class="label-indicator"></div>
-          <div class="label-name">${info.name.split(' ')[0]}</div>
+          <div class="label-name">${this.escapeHtml(shortName(panelName(modelId)))}</div>
           <div class="label-role">${ROLE_INFO[role].title}</div>
           <div class="label-status">Idle</div>
           <button class="jspace-btn" title="Jacobian-lens readout: what this researcher is about to say, before they say it">J-space</button>
@@ -1682,7 +1819,6 @@ export class UIOverlay {
     this._hoveredScientist = scientist
     const modelId = scientist.getModelId()
     const role = scientist.getRole()
-    const info = MODEL_INFO[modelId]
     const roleInfo = ROLE_INFO[role]
     const color = MODEL_COLORS_HEX[modelId]
 
@@ -1690,7 +1826,8 @@ export class UIOverlay {
       <div class="tooltip-header">
         <div class="tooltip-avatar provider-logo"><img src="${MODEL_PROVIDER_LOGOS[modelId]}" alt="${MODEL_PROVIDER_NAMES[modelId]} logo" width="22" height="22"></div>
         <div class="tooltip-title">
-          <div class="tooltip-name">${info.name}</div>
+          <div class="tooltip-name">${this.escapeHtml(panelName(modelId))}</div>
+          <div class="tooltip-provider">${this.escapeHtml(MODEL_PROVIDER_NAMES[modelId])} · ${this.escapeHtml(modelSlug(panelModelId(modelId)))}</div>
         </div>
       </div>
       <div class="tooltip-section">
@@ -1707,7 +1844,7 @@ export class UIOverlay {
       </div>
       <div class="tooltip-section">
         <div class="tooltip-section-title">Personality</div>
-        <div class="tooltip-section-content">${info.personality}</div>
+        <div class="tooltip-section-content">${MODEL_PERSONALITY[modelId]}</div>
       </div>
     `
 

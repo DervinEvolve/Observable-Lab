@@ -134,13 +134,17 @@ export class GlassTerrarium {
     this.domeGeometry = new THREE.SphereGeometry(DOME_RADIUS, 32, 16, 0, Math.PI * 2, 0, Math.PI / 2)
 
     this.domeMaterial = new THREE.MeshPhysicalMaterial({
+      // Plain transparent glass with a clear-coat sheen. Transmission looked
+      // much the same here but makes three.js draw the whole room a second
+      // time every frame for the refraction pass.
       color: COLORS.structure.glass,
       transparent: true,
-      opacity: 0.15,
+      opacity: 0.16,
       roughness: 0.05,
       metalness: 0.0,
-      transmission: 0.9,
-      thickness: 0.1,
+      clearcoat: 1,
+      clearcoatRoughness: 0.04,
+      depthWrite: false,
       side: THREE.DoubleSide,
     })
 
@@ -363,8 +367,8 @@ export class GlassTerrarium {
       opacity: 0.3,
       roughness: 0.1,
       metalness: 0.0,
-      transmission: 0.7,
-      thickness: 0.05,
+      clearcoat: 1,
+      clearcoatRoughness: 0.05,
       side: THREE.DoubleSide,
     })
 
@@ -584,6 +588,56 @@ export class GlassTerrarium {
     }
   }
 
+  // Pressure from the growth record (stage 2): 0 = clear glass, 1 = about to
+  // give. Cracks are seeded, so the same record always draws the same glass.
+  private pressure = -1
+  public setPressure(amount: number): void {
+    if (this.isShattered || this.isAnimatingShatter) return
+    const q = Math.round(Math.min(1, Math.max(0, amount)) * 40) / 40
+    if (q === this.pressure) return
+    this.pressure = q
+    if (q <= 0) {
+      this.currentState = 'pristine'
+      this.contactPoints = []
+      this.clearCracks()
+      if (this.crackOverlay) (this.crackOverlay.material as THREE.MeshBasicMaterial).opacity = 0
+      return
+    }
+    this.currentState = q < 0.5 ? 'touched' : 'cracked'
+    // where the runners inside press on the glass, spreading as pressure builds
+    const origins = 1 + Math.floor(q * 5)
+    this.contactPoints = []
+    for (let i = 0; i < origins; i++) {
+      const az = i * 1.2566 + 0.7
+      const el = 0.35 + ((i * 0.37) % 0.6)
+      const normal = new THREE.Vector3(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az))
+      const position = normal.clone().multiplyScalar(DOME_RADIUS)
+      position.y += DOME_BASE_Y
+      this.contactPoints.push({ position, normal })
+    }
+    if (!this.crackCanvas || !this.crackOverlay) return
+    const ctx = this.crackCanvas.getContext('2d')
+    if (!ctx) return
+    ctx.clearRect(0, 0, this.crackCanvas.width, this.crackCanvas.height)
+    ctx.lineCap = 'round'
+    // a faint dark edge under each bright line so the cracks read on light walls too
+    for (const [style, width] of [['rgba(40, 32, 24, 0.35)', 5], ['rgba(255, 255, 255, 0.9)', 2.5]] as const) {
+      ctx.strokeStyle = style
+      ctx.lineWidth = width
+      this.contactPoints.forEach((c, i) => {
+        const uv = this.worldToUV(c.position)
+        for (let j = 0; j < 5; j++) this.drawSingleCrack(ctx, uv.u, uv.v, 0.3 + q * 0.7, i * 17 + j * 31)
+      })
+    }
+    ;(this.crackOverlay.material as THREE.MeshBasicMaterial).opacity = 0.3 + q * 0.6
+    this.crackTexture!.needsUpdate = true
+  }
+
+  /** Break the glass now, with the crack and shard animation. */
+  public shatter(): void {
+    this.triggerShatter()
+  }
+
   // For loading persisted state (page reload)
   public setShatteredState(shattered: boolean): void {
     if (shattered && !this.isShattered) {
@@ -601,6 +655,7 @@ export class GlassTerrarium {
       }
 
       this.createStaticShards()
+      this.mergeShards()
     }
   }
 
@@ -627,8 +682,8 @@ export class GlassTerrarium {
       opacity: 0.3,
       roughness: 0.1,
       metalness: 0.0,
-      transmission: 0.7,
-      thickness: 0.05,
+      clearcoat: 1,
+      clearcoatRoughness: 0.05,
       side: THREE.DoubleSide,
     })
 
@@ -716,7 +771,42 @@ export class GlassTerrarium {
           shard.grounded = true
         }
       })
+      this.mergeShards()
     }
+  }
+
+  // Once the shards lie still they are one mesh: one draw call, not ten.
+  private mergeShards(): void {
+    const meshes = this.shardsGroup.children.filter((c): c is THREE.Mesh => c instanceof THREE.Mesh)
+    if (meshes.length < 2) return
+    this.shardsGroup.updateMatrixWorld(true)
+    const toGroup = new THREE.Matrix4().copy(this.shardsGroup.matrixWorld).invert()
+    const geos = meshes.map(m => {
+      const g = m.geometry.index ? m.geometry.toNonIndexed() : m.geometry.clone()
+      for (const name of Object.keys(g.attributes)) if (name !== 'position' && name !== 'normal') g.deleteAttribute(name)
+      g.clearGroups()
+      return g.applyMatrix4(new THREE.Matrix4().multiplyMatrices(toGroup, m.matrixWorld))
+    })
+    const pos: number[] = []
+    const nor: number[] = []
+    for (const g of geos) {
+      pos.push(...(g.getAttribute('position').array as Float32Array))
+      nor.push(...(g.getAttribute('normal').array as Float32Array))
+      g.dispose()
+    }
+    const merged = new THREE.BufferGeometry()
+    merged.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3))
+    merged.setAttribute('normal', new THREE.Float32BufferAttribute(nor, 3))
+    const material = meshes[0].material as THREE.Material
+    for (const m of meshes) {
+      this.shardsGroup.remove(m)
+      m.geometry.dispose()
+      if (m.material !== material) (m.material as THREE.Material).dispose()
+    }
+    const mesh = new THREE.Mesh(merged, material)
+    mesh.name = 'shards'
+    this.shardsGroup.add(mesh)
+    this.shards = []
   }
 
   public getIsShattered(): boolean {

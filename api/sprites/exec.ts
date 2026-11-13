@@ -1,18 +1,15 @@
 import { requireBearer } from '../_lib/auth.js'
 import type { VercelRequest, VercelResponse } from '@vercel/node'
+import { execInSprite, sanitizeOutput, spriteKeyForModel, spriteName, spritesConfigured, tailBytes, SPRITE_KEYS } from '../_lib/sprites.js'
 
-const SPRITES_API_BASE = 'https://api.sprites.dev/v1'
-
-// Sprite names for each AI model
-const MODEL_SPRITES: Record<string, string> = {
-  claude: 'observable-claude',
-  gpt: 'observable-gpt',
-  gemini: 'observable-gemini',
-  grok: 'observable-grok',
-  deepseek: 'observable-deepseek',
-}
-
-// POST /api/sprites/exec - Execute command with streaming output
+// POST /api/sprites/exec {modelId, command}  (operator only)
+// Runs one shell command in a model's sprite and replies as server-sent
+// events, in the shape src/systems/SpritesService.ts reads:
+//   {type:'start', command, spriteName} {type:'output', text} {type:'error', text}
+//   {type:'exit', exitCode} {type:'done'}
+// The Sprites HTTP exec endpoint answers once the command has finished, so
+// the output lines arrive together at the end. exitCode is null when no
+// trustworthy exit status came back.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!requireBearer(req, res)) return
 
@@ -24,128 +21,35 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
-  const token = process.env.SPRITES_TOKEN
-  if (!token) {
-    return res.status(500).json({ error: 'SPRITES_TOKEN not configured' })
+  if (!spritesConfigured()) {
+    return res.status(503).json({ error: 'SPRITES_TOKEN is not set' })
   }
 
-  const { modelId, command } = req.body as {
-    modelId: string
-    command: string
+  const { modelId, command } = (req.body && typeof req.body === 'object' ? req.body : {}) as { modelId?: unknown; command?: unknown }
+  if (typeof command !== 'string' || !command.trim() || command.length > 4000) {
+    return res.status(400).json({ error: 'command must be a non-empty string of at most 4000 characters' })
+  }
+  const key = typeof modelId === 'string' && modelId.length <= 120 ? spriteKeyForModel(modelId) : null
+  if (!key) {
+    return res.status(400).json({ error: 'modelId must be one of ' + SPRITE_KEYS.join(', ') + ' or a model id from those labs' })
   }
 
-  if (!modelId || !command) {
-    return res.status(400).json({ error: 'modelId and command are required' })
-  }
-
-  const spriteName = MODEL_SPRITES[modelId]
-  if (!spriteName) {
-    return res.status(400).json({ error: `Unknown model: ${modelId}` })
-  }
-
-  // Set up SSE headers for streaming
   res.setHeader('Content-Type', 'text/event-stream')
-  res.setHeader('Cache-Control', 'no-cache')
+  res.setHeader('Cache-Control', 'no-store')
   res.setHeader('Connection', 'keep-alive')
+  const send = (event: Record<string, unknown>) => res.write(`data: ${JSON.stringify(event)}\n\n`)
 
+  send({ type: 'start', command, spriteName: spriteName(key) })
   try {
-    // Execute command via Sprites HTTP API (non-streaming for now)
-    // Sprites.dev uses WebSocket for full streaming, but for simplicity
-    // we'll use their HTTP exec endpoint and stream the response
-    const execResponse = await fetch(`${SPRITES_API_BASE}/sprites/${spriteName}/exec`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({ command }),
-    })
-
-    if (!execResponse.ok) {
-      const errorText = await execResponse.text()
-      res.write(`data: ${JSON.stringify({ type: 'error', message: errorText })}\n\n`)
-      res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
-      return res.end()
-    }
-
-    // Check if response is streaming
-    const contentType = execResponse.headers.get('content-type') || ''
-
-    if (contentType.includes('text/event-stream') || contentType.includes('text/plain')) {
-      // Stream the response body
-      const reader = execResponse.body?.getReader()
-      if (!reader) {
-        res.write(`data: ${JSON.stringify({ type: 'error', message: 'No response body' })}\n\n`)
-        res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
-        return res.end()
-      }
-
-      const decoder = new TextDecoder()
-
-      // Send start event
-      res.write(`data: ${JSON.stringify({ type: 'start', command, spriteName })}\n\n`)
-
-      try {
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
-
-          const text = decoder.decode(value, { stream: true })
-          // Split by lines and send each as an output event
-          const lines = text.split('\n')
-          for (const line of lines) {
-            if (line.length > 0) {
-              res.write(`data: ${JSON.stringify({ type: 'output', text: line })}\n\n`)
-            }
-          }
-        }
-      } catch (streamError) {
-        console.error('[Sprites Exec] Stream error:', streamError)
-        res.write(`data: ${JSON.stringify({ type: 'error', message: 'Stream interrupted' })}\n\n`)
-      }
-    } else {
-      // JSON response - parse and send
-      const data = await execResponse.json()
-
-      res.write(`data: ${JSON.stringify({ type: 'start', command, spriteName })}\n\n`)
-
-      // Handle different response formats
-      if (data.output) {
-        const lines = String(data.output).split('\n')
-        for (const line of lines) {
-          res.write(`data: ${JSON.stringify({ type: 'output', text: line })}\n\n`)
-        }
-      } else if (data.stdout) {
-        const lines = String(data.stdout).split('\n')
-        for (const line of lines) {
-          res.write(`data: ${JSON.stringify({ type: 'output', text: line })}\n\n`)
-        }
-      }
-
-      if (data.stderr) {
-        const lines = String(data.stderr).split('\n')
-        for (const line of lines) {
-          res.write(`data: ${JSON.stringify({ type: 'error', text: line })}\n\n`)
-        }
-      }
-
-      if (data.exitCode !== undefined) {
-        res.write(`data: ${JSON.stringify({ type: 'exit', code: data.exitCode })}\n\n`)
-      }
-    }
-
-    // Send done event
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
-    return res.end()
-
+    // vercel.json gives this route 60 s; leave room for the HTTP round trip.
+    const result = await execInSprite(key, command, { dir: '/home/sprite', timeoutS: 45 })
+    const output = sanitizeOutput(tailBytes(result.output, 16 * 1024))
+    for (const line of output.split('\n')) send({ type: 'output', text: line })
+    if (result.timedOut) send({ type: 'error', text: 'timed out' })
+    send({ type: 'exit', exitCode: result.exitCode })
   } catch (error) {
-    console.error('[Sprites Exec] Error:', error)
-    res.write(`data: ${JSON.stringify({
-      type: 'error',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    })}\n\n`)
-    res.write(`data: ${JSON.stringify({ type: 'done' })}\n\n`)
-    return res.end()
+    send({ type: 'error', text: sanitizeOutput(error instanceof Error ? error.message : 'Unknown error') })
   }
+  send({ type: 'done' })
+  return res.end()
 }
-

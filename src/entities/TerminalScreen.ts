@@ -284,8 +284,11 @@ export class TerminalScreen {
     this.render()
   }
 
-  // Add output line
+  // Add output line. Plain lines that start with a test runner's own pass or
+  // fail mark (vitest prints ✓ and ×, and "FAIL" for a failed file) take the
+  // matching colour, so a real test log reads the way it does in a terminal.
   public addOutput(text: string, type: 'normal' | 'success' | 'error' = 'normal'): void {
+    if (type === 'normal') type = toneOf(text)
     const color =
       type === 'success' ? TERMINAL_CONFIG.successColor :
       type === 'error' ? TERMINAL_CONFIG.errorColor :
@@ -456,6 +459,14 @@ export class TerminalScreen {
     ;(this.mesh.material as THREE.Material).dispose()
     this.texture.dispose()
   }
+}
+
+/** Colour for a plain output line, from the pass or fail mark it starts with. */
+export function toneOf(text: string): 'normal' | 'success' | 'error' {
+  const line = text.trimStart()
+  if (line.startsWith('✓') || line.startsWith('✔')) return 'success'
+  if (line.startsWith('×') || line.startsWith('✗') || line.startsWith('✘') || /^FAIL\b/.test(line)) return 'error'
+  return 'normal'
 }
 
 // Factory function

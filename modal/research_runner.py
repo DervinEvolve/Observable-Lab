@@ -3,6 +3,9 @@
 # Runs one fixed-budget training experiment on a dedicated GPU and returns the
 # measured result. The contract mirrors karpathy/autoresearch:
 #
+#   * Before anything else, train.py must compile under the runner's own
+#     Python. A syntax error comes back as a crash at stage "syntax" without
+#     preparing data or starting a GPU (run 1 spent epoch 20 on one).
 #   * Trusted preparation runs before generated code, in the controller.
 #   * Each train.py runs in a fresh Modal Sandbox: no secrets, no network,
 #     a read-only data Volume, and a bounded lifetime. It cannot write back
@@ -37,6 +40,7 @@ import hashlib
 
 import modal
 from fastapi import HTTPException, Request
+from modal.exception import OutputExpiredError
 
 APP_NAME = "oblab-research-runner"
 GPU_KIND = os.environ.get("OBLAB_RUNNER_GPU", "A10G")  # fixed per deployment: comparability
@@ -71,8 +75,17 @@ if not os.path.isfile(prepare_path) and os.path.isfile("/harness/prepare.py"):
 # and record the change; the GPU results are only comparable within one image.
 PYTHON_BASE_IMAGE = "python:3.11.18-slim-bookworm@sha256:94a8fee35252d06ab75856f15f12c7bae67b10e8a6da93c7fded82b2610926cd"
 
+# Compilers: torch.compile hands GPU kernels to Triton, which builds a small C
+# launcher with the system C compiler on first use, and on CPU (the --smoke
+# check) Inductor needs a C++ compiler. The slim base has neither, so every
+# compiled train.py crashed at its first forward pass (run 1, epochs 21
+# onwards). gcc and g++ are the bookworm meta packages, fixed at 4:12.2.0-3 for
+# the whole release; libc6-dev has to match the base image's libc6 exactly, so
+# apt picks it. Adding these changed the image: results from before and after
+# are not comparable, which is why run 2 starts from a fresh baseline run.
 image = (
     modal.Image.from_registry(PYTHON_BASE_IMAGE)
+    .apt_install("gcc=4:12.2.0-3", "g++=4:12.2.0-3", "libc6-dev")
     .pip_install("numpy==2.4.6", "requests==2.34.2", "pyarrow==26.0.0")
     .pip_install("torch==2.6.0", index_url="https://download.pytorch.org/whl/cu124")
     # Modal imports this whole module in the controller as well as the endpoints.
@@ -84,6 +97,27 @@ cache = modal.Volume.from_name("oblab-research-data-v2", create_if_missing=True)
 
 # Endpoint functions need fastapi; keep their image tiny (no torch).
 web_image = modal.Image.from_registry(PYTHON_BASE_IMAGE).pip_install("fastapi[standard]==0.162.0")
+
+
+def _check_train_py(source: str):
+    """None when train.py compiles, else a short reason.
+
+    compile() parses and builds bytecode without running anything, so this is
+    safe on generated code. It runs in the controller, which uses the same
+    image (and so the same Python) as the training sandbox.
+    """
+    try:
+        compile(source, "train.py", "exec", dont_inherit=True)
+    except SyntaxError as exc:  # also IndentationError and TabError
+        where = f"line {exc.lineno}" if exc.lineno else "unknown line"
+        if exc.offset:
+            where += f", column {exc.offset}"
+        text = (exc.text or "").strip()[:200]
+        return f"{type(exc).__name__}: {exc.msg} ({where})" + (f": {text}" if text else "")
+    except (ValueError, RecursionError, MemoryError, OverflowError) as exc:
+        # null bytes, nesting too deep for the parser, and similar
+        return f"{type(exc).__name__}: {str(exc)[:300]}"
+    return None
 
 
 @app.function(
@@ -99,6 +133,11 @@ def run_experiment(train_py: str, budget_s: float = DEFAULT_BUDGET_S, smoke: boo
     """Run one experiment; returns a structured result, never raises for
     experiment-level failures (crash IS a result the reviewer needs)."""
     t0 = time.time()
+    syntax_error = _check_train_py(train_py)
+    if syntax_error is not None:
+        return {"status": "crash", "stage": "syntax",
+                "error": f"train.py does not compile; no data prepared and no GPU started. {syntax_error}",
+                "log_tail": syntax_error, "wall_seconds": time.time() - t0}
     workdir = "/work"
     os.makedirs(workdir, exist_ok=True)
 
@@ -283,7 +322,12 @@ def status(request: Request, call_id: str = "") -> dict:
     try:
         result = fc.get(timeout=0)
         return {"status": "done", "result": result}
+    except OutputExpiredError:
+        # The call's result is gone (Modal keeps outputs for a limited time).
+        # Polling it again can never succeed, so the epoch must record it.
+        return {"status": "failed", "error": "run result expired before it was collected"}
     except TimeoutError:
+        # Modal raises the built-in TimeoutError while the call is still running.
         return {"status": "running"}
     except Exception as e:
         return {"status": "failed", "error": str(e)[-1500:]}

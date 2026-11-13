@@ -11,7 +11,8 @@ test('the production bundle has no debug console object, fake build output, or a
   assert.ok(existsSync(dist), 'run `npm run build` first')
   const js = readdirSync(dist).filter(name => name.endsWith('.js')).map(name => readFileSync(join(dist, name), 'utf8')).join('\n')
   assert.ok(js.length > 0, 'no JavaScript in dist/assets')
-  for (const banned of ['window.lab', 'lab.exec(', '9f2c1a', 'build passed', '/api/experiment/shatter', '/api/epoch/run']) {
+  // growthProgress / dev-growth-badge: the development-only overgrowth preview switch
+  for (const banned of ['window.lab', 'lab.exec(', '9f2c1a', 'build passed', '/api/experiment/shatter', '/api/epoch/run', 'growthProgress', 'dev-growth-badge']) {
     assert.equal(js.includes(banned), false, `production bundle contains ${banned}`)
   }
   assert.ok(js.includes('Simulation: no experiment connected'), 'simulation marker missing')
