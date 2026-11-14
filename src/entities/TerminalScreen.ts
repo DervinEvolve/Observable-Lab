@@ -79,6 +79,9 @@ export class TerminalScreen {
       transparent: true,
       side: THREE.DoubleSide,
     })
+    // a flat plane shows one face at a time: one pass draws it the same as
+    // the two a see-through two-sided material otherwise takes
+    material.forceSinglePass = true
     this.mesh = new THREE.Mesh(geometry, material)
     this.group.add(this.mesh)
 
@@ -93,6 +96,7 @@ export class TerminalScreen {
       opacity: 0.1,
       side: THREE.DoubleSide,
     })
+    glowMaterial.forceSinglePass = true
     const glow = new THREE.Mesh(glowGeometry, glowMaterial)
     glow.position.z = -0.01
     this.group.add(glow)

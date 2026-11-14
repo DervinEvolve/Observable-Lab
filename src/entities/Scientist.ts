@@ -107,7 +107,7 @@ export class Scientist {
 
   // Speech indicator for conversations
   private speechIndicator: THREE.Group | null = null
-  private speechDots: THREE.Mesh[] = []
+  private speechPhase = { value: 0 }
   private speechTime: number = 0
 
   // Thinking indicator for active work
@@ -361,22 +361,45 @@ export class Scientist {
     this.speechIndicator = new THREE.Group()
     this.speechIndicator.name = 'speechIndicator'
 
-    // Create three dots
-    const dotGeometry = new THREE.SphereGeometry(0.04, 8, 6)
-    const dotMaterial = new THREE.MeshStandardMaterial({
-      color: 0xffffff,
-      emissive: 0xffffff,
-      emissiveIntensity: 0.3,
-      transparent: true,
-      opacity: 0.9,
-    })
-
+    // Three dots bouncing in a wave: one mesh, each dot's bounce, pulse and
+    // fade worked out in the shader from its index (one draw call, not three)
     const spacing = 0.12
+    const dots: THREE.BufferGeometry[] = []
     for (let i = 0; i < 3; i++) {
-      const dot = new THREE.Mesh(dotGeometry, dotMaterial.clone())
-      dot.position.set((i - 1) * spacing, 0, 0)
-      this.speechDots.push(dot)
-      this.speechIndicator.add(dot)
+      const g = new THREE.SphereGeometry(0.04, 8, 6)
+      g.deleteAttribute('uv')
+      g.translate((i - 1) * spacing, 0, 0)
+      g.setAttribute('aDot', new THREE.BufferAttribute(new Float32Array(g.getAttribute('position').count).fill(i), 1))
+      dots.push(g)
+    }
+    const geo = mergeGeometries(dots, false)
+    dots.forEach(g => g.dispose())
+    if (geo) {
+      const mat = new THREE.MeshStandardMaterial({
+        color: 0xffffff,
+        emissive: 0xffffff,
+        emissiveIntensity: 0.3,
+        transparent: true,
+      })
+      const phase = this.speechPhase
+      mat.onBeforeCompile = sh => {
+        sh.uniforms.uSpeech = phase
+        sh.vertexShader = sh.vertexShader
+          .replace('#include <common>', '#include <common>\nattribute float aDot;\nuniform float uSpeech;\nvarying float vSpeechA;')
+          .replace(
+            '#include <begin_vertex>',
+            `#include <begin_vertex>
+            float sp = max(0.0, sin(uSpeech - aDot * ${0.3.toFixed(1)}));
+            vec3 dc = vec3((aDot - 1.0) * ${spacing.toFixed(2)}, 0.0, 0.0);
+            transformed = dc + (transformed - dc) * (0.7 + 0.3 * sp) + vec3(0.0, sp * 0.08, 0.0);
+            vSpeechA = 0.5 + 0.5 * sp;`
+          )
+        sh.fragmentShader = sh.fragmentShader
+          .replace('#include <common>', '#include <common>\nvarying float vSpeechA;')
+          .replace('#include <color_fragment>', '#include <color_fragment>\ndiffuseColor.a *= vSpeechA;')
+      }
+      mat.customProgramCacheKey = () => 'speech-dots'
+      this.speechIndicator.add(new THREE.Mesh(geo, mat))
     }
 
     // Position above the scientist's head and model label
@@ -484,26 +507,8 @@ export class Scientist {
 
     this.speechTime += deltaTime
 
-    // Animate each dot with a wave pattern
-    const speed = 3.0
-    const waveDelay = 0.3
-
-    this.speechDots.forEach((dot, i) => {
-      // Staggered bounce animation
-      const phase = this.speechTime * speed - i * waveDelay
-      const bounce = Math.max(0, Math.sin(phase)) * 0.08
-
-      // Base Y position with bounce
-      dot.position.y = bounce
-
-      // Pulse opacity/scale
-      const pulse = 0.7 + Math.max(0, Math.sin(phase)) * 0.3
-      dot.scale.setScalar(pulse)
-
-      // Update material opacity
-      const mat = dot.material as THREE.MeshStandardMaterial
-      mat.opacity = 0.5 + Math.max(0, Math.sin(phase)) * 0.5
-    })
+    // the wave runs in the shader (createSpeechIndicator)
+    this.speechPhase.value = this.speechTime * 3.0
 
     // Make indicator face the camera (billboard effect) - rotate around Y only
     // The indicator should face outward from the scientist
@@ -1176,13 +1181,6 @@ export class Scientist {
     if (this.mixer) {
       this.mixer.stopAllAction()
     }
-
-    // Dispose speech indicator
-    this.speechDots.forEach((dot) => {
-      dot.geometry.dispose()
-      ;(dot.material as THREE.Material).dispose()
-    })
-    this.speechDots = []
 
     this.group.traverse((obj) => {
       if (obj instanceof THREE.Mesh) {

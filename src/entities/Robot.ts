@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { mergeRigidRig } from '../lib/skinnedMerge'
+import { mergeRigidRig, mergeSkinnedPieces } from '../lib/skinnedMerge'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import type { GLTF } from 'three/addons/loaders/GLTFLoader.js'
 import gsap from 'gsap'
@@ -139,7 +139,26 @@ export class Robot {
           })
           // the whole robot draws as one skinned mesh, each piece still
           // following its own animated node (src/lib/skinnedMerge.ts)
-          mergeRigidRig(this.model)
+          const rig = mergeRigidRig(this.model)
+          // The merged rig was never culled, so it was drawn into the lamp's
+          // shadow even when the robot is nowhere near the lamp's cone (2.7k
+          // triangles a frame). A sphere round its rest pose, twice as wide so
+          // swinging arms and legs stay inside it, lets it be culled like
+          // everything else.
+          if (rig) {
+            rig.geometry.computeBoundingSphere()
+            const sphere = rig.geometry.boundingSphere
+            if (sphere) {
+              rig.boundingSphere = sphere.clone()
+              rig.boundingSphere.radius *= 2
+              rig.frustumCulled = true
+            }
+          }
+          // each hand is a skinned piece in two colours: one draw call a hand
+          // (pieces that look alike in every other way merge, colour per vertex)
+          const hands = new Set<THREE.Object3D>()
+          this.model.traverse(o => { if (o instanceof THREE.SkinnedMesh && o.parent && o.name !== 'rig_merged') hands.add(o.parent) })
+          for (const h of hands) mergeSkinnedPieces(h, m => `${m.roughness}|${m.metalness}|${m.emissive.getHex()}|${m.emissiveIntensity}|${m.side}|${m.flatShading}`)
 
           // Setup animation mixer
           if (gltf.animations.length > 0) {

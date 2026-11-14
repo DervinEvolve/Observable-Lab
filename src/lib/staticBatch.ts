@@ -16,7 +16,9 @@ import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
 //    draw call (the material reads them per vertex).
 //  - textured materials merge only with the same texture.
 
-const SKIP_NAMES = new Set(['wallClock', 'corkboard'])
+// (the wall clock's frame batches with the room's brass and wood; its display,
+// the only part that changes, has a texture of its own and stays apart)
+const SKIP_NAMES = new Set(['corkboard'])
 const BRASS_REF = new THREE.Color(0xb5a642)
 const WOOD_REF = new THREE.Color(0x8b7355)
 

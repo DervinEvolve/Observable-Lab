@@ -55,14 +55,17 @@ export class CapabilityArchive {
     this.plaqueCanvas.width = 512
     this.plaqueCanvas.height = 96
     this.plaqueTexture = new THREE.CanvasTexture(this.plaqueCanvas)
-    const plaque = new THREE.Mesh(
-      new THREE.BoxGeometry(1.15, 0.16, 0.02),
-      [brass, brass, brass, brass,
-        new THREE.MeshStandardMaterial({ map: this.plaqueTexture, roughness: 0.35, metalness: 0.55 }),
-        brass]
-    )
+    // a brass block (batched with the shelves) with the etched face laid on
+    // its front: one draw call for the face, not one for each side of the box
+    const plaque = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.16, 0.02), brass)
     plaque.position.set(0, -0.12, 0.06)
     this.group.add(plaque)
+    const face = new THREE.Mesh(
+      new THREE.PlaneGeometry(1.15, 0.16),
+      new THREE.MeshStandardMaterial({ map: this.plaqueTexture, roughness: 0.35, metalness: 0.55, polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1 })
+    )
+    face.position.set(0, -0.12, 0.0702)
+    this.group.add(face)
     this.drawPlaque(0, 0, 0)
 
     // Shared halo sprite texture for the jar orbs

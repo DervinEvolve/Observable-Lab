@@ -329,14 +329,17 @@ function berry(sink: GrowthSink, p: THREE.Vector3, r: number, c: THREE.Color, li
 
 /**
  * Petal tones for a flower grown from someone's merged work: the specimen's
- * own rose-to-cream petals, drawn toward that model's accent (most at the
- * base of each petal, a little at the tip), so it reads as the specimen's
- * offspring in that model's colour. No model: the specimen's own tones.
+ * own warm rose-to-cream petals, drawn toward that model's accent (more at
+ * the base of each petal, a little at the tip), so it reads as the
+ * specimen's offspring in that model's colour, not as a flower of another
+ * kind. `strength` below 1 keeps more of the specimen's own warmth (up the
+ * walls and on the canopy, where a cool accent would read grey). No model:
+ * the specimen's own tones.
  */
-export function offspringTones(accent: number | null, v: number): { tip: THREE.Color; base: THREE.Color } {
+export function offspringTones(accent: number | null, v: number, strength = 1): { tip: THREE.Color; base: THREE.Color } {
   if (accent === null) return { tip: PETAL_TIP.clone().lerp(CREAM, v * 0.5), base: PETAL_BASE.clone().lerp(PETAL_TIP, 0.25 * v) }
   const a = new THREE.Color(accent)
-  return { tip: PETAL_TIP.clone().lerp(a, 0.26 + v * 0.1), base: PETAL_BASE.clone().lerp(a, 0.64 + v * 0.1) }
+  return { tip: PETAL_TIP.clone().lerp(a, (0.12 + v * 0.08) * strength), base: PETAL_BASE.clone().lerp(a, (0.4 + v * 0.12) * strength) }
 }
 
 export interface HeadOpts {
@@ -370,6 +373,7 @@ const frameOf = (axis: THREE.Vector3, ref: THREE.Vector3) => {
  * tip. 10 triangles.
  */
 export function budHead(sink: GrowthSink, base: THREE.Vector3, axis: THREE.Vector3, size: number, tipC: THREE.Color, surf: number, l: Life): void {
+  sink.head(base, size, l.g, surf, 1)
   const { z, x, y } = frameOf(axis, new THREE.Vector3(1, 0.3, 0.2))
   const P = [base.clone()]
   const C = [SEPAL.clone().multiplyScalar(0.9)]
@@ -395,6 +399,7 @@ export function budHead(sink: GrowthSink, base: THREE.Vector3, axis: THREE.Vecto
  * it (fine only). 10 triangles, 20 fine.
  */
 export function seedHead(sink: GrowthSink, base: THREE.Vector3, axis: THREE.Vector3, size: number, fine: boolean, surf: number, l: Life): void {
+  sink.head(base, size, l.g, surf, 2)
   const { z, x, y } = frameOf(axis, new THREE.Vector3(1, 0.3, 0.2))
   const at = (h: number, r: number, a: number) => base.clone().addScaledVector(z, h * size).addScaledVector(x, Math.cos(a) * r * size).addScaledVector(y, Math.sin(a) * r * size)
   const P = [base.clone()]
@@ -456,8 +461,13 @@ export function flowerHead(sink: GrowthSink, centre: THREE.Vector3, axis: THREE.
   const R = o.R
   const open = Math.min(1, o.open)
   const rings = o.rings ?? 1
+  sink.head(centre, o.size, o.g, o.surf, 0)
+  // the heads that are not fine (up to about 22 cm across, seen from the
+  // room, where the fold down the middle of a petal does not show) are drawn
+  // with cupped diamond petals, two triangles each
+  const tiny = !o.fine && o.size < 0.11
   for (let k = 0; k < rings; k++) {
-    const n = Math.max(4, Math.min(o.fine ? 12 : 6, Math.round(o.petals)) - k)
+    const n = Math.max(4, Math.min(o.fine ? 12 : tiny ? (o.size < 0.05 ? 4 : 5) : 6, Math.round(o.petals)) - k)
     const len = o.size * (1 - 0.24 * k)
     const width = len * 0.5 * Math.sqrt(8 / n) * lerp(0.8, 1.05, open)
     const theta0 = lerp(0.3, 1.32 - k * 0.32, open)
@@ -493,6 +503,12 @@ export function flowerHead(sink: GrowthSink, centre: THREE.Vector3, axis: THREE.
         P.push(c2.clone().addScaledVector(side, -w2).add(e2), c3, c2.clone().addScaledVector(side, w2).add(e2))
         C.push(tone(0.86).lerp(tipC, 0.2), tone(1), tone(0.86).lerp(tipC, 0.2))
         T = [0, 1, 2, 0, 2, 3, 1, 4, 2, 2, 4, 5, 2, 5, 6, 2, 6, 3]
+      } else if (tiny) {
+        P.splice(2, 1)
+        C.splice(2, 1)
+        P.push(c2)
+        C.push(tone(1))
+        T = [0, 1, 2, 1, 3, 2]
       } else {
         P.push(c2)
         C.push(tone(1))
@@ -505,7 +521,7 @@ export function flowerHead(sink: GrowthSink, centre: THREE.Vector3, axis: THREE.
   // larger heads)
   if (open > 0.3) {
     const fineHeart = o.fine && o.size >= 0.07
-    const hs = fineHeart ? 6 : 5
+    const hs = fineHeart ? 6 : tiny ? 3 : 5
     const P = [centre.clone().addScaledVector(z, o.size * 0.14)]
     const C = [HEART_DARK.clone().lerp(SEPAL, 0.25)]
     const T: number[] = []

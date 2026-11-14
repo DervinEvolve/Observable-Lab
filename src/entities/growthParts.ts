@@ -42,6 +42,10 @@ export class GrowthSink {
   plant: number[] = []
   idx: number[] = []
   leaves: LeafSpec[] = []
+  // where the flower heads are, seven numbers each: x, y, z, size, the level
+  // it shows from, the surface, and what it is (0 a flower, 1 a bud, 2 gone
+  // to seed), so a view can be checked for how much of it is in bloom
+  heads: number[] = []
   // what vert() writes to aPlant: set while drawing the flowering plant
   plantAttr: [number, number, number, number] = [0, 0, 0, 0]
 
@@ -63,6 +67,10 @@ export class GrowthSink {
     return this.pos.length / 3 - 1
   }
 
+  head(p: THREE.Vector3, size: number, g: number, surf: number, kind: number): void {
+    this.heads.push(p.x, p.y, p.z, size, g, surf, kind)
+  }
+
   /** Appends another sink's geometry (indices shifted). */
   append(o: GrowthSink): void {
     const base = this.vertexCount
@@ -73,6 +81,7 @@ export class GrowthSink {
     }
     for (let i = 0; i < o.idx.length; i++) this.idx.push(o.idx[i] + base)
     for (const l of o.leaves) this.leaves.push(l)
+    for (let i = 0; i < o.heads.length; i++) this.heads.push(o.heads[i])
   }
 
   geometry(): THREE.BufferGeometry {
@@ -153,7 +162,7 @@ export function tube(sink: GrowthSink, rings: Ring[], radial = 3): void {
  * stem, in the plane the ring's normal faces out of): two triangles a
  * segment, for stems that creep along the floor, walls and ceiling.
  */
-export function ribbon(sink: GrowthSink, rings: Ring[]): void {
+export function ribbon(sink: GrowthSink, rings: Ring[], cap = false): void {
   if (rings.length < 2) return
   const base = sink.vertexCount
   const nrm = new THREE.Vector3()
@@ -187,6 +196,15 @@ export function ribbon(sink: GrowthSink, rings: Ring[]): void {
       const p = base + (i - 1) * 2
       sink.idx.push(p, p + 2, p + 1, p + 1, p + 2, p + 3)
     }
+  }
+  if (cap) {
+    // a rounded end instead of a flat cut: the last pair of edges meet a
+    // little beyond the last ring (_T, _N are still the last ring's frame)
+    const R = rings[rings.length - 1]
+    const last = base + (rings.length - 1) * 2
+    _V.copy(R.p).addScaledVector(_T, R.r * 1.6).addScaledVector(_N, R.r * 0.3)
+    sink.vert(_V, _N, R.c, R.g, R.p, R.surf, R.appear, R.wither, rings[rings.length - 2].p)
+    sink.idx.push(last, last + 2, last + 1)
   }
 }
 

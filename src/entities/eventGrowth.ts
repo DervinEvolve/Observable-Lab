@@ -1,7 +1,7 @@
 import * as THREE from 'three'
 import { LAB_HEIGHT } from '../scene/Lab'
 import { STATION_RADIUS } from './Station'
-import { accentForModel, eventRandom, lineageOf, type GrowthEvent } from '../systems/growthEvents'
+import { accentForModel, eventRandom, familyAccent, hashString, lineageOf, rng, type GrowthEvent } from '../systems/growthEvents'
 import { CEIL, FREE, GrowthSink, LONG_AGO, NEVER, WALL, leafMatrix, ribbon, splineStations, tube, type Ring } from './growthParts'
 import { budHead, flowerHead, offspringTones, seedHead, soilHeight, type Specimen } from './specimen'
 
@@ -29,9 +29,13 @@ import { budHead, flowerHead, offspringTones, seedHead, soilHeight, type Specime
 //
 // Out in the room every flower is the specimen's own flower (specimen.ts
 // flowerHead): buds, half-open and open heads of different sizes, the petals
-// tinted toward the author's accent, the same dark heart ringed with gold;
-// older growth has gone to seed. Stems are splines through the walk, with
-// more rings where they bend, tapering to their tips and turning a little.
+// tinted toward the author's accent, the same dark heart ringed with gold.
+// Older growth goes woody and some of its first flowers go to seed, but a
+// lineage that keeps landing work brings its older stretches into flower
+// again (a second flush, and new leaves near the dome), and once the plant
+// is up the walls its climbers and canopy flower in clusters earned the same
+// way (flowerSites). Stems are splines through the walk, with more rings
+// where they bend, tapering to their tips and turning a little.
 // After the break-out nothing grows back into the dome or rises near it, so
 // the flower keeps a clear space round it.
 
@@ -239,6 +243,22 @@ export interface ExhibitBayRef {
   mergedAt: number
 }
 
+/**
+ * A point on the base organism's wall climbers and canopy where a cluster of
+ * flowers can open (Overgrowth.ts marks them): where, which way is out of
+ * the surface, which way the vine runs, the level it shows at, whose runner
+ * it is on (-1 for none), and whether it hangs from the canopy.
+ */
+export interface FlowerSite {
+  p: THREE.Vector3
+  n: THREE.Vector3
+  t: THREE.Vector3
+  g: number
+  family: number
+  surf: number
+  hang: boolean
+}
+
 interface Node {
   theta: number
   s: number
@@ -302,6 +322,7 @@ const HABITS: Record<GrowthEvent['kind'], Habit> = {
 }
 
 const lerp = (a: number, b: number, t: number) => a + (b - a) * t
+const UP_Y = new THREE.Vector3(0, 1, 0)
 
 // ---------------------------------------------------------------------------
 // The grower
@@ -356,10 +377,15 @@ export class EventGrower {
    * Grows one event. `level` is where in the arc it belongs, `gate` the
    * stage at which it shows, `t0` when it starts to appear (LONG_AGO for
    * growth that is already there). `detail` 1 is fresh growth; older growth
-   * (lower) keeps exactly the same shape but goes woody: fewer rings, and it
-   * has dropped most of its leaves.
+   * (lower) keeps exactly the same shape but goes woody: fewer leaves, except
+   * near its tips, and many of its first flowers have gone to seed.
+   * `flush` (0..1, old growth only) is the season its lineage is in: how much
+   * merged work and breakthroughs the same lineage has had since. Old growth
+   * of a lineage in flush flowers again near the tip of a shoot (a second
+   * flush) and, near the dome, leafs out again; one that has gone quiet
+   * stays woody, its first flowers partly gone to seed.
    */
-  grow(e: GrowthEvent, index: number, level: number, gate: number, t0: number, detail = 1): void {
+  grow(e: GrowthEvent, index: number, level: number, gate: number, t0: number, detail = 1, flush = 0): void {
     const R = eventRandom(e.id)
     // in the dome it grows on the flowering plant; once the runners press on
     // the glass (later in stage 2) about a third of the rounds go to them instead
@@ -504,7 +530,7 @@ export class EventGrower {
     if (gapTo > 0.25) {
       const runOpts: WalkOpts = { ...mainOpts, len: Math.min(leg ? 3 : 1.8, gapTo), step: 0.15, attract: leg ? 0.45 : 0.22, curl: habit.curl * 0.25, wiggle: habit.wiggle * 0.4, noise: 0.05, lift: 'hug', rise: 0.006, archFreq: 0.5, coil: 0 }
       const run = this.walk(R, start, { theta: thetaGuide, s: sHead }, runOpts, 0)
-      stems.push({ steps: run, r0: radius * 0.95, r1: radius * 0.85, main: false, runner: true })
+      stems.push({ steps: run, r0: radius * 0.95, r1: radius * 0.8, main: false, runner: true })
       from = run[run.length - 1]
     }
     const total = from.d + len * (1 + (H.branches[1] > 0 ? 0.4 : 0))
@@ -540,6 +566,8 @@ export class EventGrower {
     // straight: further on old growth), tapering to its tip, turning a
     // little about itself as it goes
     const tmp = new THREE.Vector3()
+    // the drawn line of each stem, for flowers set along it later
+    const lines: Array<{ pts: THREE.Vector3[]; ns: THREE.Vector3[]; s: number[]; runner: boolean }> = []
     for (const st of stems) {
       const S = st.steps
       if (S.length < 2) continue
@@ -560,8 +588,8 @@ export class EventGrower {
         const q = pts.map(v => v.clone())
         for (let i = 1; i < pts.length - 1; i++) pts[i].copy(q[i - 1]).add(q[i + 1]).addScaledVector(q[i], 2).multiplyScalar(0.25)
       }
-      const maxLen = Math.min(0.5, (creeping ? 0.4 : Math.max(0.16, len / 3)) / Math.max(0.5, detail))
-      const stations = splineStations(pts, detail >= 1 ? 0.4 : 0.5, maxLen, creeping ? 0.07 : 0.05)
+      const maxLen = Math.min(0.5, (creeping ? 0.4 : Math.max(0.16, len / 3)) / Math.max(0.6, detail))
+      const stations = splineStations(pts, detail >= 1 ? 0.4 : 0.45, maxLen, creeping ? 0.07 : 0.05)
       const twistRate = (habit.wfreq - 6.5) * 0.25
       const drawn: Ring[] = stations.map(({ p, f }) => {
         const i0 = Math.min(S.length - 2, Math.floor(f))
@@ -571,11 +599,14 @@ export class EventGrower {
         const d = lerp(S[i0].d, S[i0 + 1].d, a)
         const c = stemC.clone().lerp(STEM_YOUNG, t * 0.6)
         if (setback) c.lerp(SETBACK_STEM, 0.4)
-        const tw = flat ? Math.sin(d * 2.3 + habit.wfreq) * 0.3 : (d - S[0].d) * twistRate
+        // (a flat strip rocks only a little, or it shades in bands)
+        const tw = flat ? Math.sin(d * 2.3 + habit.wfreq) * (detail < 1 ? 0.1 : 0.2) : (d - S[0].d) * twistRate
         return { p, n, r: lerp(st.r0, st.r1, Math.pow(t, 0.8)), g, surf: sample(lerp(S[i0].s, S[i0 + 1].s, a)).surf, c, appear: timeOf(d, total), wither: witherAt, tw }
       })
-      if (flat) ribbon(this.sink, drawn)
+      // (a runner ends rounded, not in a flat cut where the shoot takes over)
+      if (flat) ribbon(this.sink, drawn, !!st.runner)
       else tube(this.sink, drawn, 3)
+      lines.push({ pts, ns, s: S.map(x => x.s), runner: !!st.runner })
       this.stats.rings += drawn.length
 
       // leaves by this event's phyllotaxis
@@ -596,7 +627,12 @@ export class EventGrower {
           const lean = habit.leafLean * (0.8 + R() * 0.4)
           // old growth has dropped most of its leaves (drawn from the stream
           // either way, so the shape never changes with age)
-          const kept = R() < (0.1 + detail * 0.9) * (st.runner ? 0.35 : 1)
+          // (old growth keeps its leaves near its growing tips, and near the
+          // dome, where the oldest growth in the room is, a lineage in flush
+          // leafs out again with its second flush of flowers)
+          const tipKeep = detail < 1 ? Math.min(1, Math.max(0, (along - 0.5) / 0.4)) * (st.runner ? 0.4 : 0.85) : 0
+          const flushKeep = detail < 1 && S[i].s < MARK.floor + 2.4 ? flush * (st.runner ? 0.3 : 0.85) : 0
+          const kept = R() < Math.max((0.04 + detail * 0.96) * (st.runner ? 0.35 : 1), tipKeep, flushKeep)
           const dir = T.clone().multiplyScalar(Math.cos(lean)).addScaledVector(N.clone().multiplyScalar(Math.cos(a)).addScaledVector(B, Math.sin(a)), Math.sin(lean))
           // keep blades out of the surface they grow on
           const into = dir.dot(ns[i])
@@ -636,15 +672,20 @@ export class EventGrower {
     // the flowers: the specimen's own, tinted toward the author's accent,
     // from a stream of their own so the stems and leaves above never move
     const F = eventRandom(e.id + '#flower')
-    const tint = offspringTones(accent, F())
+    const tv = F()
+    const tint = offspringTones(accent, tv)
+    // up the walls and on the ceiling the petals keep more of the specimen's
+    // warm rose and cream (seen far off through the room's haze)
+    const tintHigh = offspringTones(accent, tv, 0.4)
+    tintHigh.base.lerp(tintHigh.tip, 0.35)
     const vig = Math.sqrt(vigour)
     const flowerStem = STEM_YOUNG.clone().lerp(stemC, 0.35)
     const headOpts = (size: number, open: number, fine: boolean, surf: number, appear: number) => ({
       size,
       open,
       petals: habit.petals,
-      tip: tint.tip.clone().multiplyScalar(0.96 + F() * 0.08),
-      base: tint.base.clone(),
+      tip: (surf === FREE ? tint : tintHigh).tip.clone().multiplyScalar(0.96 + F() * 0.08),
+      base: (surf === FREE ? tint : tintHigh).base.clone(),
       cup: 0.1 + habit.cup * 0.5,
       curl: 0.18 + F() * 0.22,
       fine,
@@ -710,7 +751,7 @@ export class EventGrower {
         const sk = this.flowerStalk(tip.p, tip.n, tip.dir, h, radius * 0.45, flowerStem, g, tip.surf, tip.appear, animate)
         const size = (0.045 + m * 0.05) * (0.8 + F() * 0.5) * vig * headScale(tip.s)
         // (the rounded petal tips only where a head is large enough to show them)
-        flowerHead(this.sink, sk.tip, sk.dir, tip.dir, headOpts(size, openness(), size >= 0.075, tip.surf, bloomAt))
+        flowerHead(this.sink, sk.tip, sk.dir, tip.dir, headOpts(size, openness(), size >= 0.085, tip.surf, bloomAt))
         this.stats.flowers++
         const extra = habit.cluster === 2 ? 0 : 1
         for (let f = 0; f < extra; f++) {
@@ -736,7 +777,7 @@ export class EventGrower {
         // most of the oldest have gone to seed
         const h = Math.min((0.07 + F() * 0.08) * vig, stalkCap(tip.s))
         const size = (0.04 + m * 0.04) * (0.8 + F() * 0.4) * vig * headScale(tip.s)
-        const bloomy = F() < (detail >= 0.5 ? 0.75 : 0.45)
+        const bloomy = F() < (detail >= 0.5 ? 0.8 : 0.6)
         // (the oldest seed heads sit straight on the tip of the stem)
         const sk = detail >= 0.5 ? this.flowerStalk(tip.p, tip.n, tip.dir, h, radius * 0.4, flowerStem.clone().lerp(BARK, 0.3), g, tip.surf, tip.appear, animate, 2) : { tip: tip.p.clone().addScaledVector(tip.n, 0.01), dir: tip.n.clone().addScaledVector(tip.dir, 0.4).normalize() }
         if (bloomy) {
@@ -765,8 +806,8 @@ export class EventGrower {
       this.stats.flowers += 2
       for (const st of stems.slice(1)) {
         const bt = tipOf(st.steps)
-        // (on an old surge the branch flowers have gone to seed)
-        if (detail < 1) {
+        // (on an old surge about half the branch flowers have gone to seed)
+        if (detail < 1 && F() < 0.5) {
           seedHead(this.sink, bt.p.clone().addScaledVector(bt.n, 0.01), bt.n.clone().addScaledVector(bt.dir, 0.4), size * 0.4, false, bt.surf, { g, appear: LONG_AGO, wither: NEVER })
           this.stats.buds++
           continue
@@ -775,7 +816,137 @@ export class EventGrower {
         this.stats.flowers++
       }
     }
+
+    // From a stream of its own, so nothing above moves:
+    // - a fresh round out in the room that went well (most of its changes
+    //   approved) sets a bud or a small flower at the tip of its shoot;
+    // - old growth of a lineage in flush flowers again: a cluster of small
+    //   heads and buds near the tip of one of its shoots (a second flush).
+    if (out && !setback && e.kind !== 'exhibit_merged') {
+      const Q = eventRandom(e.id + '#flush')
+      const capV = Math.min(1.15, vig)
+      const count = (o: number) => (o < 0.16 ? this.stats.buds++ : this.stats.flowers++)
+      // (on the floor and the desks: up the walls a head this small would not
+      // read, and the climbers flower there)
+      const tip = tipOf(main)
+      if (e.kind === 'epoch' && detail >= 1 && Q() < Math.max(0, (m - 0.12) / 0.18) * 0.45 && tip.surf === FREE) {
+        const o = Q() < 0.35 ? 0.08 : 0.6 + Q() * 0.4
+        const at = tip.p.clone().addScaledVector(tip.n, 0.01)
+        const size = (0.038 + Q() * 0.026) * capV * headScale(tip.s)
+        flowerHead(this.sink, at, tip.dir.clone().lerp(tip.n, 0.6).normalize(), tip.dir, headOpts(size, o, false, tip.surf, animate ? tip.appear + 0.5 : LONG_AGO))
+        count(o)
+      }
+      const shoots = lines.filter(l => !l.runner)
+      // (old rounds flower again more often near the dome, where the oldest
+      // growth in the room is, so the ground there fills in as the record grows)
+      const nearDome = sGuide < MARK.floor + 2.4
+      if (detail < 1 && shoots.length && Q() < flush * (e.kind === 'epoch' ? (nearDome ? 0.2 : 0.1) : 0.75)) {
+        // near the tip of the main shoot, or of a side branch
+        const L = shoots[Q() < 0.6 ? 0 : Math.min(shoots.length - 1, 1 + Math.floor(Q() * (shoots.length - 1)))]
+        const k = Math.min(L.pts.length - 2, Math.floor((0.72 + Q() * 0.26) * (L.pts.length - 1)))
+        const sv = L.s[k]
+        const surf = sample(sv).surf
+        const n = L.ns[k]
+        const along = L.pts[k + 1].clone().sub(L.pts[k]).normalize()
+        const side = new THREE.Vector3().crossVectors(along, n).multiplyScalar(Q() < 0.5 ? -1 : 1)
+        const up = n.clone().addScaledVector(along, 0.25).addScaledVector(side, 0.2)
+        // on a wall it faces out and up toward the light
+        if (surf === WALL) up.y += 0.45
+        up.normalize()
+        const lead = (0.05 + Math.pow(Q(), 1.4) * 0.03) * capV * headScale(sv)
+        const sk = this.flowerStalk(L.pts[k], up, side, Math.min(0.03 + Q() * 0.05, stalkCap(sv)), 0.004, flowerStem, g, surf, LONG_AGO, false, 2)
+        flowerHead(this.sink, sk.tip, sk.dir, side, headOpts(lead, 0.8 + Q() * 0.2, false, surf, LONG_AGO))
+        this.stats.flowers++
+        // the rest of the cluster round it, smaller, some still in bud
+        const nMore = e.kind === 'epoch' ? 1 : 1 + Math.floor(Q() * 2)
+        const x = new THREE.Vector3().crossVectors(sk.dir, side).normalize()
+        for (let h = 0; h < nMore; h++) {
+          const a = (h / nMore) * Math.PI * 2 + Q() * 1.2
+          const off = side.clone().multiplyScalar(Math.cos(a)).addScaledVector(x, Math.sin(a))
+          const at = sk.tip.clone().addScaledVector(off, lead * (1.0 + Q() * 0.4)).addScaledVector(sk.dir, -lead * (0.25 + Q() * 0.3))
+          const r = Q()
+          const o = r < 0.5 ? 0.7 + Q() * 0.3 : r < 0.75 ? 0.4 + Q() * 0.2 : 0.08
+          flowerHead(this.sink, at, sk.dir.clone().addScaledVector(off, 0.7).normalize(), off, headOpts(lead * (0.6 + Q() * 0.2), o, false, surf, LONG_AGO))
+          count(o)
+        }
+      }
+    }
     this.stats.events++
+  }
+
+  /**
+   * Clusters of the specimen's flowers along the wall climbers and hanging
+   * from the canopy, once the plant has reached them (stage 6 on the walls).
+   * How many of a lineage's points flower is earned: `earned[f]` is its
+   * merged work and breakthroughs in the record (up the walls at most about
+   * one point in eight, reached at 12 of them). Each point's choice and shape
+   * come from its own stream, so a point that flowers keeps flowering
+   * as more work lands, and more points join it. The petals are the
+   * specimen's warm rose and cream, drawn a little toward that lineage's
+   * model.
+   */
+  flowerSites(sites: FlowerSite[], earned: number[]): void {
+    const all = earned.reduce((a, b) => a + b, 0) / Math.max(1, earned.length)
+    const stem = STEM_YOUNG.clone().lerp(STEM_OLD, 0.3)
+    sites.forEach((site, i) => {
+      const Q = rng(hashString('flower-site:' + i))
+      const e = site.family >= 0 ? earned[site.family] ?? 0 : all
+      // (at most about one point in eight up the walls and one in three of the
+      // tendrils hanging from the canopy; the canopy vines themselves are
+      // thick with leaves, and flowers there would face down into its shade)
+      const share = site.hang ? Math.min(0.32, e / 40) : site.surf === WALL ? Math.min(0.13, e / 95) : 0
+      if (Q() >= share) return
+      // (lighter than on the floor: up a wall in the room's shade a deep
+      // rose reads as dull mauve from across the room)
+      const tones = offspringTones(site.family >= 0 ? familyAccent(site.family) : null, Q(), 0.35)
+      // (under the ceiling they face down into its shade: lighter still)
+      const lift = site.surf === WALL ? 1 : 1.12
+      tones.base.lerp(tones.tip, 0.5).multiplyScalar(1.12 * lift)
+      tones.tip.multiplyScalar(1.08 * lift)
+      const g = site.surf === WALL ? Math.max(site.g + 0.05, 5.92) : site.g + 0.05
+      const side = new THREE.Vector3().crossVectors(site.t, site.n).normalize()
+      const nHeads = 2 + Math.floor(Q() * 1.8)
+      for (let h = 0; h < nHeads; h++) {
+        const o = h === 0 ? 0.85 + Q() * 0.15 : Q() < 0.4 ? 0.08 : 0.5 + Q() * 0.5
+        const size = (h === 0 ? 0.07 + Q() * 0.03 : 0.05 + Q() * 0.02) * (site.hang ? 0.8 : 1)
+        const sideOff = (Q() - 0.5) * 0.12
+        const at = site.p.clone().addScaledVector(site.t, (h === 0 ? 0 : (Q() - 0.5) * 0.16)).addScaledVector(side, h === 0 ? 0 : sideOff)
+        let up: THREE.Vector3
+        if (site.hang) {
+          // hanging from the canopy: on drooping pedicels, faces turned out
+          // more than down, toward the room and its light
+          up = new THREE.Vector3((Q() - 0.5) * 1.6, -0.6, (Q() - 0.5) * 1.6).normalize()
+          const sk = this.flowerStalk(at, up, side.clone().multiplyScalar(sideOff < 0 ? -1 : 1), 0.05 + Q() * 0.07, 0.003, stem, g, site.surf, LONG_AGO, false, 2)
+          flowerHead(this.sink, sk.tip, sk.dir, side, this.siteHead(size, o, tones, g, site.surf, Q))
+        } else {
+          // along a climber: out from the wall and turned up toward the light
+          // (or down from the ceiling), close on the vine
+          up = site.n.clone().addScaledVector(side, (Q() - 0.5) * 0.9).addScaledVector(site.surf === WALL ? UP_Y : site.t, site.surf === WALL ? 0.6 : 0.35).normalize()
+          const head = at.clone().addScaledVector(site.n, 0.02)
+          flowerHead(this.sink, head, up, side, this.siteHead(size, o, tones, g, site.surf, Q))
+        }
+        if (o < 0.16) this.stats.buds++
+        else this.stats.flowers++
+      }
+    })
+  }
+
+  private siteHead(size: number, open: number, tones: { tip: THREE.Color; base: THREE.Color }, g: number, surf: number, Q: () => number) {
+    return {
+      size,
+      open,
+      petals: 5 + Math.floor(Q() * 3),
+      tip: tones.tip.clone().multiplyScalar(0.97 + Q() * 0.06),
+      base: tones.base.clone(),
+      cup: 0.12 + Q() * 0.12,
+      curl: 0.2 + Q() * 0.2,
+      fine: false,
+      g,
+      surf,
+      appear: LONG_AGO,
+      wither: NEVER,
+      R: Q,
+    }
   }
 
   // A flowering stalk: rises from `at` along `up`, bending over toward

@@ -2824,7 +2824,8 @@ class ObservableLab {
     // Update controls
     this.controls.update()
 
-    // Render
+    // Render (the overgrowth leaves out what this view would hide anyway)
+    this.overgrowth.cull(this.camera)
     this.renderer.render(this.scene, this.camera)
   }
 }

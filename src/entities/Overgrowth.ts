@@ -1,9 +1,9 @@
 import * as THREE from 'three'
 import { LAB_RADIUS, LAB_HEIGHT } from '../scene/Lab'
 import { STATION_RADIUS } from './Station'
-import { eventsKey, rng, type GrowthEvent } from '../systems/growthEvents'
+import { eventsKey, lineageOf, rng, type GrowthEvent } from '../systems/growthEvents'
 import { CEIL, FREE, WALL, GrowthSink, LONG_AGO, NEVER, leafGeometry, leafMatrix, splineStations, type LeafSpec } from './growthParts'
-import { EventGrower, toChart, type Anchor, type ExhibitBayRef, type GrowStats } from './eventGrowth'
+import { EventGrower, toChart, type Anchor, type ExhibitBayRef, type FlowerSite, type GrowStats } from './eventGrowth'
 import { BERRIES, PART, SOIL_Y, Specimen, plantHeight, soilHeight } from './specimen'
 
 // The specimen taking over the room. Until it breaks out it is one flowering
@@ -25,9 +25,12 @@ import { BERRIES, PART, SOIL_Y, Specimen, plantHeight, soilHeight } from './spec
 //   random stream. New events since the last poll grow in over a few seconds;
 //   the history already there on load is simply there.
 //
-// Cost: two draw calls (the plant, stems with flowers, buds and lifted boards;
-// leaves, growing and falling, and the drifting spores), plus the canopy's
-// shade on the floor once there is a canopy. None cast shadows.
+// Cost: two draw calls until the plant reaches the walls (the plant, stems
+// with flowers, buds and lifted boards; leaves, growing and falling, and the
+// drifting spores), two more once it climbs them and two for the canopy,
+// which are left out when the room is seen from above (where the shader hides
+// the canopy anyway), plus the canopy's shade on the floor once there is a
+// canopy. None cast shadows.
 
 const WALL_R = LAB_RADIUS + 0.22 // just in front of the wall surface (8.3)
 const RAIL_R = LAB_RADIUS // brass baseboard ring
@@ -70,6 +73,8 @@ const SPORE = -3e4
 // about half their leaves, the rest most of them (same shapes, fewer parts).
 const FRESH = 90
 const WOODY = 200
+// how far back a lineage's recent work counts toward its season (a second flush)
+const SEASON = 120
 
 /** How many of the sorted values are below v. */
 function countBelow(sorted: Float32Array, v: number): number {
@@ -112,6 +117,7 @@ interface PathOpts {
   leafTones?: THREE.Color[]
   sway: number
   round?: boolean // a round stem even where it lies on something
+  bend?: number // a ring every this many radians of bend (flat strips: 0.6 unless given)
 }
 
 // Geometry of the base organism
@@ -120,6 +126,9 @@ class VineBuilder extends GrowthSink {
   // points on the five runners (and everything that grows off them) that
   // event growth can start from
   anchors: Array<{ p: THREE.Vector3; g: number; family: number }> = []
+  // points on the wall climbers and the canopy where flowers can open
+  // (eventGrowth flowerSites decides which do, from the record)
+  sites: FlowerSite[] = []
   family = -1
   private rand: () => number
 
@@ -134,6 +143,10 @@ class VineBuilder extends GrowthSink {
 
   addPath(cps: CP[], o: PathOpts): void {
     if (cps.length < 2) return
+    // each path draws from a stream of its own (one draw from the organism's
+    // stream seeds it), so how many rings and leaves one path has never moves
+    // anything else in the room
+    const pr = rng(Math.floor(this.r() * 4294967296))
     const curve = new THREE.CatmullRomCurve3(cps.map(c => c.p), false, 'centripetal')
     const len = curve.getLength()
     // stems lying on the floor, walls or ceiling are flat strips (two
@@ -143,11 +156,11 @@ class VineBuilder extends GrowthSink {
     // rings where the path bends, sparse on the straight: a smooth stem
     // without spending triangles on the long runs
     const maxLen = o.spacing * (o.round ? 1.2 : BASE.coarse)
-    const stations = splineStations(cps.map(c => c.p), flat ? 0.6 : 0.34, maxLen, Math.min(maxLen, flat ? 0.1 : 0.045))
+    const stations = splineStations(cps.map(c => c.p), o.bend ?? (flat ? 0.6 : 0.34), maxLen, Math.min(maxLen, flat ? 0.1 : 0.045))
     const params = stations.map(st => st.f / (cps.length - 1))
     const n = params.length - 1
     // a slight twist along the stem, so its facets spiral like a living one
-    const twistRate = (this.r() - 0.5) * 3
+    const twistRate = (pr() - 0.5) * 3
     const last = cps.length - 1
     const T = new THREE.Vector3()
     const N = new THREE.Vector3()
@@ -158,13 +171,16 @@ class VineBuilder extends GrowthSink {
     const spine = new THREE.Vector3()
     const color = new THREE.Color()
     const base = this.vertexCount
-    let nextLeaf = o.leafEvery > 0 ? o.leafEvery * (0.3 + this.r() * 0.7) : Infinity
+    let nextLeaf = o.leafEvery > 0 ? o.leafEvery * (0.3 + pr() * 0.7) : Infinity
     let travelled = 0
     const prev = new THREE.Vector3()
-    let side = this.r() < 0.5 ? 1 : -1
-    const wob = this.r() * 10
+    let side = pr() < 0.5 ? 1 : -1
+    const wob = pr() * 10
 
     let along = 0
+    let lastG = 0
+    let lastRad = 0
+    let lastSurf = FREE
     for (let i = 0; i <= n; i++) {
       const t = params[i]
       curve.getPoint(t, sp)
@@ -196,6 +212,9 @@ class VineBuilder extends GrowthSink {
         B.copy(off)
       }
       color.copy(o.c0).lerp(o.c1, Math.min(1, t * 1.2))
+      lastG = g
+      lastRad = rad
+      lastSurf = surf
       if (this.family >= 0 && i % 2 === 0) this.anchors.push({ p: sp.clone(), g, family: this.family })
 
       if (flat) {
@@ -230,27 +249,45 @@ class VineBuilder extends GrowthSink {
       // leaves along the way (several to a segment where the rings are far apart)
       while (travelled >= nextLeaf && i < n) {
         const back = travelled - nextLeaf
-        nextLeaf += o.leafEvery * (0.6 + this.r() * 0.8)
+        nextLeaf += o.leafEvery * (0.6 + pr() * 0.8)
         side = -side
         const pos = spine.clone().addScaledVector(T, -back).addScaledVector(B, side * rad * 0.7).addScaledVector(N, rad * 0.4)
         const dir = new THREE.Vector3()
-          .addScaledVector(T, 0.45 + this.r() * 0.3)
-          .addScaledVector(B, side * (0.7 + this.r() * 0.3))
-          .addScaledVector(N, 0.35 + this.r() * 0.5)
+          .addScaledVector(T, 0.45 + pr() * 0.3)
+          .addScaledVector(B, side * (0.7 + pr() * 0.3))
+          .addScaledVector(N, 0.35 + pr() * 0.5)
           .normalize()
-        const size = o.leafSize * (0.7 + this.r() * 0.6) * (0.55 + 0.45 * Math.min(1, t * 3 + 0.3))
+        const size = o.leafSize * (0.7 + pr() * 0.6) * (0.55 + 0.45 * Math.min(1, t * 3 + 0.3))
         const tones = o.leafTones || LEAF_TONES
         this.leaves.push({
           m: leafMatrix(pos, dir, N, size),
-          thr: g + 0.03 + this.r() * 0.05,
-          phase: this.r() * Math.PI * 2,
+          thr: g + 0.03 + pr() * 0.05,
+          phase: pr() * Math.PI * 2,
           surf,
-          sway: o.sway * (0.6 + this.r() * 0.8),
-          color: tones[Math.floor(this.r() * tones.length)].clone().multiplyScalar(0.9 + this.r() * 0.2),
+          sway: o.sway * (0.6 + pr() * 0.8),
+          color: tones[Math.floor(pr() * tones.length)].clone().multiplyScalar(0.9 + pr() * 0.2),
           appear: LONG_AGO,
           wither: NEVER,
         })
+        // up the walls and on the canopy, where a leaf is, flowers can open
+        if (surf !== FREE) {
+          const out = c0.n.clone().lerp(c1.n, a).normalize()
+          this.sites.push({ p: pos.clone(), n: out, t: T.clone(), g, family: this.family, surf, hang: !o.lift })
+        }
       }
+    }
+
+    // a rounded end: the last ring closes to a point a little beyond it, so
+    // a stem never stops in a flat cut
+    {
+      const tipBase = this.vertexCount
+      const r1 = base + n * radial
+      v.copy(spine).addScaledVector(T, lastRad * (flat ? 1.5 : 1.1))
+      if (flat) v.addScaledVector(N, -lastRad * 0.45)
+      off.copy(T).addScaledVector(N, 0.6).normalize()
+      this.vert(v, off, color, lastG, spine, lastSurf)
+      if (flat) this.idx.push(r1, tipBase, r1 + 1)
+      else for (let j = 0; j < radial; j++) this.idx.push(r1 + j, tipBase, r1 + ((j + 1) % radial))
     }
   }
 
@@ -393,13 +430,12 @@ export class Overgrowth {
   private anchors: Anchor[] = []
   private vineMat: THREE.MeshStandardMaterial | null = null
   private leafMat: THREE.MeshStandardMaterial | null = null
-  // the merged stems and leaves, rebuilt when the events change
-  private vines: THREE.Mesh | null = null
-  private leaves: THREE.InstancedMesh | null = null
-  // the level each triangle (and each leaf) first shows at, in drawing order,
-  // so the draw range can stop at what has grown
-  private vineGates = new Float32Array(0)
-  private leafGates = new Float32Array(0)
+  // the merged stems and leaves, rebuilt when the events change, in a few
+  // parts by where they grow (rebuild), each with the level each triangle
+  // (or leaf) first shows at, in drawing order, so the draw range can stop
+  // at what has grown
+  private vineChunks: Array<{ mesh: THREE.Mesh; region: number; gates: Float32Array; drawn?: number }> = []
+  private leafChunks: Array<{ mesh: THREE.InstancedMesh; region: number; gates: Float32Array; lead: number }> = []
   private bodyTriangles = 0
   private effectTriangles = 0
 
@@ -423,6 +459,9 @@ export class Overgrowth {
   private time = 0 // sway clock, stops under reduced motion
   private now = 0 // the room's clock for growing in, always runs
   public triangleCount = 0
+  // every flower head, bud and seed head (GrowthSink.heads), for checking
+  // how much of a view is in bloom
+  public blooms = new Float32Array(0)
 
   constructor() {
     this.group.name = 'overgrowth'
@@ -668,7 +707,7 @@ export class Overgrowth {
     const base = this.base
     if (!base || !this.vineMat || !this.leafMat) return
     const key = eventsKey(this.events) + '|' + this.levels.join(',') + '|' + this.bays.map(b => `${b.angle.toFixed(3)}:${b.model}:${b.mergedAt}`).join(',') + '|' + this.plantLevel
-    if (key === this.builtKey && this.vines) return
+    if (key === this.builtKey && this.vineChunks.length) return
     this.builtKey = key
     this.builtPlantLevel = this.plantLevel
 
@@ -687,6 +726,24 @@ export class Overgrowth {
     const grower = new EventGrower(ev, this.anchors, this.bays, plant)
     const n = this.events.length
     this.costByKind = {}
+    // Each lineage's season: its merged work and breakthroughs among the
+    // newest SEASON events, counted from each old event onward (so only work
+    // that came after it). Old growth of a lineage in flush flowers again
+    // (eventGrowth); a lineage that has gone quiet stays in seed.
+    const fam = this.events.map(e => lineageOf(e.model).family)
+    const worth = (e: GrowthEvent) => (e.kind === 'contribution_merged' ? 1 : e.kind === 'breakthrough' ? 2 : 0)
+    const later: number[][] = [] // later[i][f]: from event i on, within the season
+    {
+      const run = [0, 0, 0, 0, 0]
+      for (let i = n - 1; i >= 0; i--) {
+        if (i >= n - SEASON) run[fam[i]] += worth(this.events[i])
+        later[i] = run.slice()
+      }
+    }
+    // and what each lineage has earned in the whole record, for the flowers
+    // up the walls and on the canopy
+    const earned = [0, 0, 0, 0, 0]
+    this.events.forEach((e, i) => (earned[fam[i]] += worth(e)))
     this.events.forEach((e, i) => {
       const level = this.levels[i]
       // shown once the plant has reached that stage
@@ -694,61 +751,114 @@ export class Overgrowth {
       // the newest growth is fresh and leafy; older growth has gone woody
       const age = n - 1 - i
       const detail = age < FRESH ? 1 : age < WOODY ? 0.5 : 0.25
+      const flush = detail < 1 && i + 1 < n ? Math.min(1, later[i + 1][fam[i]] / 6) : 0
       const t0 = ev.idx.length / 3 + ev.leaves.length * 2
-      grower.grow(e, i, level, gate, this.appearAt.get(e.id) ?? LONG_AGO, detail)
+      grower.grow(e, i, level, gate, this.appearAt.get(e.id) ?? LONG_AGO, detail, flush)
       const k = this.costByKind[e.kind] || (this.costByKind[e.kind] = { events: 0, triangles: 0 })
       k.events++
       k.triangles += ev.idx.length / 3 + ev.leaves.length * 2 - t0
     })
+    {
+      const t0 = ev.idx.length / 3
+      grower.flowerSites(base.sites, earned)
+      this.costByKind.climberFlowers = { events: 0, triangles: ev.idx.length / 3 - t0 }
+    }
     this.eventStats = { ...grower.getStats() }
 
     const all = new GrowthSink()
     all.append(base)
     all.append(ev)
+    this.blooms = Float32Array.from(all.heads)
 
     // swap in the new meshes
-    if (this.vines) {
-      this.body.remove(this.vines)
-      this.vines.geometry.dispose()
+    for (const c of this.vineChunks) {
+      this.body.remove(c.mesh)
+      c.mesh.geometry.dispose()
     }
-    if (this.leaves) {
-      this.body.remove(this.leaves)
-      this.leaves.geometry.dispose()
-      this.leaves.dispose()
+    for (const c of this.leafChunks) {
+      this.body.remove(c.mesh)
+      c.mesh.geometry.dispose()
+      c.mesh.dispose()
     }
-    // Triangles in the order they grow in (by the lowest level any of their
-    // corners shows at), so each frame draws only up to the drawn level: the
-    // parts still to come cost nothing until they start to grow.
+    this.vineChunks = []
+    this.leafChunks = []
+
+    // Three parts by where it grows: on the floor, the dome and the desks;
+    // on the canopy; up the walls. The shader already hides the canopy when
+    // the room is seen from above (ogVisible), so then it is simply not drawn
+    // (cull); the walls and the canopy are left to the frustum otherwise.
+    const regionOf = (surf: number) => (surf === CEIL ? 1 : surf === WALL ? 2 : 0)
+    const nRegions = 3
+    const master = all.geometry()
     {
+      // Triangles in the order they grow in (by the lowest level any of their
+      // corners shows at), so each frame draws only up to the drawn level: the
+      // parts still to come cost nothing until they start to grow.
       const n = all.idx.length / 3
       const key = new Float32Array(n)
-      for (let t = 0; t < n; t++) key[t] = Math.min(all.grow[all.idx[t * 3]], all.grow[all.idx[t * 3 + 1]], all.grow[all.idx[t * 3 + 2]])
+      const reg = new Uint8Array(n)
+      for (let t = 0; t < n; t++) {
+        const a = all.idx[t * 3]
+        key[t] = Math.min(all.grow[a], all.grow[all.idx[t * 3 + 1]], all.grow[all.idx[t * 3 + 2]])
+        reg[t] = regionOf(all.surf[a])
+      }
       const order = Array.from({ length: n }, (_, t) => t).sort((a, b) => key[a] - key[b])
-      const idx: number[] = new Array(n * 3)
-      this.vineGates = new Float32Array(n)
-      order.forEach((t, k) => {
-        idx[k * 3] = all.idx[t * 3]
-        idx[k * 3 + 1] = all.idx[t * 3 + 1]
-        idx[k * 3 + 2] = all.idx[t * 3 + 2]
-        this.vineGates[k] = key[t]
-      })
-      all.idx = idx
+      const big = all.vertexCount > 65535
+      for (let r = 0; r < nRegions; r++) {
+        const tris = order.filter(t => reg[t] === r)
+        if (!tris.length) continue
+        const idx = big ? new Uint32Array(tris.length * 3) : new Uint16Array(tris.length * 3)
+        tris.forEach((t, k) => {
+          for (let j = 0; j < 3; j++) idx[k * 3 + j] = all.idx[t * 3 + j]
+        })
+        const geo = new THREE.BufferGeometry()
+        for (const [name, attr] of Object.entries(master.attributes)) geo.setAttribute(name, attr)
+        geo.setIndex(new THREE.BufferAttribute(idx, 1))
+        const mesh = new THREE.Mesh(geo, this.vineMat)
+        mesh.name = 'overgrowthVines'
+        if (r === 0) mesh.frustumCulled = false
+        else {
+          // round what this part draws (the attributes are shared with the others)
+          const box = new THREE.Box3()
+          const v = new THREE.Vector3()
+          for (let k = 0; k < idx.length; k++) box.expandByPoint(v.fromArray(all.pos, idx[k] * 3))
+          geo.boundingSphere = box.getBoundingSphere(new THREE.Sphere())
+          geo.boundingSphere.radius += 0.35 // (sway and growing in)
+        }
+        this.body.add(mesh)
+        this.vineChunks.push({ mesh, region: r, gates: Float32Array.from(tris, t => key[t]) })
+      }
     }
-    const vineGeo = all.geometry()
-    const vines = new THREE.Mesh(vineGeo, this.vineMat)
-    vines.frustumCulled = false
-    vines.name = 'overgrowthVines'
-    this.body.add(vines)
-    this.vines = vines
 
-    // falling leaves and spores first (always drawn), then the leaves in the order they grow in
+    // falling leaves and spores first (always drawn, with the floor's
+    // leaves), then the leaves in the order they grow in
     const grown = all.leaves.slice().sort((a, b) => a.thr - b.thr)
-    this.leafGates = Float32Array.from(grown.map(l => l.thr))
-    this.leaves = this.instancedLeaves([...this.falling, ...grown])
-    this.body.add(this.leaves)
+    for (let r = 0; r < nRegions; r++) {
+      const mine = grown.filter(l => regionOf(l.surf) === r)
+      if (!mine.length && r > 0) continue
+      const lead = r === 0 ? this.falling : []
+      const mesh = this.instancedLeaves([...lead, ...mine])
+      if (r > 0) {
+        mesh.frustumCulled = true
+        mesh.computeBoundingSphere()
+        if (mesh.boundingSphere) mesh.boundingSphere.radius += 0.35
+      }
+      this.body.add(mesh)
+      this.leafChunks.push({ mesh, region: r, gates: Float32Array.from(mine, l => l.thr), lead: lead.length })
+    }
 
-    this.bodyTriangles = Math.round((vineGeo.index?.count ?? 0) / 3 + all.leaves.length * 2)
+    this.bodyTriangles = Math.round(all.idx.length / 3 + all.leaves.length * 2)
     this.triangleCount = this.bodyTriangles + this.effectTriangles
+  }
+
+  /**
+   * Leaves out what the shader would hide anyway from this camera: the
+   * canopy, seen from above the ceiling. Call before each render.
+   */
+  public cull(camera: THREE.Camera): void {
+    const canopy = camera.position.y < LAB_HEIGHT + 0.05
+    for (const c of this.vineChunks) c.mesh.visible = (c.drawn ?? 0) > 0 && (c.region !== 1 || canopy)
+    for (const c of this.leafChunks) c.mesh.visible = c.mesh.count > 0 && (c.region !== 1 || canopy)
   }
 
   private instancedLeaves(specs: LeafSpec[]): THREE.InstancedMesh {
@@ -858,8 +968,15 @@ export class Overgrowth {
     this.now += Math.min(Math.max(dt, 0), 0.5)
     this.uniforms.uG.value = this.level
     // draw only what has started to grow (a part shows once the level passes its gate)
-    if (this.vines) this.vines.geometry.setDrawRange(0, countBelow(this.vineGates, this.level) * 3)
-    if (this.leaves) this.leaves.count = this.falling.length + countBelow(this.leafGates, this.level)
+    for (const c of this.vineChunks) {
+      c.drawn = countBelow(c.gates, this.level)
+      c.mesh.geometry.setDrawRange(0, c.drawn * 3)
+      c.mesh.visible = c.drawn > 0
+    }
+    for (const c of this.leafChunks) {
+      c.mesh.count = c.lead + countBelow(c.gates, this.level)
+      c.mesh.visible = c.mesh.count > 0
+    }
     this.uniforms.uTime.value = this.time
     this.uniforms.uNow.value = this.now
     // the plant grows into its new build while the drawn level catches up
@@ -874,9 +991,11 @@ export class Overgrowth {
   }
 
   public dispose(): void {
-    this.vines?.geometry.dispose()
-    this.leaves?.geometry.dispose()
-    this.leaves?.dispose()
+    for (const c of this.vineChunks) c.mesh.geometry.dispose()
+    for (const c of this.leafChunks) {
+      c.mesh.geometry.dispose()
+      c.mesh.dispose()
+    }
     this.geometries.forEach(g => g.dispose())
     this.materials.forEach(m => m.dispose())
   }
@@ -907,15 +1026,52 @@ function cp(p: THREE.Vector3, g: number, r: number, n: THREE.Vector3 = UP, s = F
   return { p, g, r, n: n.clone(), s }
 }
 
+/**
+ * The same path, resampled every `step` metres and swaying from side to side
+ * across the surface it lies on (`amp` metres either way, a wave every `wl`
+ * metres), easing to nothing at both ends so it still meets what it grows
+ * from and into. Roots and tendrils wander like living ones instead of
+ * running straight between their few points. The phase comes from where the
+ * path starts, so it takes nothing from the organism's random stream.
+ */
+function meander(cps: CP[], amp: number, wl: number, step = 0.22): CP[] {
+  const d = [0]
+  for (let i = 1; i < cps.length; i++) d.push(d[i - 1] + cps[i].p.distanceTo(cps[i - 1].p))
+  const L = d[d.length - 1]
+  if (L < step * 2) return cps
+  const phase = (cps[0].p.x * 3.7 + cps[0].p.z * 2.3 + cps[0].p.y * 1.3) % (Math.PI * 2)
+  const ease = Math.min(0.45, L / 3)
+  const out: CP[] = []
+  const steps = Math.ceil(L / step)
+  let j = 0
+  for (let k = 0; k <= steps; k++) {
+    const at = (L * k) / steps
+    while (j < cps.length - 2 && d[j + 1] < at) j++
+    const t = Math.min(1, Math.max(0, (at - d[j]) / Math.max(1e-6, d[j + 1] - d[j])))
+    const a = cps[j]
+    const c = cps[j + 1]
+    const T = c.p.clone().sub(a.p).normalize()
+    const n = a.n.clone().lerp(c.n, t).normalize()
+    const lateral = new THREE.Vector3().crossVectors(n, T).normalize()
+    const env = Math.min(1, at / ease, (L - at) / ease)
+    const p = a.p.clone().lerp(c.p, t).addScaledVector(lateral, amp * env * Math.sin((at / wl) * Math.PI * 2 + phase))
+    out.push({ p, n, g: THREE.MathUtils.lerp(a.g, c.g, t), r: THREE.MathUtils.lerp(a.r, c.r, t), s: t < 0.5 ? a.s : c.s })
+  }
+  return out
+}
+
 function buildOrganism(b: VineBuilder): void {
   const R = () => b.r()
   const P = BASE
   // more behaviours, denser leaves: leaf spacing shrinks
   const every = (v: number) => v / P.leafDensity
-  const root: PathOpts = { radial: 4, spacing: 0.3, lift: true, c0: ROOT_DARK, c1: ROOT, leafEvery: every(0.3), leafSize: 0.13, sway: 0.08 }
+  // (roots get a ring every 0.45 rad of bend, not 0.6, so they curve with
+  // their meander instead of running in straight planks)
+  const root: PathOpts = { radial: 4, spacing: 0.3, lift: true, c0: ROOT_DARK, c1: ROOT, leafEvery: every(0.3), leafSize: 0.13, sway: 0.08, bend: 0.45 }
   const vine: PathOpts = { radial: 3, spacing: 0.28, lift: true, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: every(0.1), leafSize: 0.22, sway: 0.18 }
   const tendril: PathOpts = { radial: 3, spacing: 0.1, lift: true, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: every(0.15), leafSize: 0.1, sway: 0.15 }
-  const hanging: PathOpts = { radial: 3, spacing: 0.2, lift: false, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: every(0.13), leafSize: 0.15, sway: 0.3 }
+  // (thin hanging tendrils: a ring every 0.5 rad of bend is round enough at their size)
+  const hanging: PathOpts = { radial: 3, spacing: 0.2, lift: false, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: every(0.13), leafSize: 0.15, sway: 0.3, bend: 0.5 }
   // more constraints, thicker roots
   const girth = P.rootGirth
 
@@ -959,12 +1115,20 @@ function buildOrganism(b: VineBuilder): void {
     }
     const hug: CP[] = []
     const aH = a0 + twist * 0.9
+    // where it meets the glass it eases up onto it: along the soil's edge,
+    // then onto the foot of the glass, then up (no corner)
+    {
+      const foot = (el: number, az: number) => DOME_C.clone().addScaledVector(new THREE.Vector3(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az)), 0.9)
+      const e1 = polar(0.8, aH + twist * 0.06, soilHeight(0.8) + 0.012)
+      const e2 = foot(0.06, aH + twist * 0.12)
+      inner.push(cp(e1, 2.4, 0.011), cp(e2, 2.43, 0.0108, e2.clone().sub(DOME_C).negate().normalize().lerp(UP, 0.5).normalize()))
+    }
     const climbDome = 0.4 + R() * 0.16
     for (let j = 1; j <= 6; j++) {
       const t = j / 6
       // up the glass and leaning along it, easing off as it nears the top of the climb
       const el = 0.12 + Math.sin((t * Math.PI) / 2) * climbDome // elevation on the dome, radians
-      const az = aH + twist * t * 1.1
+      const az = aH + twist * (0.12 + t * 1.0)
       const dir = new THREE.Vector3(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az))
       hug.push(cp(DOME_C.clone().addScaledVector(dir, 0.9), 2.4 + t * 0.55, 0.011 - t * 0.002, dir.clone().negate()))
     }
@@ -986,7 +1150,7 @@ function buildOrganism(b: VineBuilder): void {
     const aS = aOut + twist * 0.25
     const split = polar(splitR, aS, 0)
     const toSplit = [cp(polar(1.55, aOut + twist * 0.1, 0), 3.42, 0.034 * girth), cp(polar((1.55 + splitR) / 2, aOut + twist * 0.2 + (R() - 0.5) * 0.3, 0), 3.62, 0.048 * girth), cp(split, 3.85, 0.054 * girth)]
-    b.addPath(toSplit, root)
+    b.addPath(meander(toSplit, 0.06, 1.6, 0.4), root)
     b.addLiftedBoards(polar((1.55 + splitR) / 2 + 0.1, aOut + twist * 0.2, 0), polar(1, aOut + twist * 0.2, 0), 3.66)
 
     // ---- desk branch: to a centre-facing leg, up it, across the desk to the lamp
@@ -1034,7 +1198,7 @@ function buildOrganism(b: VineBuilder): void {
     }
     lampUp.push(cp(new THREE.Vector3(lx + 0.06, 1.15, lz).applyMatrix4(st), 5.96, 0.008))
     lampUp.push(cp(new THREE.Vector3(lx + 0.12, 1.2, lz + 0.02).applyMatrix4(st), 6.02, 0.007))
-    b.addPath([...deskRoot], root)
+    b.addPath(meander(deskRoot, 0.05, 1.6, 0.4), root)
     b.addPath([...helix, ...toLamp, ...lampUp], { ...tendril, spacing: 0.075 })
     // a tendril dropping from the shade
     b.addPath(
@@ -1075,7 +1239,7 @@ function buildOrganism(b: VineBuilder): void {
       const r = THREE.MathUtils.lerp(splitR, RAIL_R - 0.12, t)
       wallRoot.push(cp(polar(r, wallAt(t), 0), 3.85 + t * 1.1, (0.056 - t * 0.024) * girth))
     }
-    b.addPath(wallRoot, root)
+    b.addPath(meander(wallRoot, 0.09, 2.0, 0.4), root)
     const tAtR = (rr: number) => (rr - splitR) / (RAIL_R - 0.12 - splitR)
     // more constraints, more of the floor prised up along the way
     // each runner lifts its own boards at its own distances, so the five runners never echo each other
@@ -1095,7 +1259,7 @@ function buildOrganism(b: VineBuilder): void {
       const reach = P.rootSpread
       const g = 3.85 + t * 1.1
       b.addPath(
-        [cp(polar(rr, a, 0), g, 0.02 * girth), cp(polar(rr + 0.45 * reach, a + dir, 0), g + 0.2, 0.014 * girth), cp(polar(Math.min(RAIL_R - 0.2, rr + 0.75 * reach), a + dir * 2.2, 0), g + 0.35, 0.008 * girth)],
+        meander([cp(polar(rr, a, 0), g, 0.02 * girth), cp(polar(rr + 0.45 * reach, a + dir, 0), g + 0.2, 0.014 * girth), cp(polar(Math.min(RAIL_R - 0.2, rr + 0.75 * reach), a + dir * 2.2, 0), g + 0.35, 0.008 * girth)], 0.05, 0.9, 0.2),
         { ...root, radial: 3, leafEvery: every(0.5) }
       )
     }
@@ -1170,11 +1334,16 @@ function buildOrganism(b: VineBuilder): void {
           const end = shoot[2].p
           const drop = 0.5 + R() * 0.9
           b.addPath(
-            [
-              cp(end.clone(), g + 0.28, 0.007, inward(end), CEIL),
-              cp(end.clone().add(new THREE.Vector3(0.05, -drop * 0.5, 0.03)), g + 0.4, 0.006, inward(end), CEIL),
-              cp(end.clone().add(new THREE.Vector3(0.02, -drop, 0.06)), g + 0.55, 0.004, inward(end), CEIL),
-            ],
+            meander(
+              [
+                cp(end.clone(), g + 0.28, 0.007, inward(end), CEIL),
+                cp(end.clone().add(new THREE.Vector3(0.05, -drop * 0.5, 0.03)), g + 0.4, 0.006, inward(end), CEIL),
+                cp(end.clone().add(new THREE.Vector3(0.02, -drop, 0.06)), g + 0.55, 0.004, inward(end), CEIL),
+              ],
+              0.035,
+              0.5,
+              0.12
+            ),
             hanging
           )
         }
@@ -1186,11 +1355,16 @@ function buildOrganism(b: VineBuilder): void {
         const len = 0.5 + R() * 1.4
         const p0 = polar(LAB_RADIUS - 0.08, a, LAB_HEIGHT - 0.12)
         b.addPath(
-          [
-            cp(p0, 6.05 + s * 0.05, 0.01, inward(p0), WALL),
-            cp(polar(LAB_RADIUS - 0.04, a + 0.02, LAB_HEIGHT - 0.12 - len * 0.5), 6.25 + s * 0.05, 0.008, inward(p0), WALL),
-            cp(polar(LAB_RADIUS, a + 0.03, LAB_HEIGHT - 0.12 - len), 6.5 + s * 0.05, 0.005, inward(p0), WALL),
-          ],
+          meander(
+            [
+              cp(p0, 6.05 + s * 0.05, 0.01, inward(p0), WALL),
+              cp(polar(LAB_RADIUS - 0.04, a + 0.02, LAB_HEIGHT - 0.12 - len * 0.5), 6.25 + s * 0.05, 0.008, inward(p0), WALL),
+              cp(polar(LAB_RADIUS, a + 0.03, LAB_HEIGHT - 0.12 - len), 6.5 + s * 0.05, 0.005, inward(p0), WALL),
+            ],
+            0.03,
+            1.0,
+            0.2
+          ),
           { ...hanging, leafEvery: every(0.12), leafSize: 0.16 }
         )
       }

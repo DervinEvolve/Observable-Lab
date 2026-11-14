@@ -174,6 +174,12 @@ export function accentForModel(model: string | null): number | null {
   return wc ? WILDCARD_ACCENTS[wc] : null
 }
 
+/** The accent of the panel model whose growth follows runner family `f` (lineageOf), or null for none. */
+export function familyAccent(f: number): number | null {
+  const id = PANEL_ORDER[f]
+  return id ? COLORS.models[id] : null
+}
+
 /**
  * Which of the five runner families a model's growth follows, and a small
  * offset so a fallback or wildcard sharing a family keeps its own line.
