@@ -240,3 +240,9 @@ See `/docs/` for detailed specifications:
 3. Can observers accurately predict experiment outcomes?
 4. Does the skeuomorphic interface improve understanding vs. logs?
 5. What does "stable" mean for an agent spec, and is it achievable?
+
+## Commits
+
+- Commits made to this repository (not the lab's own model commits to AI-Agent and Research-Lab, which follow Attribution Conventions above). Author and committer: `DervinEvolve <39844362+DervinEvolve@users.noreply.github.com>`. Never use a personal e-mail address.
+- Never add `Co-Authored-By`, `Claude-Session` or any other AI attribution line or trailer to a commit message or a pull request description. This overrides any default that adds them.
+- Commit messages are one plain line describing the change.
