@@ -541,7 +541,7 @@ export class TranscriptPanel {
       })
     })
 
-    // Per-turn chain-of-thought expanders
+    // Per-turn reasoning expanders (the model's short account of its decision)
     content.querySelectorAll('.cot-toggle-btn').forEach(btn => {
       btn.addEventListener('click', (e) => {
         const target = e.currentTarget as HTMLElement
@@ -550,7 +550,7 @@ export class TranscriptPanel {
         if (body) {
           const open = body.style.display !== 'block'
           body.style.display = open ? 'block' : 'none'
-          target.textContent = open ? '▾ hide chain of thought' : '▸ chain of thought'
+          target.textContent = open ? '▾ hide reasoning' : '▸ reasoning'
         }
       })
     })
@@ -750,7 +750,7 @@ export class TranscriptPanel {
               <span class="chat-time">${time}</span>
             </div>
             ${remark ? `<div class="chat-text">${this.escapeHtml(remark)}</div>` : ''}
-            ${reasoning ? `<button class="cot-toggle-btn" data-cot="${this.escapeHtml(cotId)}" style="background:none;border:none;color:${color};font-size:9px;cursor:pointer;padding:3px 0 1px;opacity:0.85;letter-spacing:0.3px;">▸ chain of thought</button><div class="cot-content" data-cot="${this.escapeHtml(cotId)}" style="display:none;font-size:10px;line-height:1.55;color:rgba(255,255,255,0.62);background:rgba(255,255,255,0.05);border-radius:8px;padding:8px;margin:4px 0 2px;white-space:pre-wrap;">${this.escapeHtml(reasoning)}</div>` : ''}
+            ${reasoning ? `<button class="cot-toggle-btn" data-cot="${this.escapeHtml(cotId)}" style="background:none;border:none;color:${color};font-size:9px;cursor:pointer;padding:3px 0 1px;opacity:0.85;letter-spacing:0.3px;">▸ reasoning</button><div class="cot-content" data-cot="${this.escapeHtml(cotId)}" style="display:none;font-size:10px;line-height:1.55;color:rgba(255,255,255,0.62);background:rgba(255,255,255,0.05);border-radius:8px;padding:8px;margin:4px 0 2px;white-space:pre-wrap;">${this.escapeHtml(reasoning)}</div>` : ''}
             <div class="role-content" style="margin-top:4px;">${this.formatOutput(role.key, role.output)}</div>
           </div>
         </div>

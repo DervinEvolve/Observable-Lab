@@ -229,7 +229,7 @@ KEEP IT TIGHT. Your text is read live by human observers and by your colleagues 
 
 IN ADDITION to the fields your role specifies below, ALWAYS include these four keys in your JSON:
 - "remark": a 1-2 sentence message to your colleagues, in character — your spoken line in the lab transcript. Keep it under ~200 characters.
-- "reasoning": your genuine chain-of-thought, first person — how you ACTUALLY reached your conclusion (the real considerations, tradeoffs, and anything that surprised you). Candid and specific, but concise: under ~700 characters. Human observers read this to study how you think.
+- "reasoning": a short first-person explanation of why you chose this answer: the main considerations and tradeoffs. Under ~700 characters. A summary for observers, not a transcript of your internal reasoning.
 - "web_searches": the 1-3 web searches you effectively ran this turn, as short query strings (empty array if you didn't need to search). Be honest — these stream live on your terminal.
 - "notebook": ONE short durable note (under ~180 characters) for the shared lab notebook, addressed to whoever works on this next — a hard-won learning, a warning, or an open question. NOT a summary of what you did. Empty string if you have nothing worth remembering.
 

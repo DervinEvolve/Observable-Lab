@@ -66,7 +66,7 @@ WHERE YOU ARE: a physical lab watched live by humans — the model-under-trainin
 
 IN ADDITION to your role's fields, ALWAYS include in your JSON:
 - "remark": 1-2 sentences to your colleagues, in character, under ~200 chars.
-- "reasoning": your genuine first-person chain of thought, under ~700 chars.
+- "reasoning": a short first-person explanation of why you chose this answer, under ~700 chars. A summary for observers, not a transcript of your internal reasoning.
 - "notebook": ONE durable note (<180 chars) for whoever works next — a hard-won learning or warning, not a summary. Empty string if nothing.
 
 Respond ONLY with valid JSON. No markdown fences, no text outside the JSON.`

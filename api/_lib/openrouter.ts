@@ -43,6 +43,24 @@ function extractCitations(message: any): WebCitation[] {
   return out
 }
 
+/**
+ * The model declined to answer: OpenRouter reports finish_reason
+ * "content_filter" (native "refusal" for Anthropic). Asking again with the
+ * same prompt gets the same refusal and is billed for the prompt each time,
+ * so it is not retried, and a fallback from the same lab is skipped.
+ */
+export class ModelRefusalError extends Error {
+  constructor(readonly modelId: string, readonly finishReason: string, readonly usage: CallUsage) {
+    super(`${modelId} refused (finish_reason=${finishReason})`)
+    this.name = 'ModelRefusalError'
+  }
+}
+
+/** The lab part of a model ID: "anthropic" for "anthropic/claude-fable-5.2". */
+export function providerOf(modelId: string): string {
+  return modelId.split('/')[0]
+}
+
 function extractJson(content: string): unknown {
   let trimmed = content.trim();
   if (!trimmed) {
@@ -347,6 +365,12 @@ async function requestCompletion(
 
   const choice = data.choices?.[0] ?? {};
   const message = choice.message ?? {};
+  // A refusal is billed (recorded above) but has nothing to parse.
+  if (choice.finish_reason === 'content_filter' || choice.native_finish_reason === 'refusal') {
+    const reason = choice.native_finish_reason || choice.finish_reason
+    console.warn(`[MODEL] ${modelId} refused the request (finish_reason=${choice.finish_reason}, native=${choice.native_finish_reason ?? 'n/a'})`)
+    throw new ModelRefusalError(modelId, String(reason), usage)
+  }
   // Some models (e.g. reasoning models) return the answer in content, but if
   // content is empty and reasoning holds the text, fall back to it so we don't
   // discard a usable response. finish_reason is logged to diagnose emptiness.
@@ -430,6 +454,10 @@ export async function callModel(
       break;
     } catch (e) {
       lastError = e as Error;
+      if (e instanceof ModelRefusalError) {
+        tally(e.usage) // billed, so it counts toward this call's cost
+        break // the same prompt gets the same refusal
+      }
       if (attempt < 2) {
         console.warn(`[PARSE] Attempt ${attempt + 1} failed for ${modelId}, retrying...`);
         // Brief delay before retry
@@ -445,8 +473,16 @@ export async function callModel(
   // reliable substitute so ONE bad model call can't kill the whole epoch —
   // roles depend on each other, so a dead planner/executor is fatal otherwise.
   if (parsed === undefined && !opts.noFallback) {
+    // A refusal comes from the lab's own policy, so another model from the
+    // same lab refuses the same prompt; go straight to a different lab.
+    const refusedBy = new Set<string>()
+    if (lastError instanceof ModelRefusalError) refusedBy.add(providerOf(modelId))
     const fallbacks = FALLBACK_MODELS.filter(m => m !== modelId);
     for (const fb of fallbacks) {
+      if (refusedBy.has(providerOf(fb))) {
+        console.warn(`[MODEL] skipping fallback ${fb}: ${providerOf(fb)} already refused this prompt`);
+        continue;
+      }
       try {
         console.warn(`[MODEL] ${modelId} failed — falling back to ${fb}`);
         const result = await requestCompletion(fb, systemPrompt, userPrompt, true, false, opts.maxTokens, modelId);
@@ -458,6 +494,10 @@ export async function callModel(
         break;
       } catch (e) {
         lastError = e as Error;
+        if (e instanceof ModelRefusalError) {
+          tally(e.usage)
+          refusedBy.add(providerOf(fb))
+        }
       }
     }
   }

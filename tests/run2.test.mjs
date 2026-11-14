@@ -481,6 +481,44 @@ test('every billed attempt, retry and fallback is counted at its real usage.cost
   assert.ok(lab.modelCalls.every(c => c.experiment_id === 'exp-cost' && c.epoch_number === 7 && c.purpose === 'epoch'))
 })
 
+test('a refusal is not retried, skips the same lab\'s fallback, and its billed prompt still counts', async () => {
+  const refusal = (model) => new Response(JSON.stringify({
+    model, choices: [{ finish_reason: 'content_filter', native_finish_reason: 'refusal', message: { content: '' } }],
+    usage: { prompt_tokens: 4000, completion_tokens: 0, cost: 0.032 },
+  }))
+  const asked = []
+  fakeFetch(body => {
+    asked.push(body.model)
+    if (body.model.startsWith('anthropic/')) return refusal(body.model)
+    return completion(body.model, { mutations: [] }, { prompt_tokens: 4000, completion_tokens: 500, cost: 0.004 })
+  })
+  const result = await spend.withSpendContext({ experimentId: 'exp-refusal', epochNumber: 1, purpose: 'epoch' }, () =>
+    openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u', { webSearch: true }))
+  // One ask of the assigned model, no Anthropic fallback, straight to another lab.
+  assert.deepEqual(asked, ['anthropic/claude-fable-5.2', 'google/gemini-3.8-flash'])
+  assert.equal(result.servedBy.model, 'google/gemini-3.8-flash')
+  assert.equal(result.servedBy.fallback, true)
+  assert.ok(Math.abs(result.cost - 0.036) < 1e-9, `cost ${result.cost}`)
+  assert.equal(result.usage.requests, 2)
+  assert.deepEqual(lab.modelCalls.map(c => [c.model_id, c.cost_usd]), [
+    ['anthropic/claude-fable-5.2', 0.032],
+    ['google/gemini-3.8-flash', 0.004],
+  ])
+
+  // With no fallback allowed, a refusal fails after one billed ask.
+  asked.length = 0
+  await assert.rejects(openrouter.callModel('anthropic/claude-sonnet-5.5', 's', 'u', { noFallback: true }), /invalid response/)
+  assert.deepEqual(asked, ['anthropic/claude-sonnet-5.5'])
+})
+
+test('the shared prompt asks for a short explanation, not the model\'s chain of thought', () => {
+  for (const file of ['api/_lib/prompts.ts', 'api/_lib/research-prompts.ts']) {
+    const source = readFileSync(join(root, file), 'utf8')
+    assert.doesNotMatch(source, /chain[- ]of[- ]thought/i, `${file} still asks for chain of thought`)
+    assert.match(source, /not a transcript of your internal reasoning/, `${file} reasoning line`)
+  }
+})
+
 test('a response without usage.cost is priced from the catalog, not at a flat rate', async () => {
   fakeFetch(body => completion(body.model, { ok: 1 }, { prompt_tokens: 1_000_000, completion_tokens: 100_000 }))
   const { cost } = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u', { noFallback: true })
