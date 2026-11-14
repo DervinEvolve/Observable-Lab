@@ -2,15 +2,20 @@ import * as THREE from 'three'
 import { LAB_RADIUS, LAB_HEIGHT } from '../scene/Lab'
 import { STATION_RADIUS } from './Station'
 import { eventsKey, rng, type GrowthEvent } from '../systems/growthEvents'
-import { CEIL, FREE, WALL, GrowthSink, LONG_AGO, NEVER, leafGeometry, leafMatrix, type LeafSpec } from './growthParts'
+import { CEIL, FREE, WALL, GrowthSink, LONG_AGO, NEVER, leafGeometry, leafMatrix, splineStations, type LeafSpec } from './growthParts'
 import { EventGrower, toChart, type Anchor, type ExhibitBayRef, type GrowStats } from './eventGrowth'
+import { BERRIES, PART, SOIL_Y, Specimen, plantHeight, soilHeight } from './specimen'
 
-// The specimen taking over the room. One organism grows out of the dome:
-// tendrils fill the glass, press on it, spill over the broken rim, root across
-// the floor (cracking and lifting boards), climb desk legs and lamps, run along
-// the brass rail, climb the walls, and finally knit a canopy over the ceiling.
+// The specimen taking over the room. Until it breaks out it is one flowering
+// plant in the dome (specimen.ts); at stage 2 runners leave its foot and press
+// on the glass, and from the break-out the same plant spills over the broken
+// rim, roots across the floor (cracking and lifting boards), climbs desk legs
+// and lamps, runs along the brass rail, climbs the walls, and finally knits a
+// canopy over the ceiling.
 //
-// Two layers, drawn together:
+// Three layers, drawn together:
+// - The flowering plant, built for the record's level: its stem, leaves and
+//   flowers, which the events inside the dome grow on.
 // - The base organism, the same in every run: five runners and their roots,
 //   climbers and canopy, so the stage arc reads. Each vertex carries the growth
 //   level G = stage + progress at which it appears, so the stage is a single
@@ -20,9 +25,9 @@ import { EventGrower, toChart, type Anchor, type ExhibitBayRef, type GrowStats }
 //   random stream. New events since the last poll grow in over a few seconds;
 //   the history already there on load is simply there.
 //
-// Cost: two draw calls (stems with flowers, buds and lifted boards; leaves,
-// growing and falling, and the drifting spores), plus the canopy's shade on
-// the floor once there is a canopy. None cast shadows.
+// Cost: two draw calls (the plant, stems with flowers, buds and lifted boards;
+// leaves, growing and falling, and the drifting spores), plus the canopy's
+// shade on the floor once there is a canopy. None cast shadows.
 
 const WALL_R = LAB_RADIUS + 0.22 // just in front of the wall surface (8.3)
 const RAIL_R = LAB_RADIUS // brass baseboard ring
@@ -65,6 +70,18 @@ const SPORE = -3e4
 // about half their leaves, the rest most of them (same shapes, fewer parts).
 const FRESH = 90
 const WOODY = 200
+
+/** How many of the sorted values are below v. */
+function countBelow(sorted: Float32Array, v: number): number {
+  let lo = 0
+  let hi = sorted.length
+  while (lo < hi) {
+    const m = (lo + hi) >> 1
+    if (sorted[m] < v) lo = m + 1
+    else hi = m
+  }
+  return lo
+}
 
 function polar(r: number, a: number, y: number): THREE.Vector3 {
   return new THREE.Vector3(Math.cos(a) * r, y, Math.sin(a) * r)
@@ -119,11 +136,18 @@ class VineBuilder extends GrowthSink {
     if (cps.length < 2) return
     const curve = new THREE.CatmullRomCurve3(cps.map(c => c.p), false, 'centripetal')
     const len = curve.getLength()
-    const n = Math.max(3, Math.ceil(len / (o.spacing * (o.round ? 1.2 : BASE.coarse))))
     // stems lying on the floor, walls or ceiling are flat strips (two
     // triangles a segment); the rest are round
     const flat = o.lift && !o.round
     const radial = flat ? 2 : Math.min(3, o.radial)
+    // rings where the path bends, sparse on the straight: a smooth stem
+    // without spending triangles on the long runs
+    const maxLen = o.spacing * (o.round ? 1.2 : BASE.coarse)
+    const stations = splineStations(cps.map(c => c.p), flat ? 0.6 : 0.34, maxLen, Math.min(maxLen, flat ? 0.1 : 0.045))
+    const params = stations.map(st => st.f / (cps.length - 1))
+    const n = params.length - 1
+    // a slight twist along the stem, so its facets spiral like a living one
+    const twistRate = (this.r() - 0.5) * 3
     const last = cps.length - 1
     const T = new THREE.Vector3()
     const N = new THREE.Vector3()
@@ -140,10 +164,13 @@ class VineBuilder extends GrowthSink {
     let side = this.r() < 0.5 ? 1 : -1
     const wob = this.r() * 10
 
+    let along = 0
     for (let i = 0; i <= n; i++) {
-      const t = i / n
+      const t = params[i]
       curve.getPoint(t, sp)
       curve.getTangent(t, T).normalize()
+      if (i > 0) along += prev.distanceTo(sp)
+      const tw = along * twistRate
       // interpolate per-control-point values by curve parameter
       const f = t * last
       const k0 = Math.min(Math.floor(f), last - 1)
@@ -161,6 +188,13 @@ class VineBuilder extends GrowthSink {
       B.crossVectors(T, N).normalize()
       const lift = o.lift ? rad : 0
       spine.set(sp.x + N.x * lift, sp.y + N.y * lift, sp.z + N.z * lift)
+      if (tw !== 0) {
+        // turn the cross-section about the stem (flat strips only a little)
+        const a = flat ? Math.sin(tw) * 0.3 : tw
+        off.copy(B).multiplyScalar(Math.cos(a)).addScaledVector(N, Math.sin(a))
+        N.multiplyScalar(Math.cos(a)).addScaledVector(B, -Math.sin(a))
+        B.copy(off)
+      }
       color.copy(o.c0).lerp(o.c1, Math.min(1, t * 1.2))
       if (this.family >= 0 && i % 2 === 0) this.anchors.push({ p: sp.clone(), g, family: this.family })
 
@@ -280,6 +314,13 @@ uniform float uG;
 uniform float uTime;
 uniform float uSway;
 uniform float uNow;
+uniform float uPlantScale;
+uniform float uPulseY;
+uniform float uPulseA;
+uniform float uVital;
+uniform float uBlight;
+uniform float uNorth;
+uniform float uGold;
 // 1 when the surface this sits on is drawn from where the camera is
 float ogVisible(vec3 wp, float surf) {
   if (surf > 1.5) return 1.0 - smoothstep(${(LAB_HEIGHT - 0.06).toFixed(2)}, ${(LAB_HEIGHT + 0.04).toFixed(2)}, cameraPosition.y);
@@ -330,6 +371,13 @@ export class Overgrowth {
     uTime: { value: 0 },
     uSway: { value: 1 },
     uNow: { value: 0 },
+    uPlantScale: { value: 1 },
+    uPulseY: { value: -1 },
+    uPulseA: { value: 0 },
+    uVital: { value: 1 },
+    uBlight: { value: 0 },
+    uNorth: { value: 0 },
+    uGold: { value: 0 },
   }
   private fallUniforms = { uFall: { value: 0 }, uSpore: { value: 0 } }
   // falling leaves: aLeaf holds (x, z, speed, seed) instead of (threshold, phase, surface, sway)
@@ -348,6 +396,10 @@ export class Overgrowth {
   // the merged stems and leaves, rebuilt when the events change
   private vines: THREE.Mesh | null = null
   private leaves: THREE.InstancedMesh | null = null
+  // the level each triangle (and each leaf) first shows at, in drawing order,
+  // so the draw range can stop at what has grown
+  private vineGates = new Float32Array(0)
+  private leafGates = new Float32Array(0)
   private bodyTriangles = 0
   private effectTriangles = 0
 
@@ -364,6 +416,9 @@ export class Overgrowth {
 
   private level = 0 // what is drawn
   private target = 0 // what the record says
+  // the flowering plant is built for the record's level (to the nearest 0.02)
+  private plantLevel = 0
+  private builtPlantLevel = -1
   private reducedMotion = false
   private time = 0 // sway clock, stops under reduced motion
   private now = 0 // the room's clock for growing in, always runs
@@ -456,19 +511,47 @@ export class Overgrowth {
       Object.assign(sh.uniforms, this.uniforms)
       lighterFog(sh)
       sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', `#include <common>\nattribute float aGrow;\nattribute vec3 aSpine;\nattribute vec3 aPrev;\nattribute float aSurf;\nattribute vec2 aLife;\n${VIS_FN}`)
+        .replace('#include <common>', `#include <common>\nattribute float aGrow;\nattribute vec3 aSpine;\nattribute vec3 aPrev;\nattribute float aSurf;\nattribute vec2 aLife;\nattribute vec4 aPlant;\n${VIS_FN}`)
         .replace(
           '#include <begin_vertex>',
           `vec3 transformed = vec3(position);
           float ogB = ogBorn(aLife);
           float ogW = ogWither(aLife);
           float ogk = ogGrow(aGrow, 0.14) * ogVisible((modelMatrix * vec4(aSpine, 1.0)).xyz, aSurf);
+          // berries: as many as the spec has, the rest not drawn
+          if (aPlant.w > ${(PART.north - 0.5).toFixed(1)}) {
+            float idx = fract(aPlant.w) * 100.0 + 0.5;
+            ogk *= step(idx, aPlant.w < ${(PART.gold - 0.5).toFixed(1)} ? uNorth : uGold);
+          }
           // a new ring slides out from the one before it, so a stem grows from its tip
           vec3 ogC = mix(aPrev, aSpine, ogB);
           transformed = ogC + (transformed - aSpine) * ogk * ogB * (1.0 - 0.3 * ogW);
           #if defined( USE_COLOR )
             vColor.rgb = mix(vColor.rgb, ogBrown(aSpine), ogW);
-          #endif`
+          #endif
+          if (aPlant.x > 0.5) {
+            // the flowering plant: grows about the foot of its stem while the
+            // drawn level catches up with the record, and sways by height, so
+            // everything on one stem moves together
+            vec3 foot = vec3(0.0, ${SOIL_Y.toFixed(3)}, 0.0);
+            transformed = foot + (transformed - foot) * uPlantScale;
+            float h = max(0.0, transformed.y - foot.y) / 0.6;
+            float ph = aPlant.z;
+            vec2 wind = vec2(sin(uTime * 0.83 + ph) + 0.35 * sin(uTime * 1.9 + ph * 2.3), sin(uTime * 0.61 + ph * 1.7 + 1.1) + 0.3 * sin(uTime * 1.7 + ph));
+            transformed.xz += wind * aPlant.y * h * h * 0.014 * uSway;
+            #if defined( USE_COLOR )
+              float part = floor(aPlant.w + 0.5);
+              float hsh = fract(sin(dot(aSpine.xz * 97.0, vec2(12.9898, 78.233))) * 43758.5453);
+              // a tired spec dulls the leaves; unresolved conflicts brown a few
+              if (part > 0.5 && part < 1.5) {
+                vColor.rgb = mix(vColor.rgb, vec3(0.62, 0.58, 0.3), (1.0 - uVital) * 0.4);
+                vColor.rgb = mix(vColor.rgb, ogBrown(aSpine), step(hsh, uBlight) * 0.85);
+              }
+              // gold shimmer travelling up the stem when real code merges
+              vColor.rgb += vec3(1.0, 0.8, 0.35) * exp(-pow((transformed.y - uPulseY) * 9.0, 2.0)) * uPulseA;
+              if (part > ${(PART.north - 0.5).toFixed(1)}) vColor.rgb *= 1.25 + 0.15 * sin(uTime * 2.6 + aPlant.w * 40.0);
+            #endif
+          }`
         )
     }
     vineMat.customProgramCacheKey = () => 'og-vine'
@@ -584,9 +667,10 @@ export class Overgrowth {
   private rebuild(): void {
     const base = this.base
     if (!base || !this.vineMat || !this.leafMat) return
-    const key = eventsKey(this.events) + '|' + this.levels.join(',') + '|' + this.bays.map(b => `${b.angle.toFixed(3)}:${b.model}:${b.mergedAt}`).join(',')
+    const key = eventsKey(this.events) + '|' + this.levels.join(',') + '|' + this.bays.map(b => `${b.angle.toFixed(3)}:${b.model}:${b.mergedAt}`).join(',') + '|' + this.plantLevel
     if (key === this.builtKey && this.vines) return
     this.builtKey = key
+    this.builtPlantLevel = this.plantLevel
 
     // when each event starts to appear on this screen: history that is
     // already there on load (or under reduced motion) is simply there; new
@@ -598,7 +682,9 @@ export class Overgrowth {
     if (this.events.length) this.builtOnce = true
 
     const ev = new GrowthSink()
-    const grower = new EventGrower(ev, this.anchors, this.bays)
+    const plant = new Specimen(this.plantLevel)
+    plant.build(ev)
+    const grower = new EventGrower(ev, this.anchors, this.bays, plant)
     const n = this.events.length
     this.costByKind = {}
     this.events.forEach((e, i) => {
@@ -630,6 +716,24 @@ export class Overgrowth {
       this.leaves.geometry.dispose()
       this.leaves.dispose()
     }
+    // Triangles in the order they grow in (by the lowest level any of their
+    // corners shows at), so each frame draws only up to the drawn level: the
+    // parts still to come cost nothing until they start to grow.
+    {
+      const n = all.idx.length / 3
+      const key = new Float32Array(n)
+      for (let t = 0; t < n; t++) key[t] = Math.min(all.grow[all.idx[t * 3]], all.grow[all.idx[t * 3 + 1]], all.grow[all.idx[t * 3 + 2]])
+      const order = Array.from({ length: n }, (_, t) => t).sort((a, b) => key[a] - key[b])
+      const idx: number[] = new Array(n * 3)
+      this.vineGates = new Float32Array(n)
+      order.forEach((t, k) => {
+        idx[k * 3] = all.idx[t * 3]
+        idx[k * 3 + 1] = all.idx[t * 3 + 1]
+        idx[k * 3 + 2] = all.idx[t * 3 + 2]
+        this.vineGates[k] = key[t]
+      })
+      all.idx = idx
+    }
     const vineGeo = all.geometry()
     const vines = new THREE.Mesh(vineGeo, this.vineMat)
     vines.frustumCulled = false
@@ -637,7 +741,10 @@ export class Overgrowth {
     this.body.add(vines)
     this.vines = vines
 
-    this.leaves = this.instancedLeaves([...all.leaves, ...this.falling])
+    // falling leaves and spores first (always drawn), then the leaves in the order they grow in
+    const grown = all.leaves.slice().sort((a, b) => a.thr - b.thr)
+    this.leafGates = Float32Array.from(grown.map(l => l.thr))
+    this.leaves = this.instancedLeaves([...this.falling, ...grown])
     this.body.add(this.leaves)
 
     this.bodyTriangles = Math.round((vineGeo.index?.count ?? 0) / 3 + all.leaves.length * 2)
@@ -677,6 +784,29 @@ export class Overgrowth {
     this.ensureBase()
     this.target = THREE.MathUtils.clamp(level, 0, 7)
     if (immediate || this.reducedMotion) this.level = this.target
+    // the plant keeps maturing to the end (seed heads, a second flush), so it
+    // is rebuilt for every level, not only up to the break-out
+    const pl = Math.round(this.target * 50) / 50
+    if (pl !== this.plantLevel) {
+      this.plantLevel = pl
+      this.rebuild()
+    }
+  }
+
+  /**
+   * What the spec says about the plant's health: leaf vitality 0..1, how many
+   * conflicts are unresolved, North's and code-backed items (berries), and the
+   * gold pulse when real code merges (0..1.3 up the stem, <0 off).
+   */
+  public setSpecSignals(o: { health: number; conflicts: number; north: number; gold: number; pulse: number; pulseStrength: number }): void {
+    const u = this.uniforms
+    u.uVital.value = THREE.MathUtils.clamp(o.health, 0, 1)
+    u.uBlight.value = Math.min(3, Math.max(0, o.conflicts)) * 0.07
+    u.uNorth.value = Math.min(BERRIES, Math.max(0, o.north))
+    u.uGold.value = Math.min(BERRIES, Math.max(0, o.gold))
+    const top = soilHeight(0) + plantHeight(this.level) + 0.08
+    u.uPulseY.value = o.pulse < 0 ? -1 : SOIL_Y + o.pulse * (top - SOIL_Y)
+    u.uPulseA.value = o.pulse < 0 ? 0 : o.pulseStrength
   }
 
   public getLevel(): number {
@@ -714,6 +844,7 @@ export class Overgrowth {
   }
 
   public update(dt: number): void {
+    this.ensureBase()
     const d = Math.min(dt, 0.05)
     // Ease toward the record: a stage change unfolds over roughly ten
     // seconds, a small step in progress over a second or two.
@@ -726,9 +857,15 @@ export class Overgrowth {
     // growing in follows real time even when frames are slow (a hidden tab pauses it)
     this.now += Math.min(Math.max(dt, 0), 0.5)
     this.uniforms.uG.value = this.level
+    // draw only what has started to grow (a part shows once the level passes its gate)
+    if (this.vines) this.vines.geometry.setDrawRange(0, countBelow(this.vineGates, this.level) * 3)
+    if (this.leaves) this.leaves.count = this.falling.length + countBelow(this.leafGates, this.level)
     this.uniforms.uTime.value = this.time
     this.uniforms.uNow.value = this.now
-    this.group.visible = this.level > 1.0 || this.events.length > 0
+    // the plant grows into its new build while the drawn level catches up
+    const built = this.builtPlantLevel < 0 ? this.level : this.builtPlantLevel
+    this.uniforms.uPlantScale.value = THREE.MathUtils.clamp(plantHeight(this.level) / plantHeight(built), 0.6, 1.4)
+    this.group.visible = true
     const air = this.airborne()
     this.fallUniforms.uSpore.value = this.reducedMotion ? air * 0.5 : air
     this.fallUniforms.uFall.value = this.reducedMotion ? 0 : THREE.MathUtils.smoothstep(this.level, 5.3, 7) * 0.9
@@ -808,32 +945,39 @@ function buildOrganism(b: VineBuilder): void {
     // start far enough round that the runner leaves the dome facing its desk
     const a0 = deskAngles[k] - twist * (2.2 + (R() - 0.5) * 0.4)
 
-    // inside the dome: a low runner around the plant (stage 1), then up the
-    // inside of the glass, pressing on it (stage 2)
+    // inside the dome: once the plant fills it (stage 2) a runner leaves the
+    // foot of its stem, creeps over the soil to the glass, and climbs the
+    // inside of it, pressing on it. A living stem: slender, thinning toward
+    // its growing tip, and it stays on the lower glass, well clear of the
+    // flower (nothing grows in front of it or over it).
     const inner: CP[] = []
     for (let j = 0; j <= 4; j++) {
       const t = j / 4
       const a = a0 + twist * t * 0.9
-      inner.push(cp(polar(0.12 + t * 0.6, a, 0.31 + Math.sin(t * Math.PI) * (0.05 + R() * 0.06)), 1.0 + t * 0.95, 0.03 - t * 0.006))
+      const r = 0.05 + t * 0.67
+      inner.push(cp(polar(r, a, soilHeight(r) + 0.008 + Math.sin(t * Math.PI) * (0.02 + R() * 0.03)), 2.0 + t * 0.4, 0.0125 - t * 0.0015))
     }
     const hug: CP[] = []
     const aH = a0 + twist * 0.9
-    const climbDome = 0.9 + R() * 0.4
+    const climbDome = 0.4 + R() * 0.16
     for (let j = 1; j <= 6; j++) {
       const t = j / 6
-      const el = 0.12 + t * climbDome // elevation on the dome, radians
-      const az = aH + twist * t * 1.3
+      // up the glass and leaning along it, easing off as it nears the top of the climb
+      const el = 0.12 + Math.sin((t * Math.PI) / 2) * climbDome // elevation on the dome, radians
+      const az = aH + twist * t * 1.1
       const dir = new THREE.Vector3(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az))
-      hug.push(cp(DOME_C.clone().addScaledVector(dir, 0.9), 2.0 + t * 0.95, 0.026 + t * 0.006, dir.clone().negate()))
+      hug.push(cp(DOME_C.clone().addScaledVector(dir, 0.9), 2.4 + t * 0.55, 0.011 - t * 0.002, dir.clone().negate()))
     }
-    // out over the broken rim and down the wooden base to the floor (stage 3)
+    // out over the broken rim and down the wooden base to the floor (stage 3),
+    // thickening as it roots
     const top = hug[hug.length - 1].p
-    const aOut = Math.atan2(top.z, top.x) + twist * 0.25
+    const aOut = Math.atan2(top.z, top.x) + twist * 0.12
     const spill: CP[] = [
-      cp(polar(1.02, aOut, 0.62), 3.06, 0.034),
-      cp(polar(1.12, aOut + twist * 0.05, 0.34), 3.18, 0.04),
-      cp(polar(1.38, aOut + twist * 0.08, 0.22), 3.3, 0.054, polar(1, aOut, 0.6).normalize()),
-      cp(polar(1.55, aOut + twist * 0.1, 0.0), 3.42, 0.062),
+      cp(polar(0.99, aOut, 0.79), 3.04, 0.011),
+      cp(polar(1.08, aOut + twist * 0.03, 0.62), 3.12, 0.014),
+      cp(polar(1.14, aOut + twist * 0.05, 0.38), 3.2, 0.018),
+      cp(polar(1.38, aOut + twist * 0.08, 0.2), 3.3, 0.024, polar(1, aOut, 0.6).normalize()),
+      cp(polar(1.55, aOut + twist * 0.1, 0.0), 3.42, 0.03),
     ]
     const trunk = [...inner, ...hug, ...spill]
     b.addPath(trunk, { ...tendril, radial: 4, spacing: 0.15, leafEvery: every(0.2), leafSize: 0.11, round: true })
@@ -841,7 +985,7 @@ function buildOrganism(b: VineBuilder): void {
     // across the floor (stage 4), splitting toward a desk and the wall
     const aS = aOut + twist * 0.25
     const split = polar(splitR, aS, 0)
-    const toSplit = [cp(polar(1.55, aOut + twist * 0.1, 0), 3.42, 0.062 * girth), cp(polar((1.55 + splitR) / 2, aOut + twist * 0.2 + (R() - 0.5) * 0.3, 0), 3.62, 0.06 * girth), cp(split, 3.85, 0.056 * girth)]
+    const toSplit = [cp(polar(1.55, aOut + twist * 0.1, 0), 3.42, 0.034 * girth), cp(polar((1.55 + splitR) / 2, aOut + twist * 0.2 + (R() - 0.5) * 0.3, 0), 3.62, 0.048 * girth), cp(split, 3.85, 0.054 * girth)]
     b.addPath(toSplit, root)
     b.addLiftedBoards(polar((1.55 + splitR) / 2 + 0.1, aOut + twist * 0.2, 0), polar(1, aOut + twist * 0.2, 0), 3.66)
 

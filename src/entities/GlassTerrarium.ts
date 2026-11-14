@@ -110,15 +110,26 @@ export class GlassTerrarium {
           vec3 col = vec3(1.0, 0.97, 0.9);
           float a = fresnel * 0.32;
 
-          // condensation: misty band hugging the soil, beaded with droplets
+          // condensation: misty band hugging the soil, beaded with droplets.
+          // Each droplet is a small round bead somewhere in its cell (a whole
+          // cell lit up read as grey squares lying on the soil).
           float band = smoothstep(0.30, 0.03, vY);
           float theta = atan(vWorldPos.z, vWorldPos.x);
           vec2 cell = vec2(theta * 22.0, vY * 34.0 + uT * 0.015);
-          float h = hash(floor(cell));
-          float drop = smoothstep(0.955, 0.985, h) * band;
+          vec2 id = floor(cell);
+          float h = hash(id);
+          vec2 at = vec2(hash(id + 7.1), hash(id + 3.7)) * 0.5 + 0.25;
+          // cells are about 4.3 cm round the dome by 2.8 cm up it
+          vec2 q = (fract(cell) - at) * vec2(1.55, 1.0);
+          float r = 0.12 + 0.1 * hash(id + 1.3);
+          float bead = 1.0 - smoothstep(r * 0.6, r, length(q));
+          float drop = step(0.93, h) * bead * band;
+          // a bright catch-light on the top of each bead
+          float glint = drop * (1.0 - smoothstep(0.0, r * 0.45, length(q - vec2(-0.3, 0.35) * r)));
           float mist = band * (0.10 + 0.03 * sin(theta * 3.0 + uT * 0.2));
-          a += mist + drop * 0.30;
+          a += mist + drop * 0.16 + glint * 0.25;
           col = mix(col, vec3(0.94, 0.98, 0.96), band);
+          col = mix(col, vec3(1.0), glint);
 
           gl_FragColor = vec4(col, a);
         }`,
