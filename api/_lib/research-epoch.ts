@@ -18,6 +18,8 @@ import { modelTrailers } from './commit-identity.js'
 import { getRoleAssignments } from './role-rotation.js'
 import { generatePlantFromSpec } from './plant-generator.js'
 import { addNotebookNote, getRecentNotebook } from './notebook.js'
+import { releaseEpoch } from './epoch-claim.js'
+import { epochSpend } from './spend.js'
 import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
@@ -25,15 +27,17 @@ import {
   type ResearchRunResult,
 } from './research.js'
 import {
-  MODEL_DISPLAY_NAMES,
+  MODEL_DISPLAY_NAMES, modelDisplayName,
   type AgentSpecification, type ChallengerOutput, type CommentatorOutput,
   type Epoch, type ResearchExecutorOutput, type ResearchMeta,
   type ResearchPlannerOutput, type ResearchReviewerOutput, type RoleAssignments,
 } from './types.js'
 
 const RESEARCH_BUDGET_S = Number(process.env.RESEARCH_BUDGET_S || 300)
-// Leave headroom inside the 800s function budget for the LLM stages.
-const RUN_POLL_MAX_MS = Number(process.env.RESEARCH_RUN_POLL_MAX_MS || 560_000)
+// Leave headroom inside the 800 s function budget for the LLM stages and the
+// repo writes after the run; a run still going at the deadline is picked up
+// again from its persisted call_id on the next tick.
+const RUN_POLL_MAX_MS = Number(process.env.RESEARCH_RUN_POLL_MAX_MS || 400_000)
 
 function getGrowthStage(spec: AgentSpecification): AgentSpecification['meta']['growth_stage'] {
   const caps = spec.capabilities.filter(c => c.status === 'active').length
@@ -76,6 +80,18 @@ export async function runResearchEpoch(experimentId: string): Promise<{
   const roleAssignments: RoleAssignments = (existingEpoch?.role_assignments as RoleAssignments) || getRoleAssignments(epochNumber)
 
   if (existingEpoch?.completed_at && existingEpoch.spec_after && existingEpoch.commentator_output) {
+    // Finished earlier but the experiment row was never advanced (the
+    // function died between the two writes): advance it now, or every later
+    // tick would land here again.
+    await sql`
+      UPDATE experiments SET
+        current_spec = ${JSON.stringify(existingEpoch.spec_after)},
+        current_epoch = ${epochNumber},
+        epoch_in_progress = FALSE,
+        epoch_started_at = NULL
+      WHERE id = ${experimentId} AND current_epoch < ${epochNumber} AND status <> 'archived'
+    `
+    await releaseEpoch(experimentId)
     return {
       success: true, epochNumber,
       newSpec: existingEpoch.spec_after as AgentSpecification,
@@ -83,52 +99,8 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     }
   }
 
-  await sql`UPDATE experiments SET epoch_in_progress = TRUE, epoch_started_at = NOW() WHERE id = ${experimentId}`
-
-  // --- Assemble research context from the repo (the org's real memory) ---
-  const [trainPyFile, resultsFile, wikiIndexFile] = await Promise.all([
-    getResearchFile('train.py'),
-    getResearchFile('results.tsv'),
-    getResearchFile('wiki/index.md'),
-  ])
-  if (!trainPyFile) throw new Error('Research repo missing train.py')
-
-  const recentResult = await sql`
-    SELECT epoch_number, commentator_output FROM epochs
-    WHERE experiment_id = ${experimentId} ORDER BY epoch_number DESC LIMIT 3
-  `
-  let sharedContext = getResearchSharedContext({
-    epochNumber,
-    spec: specBefore,
-    research,
-    trainPy: trainPyFile.content,
-    resultsTsv: resultsFile?.content ?? '',
-    wikiIndex: wikiIndexFile?.content ?? '',
-    recentHistory: recentResult.rows as Epoch[],
-  })
-
-  const notebook = await getRecentNotebook(experimentId)
-  if (notebook.length) {
-    sharedContext += `\n\nLAB NOTEBOOK (durable notes from your colleagues — heed the warnings):\n${notebook
-      .map(n => `- [e${n.epoch_number} · ${n.author}] ${n.note}`).join('\n')}`
-  }
-
-  const ctxFor = (modelId: string) =>
-    `You are ${MODEL_DISPLAY_NAMES[modelId as keyof typeof MODEL_DISPLAY_NAMES] || modelId}.\n\n${sharedContext}`
-
-  let epochId: string
-  if (existingEpoch) {
-    epochId = existingEpoch.id as string
-  } else {
-    const epochResult = await sql`
-      INSERT INTO epochs (experiment_id, epoch_number, role_assignments, spec_before)
-      VALUES (${experimentId}, ${epochNumber}, ${JSON.stringify(roleAssignments)}, ${JSON.stringify(specBefore)})
-      RETURNING id
-    `
-    epochId = epochResult.rows[0].id as string
-  }
-  await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS research_run JSONB`
-
+  // The epoch is already claimed (runEpoch). Everything from here on runs
+  // inside the try, so any failure, including the repo reads, releases it.
   let totalCost = 0
   const saveNote = async (role: string, modelId: string, output: unknown) => {
     const note = output && typeof output === 'object' ? String((output as Record<string, unknown>).notebook ?? '') : ''
@@ -136,6 +108,50 @@ export async function runResearchEpoch(experimentId: string): Promise<{
   }
 
   try {
+    // --- Assemble research context from the repo (the org's real memory) ---
+    const [trainPyFile, resultsFile, wikiIndexFile] = await Promise.all([
+      getResearchFile('train.py'),
+      getResearchFile('results.tsv'),
+      getResearchFile('wiki/index.md'),
+    ])
+    if (!trainPyFile) throw new Error('Research repo missing train.py')
+
+    const recentResult = await sql`
+      SELECT epoch_number, commentator_output FROM epochs
+      WHERE experiment_id = ${experimentId} ORDER BY epoch_number DESC LIMIT 3
+    `
+    let sharedContext = getResearchSharedContext({
+      epochNumber,
+      spec: specBefore,
+      research,
+      trainPy: trainPyFile.content,
+      resultsTsv: resultsFile?.content ?? '',
+      wikiIndex: wikiIndexFile?.content ?? '',
+      recentHistory: recentResult.rows as Epoch[],
+    })
+
+    const notebook = await getRecentNotebook(experimentId)
+    if (notebook.length) {
+      sharedContext += `\n\nLAB NOTEBOOK (durable notes from your colleagues — heed the warnings):\n${notebook
+        .map(n => `- [e${n.epoch_number} · ${n.author}] ${n.note}`).join('\n')}`
+    }
+
+    const ctxFor = (modelId: string) =>
+      `You are ${MODEL_DISPLAY_NAMES[modelId as keyof typeof MODEL_DISPLAY_NAMES] || modelId}.\n\n${sharedContext}`
+
+    let epochId: string
+    if (existingEpoch) {
+      epochId = existingEpoch.id as string
+    } else {
+      const epochResult = await sql`
+        INSERT INTO epochs (experiment_id, epoch_number, role_assignments, spec_before)
+        VALUES (${experimentId}, ${epochNumber}, ${JSON.stringify(roleAssignments)}, ${JSON.stringify(specBefore)})
+        RETURNING id
+      `
+      epochId = epochResult.rows[0].id as string
+    }
+    await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS research_run JSONB`
+
     // 1. PLANNER — one falsifiable hypothesis
     let plannerOutput = existingEpoch?.planner_output as unknown as ResearchPlannerOutput | undefined
     if (!plannerOutput?.hypothesis) {
@@ -242,9 +258,9 @@ export async function runResearchEpoch(experimentId: string): Promise<{
 
     // 6. REPO EFFECTS — the org's memory is the repo, not the database
     // Credit the model that actually wrote train.py (a fallback model, if one answered).
-    // The commit identity is the lab's (commit-identity.ts); the model is a trailer.
+    // The Model: trailer names it, and commit-identity.ts makes it the author.
     const executorModel = answeredModel(executorOutput, roleAssignments.executor)
-    const displayName = (id: string) => MODEL_DISPLAY_NAMES[id as keyof typeof MODEL_DISPLAY_NAMES] || id
+    const displayName = (id: string) => modelDisplayName(id) || id
     const fallbackFor = executorModel !== roleAssignments.executor ? displayName(roleAssignments.executor) : undefined
     const author = displayName(executorModel) + (fallbackFor ? ` (fallback for ${fallbackFor})` : '')
     try {
@@ -336,13 +352,21 @@ export async function runResearchEpoch(experimentId: string): Promise<{
 
     // 9. Persist epoch + experiment
     const plantGeometry = generatePlantFromSpec(newSpec)
+    // Real cost from the ledger: includes calls from earlier attempts at
+    // this epoch (a run that resumed after the poll deadline).
+    const ledger = await epochSpend(experimentId, epochNumber)
+    const epochCost = Math.max(ledger?.cost_usd ?? 0, totalCost)
+    await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER`
+    await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS completion_tokens INTEGER`
     await sql`
       UPDATE epochs SET
         commentator_output = ${JSON.stringify(commentatorOutput)},
         spec_after = ${JSON.stringify(newSpec)},
         plant_geometry = ${JSON.stringify(plantGeometry)},
         stability_delta = ${newSpec.meta.stability_score - specBefore.meta.stability_score},
-        cost_usd = ${totalCost},
+        cost_usd = ${epochCost},
+        prompt_tokens = ${ledger?.prompt_tokens ?? null},
+        completion_tokens = ${ledger?.completion_tokens ?? null},
         completed_at = NOW()
       WHERE id = ${epochId}
     `
@@ -353,15 +377,13 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         epoch_in_progress = FALSE,
         epoch_started_at = NULL,
         status = 'growing'
-      WHERE id = ${experimentId}
+      WHERE id = ${experimentId} AND status <> 'archived'
     `
 
-    console.log(`[Research e${epochNumber}] ${verdict.toUpperCase()} — best ${newResearch.best_bpb.toFixed(4)} bpb (cost $${totalCost.toFixed(3)})`)
+    console.log(`[Research e${epochNumber}] ${verdict.toUpperCase()} — best ${newResearch.best_bpb.toFixed(4)} bpb (cost $${epochCost.toFixed(3)})`)
     return { success: true, epochNumber, newSpec, commentatorOutput }
   } catch (error) {
-    await sql`
-      UPDATE experiments SET epoch_in_progress = FALSE, epoch_started_at = NULL WHERE id = ${experimentId}
-    `
+    await releaseEpoch(experimentId)
     console.error(`[Research e${epochNumber}] failed:`, error instanceof Error ? error.message : error)
     throw error
   }

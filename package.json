@@ -9,7 +9,8 @@
     "preview": "vite preview",
     "test:security": "node --test tests/security.test.mjs",
     "check:api": "tsc --project tsconfig.api.json",
-    "test:bundle": "node --test tests/bundle.test.mjs"
+    "test:bundle": "node --test tests/bundle.test.mjs",
+    "test:run2": "node --test tests/run2.test.mjs"
   },
   "keywords": [
     "threejs",

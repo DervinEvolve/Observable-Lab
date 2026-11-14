@@ -10,6 +10,13 @@ import { contributionBranchName } from './branch-names.js'
 import { persistContribution, getRecentCIFailures } from './code-contributions-store.js'
 import { addNotebookNote, getRecentNotebook } from './notebook.js'
 import { logEpochForResearch } from './research-logger.js'
+import { claimEpoch, releaseEpoch, EpochBusyError } from './epoch-claim.js'
+import {
+  BudgetPausedError, checkDailyBudget, describeBudget, epochSpend, setSpendEpoch, withSpendContext,
+} from './spend.js'
+import {
+  clampStability, normalizeSeverity, pickContributionCandidate, sanitizeDecisions, sanitizeMutations, textOrNull,
+} from './model-output.js'
 import {
   runGRPOPractice,
   checkAwakeningConditions,
@@ -43,22 +50,27 @@ async function callModel<T>(
   systemPrompt: string,
   userPrompt: string,
   webSearch = false
-): Promise<{ output: T; cost: number }> {
+): Promise<{ output: T; cost: number; tokens: { prompt: number; completion: number } }> {
   const result = await callOpenRouter(modelId, systemPrompt, userPrompt, { webSearch })
   const output = result.output as T
   if (output && typeof output === 'object' && result.citations.length) {
     ;(output as Record<string, unknown>).web_sources = result.citations
   }
-  return { output, cost: result.cost }
+  return {
+    output,
+    cost: result.cost,
+    tokens: { prompt: result.usage?.prompt_tokens ?? 0, completion: result.usage?.completion_tokens ?? 0 },
+  }
 }
 
 // Self-governance: agents may tune these bounded knobs about their own lab
 // via the normal mutation/review pipeline. Values are HARD-CLAMPED here —
 // no prompt output can push the experiment outside safe bounds.
+// Code contributions are capped at one per epoch in code, so there is no
+// knob for that here.
 const PARAM_BOUNDS: Record<string, [number, number]> = {
   epoch_interval_minutes: [30, 180],
   north_every_n_epochs: [1, 10],
-  max_code_contributions_per_epoch: [1, 5],
 }
 
 function applyExperimentParams(spec: AgentSpecification, value: Record<string, unknown>): void {
@@ -111,7 +123,7 @@ function applyMutations(
       newSpec.meta.total_mutations++
     } else if (mutation.type === 'modify') {
       // Handle path-based modification
-      const pathMatch = mutation.path.match(/(\w+)\[(\d+)\]/)
+      const pathMatch = (mutation.path || '').match(/(\w+)\[(\d+)\]/)
       if (pathMatch) {
         const [, target, indexStr] = pathMatch
         const index = parseInt(indexStr, 10)
@@ -127,7 +139,7 @@ function applyMutations(
         // "identity.purpose", "purpose") since the prompt only documents
         // array paths. Every identity mutation was silently dropped as a
         // result (confirmed live across 4 epochs). Handle all observed forms.
-        const field = mutation.path.replace(/^identity\.?/, '')
+        const field = (mutation.path || '').replace(/^identity\.?/, '')
         if (field === 'purpose' || field === 'domain') {
           (newSpec.identity as Record<string, unknown>)[field] = value
         } else if (value && typeof value === 'object') {
@@ -137,7 +149,7 @@ function applyMutations(
       newSpec.meta.total_mutations++
     } else if (mutation.type === 'remove') {
       // Mark as pruned rather than deleting
-      const pathMatch = mutation.path.match(/(\w+)\.(\w+)/)
+      const pathMatch = (mutation.path || '').match(/(\w+)\.(\w+)/)
       if (pathMatch) {
         const [, target, id] = pathMatch
         const arr = newSpec[target as keyof AgentSpecification]
@@ -172,7 +184,7 @@ function findMutatedSpecItem(
     return arr.find(item => item.id === id) ?? null
   }
   if (mutation.type === 'modify') {
-    const pathMatch = mutation.path.match(/\[(\d+)\]/)
+    const pathMatch = (mutation.path || '').match(/\[(\d+)\]/)
     if (pathMatch) {
       const index = parseInt(pathMatch[1], 10)
       return arr[index] ?? null
@@ -181,7 +193,7 @@ function findMutatedSpecItem(
   return null
 }
 
-export async function runEpoch(experimentId: string): Promise<{
+export interface EpochRunResult {
   success: boolean
   epochNumber: number
   newSpec: AgentSpecification
@@ -193,7 +205,34 @@ export async function runEpoch(experimentId: string): Promise<{
     first_words: string
     timestamp: string
   } | null
-}> {
+}
+
+/**
+ * Runs the next epoch of an experiment. Checks the daily budget, then
+ * claims the epoch atomically (throws EpochBusyError when another request
+ * holds it, BudgetPausedError when today's spend has reached the cap).
+ * Every model call inside is written to the spend ledger under this
+ * experiment and epoch. The claim is released however the epoch ends.
+ */
+export async function runEpoch(experimentId: string): Promise<EpochRunResult> {
+  const budget = await checkDailyBudget()
+  if (!budget.allowed) {
+    console.warn(`[Epoch] Not starting an epoch for ${experimentId}: ${describeBudget(budget)}`)
+    throw new BudgetPausedError(budget)
+  }
+  if (!(await claimEpoch(experimentId))) throw new EpochBusyError(experimentId)
+  return withSpendContext({ experimentId, purpose: 'epoch' }, async () => {
+    try {
+      return await runClaimedEpoch(experimentId)
+    } catch (error) {
+      await releaseEpoch(experimentId).catch(e =>
+        console.error('[Epoch] could not release the epoch claim:', e instanceof Error ? e.message : e))
+      throw error
+    }
+  })
+}
+
+async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
   // 1. Get current experiment state
   const experimentResult = await sql`
     SELECT * FROM experiments WHERE id = ${experimentId}
@@ -209,10 +248,12 @@ export async function runEpoch(experimentId: string): Promise<{
   // ML research pipeline (real GPU runs, measured verdicts) instead of the
   // classic spec-growing pipeline.
   if (currentSpec.meta.research) {
+    setSpendEpoch((experiment.current_epoch as number) + 1)
     return runResearchEpoch(experimentId)
   }
 
   const epochNumber = (experiment.current_epoch as number) + 1
+  setSpendEpoch(epochNumber)
 
   // Check for an existing (possibly stuck) epoch record
   const existingEpochResult = await sql`
@@ -235,8 +276,10 @@ export async function runEpoch(experimentId: string): Promise<{
           epoch_in_progress = FALSE,
           epoch_started_at = NULL,
           status = ${newStatus}
-        WHERE id = ${experimentId}
+        WHERE id = ${experimentId} AND status <> 'archived'
       `
+    } else {
+      await releaseEpoch(experimentId)
     }
     return {
       success: true,
@@ -246,12 +289,7 @@ export async function runEpoch(experimentId: string): Promise<{
     }
   }
 
-  // 2. Mark epoch as in progress
-  await sql`
-    UPDATE experiments
-    SET epoch_in_progress = TRUE, epoch_started_at = NOW()
-    WHERE id = ${experimentId}
-  `
+  // 2. The epoch was claimed by runEpoch before anything else happened.
 
   // 3. Get role assignments (reuse existing if present)
   const roleAssignments = assignments
@@ -304,6 +342,12 @@ export async function runEpoch(experimentId: string): Promise<{
   }
 
   let totalCost = 0
+  const tokens = { prompt: 0, completion: 0 }
+  const addUsage = (cost: number, t: { prompt: number; completion: number }) => {
+    totalCost += cost
+    tokens.prompt += t.prompt
+    tokens.completion += t.completion
+  }
   const epochStartTime = existingEpoch?.started_at
     ? new Date(existingEpoch.started_at)
     : new Date()
@@ -319,14 +363,14 @@ export async function runEpoch(experimentId: string): Promise<{
     // 6. PLANNER
     let plannerOutput = existingEpoch?.planner_output as PlannerOutput | undefined
     if (!plannerOutput) {
-      const { output, cost } = await callModel<PlannerOutput>(
+      const { output, cost, tokens: used } = await callModel<PlannerOutput>(
         roleAssignments.planner,
         ctxFor(roleAssignments.planner) + '\n\n' + ROLE_PROMPTS.planner,
         'What direction should we take this epoch?',
         true // web search — the Planner researches what a SOTA agent needs
       )
       plannerOutput = output
-      totalCost += cost
+      addUsage(cost, used)
       await sql`
         UPDATE epochs SET planner_output = ${JSON.stringify(plannerOutput)} WHERE id = ${epochId}
       `
@@ -336,14 +380,14 @@ export async function runEpoch(experimentId: string): Promise<{
     // 7. EXECUTOR
     let executorOutput = existingEpoch?.executor_output as ExecutorOutput | undefined
     if (!executorOutput) {
-      const { output, cost } = await callModel<ExecutorOutput>(
+      const { output, cost, tokens: used } = await callModel<ExecutorOutput>(
         roleAssignments.executor,
         ctxFor(roleAssignments.executor) + '\n\n' + ROLE_PROMPTS.executor(plannerOutput),
         "Implement the planner's direction with concrete mutations.",
         true // web search — the Executor looks up real implementation approaches
       )
       executorOutput = output
-      totalCost += cost
+      addUsage(cost, used)
       await sql`
         UPDATE epochs SET executor_output = ${JSON.stringify(executorOutput)} WHERE id = ${epochId}
       `
@@ -353,13 +397,13 @@ export async function runEpoch(experimentId: string): Promise<{
     // 8. CHALLENGER
     let challengerOutput = existingEpoch?.challenger_output as ChallengerOutput | undefined
     if (!challengerOutput) {
-      const { output, cost } = await callModel<ChallengerOutput>(
+      const { output, cost, tokens: used } = await callModel<ChallengerOutput>(
         roleAssignments.challenger,
         ctxFor(roleAssignments.challenger) + '\n\n' + ROLE_PROMPTS.challenger(executorOutput),
         'Stress-test the proposed changes. Find weaknesses.'
       )
       challengerOutput = output
-      totalCost += cost
+      addUsage(cost, used)
       await sql`
         UPDATE epochs SET challenger_output = ${JSON.stringify(challengerOutput)} WHERE id = ${epochId}
       `
@@ -371,13 +415,13 @@ export async function runEpoch(experimentId: string): Promise<{
     let rebuttalOutput = existingEpoch?.executor_rebuttal as RebuttalOutput | undefined
     if (!rebuttalOutput && (challengerOutput.challenges?.length ?? 0) > 0) {
       try {
-        const { output, cost } = await callModel<RebuttalOutput>(
+        const { output, cost, tokens: used } = await callModel<RebuttalOutput>(
           roleAssignments.executor,
           ctxFor(roleAssignments.executor) + '\n\n' + ROLE_PROMPTS.rebuttal(executorOutput, challengerOutput),
           "Respond to each of the Challenger's concerns: defend, concede, or revise."
         )
         rebuttalOutput = output
-        totalCost += cost
+        addUsage(cost, used)
         await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS executor_rebuttal JSONB`
         await sql`
           UPDATE epochs SET executor_rebuttal = ${JSON.stringify(rebuttalOutput)} WHERE id = ${epochId}
@@ -392,121 +436,133 @@ export async function runEpoch(experimentId: string): Promise<{
     // 9. REVIEWER
     let reviewerOutput = existingEpoch?.reviewer_output as ReviewerOutput | undefined
     if (!reviewerOutput) {
-      const { output, cost } = await callModel<ReviewerOutput>(
+      const { output, cost, tokens: used } = await callModel<ReviewerOutput>(
         roleAssignments.reviewer,
         ctxFor(roleAssignments.reviewer) + '\n\n' + ROLE_PROMPTS.reviewer(executorOutput, challengerOutput, rebuttalOutput),
         'Make final decisions on each proposed mutation.'
       )
       reviewerOutput = output
-      totalCost += cost
+      addUsage(cost, used)
       await sql`
         UPDATE epochs SET reviewer_output = ${JSON.stringify(reviewerOutput)} WHERE id = ${epochId}
       `
       await saveNote('Reviewer', roleAssignments.reviewer, reviewerOutput)
     }
 
-    // 10. Apply approved mutations to spec
-    const newSpec = applyMutations(
-      specBefore,
-      executorOutput.mutations || [],
-      reviewerOutput.decisions || [],
-      epochNumber
-    )
+    // 10. Apply approved mutations to spec. Model output is untyped JSON:
+    // the mutations and decisions are put into a usable shape first, keeping
+    // the indexes the decisions refer to.
+    const mutations = sanitizeMutations(executorOutput.mutations)
+    const decisions = sanitizeDecisions(reviewerOutput.decisions, mutations.length)
+    // An entry whose type couldn't be mapped matches no branch and is skipped.
+    const newSpec = applyMutations(specBefore, mutations as unknown as Mutation[], decisions, epochNumber)
 
-    // 10b. Give each approved mutation a real code contribution on the AI-Agent
-    // repo (branch -> PR -> merge), so the growing spec is backed by an actual
-    // codebase, not just JSON. Best-effort and capped per epoch — a code-side
-    // failure never blocks the abstract spec pipeline above.
-    const MAX_CODE_CONTRIBUTIONS_PER_EPOCH = Math.min(5, Math.max(1,
-      newSpec.meta.experiment_params?.max_code_contributions_per_epoch ?? 3))
-    const approvedMutations = (reviewerOutput.decisions || [])
-      .filter(d => d.verdict !== 'reject')
-      .slice(0, MAX_CODE_CONTRIBUTIONS_PER_EPOCH)
-    const agentContext = `${newSpec.identity.purpose || 'An autonomous agent'}${
-      newSpec.identity.domain ? ` (domain: ${newSpec.identity.domain})` : ''
-    }`
-
-    // Contributions run in PARALLEL: each now waits on a real CI run (~1-3
-    // min), and doing that serially would blow the function's 800s budget.
-    await Promise.all(approvedMutations.map(async (decision) => {
-      const mutation = (executorOutput.mutations || [])[decision.mutation_index]
-      if (!mutation) return
-      try {
-        // Throws (and skips this contribution) unless target is one of the
-        // allowed mutation targets and the index is a small integer.
-        const branchName = contributionBranchName(epochNumber, mutation.target, decision.mutation_index)
-        const result = await contributeCode({
-          authorModelId: roleAssignments.executor,
-          branchName,
-          title: `Epoch ${epochNumber}: ${mutation.target} — ${mutation.path}`,
-          description: `${mutation.rationale}\n\nSpec field: ${mutation.target}.${mutation.path}\nProposed value: ${JSON.stringify(mutation.value)}`,
-          review: { mode: 'approved' }, // Reviewer already approved this mutation
-          deploySubagent: true, // a subagent writes a test for this contribution
-          deployExplorerSubagent: true, // a subagent researches the problem first, findings inform the code
-          agentContext,
-        })
-        totalCost += result.cost
-        await persistContribution(experimentId, epochNumber, roleAssignments.executor, branchName, result)
-        if (result.merged) {
-          console.log(`[Epoch ${epochNumber}] Code contribution merged: ${result.pr_url}`)
-          // Tag the exact leaf/branch this PR backs, so the plant can render
-          // it in a distinct "real code" color instead of the plain default.
-          const item = findMutatedSpecItem(newSpec, mutation, decision)
-          if (item) item.code_pr_url = result.pr_url
-        } else if (result.ci_passed === false) {
-          console.log(`[Epoch ${epochNumber}] Code contribution failed CI: ${result.pr_url}`)
-          // Durable memory of the failure — short note; the full log excerpt
-          // is already injected into next epoch's context separately.
-          const firstError = (result.ci_excerpt || '').split('\n').find(l => /FAIL|Error/.test(l))?.slice(0, 180) || 'see CI logs'
-          await addNotebookNote(experimentId, epochNumber, 'CI (system)',
-            `PR "${mutation.target} — ${mutation.path}" FAILED the test suite and was closed. ${firstError}`)
+    // 10b. At most ONE code contribution per epoch: the approved mutation most
+    // worth backing with code becomes a pull request on AI-Agent (explorer
+    // subagent, code, test subagent, CI, and the author's Sprite when
+    // configured). Only when today's spend allows it. Best-effort: a
+    // code-side failure never blocks the spec pipeline.
+    const candidate = pickContributionCandidate(mutations, decisions, challengerOutput.challenges)
+    if (candidate) {
+      const { mutation, decision } = candidate
+      const budget = await checkDailyBudget()
+      if (!budget.allowed) {
+        console.warn(`[Epoch ${epochNumber}] Skipping the code contribution: ${describeBudget(budget)}`)
+      } else {
+        try {
+          const agentContext = `${newSpec.identity.purpose || 'An autonomous agent'}${
+            newSpec.identity.domain ? ` (domain: ${newSpec.identity.domain})` : ''
+          }`
+          // Throws (and skips the contribution) unless target is one of the
+          // allowed mutation targets and the index is a small integer.
+          const branchName = contributionBranchName(epochNumber, mutation.target, decision.mutation_index)
+          const result = await contributeCode({
+            authorModelId: roleAssignments.executor,
+            branchName,
+            title: `Epoch ${epochNumber}: ${mutation.target}: ${mutation.path}`,
+            description: `${mutation.rationale}\n\nSpec field: ${mutation.target}.${mutation.path}\nProposed value: ${JSON.stringify(decision.modified_value ?? mutation.value)}`,
+            review: { mode: 'approved' }, // Reviewer already approved this mutation
+            deploySubagent: true, // a subagent writes a test for this contribution
+            deployExplorerSubagent: true, // a subagent researches the problem first, findings inform the code
+            agentContext,
+          })
+          // The ledger already holds these calls; this keeps the in-memory total honest too.
+          totalCost += result.cost
+          await persistContribution(experimentId, epochNumber, roleAssignments.executor, branchName, result)
+          if (result.merged) {
+            console.log(`[Epoch ${epochNumber}] Code contribution merged: ${result.pr_url}`)
+            // Tag the exact leaf/branch this PR backs, so the plant can render
+            // it in a distinct "real code" color instead of the plain default.
+            const item = findMutatedSpecItem(newSpec, mutation, decision)
+            if (item) item.code_pr_url = result.pr_url
+          } else if (result.ci_passed === false) {
+            console.log(`[Epoch ${epochNumber}] Code contribution failed CI: ${result.pr_url}`)
+            // Durable memory of the failure — short note; the full log excerpt
+            // is already injected into next epoch's context separately.
+            const firstError = (result.ci_excerpt || '').split('\n').find(l => /FAIL|Error/.test(l))?.slice(0, 180) || 'see CI logs'
+            await addNotebookNote(experimentId, epochNumber, 'CI (system)',
+              `PR "${mutation.target}: ${mutation.path}" FAILED the test suite and was closed. ${firstError}`)
+          }
+        } catch (e) {
+          console.warn(`[Epoch ${epochNumber}] Code contribution failed (non-fatal):`, e instanceof Error ? e.message : e)
         }
-      } catch (e) {
-        console.warn(`[Epoch ${epochNumber}] Code contribution failed (non-fatal):`, e instanceof Error ? e.message : e)
       }
-    }))
+    }
 
-    // Ensure stability_score is always set (fallback to previous value or 0.5 if missing)
-    newSpec.meta.stability_score = reviewerOutput.updated_stability_score ?? specBefore.meta.stability_score ?? 0.5
+    // Always a number in 0..1 (a string or 85 from a model would break the
+    // DECIMAL(4,3) stability_delta column and the lighting).
+    newSpec.meta.stability_score = clampStability(reviewerOutput.updated_stability_score, specBefore.meta.stability_score ?? 0.5)
     newSpec.meta.total_epochs = epochNumber
     newSpec.meta.growth_stage = getGrowthStage(newSpec)
 
-    // Add any new conflicts detected by reviewer
-    for (const conflict of reviewerOutput.new_conflicts_detected || []) {
-      newSpec.conflicts.push({
+    // Conflicts: the spec keeps its own ids; the conflicts table row carries
+    // that id too, so a later "resolved" can find the row.
+    await sql`ALTER TABLE conflicts ADD COLUMN IF NOT EXISTS spec_conflict_id TEXT`
+    const newConflicts = Array.isArray(reviewerOutput.new_conflicts_detected) ? reviewerOutput.new_conflicts_detected : []
+    for (const raw of newConflicts) {
+      if (!raw || typeof raw !== 'object') continue
+      const conflict = {
         id: `conflict_${epochNumber}_${newSpec.conflicts.length}`,
-        element_a: conflict.element_a,
-        element_b: conflict.element_b,
-        description: conflict.description,
-        severity: conflict.severity,
-        detected_epoch: epochNumber,
-        resolved: false,
-      })
-
-      // Also record in conflicts table
+        element_a: textOrNull(raw.element_a, 300) ?? 'unspecified',
+        element_b: textOrNull(raw.element_b, 300) ?? 'unspecified',
+        description: textOrNull(raw.description, 2000) ?? '(no description)',
+        severity: normalizeSeverity(raw.severity),
+      }
+      newSpec.conflicts.push({ ...conflict, detected_epoch: epochNumber, resolved: false })
       await sql`
-        INSERT INTO conflicts (experiment_id, detected_epoch, element_a, element_b, description, severity)
-        VALUES (${experimentId}, ${epochNumber}, ${conflict.element_a}, ${conflict.element_b}, ${conflict.description}, ${conflict.severity})
+        INSERT INTO conflicts (experiment_id, detected_epoch, element_a, element_b, description, severity, spec_conflict_id)
+        VALUES (${experimentId}, ${epochNumber}, ${conflict.element_a}, ${conflict.element_b}, ${conflict.description}, ${conflict.severity}, ${conflict.id})
       `
     }
 
-    // Mark resolved conflicts
-    for (const conflictId of reviewerOutput.conflicts_resolved || []) {
+    // Mark resolved conflicts. The reviewer names spec conflict ids; rows
+    // written before spec_conflict_id existed are matched on their fields.
+    const resolvedIds = Array.isArray(reviewerOutput.conflicts_resolved)
+      ? reviewerOutput.conflicts_resolved.filter((id): id is string => typeof id === 'string' && id.length > 0 && id.length <= 200)
+      : []
+    for (const conflictId of resolvedIds) {
       const conflict = newSpec.conflicts.find(c => c.id === conflictId)
-      if (conflict) {
-        conflict.resolved = true
-        conflict.resolved_epoch = epochNumber
-      }
+      if (!conflict || conflict.resolved) continue
+      conflict.resolved = true
+      conflict.resolved_epoch = epochNumber
       await sql`
         UPDATE conflicts SET resolved_epoch = ${epochNumber}
-        WHERE experiment_id = ${experimentId} AND element_a || element_b LIKE ${'%' + conflictId + '%'}
+        WHERE experiment_id = ${experimentId}
+          AND resolved_epoch IS NULL
+          AND (
+            spec_conflict_id = ${conflictId}
+            OR (spec_conflict_id IS NULL
+              AND detected_epoch = ${conflict.detected_epoch}
+              AND element_a = ${conflict.element_a}
+              AND element_b = ${conflict.element_b})
+          )
       `
     }
 
     // 11. COMMENTATOR
     let commentatorOutput = existingEpoch?.commentator_output as CommentatorOutput | undefined
     if (!commentatorOutput) {
-      const { output, cost } = await callModel<CommentatorOutput>(
+      const { output, cost, tokens: used } = await callModel<CommentatorOutput>(
         roleAssignments.commentator,
         ctxFor(roleAssignments.commentator) + '\n\n' + ROLE_PROMPTS.commentator({
           planner: plannerOutput,
@@ -517,24 +573,36 @@ export async function runEpoch(experimentId: string): Promise<{
         'Summarize this epoch for human observers.'
       )
       commentatorOutput = output
-      totalCost += cost
+      addUsage(cost, used)
       await saveNote('Commentator', roleAssignments.commentator, commentatorOutput)
     }
 
     // 12. Generate plant geometry
     const plantGeometry = generatePlantFromSpec(newSpec)
 
-    // 13. Update epoch record
+    // 13. Update epoch record. The cost is the ledger's total for this epoch:
+    // every billed attempt, retries, fallbacks, the contribution, and calls
+    // from earlier attempts at this same epoch. The in-memory total is the
+    // floor in case the ledger couldn't be read.
+    const ledger = await epochSpend(experimentId, epochNumber)
+    const epochCost = Math.max(ledger?.cost_usd ?? 0, totalCost)
+    const promptTokens = Math.max(ledger?.prompt_tokens ?? 0, tokens.prompt)
+    const completionTokens = Math.max(ledger?.completion_tokens ?? 0, tokens.completion)
+    await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS prompt_tokens INTEGER`
+    await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS completion_tokens INTEGER`
     await sql`
       UPDATE epochs SET
         commentator_output = ${JSON.stringify(commentatorOutput)},
         spec_after = ${JSON.stringify(newSpec)},
         plant_geometry = ${JSON.stringify(plantGeometry)},
         stability_delta = ${newSpec.meta.stability_score - specBefore.meta.stability_score},
-        cost_usd = ${totalCost},
+        cost_usd = ${epochCost},
+        prompt_tokens = ${promptTokens},
+        completion_tokens = ${completionTokens},
         completed_at = NOW()
       WHERE id = ${epochId}
     `
+    console.log(`[Epoch ${epochNumber}] cost $${epochCost.toFixed(4)} (${promptTokens} prompt / ${completionTokens} completion tokens)`)
 
     // 14. Update experiment
     const newStatus = getExperimentStatus(newSpec)
@@ -545,13 +613,18 @@ export async function runEpoch(experimentId: string): Promise<{
         epoch_in_progress = FALSE,
         epoch_started_at = NULL,
         status = ${newStatus}
-      WHERE id = ${experimentId}
+      WHERE id = ${experimentId} AND status <> 'archived'
     `
 
-    // 15. Record mutations for research
-    for (let i = 0; i < (executorOutput.mutations || []).length; i++) {
-      const mutation = executorOutput.mutations[i]
-      const decision = reviewerOutput.decisions?.find(d => d.mutation_index === i)
+    // 15. Record mutations for research. Rows whose type can't be mapped to
+    // the table's CHECK set are skipped rather than failing the epoch.
+    for (let i = 0; i < mutations.length; i++) {
+      const mutation = mutations[i]
+      if (!mutation.type) {
+        console.warn(`[Epoch ${epochNumber}] mutation ${i} has an unknown type; not recorded`)
+        continue
+      }
+      const decision = decisions.find(d => d.mutation_index === i)
 
       await sql`
         INSERT INTO mutations (epoch_id, mutation_index, type, target, path, model_id, approved, reason)
@@ -559,17 +632,19 @@ export async function runEpoch(experimentId: string): Promise<{
           ${epochId},
           ${i},
           ${mutation.type},
-          ${mutation.target},
-          ${mutation.path},
+          ${mutation.target || 'unknown'},
+          ${mutation.path || null},
           ${roleAssignments.executor},
           ${decision?.verdict === 'approve' || decision?.verdict === 'modify'},
-          ${decision?.reason || null}
+          ${textOrNull(decision?.reason)}
         )
       `
     }
 
-    // 16. Log complete epoch data for research analysis
+    // 16. Log complete epoch data for research analysis. A logging failure
+    // must not undo an epoch that is already stored.
     await logEpochForResearch({
+      experimentId,
       epochNumber,
       startTime: epochStartTime,
       endTime: new Date(),
@@ -581,8 +656,8 @@ export async function runEpoch(experimentId: string): Promise<{
       commentatorOutput,
       specBefore,
       specAfter: newSpec,
-      totalCost,
-    })
+      totalCost: epochCost,
+    }).catch(e => console.warn(`[Epoch ${epochNumber}] research log failed (non-fatal):`, e instanceof Error ? e.message : e))
 
     // 17. Run GRPO practice (non-blocking, best effort)
     let grpoResult = null
@@ -659,13 +734,12 @@ export async function runEpoch(experimentId: string): Promise<{
       awakeningEvent,
     }
   } catch (error) {
-    // Mark epoch as failed but don't lose partial data
+    // Mark epoch as failed but don't lose partial data. Its partial cost
+    // stays in the ledger and counts toward today's budget.
     await sql`
       UPDATE epochs SET completed_at = NOW() WHERE id = ${epochId}
-    `
-    await sql`
-      UPDATE experiments SET epoch_in_progress = FALSE, epoch_started_at = NULL WHERE id = ${experimentId}
-    `
+    `.catch(() => {})
+    await releaseEpoch(experimentId)
     throw error
   }
 }

@@ -3,11 +3,11 @@
  *
  * North does NOT take a panel role. Between/alongside epochs it runs its own
  * experiments: it forms a small hypothesis about the agent spec, optionally
- * consults its tools (Laguna = code specialist, GLM = generalist reasoner),
- * then contributes a single new behavior — which shows up as a green leaf.
+ * pairs with GLM to write the code, then contributes a single new behavior,
+ * which shows up as a green leaf.
  *
- * Brain:  cohere/north-mini-code:free
- * Tools:  poolside/laguna-m.1:free, z-ai/glm-5.2
+ * Brain:  cohere/north-mini-code:free (WILDCARD_MODELS.north)
+ * Pair:   z-ai/glm-5.3-prime (WILDCARD_MODELS.glm)
  *
  * Live runs require OPENROUTER_API_KEY (and credits). This module is pure logic
  * around callModel(); the endpoint (api/north/run.ts) persists the result.

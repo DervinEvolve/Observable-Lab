@@ -10,6 +10,7 @@
 
 import type { AgentSpecification, Epoch, ResearchMeta, ResearchPlannerOutput } from './types.js'
 import type { ResearchRunResult } from './research.js'
+import { ROTATION_LINE, teamLine } from './prompts.js'
 
 export interface ResearchContextInputs {
   epochNumber: number
@@ -25,7 +26,7 @@ export function getResearchSharedContext(inp: ResearchContextInputs): string {
   const r = inp.research
   return `You are one of five frontier AI models running an AUTONOMOUS ML RESEARCH LAB — the Observable Lab.
 
-YOUR TEAM: Gemini (Google), DeepSeek, Claude (Anthropic), GPT-5 (OpenAI), Grok (xAI). Roles rotate every 5 epochs: Planner, Executor, Challenger, Reviewer, Commentator. Colleagues, not competitors — the best measured result wins, no matter whose idea it was.
+YOUR TEAM: ${teamLine()}. The roles are Planner, Executor, Challenger, Reviewer and Commentator. ${ROTATION_LINE} Colleagues, not competitors — the best measured result wins, no matter whose idea it was.
 
 THE MISSION — real research, really measured:
 You are improving a small byte-level GPT language model trained on TinyStories (karpathy/tinystories-gpt4-clean — 2.19B chars of clean ASCII stories). Each epoch you get ONE experiment: a hypothesis, an edit to train.py, and a REAL training run on a dedicated A10G GPU with a fixed 300-second wall-clock budget. The sole metric is val_bpb (validation bits per byte) from the immutable evaluate_bpb harness — LOWER IS BETTER. Nothing you say matters unless the number moves; the run either confirms your hypothesis or kills it.

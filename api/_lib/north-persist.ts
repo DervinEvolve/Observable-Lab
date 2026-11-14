@@ -7,12 +7,28 @@ import { addNotebookNote } from './notebook.js'
 import { getRoleAssignments } from './role-rotation.js'
 import { northBranchName } from './branch-names.js'
 import { WILDCARD_MODELS, type AgentSpecification } from './types.js'
+import { BudgetPausedError, checkDailyBudget, describeBudget, withSpendContext } from './spend.js'
 
 // Runs one North (+ optional GLM pairing) experiment against the given
 // experiment's current spec, grafts the result on as a green leaf, and
 // persists everything. Shared by the manual endpoint (api/north/run.ts)
 // and the automatic periodic trigger inside the epoch cron (api/epoch/tick.ts).
+// Checks the daily budget first (throws BudgetPausedError when it is spent)
+// and again before the code contribution. North's calls are recorded in the
+// spend ledger under this experiment and epoch.
 export async function runAndPersistNorth(
+  experimentId: string,
+  currentSpec: AgentSpecification,
+  epochNumber: number,
+  recentDirection?: string
+): Promise<NorthResult> {
+  const budget = await checkDailyBudget()
+  if (!budget.allowed) throw new BudgetPausedError(budget)
+  return withSpendContext({ experimentId, epochNumber, purpose: 'north' }, () =>
+    runNorthAndPersist(experimentId, currentSpec, epochNumber, recentDirection))
+}
+
+async function runNorthAndPersist(
   experimentId: string,
   currentSpec: AgentSpecification,
   epochNumber: number,
@@ -63,6 +79,11 @@ export async function runAndPersistNorth(
   // quick auto-review (the current epoch's assigned Reviewer model) decides
   // whether it merges — same approve/reject gate as the main pipeline.
   const pairedWithGlm = result.toolsUsed.includes('glm')
+  const codeBudget = await checkDailyBudget()
+  if (!codeBudget.allowed) {
+    console.warn(`[North] Skipping the code contribution: ${describeBudget(codeBudget)}`)
+    return result
+  }
   try {
     const reviewerModelId = getRoleAssignments(epochNumber).reviewer
     const authorModelId = pairedWithGlm ? WILDCARD_MODELS.glm : WILDCARD_MODELS.north

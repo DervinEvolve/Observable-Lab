@@ -4,6 +4,45 @@ The browser is an observer. Server credentials must not be placed in `VITE_*` va
 
 Copy `.env.example` for local server configuration. Vite alone does not serve the Vercel API or load a connected experiment. Set up Vercel's Node functions and Postgres separately, review `api/_lib/schema.sql` and the later table-creation helpers against the target database, and use a disposable database for migration testing. Do not assume the older `vercel-server/` scaffold is the current deployment entry point.
 
+## Run 2: spend, cadence and the model panel
+
+**Model panel.** One model per lab: Gemini 4, DeepSeek V4 Pro, Claude Fable 5.2, GPT-6 Astra and Grok 4.7, with North and GLM 5.3 as wildcards and `anthropic/claude-sonnet-5.5` then `google/gemini-3.8-flash` as fallbacks (`api/_lib/types.ts`). Before a call the server reads OpenRouter's public model list (https://openrouter.ai/api/v1/models, no key, cached for six hours, with a built-in snapshot when it can't be read) and sends each model only the parameters it lists in `supported_parameters`. Reasoning effort is `medium`, or the nearest level a model offers when it has no `medium` (DeepSeek V4 Pro and GLM 5.3 get `low`). `max_tokens` is 16000 for an ordinary answer, doubled when reasoning is on, and capped at the model's own output limit.
+
+**Real cost.** Every OpenRouter response is billed at its `usage.cost`, which OpenRouter returns on every response (its older `usage: { include: true }` flag is deprecated and has no effect, so it isn't sent). Each billed response, including retries, fallbacks, code contributions and North runs, is a row in the `model_calls` table with its experiment, epoch, model, cost and token counts. An epoch's `cost_usd`, `prompt_tokens` and `completion_tokens` are that epoch's ledger totals. If a response ever lacks `usage.cost`, its tokens are priced from the model list and the row is marked `estimate`.
+
+**Daily budget.** `LAB_DAILY_BUDGET_USD` (default 15) is compared with the sum of `model_calls.cost_usd` since 00:00 UTC. It is checked before an epoch starts, before the epoch's code contribution, and before a North run. When it is reached:
+
+- the cron tick skips and logs `[CRON] Skipping epoch N: daily budget reached ($x of $y spent today, UTC; resumes <next UTC midnight>)`;
+- `POST /api/epoch/run` and `POST /api/north/run` answer 429;
+- `GET /api/experiment` shows `"run_state": "paused: daily budget reached"` with `resumes_at`, until the next UTC day.
+
+An epoch that is already running finishes; the check is at the start. If the ledger can't be read, nothing new starts. The cap is a backstop for this lab, not a replacement for a credit limit on the OpenRouter key itself.
+
+**Cadence.** `EPOCH_INTERVAL_MINUTES` defaults to 180 and is measured from the end of the last epoch. The cron runs hourly, so the tick allows 10 minutes of tolerance: an epoch that ended at 12:08 runs again at 15:00. The agents can still set their own interval between 30 and 180 minutes through `experiment_params`. `EPOCH_STALE_MINUTES` (default 50) is how long a running epoch may hold its claim before the tick treats it as dead and clears it.
+
+**One epoch at a time.** Starting an epoch is a single conditional update (`epoch_in_progress` flips only if it was not already set), shared by the cron and `POST /api/epoch/run`, so the two can never run at once. Whatever way an epoch ends, the claim is released. The tick and manual run always pick the newest experiment that is not archived; experiments in `failing` keep running so they can recover, and the public state says `failing: stability below 0.2, epochs continue`.
+
+**Code contributions.** Run 2 turns them on with `LAB_ENABLE_CODE_WRITES=true`. At most one per epoch: the approved mutation most worth backing with code (new capabilities first, then behaviors, then constraints; additions before changes; less if the Challenger left an open critical concern). It is written by that epoch's Executor, merges only when the trusted CI workflows pass, and also runs in the author's Sprite when `SPRITES_TOKEN` is set.
+
+**Commit authors.** Commits to AI-Agent and Research-Lab are authored by the model that wrote them, as `<display name> <<slug>@observable-lab.invalid>` (for example `Claude Fable 5.2 <claude-fable-5-2@observable-lab.invalid>`), and committed by `DervinEvolve <39844362+DervinEvolve@users.noreply.github.com>`. `.invalid` is reserved and can never be registered.
+
+**Timeouts.** OpenRouter calls give up after 240 s (`OPENROUTER_TIMEOUT_MS`), the model list after 15 s, GitHub requests after 30 s, research runner requests after 60 s and Modal requests after 60 s. A research epoch polls its GPU run for at most `RESEARCH_RUN_POLL_MAX_MS` (default 400000 ms) and resumes on the next tick.
+
+### Run 2 database changes
+
+These are made at runtime, like the earlier table-creation helpers, and are also in `api/_lib/schema.sql` for a fresh database:
+
+- `model_calls`: new table, the spend ledger (`api/_lib/spend.ts`).
+- `epoch_logs`: gains `experiment_id`; the old global `UNIQUE(epoch_number)` constraint (`epoch_logs_epoch_number_key`) is dropped and replaced by a unique index on `(experiment_id, epoch_number)`, so a new experiment no longer overwrites older logs. Older rows keep a NULL `experiment_id`. If your database named that constraint differently, drop it by hand.
+- `epochs`: gains `prompt_tokens` and `completion_tokens`.
+- `conflicts`: gains `spec_conflict_id`, the id the specification uses, so a resolved conflict updates its row.
+
+### Starting run 2
+
+On a test database first. `POST /api/experiment/reset?confirm=true&mode=classic` (operator) archives every experiment that is not archived, clears their epoch flags, creates the run 2 tables, and seeds a fresh classic experiment at epoch 0. `mode=research` seeds the ML research lab the same way, now or later. `POST /api/experiment` refuses while any experiment is active, whatever its status. An epoch still running on an archived experiment finishes into the archived row and cannot make it active again.
+
+The first epoch after a reset waits one interval from the seed, like every other epoch; `POST /api/epoch/run` starts it at once.
+
 ## Vercel route authorization
 
 - Set `LAB_OPERATOR_SECRET` to a random server-side value of at least 32 characters. Operator clients send it as `Authorization: Bearer <value>`.

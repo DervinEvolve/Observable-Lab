@@ -351,34 +351,37 @@ test('a fallback answer records and shows the model that actually answered', asy
   delete process.env.OPENROUTER_API_KEY
   const requested = []
   globalThis.fetch = async (url, options) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response('{"data":[]}', { status: 503 })
     const { model } = JSON.parse(options.body)
     requested.push(model)
-    if (model === 'x-ai/grok-4.3') return new Response('unavailable', { status: 503 })
-    return new Response(JSON.stringify({ model, choices: [{ message: { content: '{"verdict":"keep"}' } }], usage: { total_tokens: 10 } }))
+    if (model === 'x-ai/grok-4.7') return new Response('unavailable', { status: 503 })
+    return new Response(JSON.stringify({ model, choices: [{ message: { content: '{"verdict":"keep"}' } }], usage: { prompt_tokens: 6, completion_tokens: 4, total_tokens: 10, cost: 0.0125 } }))
   }
-  const { output, servedBy } = await callModel('x-ai/grok-4.3', 'system', 'user')
-  assert.deepEqual(requested, ['x-ai/grok-4.3', 'x-ai/grok-4.3', 'x-ai/grok-4.3', 'anthropic/claude-opus-4.8'])
-  assert.deepEqual(servedBy, { model: 'anthropic/claude-opus-4.8', assigned: 'x-ai/grok-4.3', fallback: true, reported: 'anthropic/claude-opus-4.8' })
+  const { output, servedBy, cost } = await callModel('x-ai/grok-4.7', 'system', 'user')
+  assert.deepEqual(requested, ['x-ai/grok-4.7', 'x-ai/grok-4.7', 'x-ai/grok-4.7', 'anthropic/claude-sonnet-5.5'])
+  assert.deepEqual(servedBy, { model: 'anthropic/claude-sonnet-5.5', assigned: 'x-ai/grok-4.7', fallback: true, reported: 'anthropic/claude-sonnet-5.5' })
   assert.deepEqual(output.served_by, servedBy)
-  assert.equal(answeredModel(output, 'x-ai/grok-4.3'), 'anthropic/claude-opus-4.8')
+  assert.equal(answeredModel(output, 'x-ai/grok-4.7'), 'anthropic/claude-sonnet-5.5')
+  assert.equal(cost, 0.0125) // the failed attempts were never billed
 
   requested.length = 0
-  const direct = await callModel('openai/gpt-5.5', 'system', 'user')
-  assert.deepEqual(requested, ['openai/gpt-5.5'])
+  const direct = await callModel('openai/gpt-6-astra', 'system', 'user')
+  assert.deepEqual(requested, ['openai/gpt-6-astra'])
   assert.equal(direct.servedBy.fallback, false)
-  assert.equal(answeredModel(direct.output, 'openai/gpt-5.5'), 'openai/gpt-5.5')
+  assert.equal(answeredModel(direct.output, 'openai/gpt-6-astra'), 'openai/gpt-6-astra')
 
   const { TranscriptPanel } = await load('src/systems/TranscriptPanel.js')
   const panel = Object.create(TranscriptPanel.prototype)
   panel.wildcardTurns = []
   const html = panel.renderEpoch({
     id: 'epoch-test', epoch_number: 3,
-    role_assignments: { planner: 'openai/gpt-5.5', executor: 'openai/gpt-5.5', challenger: 'openai/gpt-5.5', reviewer: 'x-ai/grok-4.3', commentator: 'openai/gpt-5.5' },
+    role_assignments: { planner: 'openai/gpt-6-astra', executor: 'openai/gpt-6-astra', challenger: 'openai/gpt-6-astra', reviewer: 'x-ai/grok-4.7', commentator: 'openai/gpt-6-astra' },
     reviewer_output: { decisions: [{ mutation_index: 0, verdict: 'approve', reason: 'ok' }], epoch_summary: 'summary', remark: 'kept', served_by: servedBy },
     commentator_output: { mood: 'stable', summary: 'summary', plant_metaphor: 'growth' },
   })
-  assert.match(html, /class="chat-name"[^>]*>Claude</)
-  assert.match(html, /fallback for Grok/)
+  // The fallback is not a panel model, so the room shows its OpenRouter id.
+  assert.match(html, /class="chat-name"[^>]*>anthropic\/claude-sonnet-5\.5</)
+  assert.match(html, /fallback for Grok 4\.7/)
   // The avatar identifies the actual fallback provider with a local, credited mark.
   assert.match(html, /<img src="\/logos\/claude\.svg" alt="Anthropic logo"/)
   assert.doesNotMatch(html, /src="\/logos\/xai\.svg"/)
@@ -425,6 +428,8 @@ test('research records carry the unverified label, dataset and harness hash', as
 })
 
 const NOREPLY = { name: 'DervinEvolve', email: '39844362+DervinEvolve@users.noreply.github.com' }
+const CLAUDE_FABLE = { name: 'Claude Fable 5.2', email: 'claude-fable-5-2@observable-lab.invalid' }
+const CLAUDE_SONNET = { name: 'Claude Sonnet 5.5', email: 'claude-sonnet-5-5@observable-lab.invalid' }
 
 test('no generated-commit identity uses the observable-lab.dev domain', () => {
   const offenders = []
@@ -444,7 +449,7 @@ test('no generated-commit identity uses the observable-lab.dev domain', () => {
   assert.deepEqual(offenders, [])
 })
 
-test('research commits use the noreply identity and name the model in a trailer', async () => {
+test('research commits are authored by the model and committed by the owner', async () => {
   process.env.RESEARCH_GITHUB_TOKEN = 'test-only-research-repository-token'
   const research = await load('api/_lib/research.js')
   const puts = []
@@ -452,16 +457,20 @@ test('research commits use the noreply identity and name the model in a trailer'
     if ((options.method || 'GET') === 'PUT') { puts.push(JSON.parse(options.body)); return new Response('{}') }
     return new Response('{}', { status: 404 })
   }
-  await research.putResearchFile('train.py', '# test experiment', 'e1 KEEP\n\nModel: Claude (anthropic/claude-opus-4.8)')
-  assert.deepEqual(puts[0].author, NOREPLY)
+  await research.putResearchFile('train.py', '# test experiment', 'e1 KEEP\n\nModel: Claude Fable 5.2 (anthropic/claude-fable-5.2)\nModel-Role: executor')
+  assert.deepEqual(puts[0].author, CLAUDE_FABLE)
   assert.deepEqual(puts[0].committer, NOREPLY)
   const provenance = research.provenanceOf({ status: 'ok', metrics: { val_bpb: 0.7 } })
-  await research.writeFindingPage({ epoch: 4, author: 'Claude', hypothesis: 'h', changeSummary: 'c', verdict: 'keep', runStatus: 'ok', valBpb: 0.7, bestBpb: 0.72, reviewReason: 'r', challengerNotes: [], provenance })
-  assert.deepEqual(puts[1].author, NOREPLY)
-  assert.match(puts[1].message, /\n\nModel: Claude\nMetrics-Source: /)
+  await research.writeFindingPage({ epoch: 4, author: 'Claude Fable 5.2 (fallback for Grok 4.7)', hypothesis: 'h', changeSummary: 'c', verdict: 'keep', runStatus: 'ok', valBpb: 0.7, bestBpb: 0.72, reviewReason: 'r', challengerNotes: [], provenance })
+  assert.deepEqual(puts[1].author, CLAUDE_FABLE)
+  assert.deepEqual(puts[1].committer, NOREPLY)
+  assert.match(puts[1].message, /\n\nModel: Claude Fable 5\.2 \(fallback for Grok 4\.7\)\nMetrics-Source: /)
+  // A record with no Model trailer (a results ledger row) stays the owner's.
+  await research.putResearchFile('results.tsv', 'x', 'results: e1')
+  assert.deepEqual(puts[2].author, NOREPLY)
 })
 
-test('contribution commits use the noreply identity and credit the answering model in trailers', async () => {
+test('contribution commits are authored by the answering model, committed by the owner, with trailers', async () => {
   // A private copy of the compiled modules, so openrouter.js reads the placeholder key at load time.
   const copy = join(build, 'identity-test')
   cpSync(join(build, 'api'), join(copy, 'api'), { recursive: true })
@@ -474,9 +483,10 @@ test('contribution commits use the noreply identity and credit the answering mod
     const target = String(url)
     const method = options.method || 'GET'
     requests.push({ url: target, method, body: options.body ? String(options.body) : '' })
+    if (target.endsWith('/api/v1/models')) return new Response('unavailable', { status: 503 })
     if (target.includes('openrouter.ai')) {
       const { model } = JSON.parse(options.body)
-      if (model === 'x-ai/grok-4.3') return new Response('unavailable', { status: 503 })
+      if (model === 'x-ai/grok-4.7') return new Response('unavailable', { status: 503 })
       const content = JSON.stringify({ files: [{ path: 'src/agent.ts', content: 'export const x = 1\n' }], commit_message: 'feat: add x', pr_summary: 'adds x' })
       return new Response(JSON.stringify({ model, choices: [{ message: { content } }], usage: { total_tokens: 10 } }))
     }
@@ -487,14 +497,14 @@ test('contribution commits use the noreply identity and credit the answering mod
     return new Response('{}')
   }
   try {
-    const result = await contributeCode({ authorModelId: 'x-ai/grok-4.3', branchName: 'epoch-7-capabilities-0', title: 'add x', description: 'add x', review: { mode: 'approved' } })
+    const result = await contributeCode({ authorModelId: 'x-ai/grok-4.7', branchName: 'epoch-7-capabilities-0', title: 'add x', description: 'add x', review: { mode: 'approved' } })
     assert.equal(result.merged, false) // no trusted CI workflow configured, so the PR is closed
-    assert.equal(result.author, 'Claude')
+    assert.equal(result.author, 'claude-sonnet-5.5') // code-contribution's own credit for a non-panel model
     const puts = requests.filter(r => r.method === 'PUT' && r.url.includes('/contents/')).map(r => JSON.parse(r.body))
     assert.equal(puts.length, 1)
-    assert.deepEqual(puts[0].author, NOREPLY)
+    assert.deepEqual(puts[0].author, CLAUDE_SONNET) // the git author uses the display name for the id
     assert.deepEqual(puts[0].committer, NOREPLY)
-    assert.equal(puts[0].message, 'feat: add x\n\nModel: Claude (anthropic/claude-opus-4.8)\nModel-Fallback-For: Grok')
+    assert.equal(puts[0].message, 'feat: add x\n\nModel: claude-sonnet-5.5 (anthropic/claude-sonnet-5.5)\nModel-Fallback-For: Grok 4.7')
     assert.equal(requests.some(r => /observable-lab\.dev/.test(r.body)), false)
   } finally {
     delete process.env.OPENROUTER_API_KEY

@@ -85,6 +85,8 @@ async function callModalEndpoint<T>(
   try {
     const options: RequestInit = {
       method,
+      // Best-effort calls after the epoch; never let one hang the function.
+      signal: AbortSignal.timeout(60_000),
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,

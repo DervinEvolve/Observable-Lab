@@ -30,9 +30,14 @@ function token(): string {
   return t
 }
 
+// Every GitHub request gives up after this long; a hung call must not eat
+// the epoch's function budget (waitForCIRun polls with its own deadline).
+const GITHUB_TIMEOUT_MS = 30_000
+
 async function gh(path: string, init: RequestInit = {}): Promise<Response> {
   const res = await fetch(`${API_BASE}${path}`, {
     ...init,
+    signal: init.signal ?? AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${token()}`,
       Accept: 'application/vnd.github+json',
@@ -230,7 +235,7 @@ export async function deleteFileOnBranch(
   if (!sha) return // nothing to delete
   const res = await gh(`${repoPath()}/contents/${encodeURIComponent(path)}`, {
     method: 'DELETE',
-    body: JSON.stringify({ message, sha, branch, ...labCommitIdentityFields() }),
+    body: JSON.stringify({ message, sha, branch, ...labCommitIdentityFields(message) }),
   })
   if (!res.ok) throw new Error(`deleteFile(${path}) failed: ${res.status} ${await res.text()}`)
 }
@@ -268,9 +273,9 @@ async function putFileOnBranch(
       content: Buffer.from(content, 'utf-8').toString('base64'),
       branch,
       ...(existingSha ? { sha: existingSha } : {}),
-      // Every lab commit uses the owner's noreply identity; the model that
-      // wrote the change is named in the message trailers (commit-identity.ts).
-      ...labCommitIdentityFields(),
+      // The model named in the Model: trailer is the author; the owner's
+      // noreply identity is the committer (commit-identity.ts).
+      ...labCommitIdentityFields(message),
     }),
   })
   if (!res.ok) throw new Error(`upsertFile(${path}) failed: ${res.status} ${await res.text()}`)

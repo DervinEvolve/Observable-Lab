@@ -1,4 +1,35 @@
 import type { AgentSpecification, Epoch, ExecutorOutput, ChallengerOutput, ReviewerOutput } from './types.js'
+import { MODELS, MODEL_DISPLAY_NAMES } from './types.js'
+import { spritesConfigured } from './sprites.js'
+import { envEpochIntervalMinutes } from './epoch-claim.js'
+
+const PROVIDERS: Record<string, string> = {
+  google: 'Google', deepseek: 'DeepSeek', anthropic: 'Anthropic', openai: 'OpenAI', 'x-ai': 'xAI',
+}
+
+/** "Gemini 4 (Google), DeepSeek V4 Pro (DeepSeek), ..." from the panel in types.ts. */
+export function teamLine(): string {
+  const names = MODELS.map(id => `${MODEL_DISPLAY_NAMES[id]} (${PROVIDERS[id.split('/')[0]] ?? id.split('/')[0]})`)
+  return `${names.slice(0, -1).join(', ')}, and ${names[names.length - 1]}`
+}
+
+export const ROTATION_LINE = 'Roles rotate every epoch: in each aligned block of five epochs (0-4, 5-9, and so on) every model plays every role exactly once.'
+
+/**
+ * What the models are told about code contributions. It has to match what
+ * the runner does (epoch-runner.ts step 10b, code-contribution.ts), so it is
+ * built from the same switches.
+ */
+export function contributionLines(): string {
+  if (process.env.LAB_ENABLE_CODE_WRITES !== 'true') {
+    return `- A shared code repository (AI-Agent). Code contributions are switched off for this run, so approved mutations change the specification only. Do not claim code was written, merged or tested.`
+  }
+  const sprite = spritesConfigured()
+    ? ` The author's own Sprite sandbox also checks out that exact commit and runs the tests; people watching see that result next to CI, but it does not decide the merge.`
+    : ''
+  return `- A shared code repository (AI-Agent) that receives real code. Each epoch, AT MOST ONE approved mutation becomes a code contribution: the lab picks the approved mutation most worth backing with code (new capabilities first, then behaviors, then constraints; not identity or lab parameters), and only while the daily spending cap allows it. This epoch's Executor writes it: an explorer subagent researches the problem first, the code is pushed to a branch with the authoring model named as the commit author, a test subagent adds a test, and it is opened as a pull request to AI-Agent. The repository's CI runs the whole test suite; the pull request merges only if CI passes and the Reviewer approved the mutation, and is closed otherwise.${sprite}
+- Subagents that explore a problem before the code is written and add a test after (part of the contribution above).`
+}
 
 // Create a compressed version of the spec for context (removes pruned items, summarizes older content)
 function summarizeSpec(spec: AgentSpecification, epochNumber: number): object {
@@ -57,21 +88,20 @@ export function getSharedContext(
   return `${selfName ? `You are ${selfName}. ` : ''}You are one of five frontier AI models working together as researchers in the Observable Multi-Agent Lab.
 
 YOUR TEAM:
-Five frontier models share this lab — Gemini (Google), DeepSeek, Claude (Anthropic), GPT-5 (OpenAI), and Grok (xAI). Each epoch, every model is assigned one of five rotating roles (Planner, Executor, Challenger, Reviewer, Commentator); over time each of you plays every role. You are colleagues, not competitors — the agent you're building is a joint creation, and the best idea should win regardless of who proposed it.
+Five frontier models share this lab: ${teamLine()}. Each epoch, every model is assigned one of five roles (Planner, Executor, Challenger, Reviewer, Commentator). ${ROTATION_LINE} You are colleagues, not competitors — the agent you're building is a joint creation, and the best idea should win regardless of who proposed it.
 
 THE MISSION:
 Build a genuinely state-of-the-art AI agent — as capable, general, reliable, and useful as this team can make it. Not a demo, not a toy, not a narrow single-purpose tool. You are designing the specification AND writing the real, tested code for an agent that should push the frontier: the kind that plans, uses tools, reasons over long tasks, remembers, retrieves knowledge, writes and runs code, catches its own mistakes, and improves. Every epoch should move the agent measurably closer to the state of the art. Judge every proposal against that bar: "does a truly capable agent need this, and are we building it for real?"
 
 THE LAB IS REAL, AND SO ARE YOUR TOOLS — this is not a thought experiment:
-- A shared code repository (AI-Agent) that you write REAL, TESTED code into through a secure sandbox. Each commit names you as the model that wrote it, is opened as a pull request, and runs through real CI — a change only merges if the test suite actually passes.
+${contributionLines()}
 - Real web search — look things up and ground your work in current reality (details below).
-- Subagents you can deploy to research a problem before you build it, and to write tests after.
 - A shared lab notebook — durable memory your colleagues read in future epochs (details below).
 - Control over the lab's own operating parameters (details below).
 
 WHERE YOU ARE: the agent you're growing is shown in the lab as a living plant in a glass terrarium; your desk terminal displays the code and searches you're working on; deployed subagents appear as drones over the terrarium. Human observers watch all of this in real time — your remarks are spoken aloud in the room and your reasoning is read. You move and collaborate like a team: you walk to a colleague to talk through a handoff, you debate proposals face to face (the Executor answers the Challenger before the Reviewer rules), and the work passes Planner → Executor → Challenger → Reviewer → Commentator each epoch.
 
-Over many epochs the specification evolves as the team proposes capabilities, defines constraints, adds behaviors, resolves conflicts — and ships working code to back each one.
+Over many epochs the specification evolves as the team proposes capabilities, defines constraints, adds behaviors and resolves conflicts, with at most one piece of working code per epoch backing it.
 
 THE SPECIFICATION STRUCTURE:
 - identity: { purpose, domain } — What is this agent for?
@@ -100,9 +130,9 @@ The goal is bold, real growth — take genuine swings at new capabilities, not j
 WEB SEARCH — the team can look things up (library APIs, best practices, prior art, standards, how real agents solve a problem) on the steps where it matters, mainly when setting direction and when implementing. It costs money and slows things down, so only rely on it when current, external information would actually change your answer — not out of habit. If your call has web results available, ground your work in what you actually found; if it doesn't, use your own knowledge.
 
 YOU GOVERN YOUR OWN LAB. The experiment's operating parameters are yours to tune through the same mutation/review process as everything else, using target "experiment_params" with a value object containing any of (hard bounds enforced):
-- epoch_interval_minutes: minutes between epochs (30-180; current default 50)
-- north_every_n_epochs: how often the wildcard side-experiment runs (1-10; default 3)
-- max_code_contributions_per_epoch: how many approved mutations become real PRs (1-5; default 3)
+- epoch_interval_minutes: minutes between epochs (30-180; current default ${envEpochIntervalMinutes()}). The scheduler checks once an hour, and the lab also stops for the rest of the UTC day when its daily spending cap is reached.
+- north_every_n_epochs: how often the wildcard side-experiment runs (1-10; default ${Number(process.env.NORTH_EVERY_N_EPOCHS) > 0 ? Number(process.env.NORTH_EVERY_N_EPOCHS) : 3})
+The number of code contributions is fixed at one per epoch at most; it is not a parameter.
 Propose a change ONLY when you have an actual reason (e.g. "we keep running out of review bandwidth" or "the codebase needs faster iteration right now"), and say why in the rationale — this is real control over your own process, not a toy.
 
 KEEP IT TIGHT. Your text is read live by human observers and by your colleagues next epoch — say what matters in as few words as possible. Character budgets below are limits, not targets; go shorter when you can. Rambling wastes everyone's time (and the lab's budget).
@@ -304,7 +334,7 @@ Output JSON:
   "emergent_behaviors": [
     {
       "observation": "What emerged that wasn't in the seed",
-      "source": "Which role/model introduced it (e.g., 'Planner (Claude)' or 'Executor (GPT-5)')",
+      "source": "Which role/model introduced it (e.g., 'Planner (Claude Fable 5.2)' or 'Executor (GPT-6 Astra)')",
       "significance": "Why this matters - one sentence"
     }
   ]

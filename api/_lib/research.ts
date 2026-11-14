@@ -40,9 +40,15 @@ function runnerToken(): string {
   return t
 }
 
+// Outbound requests give up after these limits so a hung call can't eat the
+// epoch's function budget. Polling has its own overall deadline on top.
+const GITHUB_TIMEOUT_MS = 30_000
+const RUNNER_TIMEOUT_MS = 60_000
+
 async function gh(path: string, init: RequestInit = {}): Promise<Response> {
   return fetch(`${API_BASE}${path}`, {
     ...init,
+    signal: init.signal ?? AbortSignal.timeout(GITHUB_TIMEOUT_MS),
     headers: {
       Authorization: `Bearer ${ghToken()}`,
       Accept: 'application/vnd.github+json',
@@ -107,8 +113,8 @@ export async function putResearchFile(
       content: Buffer.from(content, 'utf-8').toString('base64'),
       branch: BRANCH,
       ...(sha ? { sha } : {}),
-      // The owner's noreply identity; models are named in message trailers.
-      ...labCommitIdentityFields(),
+      // The model in the Model: trailer is the author, the owner commits.
+      ...labCommitIdentityFields(message),
     }),
   })
   if (!res.ok) throw new Error(`putResearchFile(${path}) failed: ${res.status} ${await res.text()}`)
@@ -308,6 +314,7 @@ export async function startResearchRun(trainPy: string, budgetS: number): Promis
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${runnerToken()}` },
     body: JSON.stringify({ train_py: trainPy, budget_s: budgetS }),
+    signal: AbortSignal.timeout(RUNNER_TIMEOUT_MS),
   })
   if (!res.ok) throw new Error(`runner start failed: ${res.status}`)
   const data = await res.json()
@@ -320,7 +327,7 @@ export async function pollResearchRun(callId: string): Promise<
 > {
   const url = new URL(runnerStatusUrl())
   url.searchParams.set('call_id', callId)
-  const res = await fetch(url, { headers: { Authorization: `Bearer ${runnerToken()}` } })
+  const res = await fetch(url, { headers: { Authorization: `Bearer ${runnerToken()}` }, signal: AbortSignal.timeout(RUNNER_TIMEOUT_MS) })
   if (!res.ok) return { status: 'failed', error: `status endpoint HTTP ${res.status}` }
   const data = await res.json()
   if (data.status === 'done') return { status: 'done', result: data.result as ResearchRunResult }

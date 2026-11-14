@@ -81,8 +81,9 @@ export interface ContributionResult {
 }
 
 // Resolves any OpenRouter model id (panel model or wildcard) to the display
-// name credited in each commit's Model trailer. The git author and committer
-// are always the lab identity (commit-identity.ts), never a per-model address.
+// name credited in each commit's Model trailer. commit-identity.ts makes the
+// model in that trailer the git author (on observable-lab.invalid); the
+// committer is always the owner's noreply identity.
 function modelCredit(modelId: string): string {
   const panelName = (MODEL_DISPLAY_NAMES as Record<string, string>)[modelId]
   if (panelName) return panelName

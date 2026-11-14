@@ -26,15 +26,19 @@ Roles change every epoch. In each aligned block of five epochs (0–4, 5–9, �
 
 ## The Five Models (via OpenRouter)
 
-The current IDs live in `api/_lib/types.ts` and `src/shared/types.ts`:
+The current IDs live in `api/_lib/types.ts` and `src/shared/types.ts`. Run 2 uses the newest flagship from each lab, exactly one model per lab (the room has five provider desks):
 
-| Model ID | Provider | Personality |
-|-------|----------|-------------|
-| `google/gemini-3.5-flash` | Google | Exploratory, multimodal |
-| `deepseek/deepseek-v4-pro` | DeepSeek | Methodical, structured |
-| `anthropic/claude-opus-4.8` | Anthropic | Safety-conscious, nuanced |
-| `openai/gpt-5.5` | OpenAI | Agentic, general-purpose |
-| `x-ai/grok-4.3` | xAI | Edgy, adversarial |
+| Model ID | Display name | Provider | Price per 1M tokens (in / out) | Personality |
+|-------|------|----------|------|-------------|
+| `google/gemini-4-hydrogen` | Gemini 4 | Google | $1.50 / $7.50 | Exploratory, multimodal |
+| `deepseek/deepseek-v4-pro-0813` | DeepSeek V4 Pro | DeepSeek | about $0.66 / $1.98 first-party | Methodical, structured |
+| `anthropic/claude-fable-5.2` | Claude Fable 5.2 | Anthropic | $8 / $40 | Safety-conscious, nuanced |
+| `openai/gpt-6-astra` | GPT-6 Astra | OpenAI | $10 / $50 | Agentic, general-purpose |
+| `x-ai/grok-4.7` | Grok 4.7 | xAI | $2 / $6 | Edgy, adversarial |
+
+Wildcards outside the rotation: North `cohere/north-mini-code:free` (free) and GLM 5.3 `z-ai/glm-5.3-prime` ($2.80 / $8.80). Fallbacks, in order, when an assigned model gives no usable answer: `anthropic/claude-sonnet-5.5`, then `google/gemini-3.8-flash`.
+
+Prices are what the models cost when they were chosen. Spend is never computed from this table: every call records OpenRouter's real `usage.cost` (`api/_lib/openrouter.ts`, `api/_lib/spend.ts`). Each model is sent only the request parameters its entry in https://openrouter.ai/api/v1/models lists in `supported_parameters` (Anthropic and OpenAI take no `temperature`, North takes no `response_format`), with reasoning effort `medium`, or the nearest level a model lists when it has no `medium`.
 
 ---
 
@@ -204,17 +208,18 @@ WS   /api/experiment/stream   # Real-time updates
 
 ## Environment Variables
 
-```
-OPENROUTER_API_KEY=...
-DATABASE_URL=...
-```
+See `.env.example` and `docs/OPERATIONS.md`. The ones that shape a run: `OPENROUTER_API_KEY`, `POSTGRES_URL`, `LAB_DAILY_BUDGET_USD` (default 15), `EPOCH_INTERVAL_MINUTES` (default 180), `EPOCH_STALE_MINUTES` (default 50), `LAB_ENABLE_CODE_WRITES`.
 
 ---
 
 ## Attribution Conventions
 
 - Show model providers as plain text names (the shared map in `src/shared/types.ts`). Do not add provider logos; the earlier ones had no confirmed source and were removed.
-- Commits the lab writes to other repositories use the identity in `api/_lib/commit-identity.ts` (the owner's GitHub noreply address). Name the model that produced a change in the `Model:` trailers, never as the git author, and do not invent e-mail domains.
+- Commits the lab writes to other repositories (AI-Agent contributions, their subagents, the North and GLM wildcards, and Research-Lab records) follow `api/_lib/commit-identity.ts`:
+  - **Author:** the model that produced the change, by its display name, with an address on the reserved, never-registrable `.invalid` domain: `<display name> <<slug>@observable-lab.invalid>`, where the slug is the display name lowercased with every run of other characters turned into `-`. Example: `Claude Fable 5.2 <claude-fable-5-2@observable-lab.invalid>`. A fallback model is the author under its own display name.
+  - **Committer:** always the owner, `DervinEvolve <39844362+DervinEvolve@users.noreply.github.com>`.
+  - **Trailers:** keep `Model:`, `Model-Role:` and `Model-Fallback-For:`. The author is read from the `Model:` trailer, so the trailers stay the record of who wrote what. A commit with no `Model:` trailer (bootstrap files, ledger rows) is authored by the owner.
+  - Use no other e-mail domain. `.invalid` is reserved (RFC 2606), so these addresses can never reach a mailbox. Merge commits use whatever identity the GitHub token belongs to.
 - "Hon AI Research" is the owner's personal experiment name, not an organisation.
 
 ---

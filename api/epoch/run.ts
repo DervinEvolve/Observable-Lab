@@ -2,8 +2,13 @@ import { requireBearer } from '../_lib/auth.js'
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { sql } from '@vercel/postgres'
 import { runEpoch } from '../_lib/epoch-runner.js'
+import { EpochBusyError } from '../_lib/epoch-claim.js'
+import { BUDGET_PAUSED_STATE, BudgetPausedError } from '../_lib/spend.js'
+import { persistGlassIfBrokenOut } from '../_lib/growth.js'
 
-// POST /api/epoch/run - Force trigger an epoch (for testing)
+// POST /api/epoch/run - Force trigger an epoch (operator). Shares the atomic
+// claim with the cron, so the two can never run an epoch at the same time,
+// and the same daily budget.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!requireBearer(req, res)) return
 
@@ -12,26 +17,42 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    // Get the active experiment
+    // The newest active experiment (anything not archived, failing included).
     const experimentResult = await sql`
       SELECT * FROM experiments
-      WHERE status IN ('seeding', 'growing', 'stable') AND epoch_in_progress = FALSE
+      WHERE status <> 'archived'
+      ORDER BY created_at DESC
       LIMIT 1
     `
 
     if (!experimentResult.rows[0]) {
       return res.status(404).json({
-        error: 'No active experiment found or epoch already in progress',
+        error: 'No active experiment found',
         hint: 'POST to /api/experiment to seed a new experiment first',
       })
     }
 
     const experiment = experimentResult.rows[0]
 
-    console.log(`[TEST] Force triggering epoch ${experiment.current_epoch + 1} for experiment ${experiment.id}`)
+    console.log(`[EPOCH] Manually triggering epoch ${experiment.current_epoch + 1} for experiment ${experiment.id}`)
 
-    // Run the epoch
-    const result = await runEpoch(experiment.id)
+    let result: Awaited<ReturnType<typeof runEpoch>>
+    try {
+      result = await runEpoch(experiment.id)
+    } catch (e) {
+      if (e instanceof EpochBusyError) {
+        return res.status(409).json({ error: 'An epoch is already in progress', experiment_id: experiment.id })
+      }
+      if (e instanceof BudgetPausedError) {
+        return res.status(429).json({
+          error: BUDGET_PAUSED_STATE,
+          reason: e.status.reason,
+          resumes_at: e.status.resumes_at,
+        })
+      }
+      throw e
+    }
+    await persistGlassIfBrokenOut(experiment.id)
 
     return res.status(200).json({
       success: true,
@@ -60,6 +81,3 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     })
   }
 }
-
-// redeploy trigger 1769129894
-

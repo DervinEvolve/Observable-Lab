@@ -3,8 +3,13 @@ import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { sql } from '@vercel/postgres'
 import { runEpoch } from '../_lib/epoch-runner.js'
 import { runAndPersistNorth } from '../_lib/north-persist.js'
+import {
+  EpochBusyError, clearStaleClaim, envEpochStaleMinutes, epochCadence, epochIntervalMinutes,
+} from '../_lib/epoch-claim.js'
+import { BUDGET_PAUSED_STATE, BudgetPausedError, describeBudget } from '../_lib/spend.js'
+import { persistGlassIfBrokenOut } from '../_lib/growth.js'
 
-// GET /api/epoch/tick - Cron endpoint to trigger epoch if ready
+// GET /api/epoch/tick - Cron endpoint (hourly) to run the next epoch when it is due.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!requireBearer(req, res, 'CRON_SECRET')) return
 
@@ -13,95 +18,88 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    const envInterval = parseInt(process.env.EPOCH_INTERVAL_MINUTES || '60', 10)
-    const staleMinutes = parseInt(process.env.EPOCH_STALE_MINUTES || '60', 10)
+    const staleMinutes = envEpochStaleMinutes()
 
-    // Detect and clear stale in-progress epoch so the scheduler can resume
-    const inProgressResult = await sql`
-      SELECT e.*
-      FROM experiments e
-      WHERE e.status IN ('seeding', 'growing', 'stable') AND e.epoch_in_progress = TRUE
-      ORDER BY created_at DESC
-      LIMIT 1
-    `
-
-    if (inProgressResult.rows[0]) {
-      const inProgress = inProgressResult.rows[0]
-      const startedAt = inProgress.epoch_started_at
-        ? new Date(inProgress.epoch_started_at).getTime()
-        : 0
-      const minutesInProgress = startedAt ? (Date.now() - startedAt) / 60000 : Infinity
-
-      if (minutesInProgress >= staleMinutes) {
-        await sql`
-          UPDATE experiments
-          SET epoch_in_progress = FALSE, epoch_started_at = NULL
-          WHERE id = ${inProgress.id}
-        `
-        console.warn(
-          `[CRON] Cleared stale epoch flag after ${Math.round(minutesInProgress)} minutes for experiment ${inProgress.id}`
-        )
-      } else {
-        return res.status(200).json({
-          message: 'Epoch already in progress',
-          experiment_id: inProgress.id,
-          minutes_in_progress: Math.round(minutesInProgress),
-          stale_minutes: staleMinutes,
-        })
-      }
-    }
-
-    // Check if there's an active experiment ready for next epoch
+    // The newest active experiment is the only one the cron runs. Active
+    // means anything not archived (seeding, growing, stable, failing): a
+    // failing spec keeps running so it can recover, and says so publicly.
     const experimentResult = await sql`
       SELECT e.*,
         (SELECT completed_at FROM epochs WHERE experiment_id = e.id ORDER BY epoch_number DESC LIMIT 1) as last_epoch_at
       FROM experiments e
-      WHERE e.status IN ('seeding', 'growing', 'stable') AND e.epoch_in_progress = FALSE
+      WHERE e.status <> 'archived'
+      ORDER BY e.created_at DESC
       LIMIT 1
     `
-
-    if (!experimentResult.rows[0]) {
-      return res.status(200).json({
-        message: 'No active experiment or epoch already in progress',
-        next_check: 'On next cron invocation',
-      })
+    const experiment = experimentResult.rows[0]
+    if (!experiment) {
+      console.log('[CRON] No active experiment')
+      return res.status(200).json({ message: 'No active experiment', next_check: 'On next cron invocation' })
     }
 
-    const experiment = experimentResult.rows[0]
-    // Self-governance: the agents can tune their own epoch tempo (clamped
-    // 30-180 at write time); falls back to the env default.
-    const specParams = (experiment.current_spec?.meta?.experiment_params ?? {}) as Record<string, number>
-    const interval = specParams.epoch_interval_minutes ?? envInterval
-    const lastEpochAt = experiment.last_epoch_at
-      ? new Date(experiment.last_epoch_at).getTime()
-      : 0
+    // An epoch that is still marked as running: leave it, unless it is older
+    // than the stale limit (a function that hit its time limit never clears it).
+    if (experiment.epoch_in_progress) {
+      const startedAt = experiment.epoch_started_at ? new Date(experiment.epoch_started_at).getTime() : 0
+      const minutesInProgress = startedAt ? (Date.now() - startedAt) / 60000 : Infinity
+      if (minutesInProgress < staleMinutes) {
+        return res.status(200).json({
+          message: 'Epoch already in progress',
+          experiment_id: experiment.id,
+          minutes_in_progress: Math.round(minutesInProgress),
+          stale_minutes: staleMinutes,
+        })
+      }
+      if (await clearStaleClaim(experiment.id, staleMinutes)) {
+        console.warn(`[CRON] Cleared stale epoch flag after ${Math.round(minutesInProgress)} minutes for experiment ${experiment.id}`)
+      }
+    }
 
-    const minutesSinceLastEpoch = lastEpochAt
-      ? (Date.now() - lastEpochAt) / 60000
-      : Infinity
-
-    if (minutesSinceLastEpoch < interval) {
-      const minutesRemaining = Math.round(interval - minutesSinceLastEpoch)
+    // Cadence: measured from the end of the last epoch, with a small
+    // tolerance so an hourly cron keeps a 180-minute rhythm.
+    const cadence = epochCadence(experiment.last_epoch_at, epochIntervalMinutes(experiment.current_spec))
+    if (!cadence.due) {
       return res.status(200).json({
-        message: `Waiting. ${minutesRemaining} minutes until next epoch.`,
+        message: `Waiting. ${cadence.minutes_remaining} minutes until next epoch.`,
         experiment_id: experiment.id,
         current_epoch: experiment.current_epoch,
         last_epoch_at: experiment.last_epoch_at,
-        interval_minutes: interval,
+        interval_minutes: cadence.interval_minutes,
       })
     }
 
-    // Run the epoch
-    console.log(`Starting epoch ${experiment.current_epoch + 1} for experiment ${experiment.id}`)
+    console.log(`[CRON] Starting epoch ${experiment.current_epoch + 1} for experiment ${experiment.id} (status ${experiment.status})`)
 
     const tickStart = Date.now()
-    const result = await runEpoch(experiment.id)
+    let result: Awaited<ReturnType<typeof runEpoch>>
+    try {
+      result = await runEpoch(experiment.id)
+    } catch (e) {
+      if (e instanceof BudgetPausedError) {
+        console.warn(`[CRON] Skipping epoch ${experiment.current_epoch + 1}: ${describeBudget(e.status)}`)
+        return res.status(200).json({
+          message: `Skipped: ${e.status.reason ?? 'daily budget reached'}`,
+          state: BUDGET_PAUSED_STATE,
+          resumes_at: e.status.resumes_at,
+          experiment_id: experiment.id,
+        })
+      }
+      if (e instanceof EpochBusyError) {
+        console.log(`[CRON] Epoch already claimed by another request for ${experiment.id}`)
+        return res.status(200).json({ message: 'Epoch already in progress', experiment_id: experiment.id })
+      }
+      throw e
+    }
+
+    // Once the specimen has broken out of the glass, keep it broken.
+    await persistGlassIfBrokenOut(experiment.id)
 
     // North (+ optional GLM pairing) runs its own wildcard experiment every
     // few epochs, off to the side of the main panel — kept infrequent to
     // conserve credits, per design. Skipped when the epoch (now including
     // real CI waits) already ate most of the 800s budget — North catches the
     // next multiple-of-N epoch instead of dying mid-run to the timeout.
+    const specParams = (experiment.current_spec?.meta?.experiment_params ?? {}) as Record<string, number>
     const northEveryNEpochs = specParams.north_every_n_epochs
       ?? parseInt(process.env.NORTH_EVERY_N_EPOCHS || '3', 10)
     const elapsedS = (Date.now() - tickStart) / 1000
@@ -113,7 +111,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         try {
           north = await runAndPersistNorth(experiment.id, result.newSpec, result.epochNumber)
         } catch (e) {
-          console.warn('[CRON] North experiment failed (non-fatal):', e instanceof Error ? e.message : e)
+          if (e instanceof BudgetPausedError) console.warn(`[CRON] Skipping North: ${describeBudget(e.status)}`)
+          else console.warn('[CRON] North experiment failed (non-fatal):', e instanceof Error ? e.message : e)
         }
       }
     }
@@ -141,4 +140,3 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     })
   }
 }
-

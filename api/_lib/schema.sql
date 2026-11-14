@@ -29,6 +29,8 @@ CREATE TABLE IF NOT EXISTS epochs (
   plant_geometry JSONB,
   stability_delta DECIMAL(4,3),
   cost_usd DECIMAL(10,6) DEFAULT 0,
+  prompt_tokens INTEGER,
+  completion_tokens INTEGER,
   started_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
   completed_at TIMESTAMP WITH TIME ZONE,
   UNIQUE(experiment_id, epoch_number)
@@ -43,7 +45,8 @@ CREATE TABLE IF NOT EXISTS conflicts (
   element_b TEXT NOT NULL,
   description TEXT NOT NULL,
   severity TEXT CHECK (severity IN ('critical', 'warning', 'note')),
-  resolved_epoch INTEGER
+  resolved_epoch INTEGER,
+  spec_conflict_id TEXT -- the id the spec uses, e.g. conflict_12_3
 );
 
 -- Mutation tracking for research
@@ -60,14 +63,37 @@ CREATE TABLE IF NOT EXISTS mutations (
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
 
--- Research epoch logs (comprehensive snapshots for analysis)
+-- Research epoch logs (comprehensive snapshots for analysis), one per
+-- experiment and epoch. Older databases are migrated at runtime
+-- (research-logger.ts ensureEpochLogsTable).
 CREATE TABLE IF NOT EXISTS epoch_logs (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-  epoch_number INTEGER UNIQUE NOT NULL,
+  experiment_id UUID,
+  epoch_number INTEGER NOT NULL,
   timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
   log_data JSONB NOT NULL,
   created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+CREATE UNIQUE INDEX IF NOT EXISTS idx_epoch_logs_experiment_epoch ON epoch_logs(experiment_id, epoch_number);
+
+-- Every billed model response, with the cost OpenRouter reported
+-- (spend.ts). The daily budget sums this for the current UTC day.
+CREATE TABLE IF NOT EXISTS model_calls (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+  experiment_id UUID,
+  epoch_number INTEGER,
+  purpose TEXT,
+  model_id TEXT NOT NULL,
+  assigned_model_id TEXT,
+  cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
+  cost_source TEXT,
+  prompt_tokens INTEGER NOT NULL DEFAULT 0,
+  completion_tokens INTEGER NOT NULL DEFAULT 0,
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_model_calls_created ON model_calls(created_at);
+CREATE INDEX IF NOT EXISTS idx_model_calls_epoch ON model_calls(experiment_id, epoch_number);
 
 -- Indexes for common queries
 CREATE INDEX IF NOT EXISTS idx_epochs_experiment_id ON epochs(experiment_id);

@@ -5,12 +5,17 @@
 // Model & Role Types
 // ============================================
 
+// The run 2 panel: the newest flagship from each lab, one model per lab (the
+// room has five provider desks). Prices per million tokens (in / out) when
+// chosen: Gemini 4 $1.50/$7.50, DeepSeek V4 Pro about $0.66/$1.98 first-party,
+// Claude Fable 5.2 $8/$40, GPT-6 Astra $10/$50, Grok 4.7 $2/$6. Real spend is
+// read from OpenRouter's usage.cost on every call, not from this table.
 export const MODELS = [
-  'google/gemini-3.5-flash',
-  'deepseek/deepseek-v4-pro',
-  'anthropic/claude-opus-4.8',
-  'openai/gpt-5.5',
-  'x-ai/grok-4.3',
+  'google/gemini-4-hydrogen',
+  'deepseek/deepseek-v4-pro-0813',
+  'anthropic/claude-fable-5.2',
+  'openai/gpt-6-astra',
+  'x-ai/grok-4.7',
 ] as const
 
 export type ModelId = (typeof MODELS)[number]
@@ -21,22 +26,33 @@ export type Role = (typeof ROLES)[number]
 export type RoleAssignments = Record<Role, ModelId>
 
 export const MODEL_DISPLAY_NAMES: Record<ModelId, string> = {
-  'google/gemini-3.5-flash': 'Gemini',
-  'deepseek/deepseek-v4-pro': 'DeepSeek-V4',
-  'anthropic/claude-opus-4.8': 'Claude',
-  'openai/gpt-5.5': 'GPT-5',
-  'x-ai/grok-4.3': 'Grok',
+  'google/gemini-4-hydrogen': 'Gemini 4',
+  'deepseek/deepseek-v4-pro-0813': 'DeepSeek V4 Pro',
+  'anthropic/claude-fable-5.2': 'Claude Fable 5.2',
+  'openai/gpt-6-astra': 'GPT-6 Astra',
+  'x-ai/grok-4.7': 'Grok 4.7',
+}
+
+// Answer in this order when an assigned model gives no usable response.
+export const FALLBACK_MODELS = [
+  'anthropic/claude-sonnet-5.5',
+  'google/gemini-3.8-flash',
+] as const
+
+export const FALLBACK_DISPLAY_NAMES: Record<(typeof FALLBACK_MODELS)[number], string> = {
+  'anthropic/claude-sonnet-5.5': 'Claude Sonnet 5.5',
+  'google/gemini-3.8-flash': 'Gemini 3.8 Flash',
 }
 
 // Frontend model IDs (used in Scientist.ts) — map to /models/scientists/<id> assets
 export type FrontendModelId = 'gemini' | 'deepseek' | 'claude' | 'gpt' | 'grok'
 
 export const BACKEND_TO_FRONTEND_MODEL: Record<ModelId, FrontendModelId> = {
-  'google/gemini-3.5-flash': 'gemini',
-  'deepseek/deepseek-v4-pro': 'deepseek',
-  'anthropic/claude-opus-4.8': 'claude',
-  'openai/gpt-5.5': 'gpt',
-  'x-ai/grok-4.3': 'grok',
+  'google/gemini-4-hydrogen': 'gemini',
+  'deepseek/deepseek-v4-pro-0813': 'deepseek',
+  'anthropic/claude-fable-5.2': 'claude',
+  'openai/gpt-6-astra': 'gpt',
+  'x-ai/grok-4.7': 'grok',
 }
 
 // Provider names remain available beside the credited local logo assets.
@@ -83,28 +99,30 @@ export function providerLogoForModel(modelId: unknown): string | undefined {
 // role. It runs free coding models in its own Sprites sandbox + git branch, and
 // its accepted work shows up as differently-colored leaves on the plant.
 
-export type WildcardId = 'north' | 'nemotron' | 'poolside' | 'glm'
+export type WildcardId = 'north' | 'glm'
 
 export const WILDCARD_MODELS: Record<WildcardId, string> = {
-  north:    'cohere/north-mini-code:free',           // primary: the robot's coding brain
-  nemotron: 'nvidia/nemotron-3-ultra-550b-a55b:free',// heavy reasoning (can be fused w/ north)
-  poolside: 'poolside/laguna-m.1:free',              // code specialist
-  glm:      'z-ai/glm-5.2',                          // generalist (paid, cheap)
+  north: 'cohere/north-mini-code:free', // the robot's coding brain (free)
+  glm:   'z-ai/glm-5.3-prime',          // pairs with North on code ($2.80 / $8.80 per 1M)
 }
 
 export const WILDCARD_DISPLAY_NAMES: Record<WildcardId, string> = {
-  north:    'North',
-  nemotron: 'Nemotron',
-  poolside: 'Laguna',
-  glm:      'GLM',
+  north: 'North',
+  glm:   'GLM 5.3',
 }
 
 // Accent colors for wildcard leaves on the plant (distinct from panel-model leaves)
 export const WILDCARD_ACCENTS: Record<WildcardId, number> = {
-  north:    0x39d98a, // green
-  nemotron: 0x76e000, // nvidia lime
-  poolside: 0x4cc9f0, // pool blue
-  glm:      0xb07cff, // violet
+  north: 0x39d98a, // green
+  glm:   0xb07cff, // violet
+}
+
+/** Display name for any model the lab calls: panel, fallback or wildcard. */
+export function modelDisplayName(modelId: string): string | undefined {
+  const tables: Record<string, string>[] = [MODEL_DISPLAY_NAMES, FALLBACK_DISPLAY_NAMES]
+  for (const table of tables) if (Object.hasOwn(table, modelId)) return table[modelId]
+  const wildcard = (Object.keys(WILDCARD_MODELS) as WildcardId[]).find(k => WILDCARD_MODELS[k] === modelId)
+  return wildcard ? WILDCARD_DISPLAY_NAMES[wildcard] : undefined
 }
 
 // The robot mascot's default brain. Set to a [primary, secondary] pair to "fuse".
@@ -395,6 +413,25 @@ export interface ExperimentState {
   role_assignments: RoleAssignments // Next epoch's assignments
   glass_shattered?: boolean // True when terrarium glass has shattered
   repo_commit_count?: number // Real commit count on the AI-Agent repo's main branch
+  run_state?: string // plain words: "running epoch", "paused: daily budget reached", ...
+  resumes_at?: string // ISO time a budget pause ends (next UTC midnight)
+  growth?: ExperimentGrowthRecord
+  repos?: { lab: string; specimen: string; research: string }
+}
+
+// How far the specimen has taken over the room (api/_lib/growth.ts, docs/GROWTH.md).
+export interface ExperimentGrowthRecord {
+  stage: number // 0..6
+  progress: number // 0..1 within the stage
+  epochs: number
+  capabilities: number
+  constraints: number
+  behaviors: number
+  stability: number
+  merged_contributions: number
+  contributions_with_passing_tests: number
+  sprite_test_passes: number
+  glass_shattered: boolean
 }
 
 // ============================================

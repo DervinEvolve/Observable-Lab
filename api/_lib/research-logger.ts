@@ -8,19 +8,44 @@ import type {
   ReviewerOutput,
   CommentatorOutput,
   RoleAssignments,
-  MODEL_DISPLAY_NAMES,
 } from './types.js'
+import { modelDisplayName } from './types.js'
 
-// Display names for cleaner logs
-const MODEL_NAMES: Record<string, string> = {
-  'google/gemini-3.5-flash': 'Gemini 3.5 Flash',
-  'deepseek/deepseek-v4-pro': 'DeepSeek-V4',
-  'anthropic/claude-opus-4.8': 'Claude Opus 4.8',
-  'openai/gpt-5.5': 'GPT-5.5',
-  'x-ai/grok-4.3': 'Grok 4.3',
+// Display names for cleaner logs (the shared map in types.ts).
+const MODEL_NAMES = {
+  get(id: string): string { return modelDisplayName(id) || id },
+}
+
+// epoch_logs used to be keyed on epoch_number alone, so every new experiment
+// overwrote the previous one's logs. It is keyed per experiment now; rows
+// written before this have a NULL experiment_id and are kept as they are.
+let tableReady: Promise<void> | null = null
+export function ensureEpochLogsTable(): Promise<void> {
+  if (!tableReady) {
+    tableReady = (async () => {
+      await sql`
+        CREATE TABLE IF NOT EXISTS epoch_logs (
+          id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+          experiment_id UUID,
+          epoch_number INTEGER NOT NULL,
+          timestamp TIMESTAMP WITH TIME ZONE NOT NULL,
+          log_data JSONB NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+        )
+      `
+      await sql`ALTER TABLE epoch_logs ADD COLUMN IF NOT EXISTS experiment_id UUID`
+      await sql`ALTER TABLE epoch_logs DROP CONSTRAINT IF EXISTS epoch_logs_epoch_number_key`
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_epoch_logs_experiment_epoch ON epoch_logs(experiment_id, epoch_number)`
+    })().catch(e => {
+      tableReady = null
+      throw e
+    })
+  }
+  return tableReady
 }
 
 interface LogEpochParams {
+  experimentId: string
   epochNumber: number
   startTime: Date
   endTime: Date
@@ -37,6 +62,7 @@ interface LogEpochParams {
 
 export async function logEpochForResearch(params: LogEpochParams): Promise<void> {
   const {
+    experimentId,
     epochNumber,
     startTime,
     endTime,
@@ -82,11 +108,11 @@ export async function logEpochForResearch(params: LogEpochParams): Promise<void>
     duration_ms: endTime.getTime() - startTime.getTime(),
 
     role_assignments: {
-      planner: MODEL_NAMES[roleAssignments.planner] || roleAssignments.planner,
-      executor: MODEL_NAMES[roleAssignments.executor] || roleAssignments.executor,
-      challenger: MODEL_NAMES[roleAssignments.challenger] || roleAssignments.challenger,
-      reviewer: MODEL_NAMES[roleAssignments.reviewer] || roleAssignments.reviewer,
-      commentator: MODEL_NAMES[roleAssignments.commentator] || roleAssignments.commentator,
+      planner: MODEL_NAMES.get(roleAssignments.planner),
+      executor: MODEL_NAMES.get(roleAssignments.executor),
+      challenger: MODEL_NAMES.get(roleAssignments.challenger),
+      reviewer: MODEL_NAMES.get(roleAssignments.reviewer),
+      commentator: MODEL_NAMES.get(roleAssignments.commentator),
     },
 
     outputs: {
@@ -116,10 +142,11 @@ export async function logEpochForResearch(params: LogEpochParams): Promise<void>
   }
 
   // Store in database
+  await ensureEpochLogsTable()
   await sql`
-    INSERT INTO epoch_logs (epoch_number, timestamp, log_data)
-    VALUES (${epochNumber}, ${epochLog.timestamp}, ${JSON.stringify(epochLog)})
-    ON CONFLICT (epoch_number) DO UPDATE SET
+    INSERT INTO epoch_logs (experiment_id, epoch_number, timestamp, log_data)
+    VALUES (${experimentId}, ${epochNumber}, ${epochLog.timestamp}, ${JSON.stringify(epochLog)})
+    ON CONFLICT (experiment_id, epoch_number) DO UPDATE SET
       timestamp = EXCLUDED.timestamp,
       log_data = EXCLUDED.log_data
   `
@@ -128,9 +155,10 @@ export async function logEpochForResearch(params: LogEpochParams): Promise<void>
 }
 
 // Export all epoch logs as JSON array (for research export)
-export async function exportResearchData(): Promise<EpochLog[]> {
-  const result = await sql`
-    SELECT log_data FROM epoch_logs ORDER BY epoch_number ASC
-  `
+export async function exportResearchData(experimentId?: string): Promise<EpochLog[]> {
+  await ensureEpochLogsTable()
+  const result = experimentId
+    ? await sql`SELECT log_data FROM epoch_logs WHERE experiment_id = ${experimentId} ORDER BY epoch_number ASC`
+    : await sql`SELECT log_data FROM epoch_logs ORDER BY created_at ASC, epoch_number ASC`
   return result.rows.map(row => row.log_data as EpochLog)
 }

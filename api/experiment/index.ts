@@ -6,6 +6,21 @@ import { generatePlantFromSpec, generateSeedPlant } from '../_lib/plant-generato
 import { SEED_SPECIFICATION } from '../_lib/seed-spec.js'
 import { getRepoCommitCount } from '../_lib/github-repo.js'
 import type { ExperimentState, Epoch, AgentSpecification } from '../_lib/types.js'
+import { checkDailyBudget, describeRunState, type BudgetStatus } from '../_lib/spend.js'
+import { computeGrowth, growthFactsFor, repoLinks } from '../_lib/growth.js'
+
+// Viewers poll this endpoint; the budget is read at most once a minute per instance.
+let budgetCache: { at: number; status: BudgetStatus } | null = null
+async function cachedBudget(): Promise<BudgetStatus | null> {
+  if (budgetCache && Date.now() - budgetCache.at < 60_000) return budgetCache.status
+  try {
+    const status = await checkDailyBudget()
+    budgetCache = { at: Date.now(), status }
+    return status
+  } catch {
+    return null
+  }
+}
 
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if ((req.method === 'POST' || req.query.debug === 'true') && !requireBearer(req, res)) return
@@ -105,6 +120,11 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
     // Real commit count from the AI-Agent repo (cached; null on GitHub errors)
     const repoCommitCount = await getRepoCommitCount()
 
+    // Plain run state, and how far the specimen has taken over the room,
+    // both from stored facts only.
+    const runState = describeRunState(exp as { status: string; epoch_in_progress?: boolean | null }, await cachedBudget())
+    const growth = computeGrowth(await growthFactsFor(exp as Parameters<typeof growthFactsFor>[0]))
+
     const response: ExperimentState = {
       id: exp.id,
       status: exp.status,
@@ -117,6 +137,9 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
       role_assignments: getRoleAssignments(exp.current_epoch + 1),
       glass_shattered: exp.glass_shattered || false,
       ...(repoCommitCount !== null ? { repo_commit_count: repoCommitCount } : {}),
+      ...runState,
+      growth,
+      repos: repoLinks(),
     }
 
     return res.status(200).json(response)
@@ -129,9 +152,10 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
 // POST /api/experiment - Start a new experiment (seed)
 async function handlePost(_req: VercelRequest, res: VercelResponse) {
   try {
-    // Check if there's already an active experiment
+    // Refuse while any experiment is active (seeding, growing, stable or
+    // failing). /api/experiment/reset archives the old one first.
     const existingResult = await sql`
-      SELECT id FROM experiments WHERE status IN ('seeding', 'growing') LIMIT 1
+      SELECT id FROM experiments WHERE status <> 'archived' ORDER BY created_at DESC LIMIT 1
     `
 
     if (existingResult.rows[0]) {

@@ -3,6 +3,7 @@ import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { sql } from '@vercel/postgres'
 import { runAndPersistNorth } from '../_lib/north-persist.js'
 import { generatePlantFromSpec } from '../_lib/plant-generator.js'
+import { BUDGET_PAUSED_STATE, BudgetPausedError } from '../_lib/spend.js'
 import type { AgentSpecification } from '../_lib/types.js'
 
 // POST /api/north/run — trigger one North wildcard experiment for the active experiment.
@@ -17,7 +18,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   try {
     const experimentResult = await sql`
       SELECT * FROM experiments
-      WHERE status IN ('seeding', 'growing', 'stable')
+      WHERE status <> 'archived'
       ORDER BY created_at DESC
       LIMIT 1
     `
@@ -56,6 +57,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       north_leaf_count: newSpec.behaviors.filter(b => b.source === 'north').length,
     })
   } catch (error) {
+    if (error instanceof BudgetPausedError) {
+      return res.status(429).json({ error: BUDGET_PAUSED_STATE, reason: error.status.reason, resumes_at: error.status.resumes_at })
+    }
     console.error('[North] run error:', error)
     const message = error instanceof Error ? error.message : 'Unknown error'
     const safe = ['Model service not configured', 'Model service error', 'Model returned invalid response']
