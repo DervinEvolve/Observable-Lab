@@ -7,3 +7,17 @@ If GitHub offers **Report a vulnerability** in this repository's Security tab, u
 This is an experimental project. There is no promised response time or supported production security boundary.
 
 Never include provider credentials, database URLs, runner tokens, or private experiment content in an issue, screenshot, or pull request. Revoke exposed credentials through the relevant provider; removing a file from the latest commit does not remove it from Git history.
+
+## Model proposals are never merged automatically
+
+When `LAB_ENABLE_LAB_PROPOSALS` is on, a model may propose a change to this repository. The lab opens it as a pull request labelled `model-proposal` and stops there. There is no merge call in that code path, and its token (`LAB_PROPOSALS_GITHUB_TOKEN`) is a separate fine-grained token for this one repository with Pull requests and Contents permissions only, so it cannot change repository settings, workflow files, secrets or other repositories. The lab only ever writes to `model-proposal/...` branches with it; protect the default branch so that a merge always needs the owner, whatever the token could do.
+
+Only the owner merges these, by hand, because this repository is not like AI-Agent:
+
+- **It deploys to production.** A merge to the deployed branch becomes the live site and API on the next deployment, with no CI gate in between that could judge whether generated code is safe.
+- **Its server holds the lab's credentials.** The API functions run with the OpenRouter key, the database URL, the GitHub tokens, the Sprites token, the Modal tokens and the operator and cron secrets. Code merged here runs next to all of them, so a single bad or manipulated proposal could leak them or spend without limit.
+- **It is the lab's own control surface.** It decides what the models can do, the spending cap, what the room shows as evidence and what counts as tested. A model must not be able to change those rules for itself.
+
+AI-Agent contributions and exhibits can merge on their own because that repository holds no credentials, deploys nothing, and its changes are limited to source, tests, docs and exhibit data, behind its own required CI checks.
+
+Treat a `model-proposal` pull request as untrusted outside input: read the whole diff, and do not run it with real credentials before you have.

@@ -8,6 +8,9 @@ import { getRepoCommitCount } from '../_lib/github-repo.js'
 import type { ExperimentState, Epoch, AgentSpecification } from '../_lib/types.js'
 import { checkDailyBudget, describeRunState, type BudgetStatus } from '../_lib/spend.js'
 import { computeGrowth, growthFactsFor, repoLinks } from '../_lib/growth.js'
+import { getRecentToolRuns } from '../_lib/tool-runs-store.js'
+import { enabledTools } from '../_lib/tools-config.js'
+import { exhibitsHandler } from '../_lib/exhibits-reader.js'
 
 // Viewers poll this endpoint; the budget is read at most once a minute per instance.
 let budgetCache: { at: number; status: BudgetStatus } | null = null
@@ -34,6 +37,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // Version check
   if (req.query.version === 'true') {
     return res.status(200).json({ version: 'v2-debug', timestamp: Date.now() })
+  }
+
+  // GET /api/experiment?view=exhibits: the merged exhibits for the room
+  // (docs/EXHIBITS.md). Same body the contract's /api/experiment/exhibits
+  // route describes; that route needs its entry in the public route list
+  // before it can exist, so it is served from here meanwhile.
+  if (req.method === 'GET' && req.query.view === 'exhibits') {
+    return exhibitsHandler(req, res)
   }
 
   if (req.method === 'GET') {
@@ -124,6 +135,9 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
     // both from stored facts only.
     const runState = describeRunState(exp as { status: string; epoch_in_progress?: boolean | null }, await cachedBudget())
     const growth = computeGrowth(await growthFactsFor(exp as Parameters<typeof growthFactsFor>[0]))
+    // What the models' tools really did (Sprite sessions, GPU jobs, subagents,
+    // exhibits, proposals), cleaned of anything that looks like a credential.
+    const toolRuns = await getRecentToolRuns(exp.id as string, 12)
 
     const response: ExperimentState = {
       id: exp.id,
@@ -142,7 +156,7 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
       repos: repoLinks(),
     }
 
-    return res.status(200).json(response)
+    return res.status(200).json({ ...response, tool_runs: toolRuns, tools_enabled: enabledTools() })
   } catch (error) {
     console.error('[API] Error fetching experiment:', error)
     return res.status(500).json({ error: 'Failed to load experiment' })

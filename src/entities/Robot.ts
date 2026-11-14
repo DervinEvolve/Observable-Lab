@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { mergeRigidRig } from '../lib/skinnedMerge'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import type { GLTF } from 'three/addons/loaders/GLTFLoader.js'
 import gsap from 'gsap'
@@ -136,6 +137,9 @@ export class Robot {
               child.receiveShadow = true
             }
           })
+          // the whole robot draws as one skinned mesh, each piece still
+          // following its own animated node (src/lib/skinnedMerge.ts)
+          mergeRigidRig(this.model)
 
           // Setup animation mixer
           if (gltf.animations.length > 0) {

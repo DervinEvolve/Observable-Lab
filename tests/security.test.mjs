@@ -71,6 +71,7 @@ const PUBLIC_ROUTES = {
   'experiment/index': ['GET'],              // without ?debug=true
   'experiment/code-contributions': ['GET'],
   'experiment/wildcard-transcripts': ['GET'],
+  'experiment/exhibits': ['GET'],
 }
 function discoverRoutes(directory = 'api') {
   const found = []
@@ -379,8 +380,8 @@ test('a fallback answer records and shows the model that actually answered', asy
     reviewer_output: { decisions: [{ mutation_index: 0, verdict: 'approve', reason: 'ok' }], epoch_summary: 'summary', remark: 'kept', served_by: servedBy },
     commentator_output: { mood: 'stable', summary: 'summary', plant_metaphor: 'growth' },
   })
-  // The fallback is not a panel model, so the room shows its OpenRouter id.
-  assert.match(html, /class="chat-name"[^>]*>anthropic\/claude-sonnet-5\.5</)
+  // The fallback is not a panel model, so the room shows its display name.
+  assert.match(html, /class="chat-name"[^>]*>Claude Sonnet 5\.5</)
   assert.match(html, /fallback for Grok 4\.7/)
   // The avatar identifies the actual fallback provider with a local, credited mark.
   assert.match(html, /<img src="\/logos\/claude\.svg" alt="Anthropic logo"/)

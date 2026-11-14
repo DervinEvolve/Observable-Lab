@@ -1,4 +1,6 @@
 import * as THREE from 'three'
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
+import { mergeSkinnedPieces } from '../lib/skinnedMerge'
 import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js'
 import type { GLTF } from 'three/addons/loaders/GLTFLoader.js'
 import gsap from 'gsap'
@@ -231,6 +233,17 @@ export class Scientist {
             }
           })
 
+          // One draw call for the accent pieces and one for the rest,
+          // instead of one per piece (src/lib/skinnedMerge.ts)
+          const merged = mergeSkinnedPieces(this.model, mat => (this.accentMaterials.includes(mat) ? 'accent' : 'base'))
+          if (merged.size) {
+            const live = new Set<THREE.Material>()
+            this.model.traverse(o => { if (o instanceof THREE.Mesh) live.add(o.material as THREE.Material) })
+            this.accentMaterials = this.accentMaterials.filter(m => live.has(m))
+            const accent = merged.get('accent')
+            if (accent) this.accentMaterials.push(accent.material as THREE.MeshStandardMaterial)
+          }
+
           // Setup animation mixer
           if (gltf.animations.length > 0) {
             this.mixer = new THREE.AnimationMixer(this.model)
@@ -395,27 +408,35 @@ export class Scientist {
     this.thinkingIndicator = new THREE.Group()
     this.thinkingIndicator.name = 'thinkingIndicator'
 
-    // Create a rotating ring of small dots
+    // A rotating ring of small dots, fading round the ring: one mesh, with
+    // each dot's fade in its vertex colours' alpha (one draw call, not six)
     const ringRadius = 0.15
     const dotCount = 6
-    const dotGeometry = new THREE.SphereGeometry(0.025, 6, 4)
-
+    const dots: THREE.BufferGeometry[] = []
     for (let i = 0; i < dotCount; i++) {
       const angle = (i / dotCount) * Math.PI * 2
+      const g = new THREE.SphereGeometry(0.025, 6, 4)
+      g.translate(Math.cos(angle) * ringRadius, 0, Math.sin(angle) * ringRadius)
+      g.deleteAttribute('uv')
+      const alpha = 0.3 + (i / dotCount) * 0.7 // gradient opacity
+      const n = g.getAttribute('position').count
+      const rgba = new Float32Array(n * 4)
+      for (let k = 0; k < n; k++) rgba.set([1, 1, 1, alpha], k * 4)
+      g.setAttribute('color', new THREE.BufferAttribute(rgba, 4))
+      dots.push(g)
+    }
+    const ring = mergeGeometries(dots, false)
+    dots.forEach(g => g.dispose())
+    if (ring) {
+      const accent = CHARACTER_CONFIG[this.state.modelId].accentColor
       const dotMaterial = new THREE.MeshStandardMaterial({
-        color: CHARACTER_CONFIG[this.state.modelId].accentColor,
-        emissive: CHARACTER_CONFIG[this.state.modelId].accentColor,
+        color: accent,
+        emissive: accent,
         emissiveIntensity: 0.5,
         transparent: true,
-        opacity: 0.3 + (i / dotCount) * 0.7, // Gradient opacity
+        vertexColors: true,
       })
-      const dot = new THREE.Mesh(dotGeometry, dotMaterial)
-      dot.position.set(
-        Math.cos(angle) * ringRadius,
-        0,
-        Math.sin(angle) * ringRadius
-      )
-      this.thinkingIndicator.add(dot)
+      this.thinkingIndicator.add(new THREE.Mesh(ring, dotMaterial))
     }
 
     // Position above the scientist's head

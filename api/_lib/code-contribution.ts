@@ -24,6 +24,7 @@ import { withModelTrailers } from './commit-identity.js'
 import { MODEL_DISPLAY_NAMES, WILDCARD_MODELS, WILDCARD_DISPLAY_NAMES } from './types.js'
 import { assertContributionPath } from './contribution-policy.js'
 import { checkContributionInSprite, spritesConfigured, type SpriteCheck } from './sprites.js'
+import { quietMentions } from './github-pr.js'
 
 const CODER_SYSTEM = `You are a software engineer with real write access to a shared GitHub repository (AI-Agent). This is NOT a simulation or writing exercise: the files you return are pushed as a real commit that names you as the model that wrote it, opened as a real pull request, and — once approved — merged into the actual codebase this agent runs on. Other engineers (other models, and their own subagents) are contributing to this same repo alongside you, epoch after epoch, so treat existing files as real prior work to build on, not placeholders you can ignore.
 
@@ -44,7 +45,13 @@ const SPRITE_NOTE = `\n\nAfter you push, your own Sprites sandbox checks out you
 
 const SUBAGENT_SYSTEM = `You are a subagent with the same real write access to the shared AI-Agent repo, deployed by your parent model for one focused follow-up task: add a real, meaningful test that exercises the actual logic your parent just wrote — not a trivial no-op, not a test that only checks a mock returns what you told it to return. Your test RUNS in real CI (vitest, jest-style globals — do NOT use node:test) and the PR dies if it fails, so: only import exports that actually exist in the files you were shown, get the arithmetic in your expectations right, and never assert exact error-message wording you haven't seen. Don't touch the original files. Return ONLY valid JSON: { "files": [{ "path": string, "content": string }], "commit_message": string }. If the code genuinely isn't testable, return { "files": [], "commit_message": "" }.`
 
-const EXPLORER_SYSTEM = `You are a subagent deployed by your parent model to explore and research BEFORE any code gets written — you don't write code yourself. You have REAL web access: search the web for relevant docs, standards, prior art, or best practices, and ground your findings in what you actually find (not just prior knowledge). Also look for relevant existing code or patterns in the repo to build on, weigh 1-2 implementation approaches and their real tradeoffs, and flag any concrete edge case or risk. Be specific and concise (3-5 sentences) — your parent will use this to decide what to build, so vague hedging is useless. Return ONLY valid JSON: { "task": string, "search_queries": string[], "findings": string }. "task" is a short (under 8 words) present-tense description of what you're investigating, e.g. "Researching integer overflow handling". "search_queries" is the 1-3 web searches you actually made.`
+const EXPLORER_SYSTEM = `You are a subagent deployed by your parent model to explore and research BEFORE any code gets written — you don't write code yourself. You have REAL web access: search the web for relevant docs, standards, prior art, or best practices, and ground your findings in what you actually find (not just prior knowledge). Also look for relevant existing code or patterns in the repo to build on, weigh 1-2 implementation approaches and their real tradeoffs, and flag any concrete edge case or risk. Be specific and concise (3-5 sentences) — your parent will use this to decide what to build, so vague hedging is useless. Your task, search queries and findings are published in the pull request description of the contribution they inform. Return ONLY valid JSON: { "task": string, "search_queries": string[], "findings": string }. "task" is a short (under 8 words) present-tense description of what you're investigating, e.g. "Researching integer overflow handling". "search_queries" is the 1-3 web searches you actually made.`
+
+// When the parent deploys two explorers, each takes one angle so they do not repeat each other.
+const EXPLORER_ANGLES = [
+  'Focus on the implementation: existing code in the repo to build on, and the best approach with its tradeoffs.',
+  'Focus on what can go wrong: prior art, standards, failure modes and edge cases the code must handle.',
+]
 
 interface CoderOutput {
   files: RepoFile[]
@@ -64,6 +71,26 @@ interface ExplorerOutput {
   search_queries?: string[]
 }
 
+/** One explorer's report, kept for the pull request description and the record. */
+export interface ExplorerReport {
+  task: string
+  findings: string
+  searches: string[]
+  sources: WebCitation[]
+  model: string
+  cost: number
+}
+
+/** One subagent deployment, for the tool_runs record and the drones in the room. */
+export interface SubagentRun {
+  kind: 'explore' | 'test'
+  model: string
+  ok: boolean
+  cost: number
+  task?: string
+  files?: string[]
+}
+
 export interface ContributionResult {
   merged: boolean
   pr_url?: string
@@ -78,6 +105,7 @@ export interface ContributionResult {
   ci_passed?: boolean | null  // real CI verdict for this PR (null = no run / timed out; blocks merging)
   ci_excerpt?: string         // failed-run log tail — fed back to the lab so models learn from it
   sprite?: SpriteCheck        // the author's sprite ran the tests on this branch (extra evidence, not a merge gate)
+  subagents?: SubagentRun[]   // every subagent deployed for this contribution, including failed ones
 }
 
 // Resolves any OpenRouter model id (panel model or wildcard) to the display
@@ -112,22 +140,63 @@ async function generateSubagentContribution(
 async function runExplorerSubagent(
   authorModelId: string,
   description: string,
-  tree: string[]
-): Promise<{ task: string; findings: string; searches: string[]; sources: WebCitation[]; cost: number }> {
-  const { output, cost, citations } = await callModel(
+  tree: string[],
+  angle?: string
+): Promise<ExplorerReport> {
+  const { output, cost, citations, servedBy } = await callModel(
     authorModelId,
-    EXPLORER_SYSTEM,
+    EXPLORER_SYSTEM + (angle ? `\n\n${angle}` : ''),
     `Task to investigate: ${description}\n\nCurrent repo files (top-level):\n${tree.length ? tree.join('\n') : '(empty repo)'}`,
     { webSearch: true }
   )
   const explorerOut = output as ExplorerOutput
+  const str = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, max) : '')
   return {
-    task: explorerOut.task || 'Exploring the problem',
-    findings: explorerOut.findings || '',
-    searches: Array.isArray(explorerOut.search_queries) ? explorerOut.search_queries.slice(0, 3) : [],
+    task: str(explorerOut.task, 120) || 'Exploring the problem',
+    findings: str(explorerOut.findings, 3000),
+    searches: Array.isArray(explorerOut.search_queries)
+      ? explorerOut.search_queries.filter((q): q is string => typeof q === 'string').map(q => q.slice(0, 200)).slice(0, 3)
+      : [],
     sources: citations,
+    model: servedBy.model,
     cost,
   }
+}
+
+/**
+ * The pull request description: the coder's summary, then what each explorer
+ * subagent was asked, searched for and found, so the reasoning behind the
+ * change is on GitHub next to the code.
+ */
+export function contributionPrBody(params: {
+  summary: string
+  author: string
+  explorers: ExplorerReport[]
+  testSubagent: boolean
+}): string {
+  const lines = [params.summary || '(no summary)', '']
+  if (params.explorers.length) {
+    lines.push(`## Explorer subagent${params.explorers.length > 1 ? 's' : ''}`, '')
+    lines.push(`${params.author} deployed ${params.explorers.length === 1 ? 'an explorer subagent' : `${params.explorers.length} explorer subagents`} before writing this code. Their findings were given to the model that wrote it.`, '')
+    params.explorers.forEach((e, i) => {
+      if (params.explorers.length > 1) lines.push(`### Explorer ${i + 1}`, '')
+      lines.push(`**Task:** ${e.task}`, '')
+      lines.push('**Searches:**')
+      if (e.searches.length) for (const q of e.searches) lines.push(`- ${q.replace(/\s+/g, ' ')}`)
+      else lines.push('- (none reported)')
+      lines.push('', '**Findings:**', '', e.findings ? e.findings.split('\n').map(l => `> ${l}`).join('\n') : '> (none)', '')
+      const sources = e.sources.filter(s => typeof s.url === 'string' && /^https:\/\//.test(s.url)).slice(0, 5)
+      if (sources.length) {
+        lines.push('**Sources the search returned:**')
+        for (const s of sources) lines.push(`- ${(s.title || s.url).replace(/[\[\]\n]/g, ' ').slice(0, 120)}: ${s.url}`)
+        lines.push('')
+      }
+    })
+    lines.push('The searches and findings are what the subagents reported. They are not checked by the lab.', '')
+  }
+  if (params.testSubagent) lines.push('A test subagent added its own commit with a test for this change.', '')
+  lines.push('_Opened automatically by the Observable Lab._')
+  return quietMentions(lines.join('\n'))
 }
 
 export type ReviewDecision =
@@ -159,8 +228,10 @@ export async function contributeCode(params: {
   title: string
   description: string
   review: ReviewDecision
-  deploySubagent?: boolean // if true, a subagent (same model) adds a test file for the change before it's reviewed
-  deployExplorerSubagent?: boolean // if true, a subagent researches the problem BEFORE any code is written, and its findings inform the coder
+  /** The Executor's choice: 0..2 explorers before the code, and whether a test subagent follows. */
+  subagents?: { explore: number; test: boolean }
+  deploySubagent?: boolean // older callers: a test subagent (same model) adds a test file
+  deployExplorerSubagent?: boolean // older callers: one explorer researches the problem before any code is written
   agentContext?: string // what the agent being built actually is (purpose/domain) — grounds the code in the real product, not a generic toy
 }): Promise<ContributionResult> {
   let cost = 0
@@ -170,6 +241,11 @@ export async function contributeCode(params: {
   let explorerFindings: string | undefined
   let webSearches: string[] = []
   let webSources: WebCitation[] = []
+  const explorers: ExplorerReport[] = []
+  const subagentRuns: SubagentRun[] = []
+  const exploreCount = Math.max(0, Math.min(EXPLORER_ANGLES.length,
+    params.subagents ? Math.floor(params.subagents.explore) || 0 : params.deployExplorerSubagent ? 1 : 0))
+  const deployTest = params.subagents ? params.subagents.test === true : Boolean(params.deploySubagent)
   if (process.env.LAB_ENABLE_CODE_WRITES !== 'true') {
     return { merged: false, files: [], subagent_files: [], author, cost }
   }
@@ -181,16 +257,26 @@ export async function contributeCode(params: {
     // gets written, and its findings actually shape the coder's prompt below
     // — real exploration (including real web search), not just a fixed
     // after-the-fact test-writing chore.
-    if (params.deployExplorerSubagent) {
-      try {
-        const explorer = await runExplorerSubagent(params.authorModelId, params.description, tree)
-        cost += explorer.cost
-        explorerTask = explorer.task
-        explorerFindings = explorer.findings
-        webSearches = explorer.searches
-        webSources = explorer.sources
-      } catch (e) {
-        console.warn('[code-contribution] explorer pass failed (non-fatal):', e instanceof Error ? e.message : e)
+    // The Executor chose how many explorers to deploy (0 to 2); with two,
+    // each takes its own angle and they run side by side.
+    if (exploreCount > 0) {
+      const settled = await Promise.allSettled(Array.from({ length: exploreCount }, (_, i) =>
+        runExplorerSubagent(params.authorModelId, params.description, tree, exploreCount > 1 ? EXPLORER_ANGLES[i] : undefined)))
+      for (const r of settled) {
+        if (r.status === 'fulfilled') {
+          cost += r.value.cost
+          explorers.push(r.value)
+          subagentRuns.push({ kind: 'explore', model: r.value.model, ok: true, cost: r.value.cost, task: r.value.task })
+        } else {
+          subagentRuns.push({ kind: 'explore', model: params.authorModelId, ok: false, cost: 0 })
+          console.warn('[code-contribution] explorer pass failed (non-fatal):', r.reason instanceof Error ? r.reason.message : r.reason)
+        }
+      }
+      if (explorers.length) {
+        explorerTask = explorers.map(e => e.task).join(' / ').slice(0, 300)
+        explorerFindings = explorers.map(e => e.findings).filter(Boolean).join('\n\n') || undefined
+        webSearches = explorers.flatMap(e => e.searches).slice(0, 6)
+        webSources = explorers.flatMap(e => e.sources).slice(0, 10)
       }
     }
 
@@ -217,7 +303,7 @@ export async function contributeCode(params: {
     const coderMessage = withModelTrailers(coder.commit_message || params.title, coderModel)
 
     if (!coder.files?.length) {
-      return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources }
+      return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns }
     }
 
     // Validate the whole generated batch before the first repository write.
@@ -247,10 +333,12 @@ export async function contributeCode(params: {
     // landing on the same branch as its own commit, whose Model-Role trailer
     // marks it as the subagent's so it's distinguishable in git history.
     let subagentFiles: RepoFile[] = []
-    if (params.deploySubagent) {
+    if (deployTest) {
+      let testRun: SubagentRun = { kind: 'test', model: params.authorModelId, ok: false, cost: 0 }
       try {
         const subagent = await generateSubagentContribution(params.authorModelId, params.description, coder.files)
         cost += subagent.cost
+        testRun = { kind: 'test', model: subagent.model, ok: false, cost: subagent.cost }
         const proposed = Array.isArray(subagent.files) ? subagent.files : []
         for (const file of proposed) {
           assertContributionPath(file?.path)
@@ -267,17 +355,25 @@ export async function contributeCode(params: {
         for (const file of subagentFiles) {
           await upsertFileOnBranch(params.branchName, file.path, file.content, subagentMessage)
         }
+        testRun = { ...testRun, ok: true, files: subagentFiles.map(f => f.path) }
       } catch (e) {
         console.warn('[code-contribution] subagent pass failed (non-fatal):', e instanceof Error ? e.message : e)
       }
+      subagentRuns.push(testRun)
     }
 
-    const pr = await openPullRequest(params.branchName, params.title, `${coder.pr_summary}\n\n_Opened automatically by the Observable Lab._`)
+    const prBody = contributionPrBody({
+      summary: typeof coder.pr_summary === 'string' ? coder.pr_summary : '',
+      author,
+      explorers,
+      testSubagent: subagentRuns.some(r => r.kind === 'test' && r.ok && (r.files?.length ?? 0) > 0),
+    })
+    const pr = await openPullRequest(params.branchName, params.title, prBody)
 
     const base: Omit<ContributionResult, 'merged' | 'cost'> = {
       pr_url: pr.html_url, files: coder.files, subagent_files: subagentFiles, author,
       explorer_task: explorerTask, explorer_findings: explorerFindings,
-      web_searches: webSearches, web_sources: webSources,
+      web_searches: webSearches, web_sources: webSources, subagents: subagentRuns,
     }
 
     // REAL CI GATE: the PR triggered the repo's GitHub Actions run (full vitest
@@ -359,7 +455,7 @@ export async function contributeCode(params: {
     }
   } catch (error) {
     console.warn('[code-contribution] failed (non-fatal):', error instanceof Error ? error.message : error)
-    return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources }
+    return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns }
   }
 }
 

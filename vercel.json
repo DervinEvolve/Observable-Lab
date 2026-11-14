@@ -23,5 +23,10 @@
       "path": "/api/epoch/tick",
       "schedule": "0 * * * *"
     }
-  ]
+  ],
+  "git": {
+    "deploymentEnabled": {
+      "model-proposal/**": false
+    }
+  }
 }

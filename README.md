@@ -28,6 +28,24 @@ The first grows an **agent specification**. Models propose a direction, work thr
 
 Every model takes each job once in an aligned block of five rounds. The configured panel uses Gemini, DeepSeek, Claude, GPT and Grok through OpenRouter; the model IDs are in [api/_lib/types.ts](api/_lib/types.ts). North and GLM have separate experimental roles. When a call falls back to another model, the log records which model actually answered. Comparisons between models need to account for those fallbacks.
 
+### What the models can do in run 2
+
+In run 2 the specification loop also writes code. With `LAB_ENABLE_CODE_WRITES=true`, at most one approved change per round becomes a pull request to the [AI-Agent](https://github.com/DervinEvolve/AI-Agent) repository, written by that round's Executor. It merges only if the Reviewer approved the change and the repository's tests pass in GitHub Actions for that exact commit. The commits name the model as the author; I'm the committer.
+
+The Executor also gets a small menu of tools. Each one is off unless I've switched it on and given it credentials, and the prompts only describe the ones that are on, so the models aren't told about abilities they don't have:
+
+- **Subagents.** The Executor decides how many explorer subagents (none, one or two) research the change before the code is written, and whether a test subagent adds a test afterwards. The explorers' task, searches and findings go into the pull request description. In the room they're the drones.
+- **Sprite sessions.** Each lab's model has its own Sprite, a Linux computer in the cloud, shown as the screen above its desk. The Executor can run up to four shell commands there to try something out or time it. The Sprite can reach GitHub and the usual package registries, holds no credentials, and its output is stored and shown.
+- **GPU jobs.** One short Python script on a Modal GPU, with the network blocked, no credentials inside and a 120-second limit. The script has to compile before any GPU time starts.
+- **Exhibits.** The Executor can design a small object for the room as a data file. If the Reviewer approves it, it goes to AI-Agent as a pull request, and it appears in the room once it merges.
+- **Proposals to this repository.** A model can propose a change to the lab itself. These open as pull requests labelled `model-proposal`, and I review and merge them myself, because this repository deploys the site and its server holds the lab's keys.
+
+Every tool has a daily limit, and what it costs counts against the same daily spending cap as the model calls (`LAB_DAILY_BUDGET_USD`, $15 by default). OpenRouter reports the real cost of each model call; Sprite and GPU time are my estimates from how long they ran. When the cap is reached, the lab pauses until midnight UTC.
+
+What a script prints, in a Sprite or on the GPU, is the model's own report. I store it and show it, but nothing checks it independently. Passing tests in AI-Agent mean the tests the models wrote passed; they don't measure how capable the agent is. I've tested the tool paths against fake services, and recording a connected run that uses them is still on my list. [The tool notes](docs/TOOLS.md) have the limits and setup, and [the exhibit notes](docs/EXHIBITS.md) describe the exhibit format.
+
+### The research loop
+
 The second loop tries **ML research**, influenced by [Karpathy's autoresearch](https://github.com/karpathy/autoresearch). The models choose a hypothesis, write a `train.py`, send it to a Modal GPU runner and review the reported validation score. A kept change can be committed to the separate Research-Lab repository, along with the result and finding page. The loop runs on its own after an experiment is seeded; I read the record afterwards.
 
 Each training run gets a fresh Sandbox. Network access is blocked, credentials stay outside it, and the dataset cache is read-only. The default training budget is 300 seconds, followed by a bounded grace period for startup and evaluation. The controller stops the Sandbox after each run. I tested the isolation with a live CPU run. Independent evaluation of model quality is still unfinished.
@@ -74,9 +92,9 @@ I'm planning a fresh run soon with updated models. For that run, I want fixed mo
 
 The room regularly checks for updates to the saved experiment. When I run it locally without a connected experiment, it plays a preview of the scientists moving around and working at their desks. The corner label reads **Simulation: no experiment connected**. That is the mode shown in the GIF.
 
-I'm also working on giving each agent a separate work computer through Sprites. There is code for sending a command to one of those computers and showing its output on the agent's desk. I still need to test and record the full connected flow, including subagent work. Setting up those computers is currently manual, and the desk's success and failure colours need fixing.
+Each model's Sprite is the screen above its desk. When a model runs commands there, or the tests for its pull request run there, the screen plays back the stored output. A Sprite is created the first time it's needed. I still need to record the full connected flow, including subagent work.
 
-The research loop can save its experiment code and results in the separate Research-Lab repository. A broader feature for changing code in AI-Agent is off. That feature can open pull requests and merge them after automated checks. Before enabling it, I need to review its repository access and make sure the checks can run generated code safely, with credentials kept outside the test environment. [Implementation notes](docs/RESEARCH_NOTES.md) cover the permissions and setup.
+The research loop can save its experiment code and results in the separate Research-Lab repository. The AI-Agent write path described above is on for run 2. It uses a token limited to that one repository, and the generated code only runs in GitHub Actions and in the Sprites, neither of which holds the lab's credentials. [Implementation notes](docs/RESEARCH_NOTES.md) and [Operations](docs/OPERATIONS.md) cover the permissions and setup.
 
 ## Run it locally
 
@@ -100,6 +118,7 @@ npm run build
 npm run check:api
 npm run test:security
 npm run test:bundle
+node --test tests/run2.test.mjs tests/sprites.test.mjs tests/tools.test.mjs
 python -m unittest discover -s tests -v
 ```
 

@@ -120,6 +120,27 @@ export function terminalLinesForRun(run: SpriteRun): Array<{ text: string; type:
   ]
 }
 
+/**
+ * Lines for a stored Sprite session: where it ran, then the stored transcript
+ * (each command as `$ ...`, its output and its `[exit N, t s]` line), then
+ * how the session ended. The first command is the screen's prompt line, so
+ * its `$` line is not repeated.
+ */
+export function terminalLinesForSession(s: { spriteName: string; command: string; output: string; status: string; ranAt: string }): Array<{ text: string; type: 'output' | 'error' }> {
+  const lines = s.output
+    .split('\n')
+    .map(line => line.replace(/\s+$/, ''))
+    .filter(line => line.trim().length > 0)
+  if (lines[0] === `$ ${s.command}`) lines.shift()
+  const tail = lines.slice(-MAX_LINES).map(line => (line.length > 120 ? `${line.slice(0, 119)}…` : line))
+  const ok = s.status === 'ok'
+  return [
+    { text: `# ${s.spriteName}  ${shortTime(s.ranAt)}`, type: 'output' },
+    ...tail.map(text => ({ text, type: (/^\[exit (?!0,)/.test(text) ? 'error' : 'output') as 'output' | 'error' })),
+    ok ? { text: 'session ended: ok', type: 'output' } : { text: `session ended: ${s.status}`, type: 'error' },
+  ]
+}
+
 export class SpritesService {
   private activityCallbacks: ActivityCallback[] = []
   private streamCallbacks: StreamCallback[] = []
@@ -130,7 +151,7 @@ export class SpritesService {
   private polling = false
   private firstPoll = true
   private seenRuns: Set<string> = new Set()
-  private queue: Array<{ run: SpriteRun; notBefore: number }> = []
+  private queue: Array<{ play: () => Promise<void>; notBefore: number }> = []
   private playing = false
 
   setRepoUrl(url: string): void {
@@ -226,7 +247,7 @@ export class SpritesService {
     const now = Date.now()
     const toPlay = this.firstPoll ? fresh.slice(0, 1) : fresh.slice().reverse() // oldest first
     for (const run of toPlay) {
-      this.queue.push({ run, notBefore: this.firstPoll ? now : now + FRESH_DELAY_MS })
+      this.queue.push({ play: () => this.playRun(run), notBefore: this.firstPoll ? now : now + FRESH_DELAY_MS })
     }
     this.firstPoll = false
     void this.playQueue()
@@ -240,7 +261,7 @@ export class SpritesService {
         const item = this.queue.shift()!
         const wait = item.notBefore - Date.now()
         if (wait > 0) await sleep(wait)
-        await this.playRun(item.run)
+        await item.play()
       }
     } finally {
       this.playing = false
@@ -262,6 +283,33 @@ export class SpritesService {
     await sleep(HOLD_MS)
     this.emitStreamOutput({ type: 'done', modelId })
     this.emitActivity({ type: 'idle', spriteId: run.spriteName })
+  }
+
+  /**
+   * A stored Sprite session (a tool run, not a test run): the command and its
+   * real output on the model's desk screen, then the exit status. Queued with
+   * the test runs so one screen never shows two things at once.
+   */
+  playSession(session: { modelId: ModelId; spriteName: string; command: string; output: string; status: string; exitCode: number | null; ranAt: string }): void {
+    const { modelId } = session
+    this.queue.push({
+      notBefore: Date.now(),
+      play: async () => {
+        this.emitActivity({ type: 'testing', spriteId: session.spriteName, message: session.command })
+        this.emitStreamOutput({ type: 'start', modelId, command: session.command })
+        for (const line of terminalLinesForSession(session)) {
+          await sleep(LINE_MS)
+          this.emitStreamOutput({ type: line.type, modelId, text: line.text })
+        }
+        this.emitStreamOutput({ type: 'exit', modelId, exitCode: session.exitCode })
+        if (session.status !== 'ok') this.emitActivity({ type: 'error', spriteId: session.spriteName, message: `session ${session.status}` })
+        await sleep(HOLD_MS)
+        this.emitStreamOutput({ type: 'done', modelId })
+        this.emitActivity({ type: 'idle', spriteId: session.spriteName })
+      },
+    })
+    this.startRunPolling()
+    void this.playQueue()
   }
 
   // ---- operator helper (development builds only call this) ----

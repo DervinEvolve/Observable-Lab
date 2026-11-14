@@ -248,6 +248,16 @@ export class UIOverlay {
           transform: scale(0.74);
           transform-origin: center bottom;
         }
+        .scientist-label.drone-mini .label-task {
+          max-width: 170px;
+          margin-top: 2px;
+          font-size: 9px;
+          line-height: 1.3;
+          font-weight: 500;
+          color: #4a4036;
+          white-space: normal;
+          text-align: center;
+        }
 
         @keyframes pulse {
           0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--accent-color); }
@@ -1004,6 +1014,21 @@ export class UIOverlay {
     this.labelsContainer.appendChild(label)
     this.droneLabels.push({ el: label, target })
     return label
+  }
+
+  /** A drone sent on a stored task (an explorer run) carries that task on its nameplate. */
+  public setDroneTask(label: HTMLElement | null, parent: string, task: string): void {
+    const card = label?.querySelector('.label-card')
+    if (!card) return
+    const name = card.querySelector('.label-name')
+    if (name) name.textContent = `Explorer for ${parent}`
+    let line = card.querySelector('.label-task') as HTMLDivElement | null
+    if (!line) {
+      line = document.createElement('div')
+      line.className = 'label-task'
+      card.appendChild(line)
+    }
+    line.textContent = task
   }
 
   public removeDroneLabel(el: HTMLElement | null): void {

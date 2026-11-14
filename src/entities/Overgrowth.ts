@@ -1,6 +1,7 @@
 import * as THREE from 'three'
 import { LAB_RADIUS, LAB_HEIGHT } from '../scene/Lab'
 import { STATION_RADIUS } from './Station'
+import { flowerAccents, shapeKey, shapeParams, type OrganismShape } from '../systems/organismShape'
 
 // The specimen taking over the room. One organism grows out of the dome:
 // tendrils fill the glass, press on it, spill over the broken rim, root across
@@ -37,6 +38,9 @@ const VINE_YOUNG = new THREE.Color(0x8db04e)
 const CRACK = new THREE.Color(0x1e1610)
 const LEAF_TONES = [0x6f9a42, 0x7cb342, 0x8bc34a, 0x5f8a3a, 0x9ab755, 0x76a544].map(c => new THREE.Color(c))
 const CANOPY_TONES = [0x5f8a3a, 0x6f9a42, 0x4f7a34, 0x7cb342].map(c => new THREE.Color(c))
+const CREAM = new THREE.Color(0xf4ecd8)
+// before any record: the stage 6 minimums from docs/GROWTH.md, no merges known
+const DEFAULT_SHAPE: OrganismShape = { seed: 20261113, capabilities: 20, constraints: 10, behaviors: 30, merges: [], mergedTotal: 0 }
 const FLOWER_TONES = [0xf4ecd8, 0xe9c2b8, 0xf2d98d, 0xd9cce6, 0xf7f1e6].map(c => new THREE.Color(c))
 
 function rng(seed: number): () => number {
@@ -397,6 +401,15 @@ export class Overgrowth {
   private materials: THREE.Material[] = []
   private geometries: THREE.BufferGeometry[] = []
 
+  private readonly body = new THREE.Group()
+  private bodyGeometries: THREE.BufferGeometry[] = []
+  private bodyMaterials: THREE.Material[] = []
+  private shapeKey = ''
+  private bodyTriangles = 0
+  private effectTriangles = 0
+  public flowerCount = 0
+  public accentedFlowers = 0
+
   private level = 0 // what is drawn
   private target = 0 // what the record says
   private reducedMotion = false
@@ -405,106 +418,8 @@ export class Overgrowth {
 
   constructor() {
     this.group.name = 'overgrowth'
-    const b = new VineBuilder(20261113)
-    buildOrganism(b)
-
-    // --- vines, roots and floor cracks: one merged mesh
-    const vineGeo = b.vineGeometry()
-    const vineMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.82, metalness: 0.0 })
-    vineMat.onBeforeCompile = (sh: Shader) => {
-      Object.assign(sh.uniforms, this.uniforms)
-      lighterFog(sh)
-      sh.vertexShader = sh.vertexShader
-        .replace('#include <common>', `#include <common>\nattribute float aGrow;\nattribute vec3 aSpine;\nattribute float aSurf;\n${VIS_FN}`)
-        .replace(
-          '#include <begin_vertex>',
-          `vec3 transformed = vec3(position);
-          float ogk = ogGrow(aGrow, 0.14) * ogVisible((modelMatrix * vec4(aSpine, 1.0)).xyz, aSurf);
-          transformed = mix(aSpine, transformed, ogk);`
-        )
-    }
-    vineMat.customProgramCacheKey = () => 'og-vine'
-    const vines = new THREE.Mesh(vineGeo, vineMat)
-    vines.frustumCulled = false
-    vines.name = 'overgrowthVines'
-    this.group.add(vines)
-    this.track(vineGeo, vineMat)
-    this.triangleCount += (vineGeo.index?.count ?? 0) / 3
-
-    // --- leaves and flowers: instanced, scaled in by growth, swaying in the shader
-    const mkInstanced = (geo: THREE.BufferGeometry, specs: LeafSpec[], name: string, vertexColors: boolean, span: number) => {
-      const mat = new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, roughness: 0.7, metalness: 0, vertexColors })
-      mat.onBeforeCompile = (sh: Shader) => {
-        Object.assign(sh.uniforms, this.uniforms)
-        lighterFog(sh)
-        sh.vertexShader = sh.vertexShader
-          .replace('#include <common>', `#include <common>\nattribute vec4 aLeaf;\n${VIS_FN}`)
-          .replace(
-            '#include <begin_vertex>',
-            `vec3 transformed = vec3(position);
-            vec3 ogIp = (modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
-            float ogk = ogGrow(aLeaf.x, ${span.toFixed(2)}) * ogVisible(ogIp, aLeaf.z);
-            float ogSw = sin(uTime * 1.3 + aLeaf.y) * aLeaf.w * uSway + sin(uTime * 0.53 + aLeaf.y * 2.0) * aLeaf.w * 0.5 * uSway;
-            float ogC = cos(ogSw); float ogS = sin(ogSw);
-            transformed.yz = vec2(ogC * transformed.y - ogS * transformed.z, ogS * transformed.y + ogC * transformed.z);
-            transformed *= ogk;`
-          )
-      }
-      mat.customProgramCacheKey = () => 'og-' + name
-      const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, specs.length))
-      mesh.name = name
-      mesh.frustumCulled = false
-      const attr = new Float32Array(specs.length * 4)
-      specs.forEach((sp, i) => {
-        mesh.setMatrixAt(i, sp.m)
-        mesh.setColorAt(i, sp.color)
-        attr.set([sp.thr, sp.phase, sp.surf, sp.sway], i * 4)
-      })
-      mesh.count = specs.length
-      geo.setAttribute('aLeaf', new THREE.InstancedBufferAttribute(attr, 4))
-      mesh.instanceMatrix.needsUpdate = true
-      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
-      this.group.add(mesh)
-      this.track(geo, mat)
-      this.triangleCount += ((geo.index?.count ?? 0) / 3) * specs.length
-    }
-    mkInstanced(leafGeometry(), b.leaves, 'overgrowthLeaves', false, 0.1)
-    mkInstanced(flowerGeometry(), b.flowers, 'overgrowthFlowers', true, 0.16)
-
-    // --- lifted floorboards
-    {
-      const geo = new THREE.BoxGeometry(0.21, 0.035, 0.5)
-      geo.translate(0, 0.0175, 0.25) // pivot at the outer end, lying on the floor
-      const mat = new THREE.MeshStandardMaterial({ color: 0x67533f, roughness: 0.85, metalness: 0.02 })
-      mat.onBeforeCompile = (sh: Shader) => {
-        Object.assign(sh.uniforms, this.uniforms)
-        sh.vertexShader = sh.vertexShader
-          .replace('#include <common>', `#include <common>\nattribute vec2 aBoard;\n${VIS_FN}`)
-          .replace(
-            '#include <begin_vertex>',
-            `vec3 transformed = vec3(position);
-            float ogk = ogGrow(aBoard.x, 0.2);
-            float ogA = ogk * aBoard.y;
-            float ogC = cos(ogA); float ogS = sin(ogA);
-            transformed.yz = vec2(ogC * transformed.y + ogS * transformed.z, -ogS * transformed.y + ogC * transformed.z);
-            transformed *= step(0.001, ogk);`
-          )
-      }
-      mat.customProgramCacheKey = () => 'og-boards'
-      const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, b.boards.length))
-      mesh.name = 'overgrowthBoards'
-      mesh.frustumCulled = false
-      const attr = new Float32Array(b.boards.length * 2)
-      b.boards.forEach((bd, i) => {
-        mesh.setMatrixAt(i, bd.m)
-        attr.set([bd.thr, bd.tilt], i * 2)
-      })
-      mesh.count = b.boards.length
-      geo.setAttribute('aBoard', new THREE.InstancedBufferAttribute(attr, 2))
-      this.group.add(mesh)
-      this.track(geo, mat)
-      this.triangleCount += 12 * b.boards.length
-    }
+    this.body.name = 'overgrowthBody'
+    this.group.add(this.body)
 
     // --- falling leaves from the walls and canopy (shader-animated loop)
     {
@@ -546,7 +461,7 @@ export class Overgrowth {
       mesh.frustumCulled = false
       this.group.add(mesh)
       this.track(geo, mat)
-      this.triangleCount += 4 * COUNT
+      this.effectTriangles += 4 * COUNT
     }
 
     // --- drifting spores (replace the dust motes as the room overgrows)
@@ -628,8 +543,149 @@ export class Overgrowth {
       this.track(geo, this.shadeMat)
     }
 
-    this.triangleCount = Math.round(this.triangleCount)
+    this.triangleCount = this.effectTriangles
     this.group.visible = false
+  }
+
+  /**
+   * Grows this run's organism: seeded from the experiment id and shaped by the
+   * record (see organismShape.ts). Rebuilt only when the shape changes, which
+   * is at most once an epoch; growth itself stays a uniform.
+   */
+  public configure(shape: OrganismShape): void {
+    const key = shapeKey(shape)
+    if (key === this.shapeKey) return
+    this.shapeKey = key
+    this.disposeBody()
+    const b = new VineBuilder(shape.seed)
+    buildOrganism(b, shape)
+    // flowers in the order the vine grows them, coloured by merge order
+    b.flowers.sort((x, y) => x.thr - y.thr)
+    const accents = flowerAccents(b.flowers.length, shape.merges, shape.mergedTotal)
+    b.flowers.forEach((f, i) => {
+      const a = accents[i]
+      if (a !== null) f.color = new THREE.Color(a).lerp(CREAM, 0.18)
+    })
+    this.flowerCount = b.flowers.length
+    this.accentedFlowers = accents.filter(a => a !== null).length
+    this.bodyTriangles = 0
+    // --- vines, roots and floor cracks: one merged mesh
+    const vineGeo = b.vineGeometry()
+    const vineMat = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: 0.82, metalness: 0.0 })
+    vineMat.onBeforeCompile = (sh: Shader) => {
+      Object.assign(sh.uniforms, this.uniforms)
+      lighterFog(sh)
+      sh.vertexShader = sh.vertexShader
+        .replace('#include <common>', `#include <common>\nattribute float aGrow;\nattribute vec3 aSpine;\nattribute float aSurf;\n${VIS_FN}`)
+        .replace(
+          '#include <begin_vertex>',
+          `vec3 transformed = vec3(position);
+          float ogk = ogGrow(aGrow, 0.14) * ogVisible((modelMatrix * vec4(aSpine, 1.0)).xyz, aSurf);
+          transformed = mix(aSpine, transformed, ogk);`
+        )
+    }
+    vineMat.customProgramCacheKey = () => 'og-vine'
+    const vines = new THREE.Mesh(vineGeo, vineMat)
+    vines.frustumCulled = false
+    vines.name = 'overgrowthVines'
+    this.body.add(vines)
+    this.trackBody(vineGeo, vineMat)
+    this.bodyTriangles += (vineGeo.index?.count ?? 0) / 3
+
+    // --- leaves and flowers: instanced, scaled in by growth, swaying in the shader
+    const mkInstanced = (geo: THREE.BufferGeometry, specs: LeafSpec[], name: string, vertexColors: boolean, span: number) => {
+      const mat = new THREE.MeshStandardMaterial({ side: THREE.DoubleSide, roughness: 0.7, metalness: 0, vertexColors })
+      mat.onBeforeCompile = (sh: Shader) => {
+        Object.assign(sh.uniforms, this.uniforms)
+        lighterFog(sh)
+        sh.vertexShader = sh.vertexShader
+          .replace('#include <common>', `#include <common>\nattribute vec4 aLeaf;\n${VIS_FN}`)
+          .replace(
+            '#include <begin_vertex>',
+            `vec3 transformed = vec3(position);
+            vec3 ogIp = (modelMatrix * instanceMatrix * vec4(0.0, 0.0, 0.0, 1.0)).xyz;
+            float ogk = ogGrow(aLeaf.x, ${span.toFixed(2)}) * ogVisible(ogIp, aLeaf.z);
+            float ogSw = sin(uTime * 1.3 + aLeaf.y) * aLeaf.w * uSway + sin(uTime * 0.53 + aLeaf.y * 2.0) * aLeaf.w * 0.5 * uSway;
+            float ogC = cos(ogSw); float ogS = sin(ogSw);
+            transformed.yz = vec2(ogC * transformed.y - ogS * transformed.z, ogS * transformed.y + ogC * transformed.z);
+            transformed *= ogk;`
+          )
+      }
+      mat.customProgramCacheKey = () => 'og-' + name
+      const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, specs.length))
+      mesh.name = name
+      mesh.frustumCulled = false
+      const attr = new Float32Array(specs.length * 4)
+      specs.forEach((sp, i) => {
+        mesh.setMatrixAt(i, sp.m)
+        mesh.setColorAt(i, sp.color)
+        attr.set([sp.thr, sp.phase, sp.surf, sp.sway], i * 4)
+      })
+      mesh.count = specs.length
+      geo.setAttribute('aLeaf', new THREE.InstancedBufferAttribute(attr, 4))
+      mesh.instanceMatrix.needsUpdate = true
+      if (mesh.instanceColor) mesh.instanceColor.needsUpdate = true
+      this.body.add(mesh)
+      this.trackBody(geo, mat)
+      this.bodyTriangles += ((geo.index?.count ?? 0) / 3) * specs.length
+    }
+    mkInstanced(leafGeometry(), b.leaves, 'overgrowthLeaves', false, 0.1)
+    mkInstanced(flowerGeometry(), b.flowers, 'overgrowthFlowers', true, 0.16)
+
+    // --- lifted floorboards
+    {
+      const geo = new THREE.BoxGeometry(0.21, 0.035, 0.5)
+      geo.translate(0, 0.0175, 0.25) // pivot at the outer end, lying on the floor
+      const mat = new THREE.MeshStandardMaterial({ color: 0x67533f, roughness: 0.85, metalness: 0.02 })
+      mat.onBeforeCompile = (sh: Shader) => {
+        Object.assign(sh.uniforms, this.uniforms)
+        sh.vertexShader = sh.vertexShader
+          .replace('#include <common>', `#include <common>\nattribute vec2 aBoard;\n${VIS_FN}`)
+          .replace(
+            '#include <begin_vertex>',
+            `vec3 transformed = vec3(position);
+            float ogk = ogGrow(aBoard.x, 0.2);
+            float ogA = ogk * aBoard.y;
+            float ogC = cos(ogA); float ogS = sin(ogA);
+            transformed.yz = vec2(ogC * transformed.y + ogS * transformed.z, -ogS * transformed.y + ogC * transformed.z);
+            transformed *= step(0.001, ogk);`
+          )
+      }
+      mat.customProgramCacheKey = () => 'og-boards'
+      const mesh = new THREE.InstancedMesh(geo, mat, Math.max(1, b.boards.length))
+      mesh.name = 'overgrowthBoards'
+      mesh.frustumCulled = false
+      const attr = new Float32Array(b.boards.length * 2)
+      b.boards.forEach((bd, i) => {
+        mesh.setMatrixAt(i, bd.m)
+        attr.set([bd.thr, bd.tilt], i * 2)
+      })
+      mesh.count = b.boards.length
+      geo.setAttribute('aBoard', new THREE.InstancedBufferAttribute(attr, 2))
+      this.body.add(mesh)
+      this.trackBody(geo, mat)
+      this.bodyTriangles += 12 * b.boards.length
+    }
+
+    this.bodyTriangles = Math.round(this.bodyTriangles)
+    this.triangleCount = this.bodyTriangles + this.effectTriangles
+  }
+
+  private ensureBody(): void {
+    if (!this.shapeKey) this.configure(DEFAULT_SHAPE)
+  }
+
+  private trackBody(geo: THREE.BufferGeometry, mat: THREE.Material): void {
+    this.bodyGeometries.push(geo)
+    this.bodyMaterials.push(mat)
+  }
+
+  private disposeBody(): void {
+    this.bodyGeometries.forEach(g => g.dispose())
+    this.bodyMaterials.forEach(m => m.dispose())
+    this.bodyGeometries = []
+    this.bodyMaterials = []
+    this.body.clear()
   }
 
   private track(geo: THREE.BufferGeometry, mat: THREE.Material): void {
@@ -639,6 +695,7 @@ export class Overgrowth {
 
   /** Growth level from the stored record (stage + progress, 0..7). */
   public setTarget(level: number, immediate = false): void {
+    this.ensureBody()
     this.target = THREE.MathUtils.clamp(level, 0, 7)
     if (immediate || this.reducedMotion) this.level = this.target
   }
@@ -683,6 +740,7 @@ export class Overgrowth {
   }
 
   public dispose(): void {
+    this.disposeBody()
     this.geometries.forEach(g => g.dispose())
     this.materials.forEach(m => m.dispose())
   }
@@ -712,79 +770,105 @@ function cp(p: THREE.Vector3, g: number, r: number, n: THREE.Vector3 = UP, s = F
   return { p, g, r, n: n.clone(), s }
 }
 
-function buildOrganism(b: VineBuilder): void {
+function buildOrganism(b: VineBuilder, shape: OrganismShape): void {
   const R = () => b.r()
-  const root: PathOpts = { radial: 4, spacing: 0.3, lift: true, c0: ROOT_DARK, c1: ROOT, leafEvery: 0.3, leafSize: 0.13, flowerChance: 0.05, sway: 0.08 }
-  const vine: PathOpts = { radial: 3, spacing: 0.28, lift: true, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: 0.1, leafSize: 0.22, flowerChance: 0.12, sway: 0.18 }
-  const tendril: PathOpts = { radial: 3, spacing: 0.1, lift: true, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: 0.15, leafSize: 0.1, flowerChance: 0.1, sway: 0.15 }
-  const hanging: PathOpts = { radial: 3, spacing: 0.2, lift: false, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: 0.13, leafSize: 0.15, flowerChance: 0.08, sway: 0.3 }
+  const P = shapeParams(shape)
+  // more behaviours, denser leaves: leaf spacing shrinks
+  const every = (v: number) => v / P.leafDensity
+  const root: PathOpts = { radial: 4, spacing: 0.3, lift: true, c0: ROOT_DARK, c1: ROOT, leafEvery: every(0.3), leafSize: 0.13, flowerChance: 0.05, sway: 0.08 }
+  const vine: PathOpts = { radial: 3, spacing: 0.28, lift: true, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: every(0.1), leafSize: 0.22, flowerChance: 0.12, sway: 0.18 }
+  const tendril: PathOpts = { radial: 3, spacing: 0.1, lift: true, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: every(0.15), leafSize: 0.1, flowerChance: 0.1, sway: 0.15 }
+  const hanging: PathOpts = { radial: 3, spacing: 0.2, lift: false, c0: VINE_OLD, c1: VINE_YOUNG, leafEvery: every(0.13), leafSize: 0.15, flowerChance: 0.08, sway: 0.3 }
+  // more constraints, thicker roots
+  const girth = P.rootGirth
+
+  // This run's habit, all from the seed: which way the runners wind out of
+  // the dome, which way the canopy turns, how restless the climbers are.
+  const twist = R() < 0.5 ? 1 : -1
+  const sweep = R() < 0.5 ? 1 : -1
+  const wave = 0.03 + R() * 0.09
+  const waveF = 3 + R() * 5
+  const splitR = 2.2 + R() * 0.8
 
   // the station angles, and the gaps between desks where roots run to the wall
   const deskAngles = [0, 1, 2, 3, 4].map(i => (i * 2 * Math.PI) / 5 - Math.PI / 2)
 
+  // more capabilities, more climbing runners: share them out over the ten
+  // rail runs (five runners, two ways each), in a seeded order
+  const sides: Array<{ k: number; dirA: number; climbers: number }> = []
+  for (let k = 0; k < 5; k++) for (const dirA of [-1, 1]) sides.push({ k, dirA, climbers: 0 })
+  for (let i = sides.length - 1; i > 0; i--) {
+    const j = Math.floor(R() * (i + 1))
+    ;[sides[i], sides[j]] = [sides[j], sides[i]]
+  }
+  for (let c = 0; c < P.climbers; c++) sides[c % sides.length].climbers++
+
   for (let k = 0; k < 5; k++) {
     // start far enough round that the runner leaves the dome facing its desk
-    const a0 = deskAngles[k] - 2.2 + (R() - 0.5) * 0.2
+    const a0 = deskAngles[k] - twist * (2.2 + (R() - 0.5) * 0.4)
 
     // inside the dome: a low runner around the plant (stage 1), then up the
     // inside of the glass, pressing on it (stage 2)
     const inner: CP[] = []
     for (let j = 0; j <= 4; j++) {
       const t = j / 4
-      const a = a0 + t * 0.9
-      inner.push(cp(polar(0.12 + t * 0.6, a, 0.31 + Math.sin(t * Math.PI) * 0.08), 1.0 + t * 0.95, 0.03 - t * 0.006))
+      const a = a0 + twist * t * 0.9
+      inner.push(cp(polar(0.12 + t * 0.6, a, 0.31 + Math.sin(t * Math.PI) * (0.05 + R() * 0.06)), 1.0 + t * 0.95, 0.03 - t * 0.006))
     }
     const hug: CP[] = []
-    const aH = a0 + 0.9
+    const aH = a0 + twist * 0.9
+    const climbDome = 0.9 + R() * 0.4
     for (let j = 1; j <= 6; j++) {
       const t = j / 6
-      const el = 0.12 + t * 1.05 // elevation on the dome, radians
-      const az = aH + t * 1.3
+      const el = 0.12 + t * climbDome // elevation on the dome, radians
+      const az = aH + twist * t * 1.3
       const dir = new THREE.Vector3(Math.cos(el) * Math.cos(az), Math.sin(el), Math.cos(el) * Math.sin(az))
       hug.push(cp(DOME_C.clone().addScaledVector(dir, 0.9), 2.0 + t * 0.95, 0.026 + t * 0.006, dir.clone().negate()))
     }
     // out over the broken rim and down the wooden base to the floor (stage 3)
     const top = hug[hug.length - 1].p
-    const aOut = Math.atan2(top.z, top.x) + 0.25
+    const aOut = Math.atan2(top.z, top.x) + twist * 0.25
     const spill: CP[] = [
       cp(polar(1.02, aOut, 0.62), 3.06, 0.034),
-      cp(polar(1.12, aOut + 0.05, 0.34), 3.18, 0.04),
-      cp(polar(1.38, aOut + 0.08, 0.22), 3.3, 0.054, polar(1, aOut, 0.6).normalize()),
-      cp(polar(1.55, aOut + 0.1, 0.0), 3.42, 0.062),
+      cp(polar(1.12, aOut + twist * 0.05, 0.34), 3.18, 0.04),
+      cp(polar(1.38, aOut + twist * 0.08, 0.22), 3.3, 0.054, polar(1, aOut, 0.6).normalize()),
+      cp(polar(1.55, aOut + twist * 0.1, 0.0), 3.42, 0.062),
     ]
     const trunk = [...inner, ...hug, ...spill]
-    b.addPath(trunk, { ...tendril, radial: 4, spacing: 0.15, leafEvery: 0.2, leafSize: 0.11 })
+    b.addPath(trunk, { ...tendril, radial: 4, spacing: 0.15, leafEvery: every(0.2), leafSize: 0.11 })
 
     // across the floor (stage 4), splitting toward a desk and the wall
-    const split = polar(2.6, aOut + 0.25, 0)
-    const toSplit = [cp(polar(1.55, aOut + 0.1, 0), 3.42, 0.062), cp(polar(2.05, aOut + 0.2 + (R() - 0.5) * 0.2, 0), 3.62, 0.06), cp(split, 3.85, 0.056)]
+    const aS = aOut + twist * 0.25
+    const split = polar(splitR, aS, 0)
+    const toSplit = [cp(polar(1.55, aOut + twist * 0.1, 0), 3.42, 0.062 * girth), cp(polar((1.55 + splitR) / 2, aOut + twist * 0.2 + (R() - 0.5) * 0.3, 0), 3.62, 0.06 * girth), cp(split, 3.85, 0.056 * girth)]
     b.addPath(toSplit, root)
-    b.addLiftedBoards(polar(2.15, aOut + 0.2, 0), polar(1, aOut + 0.2, 0), 3.66)
+    b.addLiftedBoards(polar((1.55 + splitR) / 2 + 0.1, aOut + twist * 0.2, 0), polar(1, aOut + twist * 0.2, 0), 3.66)
 
-    // ---- desk branch: to the centre-facing leg, up it, across the desk to the lamp
+    // ---- desk branch: to a centre-facing leg, up it, across the desk to the lamp
     const st = stationFrame(k)
     const [lx, lz] = LAMP_LOCAL[k]
-    const sx = Math.sign(lx) || 1
+    const sx = (R() < 0.7 ? Math.sign(lx) : -Math.sign(lx)) || 1
     const legL = new THREE.Vector3(sx * 0.8, 0, 0.35)
     const legW = legL.clone().applyMatrix4(st)
-    const deskRoot: CP[] = [cp(split, 3.85, 0.05)]
+    const deskRoot: CP[] = [cp(split, 3.85, 0.05 * girth)]
     {
       const steps = 4
+      const amp = 0.15 + R() * 0.3
       for (let j = 1; j <= steps; j++) {
         const t = j / steps
         const p = new THREE.Vector3().lerpVectors(split, legW, t)
         const perp = new THREE.Vector3(-(legW.z - split.z), 0, legW.x - split.x).normalize()
-        if (j < steps) p.addScaledVector(perp, Math.sin(t * Math.PI * 2 + k) * 0.32)
+        if (j < steps) p.addScaledVector(perp, Math.sin(t * Math.PI * 2 + k) * amp)
         p.y = 0
-        deskRoot.push(cp(p, 3.85 + t * 1.0, 0.05 - t * 0.026))
+        deskRoot.push(cp(p, 3.85 + t * 1.0, (0.05 - t * 0.026) * girth))
       }
     }
     // a gentle hop around the leg base, then the climb
     const helix: CP[] = []
-    const turns = 2.25
+    const turns = 1.5 + R() * 1.5
     for (let j = 0; j <= 18; j++) {
       const t = j / 18
-      const th = t * turns * Math.PI * 2 + k
+      const th = t * turns * Math.PI * 2 * twist + k
       const local = new THREE.Vector3(legL.x + Math.cos(th) * 0.058, 0.02 + t * 0.74, legL.z + Math.sin(th) * 0.058)
       const nrm = new THREE.Vector3(Math.cos(th), 0, Math.sin(th)).transformDirection(st)
       helix.push(cp(local.applyMatrix4(st), 5.0 + t * 0.45, 0.02, nrm))
@@ -800,7 +884,7 @@ function buildOrganism(b: VineBuilder): void {
     const lampUp: CP[] = []
     for (let j = 0; j <= 10; j++) {
       const t = j / 10
-      const th = t * Math.PI * 3.2 + k
+      const th = t * Math.PI * 3.2 * twist + k
       lampUp.push(cp(new THREE.Vector3(lx + Math.cos(th) * 0.026, 0.86 + t * 0.24, lz + Math.sin(th) * 0.026).applyMatrix4(st), 5.66 + t * 0.26, 0.009, new THREE.Vector3(Math.cos(th), 0, Math.sin(th)).transformDirection(st)))
     }
     lampUp.push(cp(new THREE.Vector3(lx + 0.06, 1.15, lz).applyMatrix4(st), 5.96, 0.008))
@@ -812,113 +896,129 @@ function buildOrganism(b: VineBuilder): void {
       [
         cp(new THREE.Vector3(lx + 0.12, 1.2, lz + 0.02).applyMatrix4(st), 6.02, 0.006),
         cp(new THREE.Vector3(lx + 0.16, 1.06, lz + 0.05).applyMatrix4(st), 6.15, 0.005),
-        cp(new THREE.Vector3(lx + 0.15, 0.95, lz + 0.03).applyMatrix4(st), 6.3, 0.004),
+        cp(new THREE.Vector3(lx + 0.15, 0.95 - R() * 0.2, lz + 0.03).applyMatrix4(st), 6.3, 0.004),
       ],
-      { ...hanging, leafEvery: 0.07, leafSize: 0.06 }
+      { ...hanging, leafEvery: every(0.07), leafSize: 0.06 }
     )
-    // and one along the front edge to the far leg and down it
-    const edge: CP[] = []
-    for (let j = 0; j <= 6; j++) {
-      const t = j / 6
-      edge.push(cp(deskTop(sx * 0.8 - sx * 1.6 * t, 0.46, 0.79 + Math.sin(t * Math.PI * 3) * 0.015), 5.42 + t * 0.4, 0.014, new THREE.Vector3(0, 0, 1).transformDirection(st)))
+    // and, on most desks, one along the front edge to the far leg and down it
+    if (R() < 0.75) {
+      const edge: CP[] = []
+      for (let j = 0; j <= 6; j++) {
+        const t = j / 6
+        edge.push(cp(deskTop(sx * 0.8 - sx * 1.6 * t, 0.46, 0.79 + Math.sin(t * Math.PI * 3) * 0.015), 5.42 + t * 0.4, 0.014, new THREE.Vector3(0, 0, 1).transformDirection(st)))
+      }
+      for (let j = 1; j <= 8; j++) {
+        const t = j / 8
+        const th = t * 1.7 * Math.PI * 2
+        const nrm = new THREE.Vector3(Math.cos(th), 0, Math.sin(th)).transformDirection(st)
+        edge.push(cp(new THREE.Vector3(-sx * 0.8 + Math.cos(th) * 0.056, 0.76 - t * 0.7, 0.35 + Math.sin(th) * 0.056).applyMatrix4(st), 5.82 + t * 0.3, 0.012, nrm))
+      }
+      b.addPath(edge, { ...tendril, spacing: 0.1, leafEvery: every(0.2) })
     }
-    for (let j = 1; j <= 8; j++) {
-      const t = j / 8
-      const th = t * 1.7 * Math.PI * 2
-      const nrm = new THREE.Vector3(Math.cos(th), 0, Math.sin(th)).transformDirection(st)
-      edge.push(cp(new THREE.Vector3(-sx * 0.8 + Math.cos(th) * 0.056, 0.76 - t * 0.7, 0.35 + Math.sin(th) * 0.056).applyMatrix4(st), 5.82 + t * 0.3, 0.012, nrm))
-    }
-    b.addPath(edge, { ...tendril, spacing: 0.1, leafEvery: 0.2 })
 
-    // ---- wall branch: across the floor to the brass rail
-    let aW = deskAngles[k] + Math.PI / 5 + (R() - 0.5) * 0.3 // between this desk and the next
+    // ---- wall branch: across the floor to the brass rail, in the gap on
+    // one side of the desk or the other
+    const gapSide = R() < 0.5 ? 1 : -1
+    let aW = deskAngles[k] + gapSide * Math.PI / 5 + (R() - 0.5) * 0.35
     // take the short way round
-    while (aW - (aOut + 0.25) > Math.PI) aW -= Math.PI * 2
-    while (aW - (aOut + 0.25) < -Math.PI) aW += Math.PI * 2
-    const wallRoot: CP[] = [cp(split, 3.85, 0.056)]
+    while (aW - aS > Math.PI) aW -= Math.PI * 2
+    while (aW - aS < -Math.PI) aW += Math.PI * 2
+    const wallAt = (t: number) => THREE.MathUtils.lerp(aS, aW, Math.min(1, t * 1.3)) + Math.sin(t * waveF + k) * wave
+    const wallRoot: CP[] = [cp(split, 3.85, 0.056 * girth)]
     for (let j = 1; j <= 6; j++) {
       const t = j / 6
-      const r = THREE.MathUtils.lerp(2.6, RAIL_R - 0.12, t)
-      const a = THREE.MathUtils.lerp(aOut + 0.25, aW, Math.min(1, t * 1.3)) + Math.sin(t * 7 + k) * 0.06
-      wallRoot.push(cp(polar(r, a, 0), 3.85 + t * 1.1, 0.056 - t * 0.024))
+      const r = THREE.MathUtils.lerp(splitR, RAIL_R - 0.12, t)
+      wallRoot.push(cp(polar(r, wallAt(t), 0), 3.85 + t * 1.1, (0.056 - t * 0.024) * girth))
     }
     b.addPath(wallRoot, root)
-    // boards prised up and the floor split along the way
-    for (const rr of [4.1, 6.3]) {
-      const t = (rr - 2.6) / (RAIL_R - 0.12 - 2.6)
-      const a = THREE.MathUtils.lerp(aOut + 0.25, aW, Math.min(1, t * 1.3)) + Math.sin(t * 7 + k) * 0.06
+    const tAtR = (rr: number) => (rr - splitR) / (RAIL_R - 0.12 - splitR)
+    // more constraints, more of the floor prised up along the way
+    for (const rr of [4.1, 6.3, 5.2].slice(0, P.boardsPerRun)) {
+      const t = tAtR(rr + (R() - 0.5) * 0.4)
+      const a = wallAt(t)
       b.addLiftedBoards(polar(rr, a, 0), polar(1, a, 0), 3.85 + t * 1.1)
     }
-    // a few side roots off the wall branch
-    for (let j = 0; j < 2; j++) {
-      const rr = 3.4 + j * 2 + R() * 0.6
-      const t = (rr - 2.6) / (RAIL_R - 0.12 - 2.6)
-      const a = THREE.MathUtils.lerp(aOut + 0.25, aW, Math.min(1, t * 1.3))
-      const dir = (R() < 0.5 ? -1 : 1) * (0.12 + R() * 0.1)
+    // side roots off the wall branch: more and wider with more constraints
+    for (let j = 0; j < P.sideRoots; j++) {
+      const rr = splitR + 0.5 + ((j + R() * 0.8) / P.sideRoots) * (RAIL_R - splitR - 1.6)
+      const t = tAtR(rr)
+      const a = wallAt(t)
+      const dir = (R() < 0.5 ? -1 : 1) * (0.1 + R() * 0.1) * P.rootSpread
+      const reach = P.rootSpread
       const g = 3.85 + t * 1.1
       b.addPath(
-        [cp(polar(rr, a, 0), g, 0.02), cp(polar(rr + 0.5, a + dir, 0), g + 0.2, 0.014), cp(polar(rr + 0.8, a + dir * 2.2, 0), g + 0.35, 0.008)],
-        { ...root, radial: 3, leafEvery: 0.5 }
+        [cp(polar(rr, a, 0), g, 0.02 * girth), cp(polar(rr + 0.45 * reach, a + dir, 0), g + 0.2, 0.014 * girth), cp(polar(Math.min(RAIL_R - 0.2, rr + 0.75 * reach), a + dir * 2.2, 0), g + 0.35, 0.008 * girth)],
+        { ...root, radial: 3, leafEvery: every(0.5) }
       )
     }
 
     // ---- along the brass rail both ways (stage 5), then up the wall
     for (const dirA of [-1, 1]) {
-      const span = 0.42 + R() * 0.2
+      const climbers = sides.find(sd => sd.k === k && sd.dirA === dirA)?.climbers ?? 0
+      const span = 0.3 + R() * 0.45
       const rail: CP[] = [cp(polar(RAIL_R - 0.12, aW, 0), 4.95, 0.03)]
       for (let j = 1; j <= 6; j++) {
         const t = j / 6
         rail.push(cp(polar(RAIL_R, aW + dirA * span * t, 0.105), 5.0 + t * 0.4, 0.028, UP))
       }
+      if (climbers === 0) {
+        b.addPath(rail, { ...vine, spacing: 0.34 })
+        continue
+      }
       const aC = aW + dirA * span
       const climb: CP[] = []
+      const lean = (R() - 0.3) * 0.16
       for (let j = 0; j <= 8; j++) {
         const t = j / 8
         const y = 0.2 + t * (LAB_HEIGHT - 0.55)
-        const a = aC + Math.sin(t * 5 + k + dirA) * 0.05 + dirA * t * 0.08
+        const a = aC + Math.sin(t * waveF + k + dirA) * wave + dirA * t * lean
         const p = polar(WALL_R, a, y)
         climb.push(cp(p, 5.4 + t * 0.6, 0.036 - t * 0.012, inward(p), WALL))
       }
       // over the crown moulding and onto the ceiling, toward the lamp (stage 6)
       const aT = aC + dirA * 0.08
+      const turn = dirA * sweep * (0.25 + R() * 0.8)
       const ceiling: CP[] = [
         cp(polar(LAB_RADIUS - 0.12, aT, LAB_HEIGHT - 0.2), 6.02, 0.022, inward(polar(1, aT, 0)), WALL),
         cp(polar(LAB_RADIUS - 0.3, aT, CEIL_Y), 6.08, 0.022, DOWN, CEIL),
       ]
+      const reachIn = 0.4 + R() * 1.8
       for (let j = 1; j <= 7; j++) {
         const t = j / 7
-        const r = THREE.MathUtils.lerp(LAB_RADIUS - 0.3, 0.5, t)
-        const a = aT + dirA * t * 0.6 + Math.sin(t * 6 + k) * 0.12
+        const r = THREE.MathUtils.lerp(LAB_RADIUS - 0.3, reachIn, t)
+        const a = aT + t * turn + Math.sin(t * 6 + k) * 0.12
         ceiling.push(cp(polar(r, a, CEIL_Y), 6.08 + t * 0.75, 0.022 - t * 0.01, DOWN, CEIL))
       }
       b.addPath([...rail, ...climb], { ...vine, spacing: 0.34 })
-      // a second, younger climber from the middle of the rail run
-      {
-        const aM = aW + dirA * span * 0.5
+      // younger climbers from along the rail run
+      for (let c = 1; c < climbers; c++) {
+        const aM = aW + dirA * span * (c / climbers) + (R() - 0.5) * 0.05
+        const height = 0.55 + R() * 0.35
         const mid: CP[] = []
         for (let j = 0; j <= 7; j++) {
           const t = j / 7
-          const p = polar(WALL_R, aM + Math.sin(t * 4 + k * 2 + dirA) * 0.07, 0.12 + t * LAB_HEIGHT * 0.78)
+          const p = polar(WALL_R, aM + Math.sin(t * waveF * 0.8 + k * 2 + dirA + c) * wave, 0.12 + t * LAB_HEIGHT * height)
           mid.push(cp(p, 5.2 + t * 0.75, 0.03 - t * 0.012, inward(p), WALL))
         }
         b.addPath(mid, { ...vine, spacing: 0.34 })
       }
-      b.addPath(ceiling, { ...vine, spacing: 0.36, leafEvery: 0.2, leafSize: 0.24, leafTones: CANOPY_TONES })
+      b.addPath(ceiling, { ...vine, spacing: 0.36, leafEvery: every(0.2), leafSize: 0.24, leafTones: CANOPY_TONES })
 
       // canopy side shoots across the ceiling, with tendrils hanging down
-      for (let s = 0; s < 3; s++) {
-        const t = 0.2 + s * 0.25 + R() * 0.08
-        const r = THREE.MathUtils.lerp(LAB_RADIUS - 0.3, 0.5, t)
-        const a = aT + dirA * t * 0.6
+      const shoots = 2 + Math.floor(R() * 3)
+      for (let s = 0; s < shoots; s++) {
+        const t = 0.15 + (s / shoots) * 0.75 + R() * 0.08
+        const r = THREE.MathUtils.lerp(LAB_RADIUS - 0.3, reachIn, t)
+        const a = aT + t * turn
         const g = 6.08 + t * 0.75
         const side = (R() < 0.5 ? -1 : 1) * (0.25 + R() * 0.2)
         const shoot = [
           cp(polar(r, a, CEIL_Y), g, 0.014, DOWN, CEIL),
-          cp(polar(r - 0.4, a + side * 0.6, CEIL_Y), g + 0.15, 0.011, DOWN, CEIL),
-          cp(polar(r - 0.6, a + side * 1.3, CEIL_Y), g + 0.28, 0.008, DOWN, CEIL),
+          cp(polar(Math.max(0.5, r - 0.4), a + side * 0.6, CEIL_Y), g + 0.15, 0.011, DOWN, CEIL),
+          cp(polar(Math.max(0.5, r - 0.6), a + side * 1.3, CEIL_Y), g + 0.28, 0.008, DOWN, CEIL),
         ]
-        b.addPath(shoot, { ...vine, spacing: 0.3, leafEvery: 0.18, leafSize: 0.22, leafTones: CANOPY_TONES })
-        if (s !== 1) {
+        b.addPath(shoot, { ...vine, spacing: 0.3, leafEvery: every(0.18), leafSize: 0.22, leafTones: CANOPY_TONES })
+        if (R() < 0.65) {
           const end = shoot[2].p
           const drop = 0.5 + R() * 0.9
           b.addPath(
@@ -932,9 +1032,10 @@ function buildOrganism(b: VineBuilder): void {
         }
       }
       // drapes off the crown, down the wall: what you see of the canopy from above
-      for (let s = 0; s < 3; s++) {
-        const a = aC + dirA * (0.06 + s * 0.12) + (R() - 0.5) * 0.06
-        const len = 0.7 + R() * 1.1
+      const drapes = 2 + Math.floor(R() * 3)
+      for (let s = 0; s < drapes; s++) {
+        const a = aC + dirA * (0.06 + s * 0.1) + (R() - 0.5) * 0.06
+        const len = 0.5 + R() * 1.4
         const p0 = polar(LAB_RADIUS - 0.08, a, LAB_HEIGHT - 0.12)
         b.addPath(
           [
@@ -942,7 +1043,7 @@ function buildOrganism(b: VineBuilder): void {
             cp(polar(LAB_RADIUS - 0.04, a + 0.02, LAB_HEIGHT - 0.12 - len * 0.5), 6.25 + s * 0.05, 0.008, inward(p0), WALL),
             cp(polar(LAB_RADIUS, a + 0.03, LAB_HEIGHT - 0.12 - len), 6.5 + s * 0.05, 0.005, inward(p0), WALL),
           ],
-          { ...hanging, leafEvery: 0.12, leafSize: 0.16 }
+          { ...hanging, leafEvery: every(0.12), leafSize: 0.16 }
         )
       }
     }
@@ -952,35 +1053,40 @@ function buildOrganism(b: VineBuilder): void {
   // It is a real object in front of the room on the near side too, so these
   // stay visible from everywhere.
   const crownY = LAB_HEIGHT - 0.08
-  for (let k = 0; k < 6; k++) {
-    const a0 = (k / 6) * Math.PI * 2 + 0.3
-    const arc = 0.55 + R() * 0.2
+  const crowns = 4 + Math.floor(R() * 4)
+  const crownStart = R() * Math.PI * 2
+  for (let k = 0; k < crowns; k++) {
+    const a0 = crownStart + (k / crowns) * Math.PI * 2 + (R() - 0.5) * 0.4
+    const arc = 0.4 + R() * 0.45
     const crown: CP[] = []
     const steps = 28
     for (let j = 0; j <= steps; j++) {
       const t = j / steps
-      const a = a0 + t * arc
+      const a = a0 + sweep * t * arc
       const phi = t * arc * LAB_RADIUS * 2.2 + k // about one wrap per half metre
       const radial = polar(1, a, 0)
       const nrm = radial.clone().multiplyScalar(Math.cos(phi)).addScaledVector(UP, Math.sin(phi))
       const p = polar(LAB_RADIUS, a, crownY).addScaledVector(nrm, 0.08)
       crown.push(cp(p, 6.0 + t * 0.7, 0.022 - t * 0.008, nrm))
     }
-    b.addPath(crown, { ...vine, spacing: 0.15, leafEvery: 0.16, leafSize: 0.17 })
+    b.addPath(crown, { ...vine, spacing: 0.15, leafEvery: every(0.16), leafSize: 0.17 })
   }
 
   // around the central lamp: the canopy closes over the light
-  for (let k = 0; k < 4; k++) {
-    const a0 = (k / 4) * Math.PI * 2
+  const rings = 3 + Math.floor(R() * 3)
+  const ringStart = R() * Math.PI * 2
+  for (let k = 0; k < rings; k++) {
+    const a0 = ringStart + (k / rings) * Math.PI * 2
     const ring: CP[] = []
+    const bulge = 0.05 + R() * 0.15
     for (let j = 0; j <= 5; j++) {
       const t = j / 5
-      ring.push(cp(polar(0.5 + Math.sin(t * Math.PI) * 0.1, a0 + t * 1.6, CEIL_Y), 6.75 + t * 0.2, 0.012, DOWN, CEIL))
+      ring.push(cp(polar(0.5 + Math.sin(t * Math.PI) * bulge, a0 + sweep * t * 1.6, CEIL_Y), 6.75 + t * 0.2, 0.012, DOWN, CEIL))
     }
-    b.addPath(ring, { ...vine, spacing: 0.2, leafEvery: 0.14, leafSize: 0.2, leafTones: CANOPY_TONES })
+    b.addPath(ring, { ...vine, spacing: 0.2, leafEvery: every(0.14), leafSize: 0.2, leafTones: CANOPY_TONES })
     const end = ring[ring.length - 1].p
     b.addPath(
-      [cp(end.clone(), 6.95, 0.006, inward(end), CEIL), cp(end.clone().add(new THREE.Vector3(0.04, -0.6, 0.0)), 7.0, 0.004, inward(end), CEIL)],
+      [cp(end.clone(), 6.95, 0.006, inward(end), CEIL), cp(end.clone().add(new THREE.Vector3(0.04, -0.4 - R() * 0.4, 0.0)), 7.0, 0.004, inward(end), CEIL)],
       hanging
     )
   }

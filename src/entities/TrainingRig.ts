@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { mergeGeometries } from 'three/addons/utils/BufferGeometryUtils.js'
 import { COLORS } from '../scene/colors'
 
 // The lab's compute corner comes alive while a REAL GPU training run is in
@@ -16,8 +17,16 @@ const IDLE_GREEN = new THREE.Color(0x7cb342)
 export class TrainingRig {
   public group: THREE.Group
 
-  private lamps: THREE.Mesh[] = []
-  private lampMats: THREE.MeshBasicMaterial[] = []
+  // three status lamps drawn as one mesh; each lamp's colour and alpha live
+  // in its vertices' colours (rgba), updated per frame
+  private lamps: THREE.Mesh
+  private lampColours: THREE.BufferAttribute
+  private lampVerts = 0
+  // the last stored GPU job: its result line on a paper ticket beside the gauge
+  private ticket: THREE.Mesh
+  private ticketCanvas: HTMLCanvasElement
+  private ticketTexture: THREE.CanvasTexture
+  private jobUntil = -1
   private fan: THREE.Mesh
   private fanMat: THREE.ShaderMaterial
   private pulses: THREE.Points
@@ -43,18 +52,25 @@ export class TrainingRig {
     const inward = rackPos.clone().multiplyScalar(-1).setY(0).normalize()
 
     // --- status lamp stack on the rack's inner face ---
-    for (let i = 0; i < 3; i++) {
-      const mat = new THREE.MeshBasicMaterial({ color: IDLE_GREEN.clone(), transparent: true, opacity: 0.65 })
-      const lamp = new THREE.Mesh(new THREE.SphereGeometry(0.022, 8, 8), mat)
-      lamp.position.copy(rackPos)
-        .addScaledVector(inward, 0.33)
-        .add(new THREE.Vector3(0, 1.28 + i * 0.12, 0))
-      // offset sideways along the rack face
+    {
       const side = new THREE.Vector3(-inward.z, 0, inward.x)
-      lamp.position.addScaledVector(side, 0.18)
-      this.group.add(lamp)
-      this.lamps.push(lamp)
-      this.lampMats.push(mat)
+      const parts: THREE.BufferGeometry[] = []
+      for (let i = 0; i < 3; i++) {
+        const g = new THREE.SphereGeometry(0.022, 8, 8)
+        g.deleteAttribute('uv')
+        g.deleteAttribute('normal')
+        const p = rackPos.clone().addScaledVector(inward, 0.33).add(new THREE.Vector3(0, 1.28 + i * 0.12, 0)).addScaledVector(side, 0.18)
+        g.translate(p.x, p.y, p.z)
+        parts.push(g)
+      }
+      this.lampVerts = parts[0].getAttribute('position').count
+      const merged = mergeGeometries(parts, false)!
+      parts.forEach(g => g.dispose())
+      this.lampColours = new THREE.BufferAttribute(new Float32Array(this.lampVerts * 3 * 4), 4)
+      this.lampColours.setUsage(THREE.DynamicDrawUsage)
+      merged.setAttribute('color', this.lampColours)
+      this.lamps = new THREE.Mesh(merged, new THREE.MeshBasicMaterial({ vertexColors: true, transparent: true }))
+      this.group.add(this.lamps)
     }
 
     // --- cooling fan: rotating streak disc (same trick as drone rotors) ---
@@ -118,6 +134,23 @@ export class TrainingRig {
       m.lookAt(new THREE.Vector3(0, 2.15, 0))
       this.group.add(m)
     }
+
+    // --- paper ticket beside the gauge for a stored GPU job's result line ---
+    this.ticketCanvas = document.createElement('canvas')
+    this.ticketCanvas.width = 512
+    this.ticketCanvas.height = 128
+    this.ticketTexture = new THREE.CanvasTexture(this.ticketCanvas)
+    this.ticketTexture.colorSpace = THREE.SRGBColorSpace
+    this.ticket = new THREE.Mesh(new THREE.PlaneGeometry(0.84, 0.21), new THREE.MeshStandardMaterial({ map: this.ticketTexture, roughness: 0.9, emissive: 0x333028, emissiveMap: this.ticketTexture }))
+    // pinned on the wall beside the gauge, clear of the rack
+    {
+      const along = new THREE.Vector3(-wallPos.z, 0, wallPos.x).normalize()
+      this.ticket.position.copy(wallPos).addScaledVector(along, 0.72).setY(2.12)
+      this.ticket.position.multiplyScalar(0.999).setY(2.12)
+      this.ticket.lookAt(new THREE.Vector3(0, 2.12, 0))
+    }
+    this.ticket.visible = false
+    this.group.add(this.ticket)
     this.drawGauge(0)
   }
 
@@ -143,7 +176,7 @@ export class TrainingRig {
     ctx.fillText('TRAINING', c, 190)
     ctx.font = '600 26px "Courier New", monospace'
     ctx.fillStyle = this.bestBpb !== null && this.baselineBpb !== null && this.bestBpb < this.baselineBpb ? '#4a7a34' : '#3a3128'
-    ctx.fillText(this.bestBpb !== null ? this.bestBpb.toFixed(4) : '—', c, 224)
+    ctx.fillText(this.bestBpb !== null ? this.bestBpb.toFixed(4) : 'none yet', c, 224)
     ctx.font = '500 13px Georgia, serif'
     ctx.fillStyle = '#8a8072'
     ctx.fillText('best val_bpb', c, 242)
@@ -167,6 +200,44 @@ export class TrainingRig {
     this.active = active
   }
 
+  /**
+   * A stored GPU job: the corner lights up for a while and its result line
+   * stays on the ticket beside the gauge. `purpose` is what the model asked
+   * for, `line` the last line the job printed (self-reported), `by` the model.
+   */
+  public showJob(purpose: string, line: string, by: string, status: string, holdS = 45): void {
+    const ctx = this.ticketCanvas.getContext('2d')
+    if (!ctx) return
+    ctx.fillStyle = '#f4ecd8'
+    ctx.fillRect(0, 0, 512, 128)
+    ctx.strokeStyle = 'rgba(90, 80, 68, 0.6)'
+    ctx.setLineDash([6, 5])
+    ctx.strokeRect(5, 5, 502, 118)
+    ctx.setLineDash([])
+    ctx.textAlign = 'left'
+    ctx.fillStyle = '#5a5044'
+    ctx.font = '600 20px Georgia, serif'
+    ctx.fillText(`GPU job · ${by}`.slice(0, 44), 18, 36)
+    ctx.fillStyle = status === 'ok' ? '#4a7a34' : '#a33d2f'
+    ctx.textAlign = 'right'
+    ctx.fillText(status, 494, 36)
+    ctx.textAlign = 'left'
+    const fit = (text: string, max: number) => {
+      let t = text
+      while (ctx.measureText(t).width > max && t.length > 4) t = t.slice(0, -2)
+      return t === text ? t : `${t.trimEnd()}…`
+    }
+    ctx.fillStyle = '#5a5044'
+    ctx.font = 'italic 400 19px Georgia, serif'
+    ctx.fillText(fit(purpose.replace(/\s+/g, ' ').trim(), 476), 18, 70)
+    ctx.fillStyle = '#2b241b'
+    ctx.font = '600 21px "Courier New", monospace'
+    ctx.fillText(fit(line.replace(/\s+/g, ' ').trim(), 476), 18, 104)
+    this.ticketTexture.needsUpdate = true
+    this.ticket.visible = true
+    this.jobUntil = this.time + holdS
+  }
+
   public setResearch(best: number | null, baseline: number | null): void {
     if (best !== this.bestBpb || baseline !== this.baselineBpb) {
       this.bestBpb = best
@@ -178,17 +249,20 @@ export class TrainingRig {
   public update(dt: number): void {
     const fdt = Math.min(dt, 0.05)
     this.time += fdt
-    this.activeAmount += ((this.active ? 1 : 0) - this.activeAmount) * Math.min(1, fdt * 2)
+    const jobLive = this.time < this.jobUntil
+    this.activeAmount += ((this.active || jobLive ? 1 : 0) - this.activeAmount) * Math.min(1, fdt * 2)
     const k = this.activeAmount
 
     // lamps: slow green breathing idle → frantic amber chase while training
-    for (let i = 0; i < this.lamps.length; i++) {
-      const mat = this.lampMats[i]
+    const c = IDLE_GREEN.clone().lerp(AMBER, k)
+    const rgba = this.lampColours.array as Float32Array
+    for (let i = 0; i < 3; i++) {
       const idle = 0.45 + 0.2 * Math.sin(this.time * 1.2 + i * 2.1)
       const frantic = Math.sin(this.time * 9 + i * 2.4) > 0.2 ? 1 : 0.15
-      mat.opacity = idle * (1 - k) + frantic * k
-      mat.color.copy(IDLE_GREEN).lerp(AMBER, k)
+      const a = idle * (1 - k) + frantic * k
+      for (let v = 0; v < this.lampVerts; v++) rgba.set([c.r, c.g, c.b, a], (i * this.lampVerts + v) * 4)
     }
+    this.lampColours.needsUpdate = true
 
     // fan spins up
     this.fanAngle += fdt * (2 + k * 55)
@@ -229,5 +303,6 @@ export class TrainingRig {
       }
     })
     this.gaugeTexture.dispose()
+    this.ticketTexture.dispose()
   }
 }

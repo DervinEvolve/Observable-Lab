@@ -1,6 +1,6 @@
 import { sql } from '@vercel/postgres'
 import { getRoleAssignments } from './role-rotation.js'
-import { getSharedContext, ROLE_PROMPTS } from './prompts.js'
+import { getSharedContext, reviewerToolSection, ROLE_PROMPTS } from './prompts.js'
 import { runResearchEpoch } from './research-epoch.js'
 import { getExperimentStatus, getGrowthStage } from './seed-spec.js'
 import { generatePlantFromSpec } from './plant-generator.js'
@@ -38,7 +38,15 @@ import type {
   ReviewerDecision,
   RoleAssignments,
 } from './types.js'
-import { MODEL_DISPLAY_NAMES } from './types.js'
+import { MODEL_DISPLAY_NAMES, modelDisplayName } from './types.js'
+import { toolConfig } from './tools-config.js'
+import { planTools, type ToolPlan } from './tool-requests.js'
+import { prepareExhibit } from './exhibits.js'
+import { recordToolRun } from './tool-runs-store.js'
+import {
+  alreadyRan, readToolVerdicts, recentToolContext, recordIgnored, runDeliverables, runSideTools, subagentAllowance,
+  type EpochToolContext, type ToolOutcome,
+} from './epoch-tools.js'
 
 // Type-safe wrapper around OpenRouter callModel. Web search is opt-in per call
 // — it costs money and most turns don't need current external info, so only the
@@ -323,6 +331,13 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
       .join('\n')}`
   }
 
+  // What the models' own tools did recently (Sprite sessions, GPU jobs,
+  // exhibits, proposals), from the stored tool_runs records only.
+  const toolHistory = await recentToolContext(experimentId).catch(() => '')
+  if (toolHistory) {
+    sharedContext += `\n\nRECENT TOOL RUNS (what really ran, from the lab's records):\n${toolHistory}`
+  }
+
   // Each role's system prompt opens by naming which model, specifically, is
   // speaking — so they inhabit their own identity in the shared lab.
   const ctxFor = (modelId: string) =>
@@ -359,6 +374,13 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     await addNotebookNote(experimentId, epochNumber, `${role} (${answeredModel(output, modelId).split('/').pop()})`, note)
   }
 
+  // Tools the Executor chooses (tools-config.ts, epoch-tools.ts). Side tools
+  // start after the Executor and are awaited before the Commentator.
+  let sideTools: Promise<ToolOutcome[]> = Promise.resolve([])
+  let toolPlan: ToolPlan | null = null
+  let toolCtx: EpochToolContext | null = null
+  let toolsAlreadyRun: Set<string> = new Set()
+
   try {
     // 6. PLANNER
     let plannerOutput = existingEpoch?.planner_output as PlannerOutput | undefined
@@ -379,6 +401,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
 
     // 7. EXECUTOR
     let executorOutput = existingEpoch?.executor_output as ExecutorOutput | undefined
+    const executorWasStored = Boolean(executorOutput)
     if (!executorOutput) {
       const { output, cost, tokens: used } = await callModel<ExecutorOutput>(
         roleAssignments.executor,
@@ -393,6 +416,18 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
       `
       await saveNote('Executor', roleAssignments.executor, executorOutput)
     }
+
+    // 7b. The Executor's tool choices. Unknown or switched-off tools are
+    // ignored and recorded; the ones that remain run within their limits.
+    const executorModel = answeredModel(executorOutput, roleAssignments.executor)
+    toolCtx = {
+      experimentId, epochNumber, executorModelId: executorModel,
+      assignedExecutorId: roleAssignments.executor, reviewerModelId: roleAssignments.reviewer,
+    }
+    toolPlan = planTools((executorOutput as unknown as Record<string, unknown>).tools, toolConfig())
+    toolsAlreadyRun = await alreadyRan(toolCtx)
+    if (!executorWasStored) await recordIgnored(toolCtx, toolPlan)
+    sideTools = runSideTools(toolCtx, toolPlan, toolsAlreadyRun)
 
     // 8. CHALLENGER
     let challengerOutput = existingEpoch?.challenger_output as ChallengerOutput | undefined
@@ -438,7 +473,16 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     if (!reviewerOutput) {
       const { output, cost, tokens: used } = await callModel<ReviewerOutput>(
         roleAssignments.reviewer,
-        ctxFor(roleAssignments.reviewer) + '\n\n' + ROLE_PROMPTS.reviewer(executorOutput, challengerOutput, rebuttalOutput),
+        ctxFor(roleAssignments.reviewer) + '\n\n' + ROLE_PROMPTS.reviewer(executorOutput, challengerOutput, rebuttalOutput, reviewerToolSection({
+          exhibit: toolPlan?.exhibit ? {
+            slug: toolPlan.exhibit.slug,
+            check: (() => {
+              const checked = prepareExhibit(toolPlan.exhibit.exhibit, modelDisplayName(executorModel) || executorModel)
+              return checked.ok ? 'it meets the version 1 contract' : `it does NOT meet the contract and will not be opened (${checked.errors.slice(0, 3).join('; ')})`
+            })(),
+          } : undefined,
+          lab_proposal: toolPlan?.lab_proposal ? { title: toolPlan.lab_proposal.title, files: toolPlan.lab_proposal.files.map(f => f.path) } : undefined,
+        })),
         'Make final decisions on each proposed mutation.'
       )
       reviewerOutput = output
@@ -458,11 +502,17 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     const newSpec = applyMutations(specBefore, mutations as unknown as Mutation[], decisions, epochNumber)
 
     // 10b. At most ONE code contribution per epoch: the approved mutation most
-    // worth backing with code becomes a pull request on AI-Agent (explorer
-    // subagent, code, test subagent, CI, and the author's Sprite when
-    // configured). Only when today's spend allows it. Best-effort: a
-    // code-side failure never blocks the spec pipeline.
+    // worth backing with code becomes a pull request on AI-Agent (the
+    // explorer and test subagents the Executor chose, the code, CI, and the
+    // author's Sprite when configured). Only when today's spend allows it.
+    // Best-effort: a code-side failure never blocks the spec pipeline.
     const candidate = pickContributionCandidate(mutations, decisions, challengerOutput.challenges)
+    // An exhibit or lab proposal the Reviewer approved goes out alongside the
+    // code contribution (each waits on its own CI or nothing at all).
+    const deliverables: Promise<ToolOutcome[]> = toolPlan && toolCtx
+      ? runDeliverables(toolCtx, toolPlan, readToolVerdicts(reviewerOutput), toolsAlreadyRun,
+        executorModel !== roleAssignments.executor ? (modelDisplayName(roleAssignments.executor) || roleAssignments.executor) : undefined)
+      : Promise.resolve([])
     if (candidate) {
       const { mutation, decision } = candidate
       const budget = await checkDailyBudget()
@@ -476,16 +526,27 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
           // Throws (and skips the contribution) unless target is one of the
           // allowed mutation targets and the index is a small integer.
           const branchName = contributionBranchName(epochNumber, mutation.target, decision.mutation_index)
+          // The Executor chose its subagents (or got the default), within today's limit.
+          const chosen = toolPlan?.subagents ?? { explore: 1, test: true, chosen: false }
+          const subagents = await subagentAllowance(chosen)
+          if (subagents.note) console.warn(`[Epoch ${epochNumber}] subagents trimmed: ${subagents.note}`)
           const result = await contributeCode({
             authorModelId: roleAssignments.executor,
             branchName,
             title: `Epoch ${epochNumber}: ${mutation.target}: ${mutation.path}`,
             description: `${mutation.rationale}\n\nSpec field: ${mutation.target}.${mutation.path}\nProposed value: ${JSON.stringify(decision.modified_value ?? mutation.value)}`,
             review: { mode: 'approved' }, // Reviewer already approved this mutation
-            deploySubagent: true, // a subagent writes a test for this contribution
-            deployExplorerSubagent: true, // a subagent researches the problem first, findings inform the code
+            subagents: { explore: subagents.explore, test: subagents.test },
             agentContext,
           })
+          for (const run of result.subagents ?? []) {
+            await recordToolRun({
+              experimentId, epoch: epochNumber, model: run.model, tool: run.kind === 'explore' ? 'subagent_explore' : 'subagent_test',
+              requestSummary: run.kind === 'explore' ? (run.task || 'explore') : `test for ${branchName}`,
+              status: run.ok ? 'ok' : 'error', costUsd: run.cost,
+              detail: { branch: branchName, pr_url: result.pr_url ?? null, chosen_by_executor: chosen.chosen, files: run.files ?? [] },
+            })
+          }
           // The ledger already holds these calls; this keeps the in-memory total honest too.
           totalCost += result.cost
           await persistContribution(experimentId, epochNumber, roleAssignments.executor, branchName, result)
@@ -508,6 +569,8 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
         }
       }
     }
+
+    const toolOutcomes: ToolOutcome[] = [...(await sideTools), ...(await deliverables)]
 
     // Always a number in 0..1 (a string or 85 from a model would break the
     // DECIMAL(4,3) stability_delta column and the lighting).
@@ -569,6 +632,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
           executor: executorOutput,
           challenger: challengerOutput,
           reviewer: reviewerOutput,
+          tools: toolOutcomes,
         }),
         'Summarize this epoch for human observers.'
       )

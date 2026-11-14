@@ -19,7 +19,10 @@ import { AbstractScreen, ScreenActivity } from './entities/AbstractScreen'
 import { TerminalScreen } from './entities/TerminalScreen'
 import { GlassTerrarium } from './entities/GlassTerrarium'
 import { Overgrowth } from './entities/Overgrowth'
+import { ExhibitHall } from './entities/ExhibitHall'
+import { ToolRunsService, parseToolRuns } from './systems/toolRuns'
 import { parseGrowth, growthLevel } from './systems/growth'
+import { parseMerges, seedFromId, shapeFrom, type MergeMark } from './systems/organismShape'
 import { repoLinksFrom } from './systems/repoLinks'
 import { StationRole, COLORS } from './scene/colors'
 import { UIOverlay } from './systems/UIOverlay'
@@ -32,7 +35,7 @@ import { getStateManager } from './api/StateManager'
 import { getTaskOrchestrator, Task, TaskType } from './systems/TaskOrchestrator'
 import { getSpritesService, SpritesActivityEvent, StreamOutputEvent, ModelId as SpriteModelId } from './systems/SpritesService'
 import type { ExperimentState, ExperimentStatus } from './shared/types'
-import { BACKEND_TO_FRONTEND_MODEL, ROLES, MODEL_DISPLAY_NAMES, WILDCARD_DISPLAY_NAMES } from './shared/types'
+import { BACKEND_TO_FRONTEND_MODEL, ROLES, MODEL_DISPLAY_NAMES, WILDCARD_DISPLAY_NAMES, modelDisplayName } from './shared/types'
 
 // Map backend role names to station roles
 const ROLE_TO_STATION: Record<string, StationRole> = {
@@ -52,10 +55,16 @@ class ObservableLab {
   private glassTerrarium: GlassTerrarium
   // The specimen spreading through the room, driven only by the stored growth record
   private overgrowth: Overgrowth
+  private exhibitHall: ExhibitHall | null = null
+  private toolRuns: ToolRunsService | null = null
   private growthSeen = false // a growth record (or the dev preview) has arrived
   private growthShattered = false // the record says the glass is broken
   private growthTarget = 0
   private devGrowth = false // development preview via ?growth= is in charge
+  // merged contributions seen on the public contributions endpoint, by id,
+  // used for flower colours when the growth record carries no merge list
+  private mergeLog: Map<string, MergeMark> = new Map()
+  private lastShapeState: ExperimentState | null = null
   private baseExposure = 1.2
   private baseFog = new THREE.Color(0xf5f2eb)
   private canopyFog = new THREE.Color(0xdde4cc)
@@ -238,6 +247,7 @@ class ObservableLab {
       this.archive.group.position.set(Math.cos(a) * 7.8, 1.35, Math.sin(a) * 7.8)
       this.archive.group.rotation.y = -a - Math.PI / 2
     }
+    batchStatic(this.archive.group) // its frame; jars and books are added later
     this.scene.add(this.archive.group)
 
     // The challenger's kill-wall: pruned ideas end up in ashen jars above
@@ -248,6 +258,7 @@ class ObservableLab {
       this.killWall.group.position.set(Math.cos(a) * 7.84, 2.05, Math.sin(a) * 7.84)
       this.killWall.group.rotation.y = -a - Math.PI / 2
     }
+    batchStatic(this.killWall.group)
     this.scene.add(this.killWall.group)
 
     // The compute corner comes alive during real GPU training runs
@@ -285,6 +296,7 @@ class ObservableLab {
     // Add lighting and store ambient light reference
     const lighting = createLighting()
     this.scene.add(lighting)
+    batchStatic(lighting) // the lamp's brass parts
 
     // Find and store ambient light for LightingController
     lighting.traverse((obj) => {
@@ -297,10 +309,15 @@ class ObservableLab {
     const stations = createAllStations()
     this.scene.add(stations)
 
-    // The shell, set dressing and desks never move: merge what looks alike
-    for (const root of [lab, labDetails, stations]) {
-      const r = batchStatic(root)
-      if (import.meta.env.DEV) console.log(`batched ${root.name}: ${r.before} -> ${r.after} meshes`)
+    // The shell, set dressing and desks never move: merge what looks alike,
+    // across all three at once so they share draw calls
+    {
+      const fixed = new THREE.Group()
+      fixed.name = 'room_fixed'
+      fixed.add(lab, labDetails, stations)
+      this.scene.add(fixed)
+      const r = batchStatic(fixed)
+      if (import.meta.env.DEV) console.log(`batched room: ${r.before} -> ${r.after} meshes`)
     }
 
     // Add the procedural plant
@@ -311,6 +328,18 @@ class ObservableLab {
 
     // What grows out of it once the record says so
     this.scene.add(this.overgrowth.group)
+
+    // Merged exhibits on plinths and shelves round the walls (none without a backend)
+    this.exhibitHall = new ExhibitHall(this.camera, this.renderer.domElement)
+    {
+      const mq = window.matchMedia?.('(prefers-reduced-motion: reduce)')
+      if (mq) {
+        this.exhibitHall.setReducedMotion(mq.matches)
+        mq.addEventListener?.('change', e => this.exhibitHall?.setReducedMotion(e.matches))
+      }
+    }
+    this.scene.add(this.exhibitHall.group)
+    this.exhibitHall.startPolling()
 
     // Set up shatter callback to persist state
     this.glassTerrarium.onShatter = () => {
@@ -438,6 +467,30 @@ class ObservableLab {
   }
 
   private initializePhase4Systems(): void {
+    // Stored tool runs (src/systems/toolRuns.ts): each plays once, nothing
+    // plays without a stored run
+    this.toolRuns = new ToolRunsService({
+      sprite_session: run => {
+        if (!run.desk || !run.command || !run.output) return // no desk for this model: nothing to show it on
+        getSpritesService().playSession({
+          modelId: run.desk,
+          spriteName: run.spriteName || `observable-${run.desk}`,
+          command: run.command,
+          output: run.output,
+          status: run.status,
+          exitCode: run.exitCode ?? null,
+          ranAt: run.at,
+        })
+      },
+      gpu_job: run => {
+        if (run.resultLine) this.trainingRig?.showJob(run.summary ?? 'GPU job', run.resultLine, run.modelName, run.status)
+      },
+      explorer: run => {
+        // the contribution's own drone may already carry this task
+        if (run.task && !this.drones.some(d => !d.dead && d.lockedTask === run.task)) void this.spawnRealSubagentDrone(run.modelName, run.task, true)
+      },
+    })
+
     // Initialize LightingController
     if (this.ambientLight) {
       this.lightingController = new LightingController({
@@ -506,7 +559,11 @@ class ObservableLab {
       scene: this.scene,
       renderer: this.renderer,
       camera: this.camera,
+      controls: this.controls,
       overgrowth: this.overgrowth,
+      exhibits: () => this.exhibitHall,
+      // feed stored tool_runs rows through the same path as the state (development only)
+      acceptToolRuns: (raw: unknown) => this.toolRuns?.accept(parseToolRuns(raw)),
       renderInfo: () => ({ ...this.renderer.info.render, geometries: this.renderer.info.memory.geometries, textures: this.renderer.info.memory.textures }),
       // Replay live per-role activity from a real in-progress/completed epoch object
       liveReplay: (epoch: ExperimentState['recent_epochs'][0]) => { this.liveAnnouncedKeys.clear(); this.streamedBrowsingKeys.clear(); this.driveLiveEpochActivity(epoch) },
@@ -1061,7 +1118,22 @@ class ObservableLab {
     if (growth && !this.devGrowth) {
       this.applyGrowth(growthLevel(growth), growth.glass_shattered === true || !!state.glass_shattered)
     }
-    if (extra.repos !== undefined) this.uiOverlay.setRepoLinks(repoLinksFrom(extra.repos))
+    // tool runs may also come on the state itself
+    const runsOnState = (state as unknown as { tool_runs?: unknown }).tool_runs
+    if (runsOnState !== undefined) this.toolRuns?.accept(parseToolRuns(runsOnState))
+
+    if (!this.devGrowth) {
+      const firstShape = !this.lastShapeState
+      this.lastShapeState = state
+      this.applyOrganismShape(state)
+      if (firstShape) void this.loadMergeHistory()
+    }
+    if (extra.repos !== undefined) {
+      const links = repoLinksFrom(extra.repos)
+      this.uiOverlay.setRepoLinks(links)
+      const specimen = links.find(l => l.key === 'ai_agent')
+      if (specimen) this.exhibitHall?.setRepoUrl(specimen.url)
+    }
 
     // Older records without growth: the glass reacts to the plant's bounds
     if (!this.growthSeen) this.glassTerrarium.checkPlantBounds(this.plant.group)
@@ -1242,8 +1314,8 @@ class ObservableLab {
       const fellBack = servedBy?.fallback === true && typeof servedBy.model === 'string' && servedBy.model !== ''
       const backendModelId = (fellBack ? servedBy.model : assignedModelId) as typeof assignedModelId
       const frontendModelId = (BACKEND_TO_FRONTEND_MODEL as Record<string, SpriteModelId>)[backendModelId]
-      const name = (MODEL_DISPLAY_NAMES[backendModelId] || backendModelId) +
-        (fellBack ? ` (fallback for ${MODEL_DISPLAY_NAMES[assignedModelId] || assignedModelId})` : '')
+      const name = (modelDisplayName(backendModelId) || backendModelId) +
+        (fellBack ? ` (fallback for ${modelDisplayName(assignedModelId) || assignedModelId})` : '')
       const accentHex = frontendModelId
         ? '#' + (COLORS.models[frontendModelId] ?? 0x9aa4ad).toString(16).padStart(6, '0')
         : '#9aa4ad'
@@ -1428,12 +1500,16 @@ class ObservableLab {
           subagent_files: Array<{ path: string; content: string }>
           explorer_task: string | null
           explorer_findings: string | null
+          created_at?: string
           web_searches?: string[]
           web_sources?: Array<{ url: string; title: string }>
         }>
       }
 
       for (const contribution of data.contributions) {
+        if (contribution.merged && typeof contribution.created_at === 'string') {
+          this.mergeLog.set(contribution.id, { model_id: contribution.model_id, merged_at: contribution.created_at })
+        }
         if (this.streamedContributionIds.has(contribution.id)) continue
         this.streamedContributionIds.add(contribution.id)
 
@@ -1469,6 +1545,7 @@ class ObservableLab {
         }
 
       }
+      if (this.lastShapeState && !this.devGrowth) this.applyOrganismShape(this.lastShapeState)
     } catch (e) {
       console.warn('[ObservableLab] Failed to fetch code contributions:', e)
     }
@@ -1477,10 +1554,12 @@ class ObservableLab {
   // Deploy a drone for a subagent that really did something (explored a
   // problem or wrote a test — not the debug/random simulation) and despawn
   // that exact drone once its work is done.
-  private async spawnRealSubagentDrone(parentModel: string, realTask?: string): Promise<void> {
+  private async spawnRealSubagentDrone(parentModel: string, realTask?: string, showTask = false): Promise<void> {
     const drone = await this.spawnSubagent(parentModel)
     if (!drone) return // at the visible cap right now — skip rather than evict another one
     if (realTask) drone.lockedTask = realTask
+    // a stored explorer run: the task is written on the drone's nameplate
+    if (realTask && showTask) this.uiOverlay.setDroneTask(drone.labelEl ?? null, parentModel, realTask)
     // Linger long enough for a viewer to notice, hover, and read the task the
     // subagent worked on this epoch (they don't do real work every second, so
     // a short life made them easy to miss).
@@ -1847,44 +1926,57 @@ class ObservableLab {
 
   // One pinned index card per active behavior (cap 12). First sync lays the
   // board out instantly; behaviors gained while watching pop in.
-  private corkNotes: THREE.Mesh[] = []
+  // Behaviour cards on the corkboard and chalk tallies on the planner's board
+  // are one instanced mesh each (one draw call apiece, however many there are).
+  private corkNotes: THREE.InstancedMesh | null = null
+  private corkCount = 0
   private syncBehaviorBoard(count: number): void {
     const board = this.scene.getObjectByName('corkboard')
     if (!board) return
     const target = Math.min(count, 12)
     const colors = [0xf6e08a, 0xbfe3c0, 0xf3b8b0, 0xbcd3ef]
-    const animate = this.corkNotes.length > 0
-    while (this.corkNotes.length < target) {
-      const i = this.corkNotes.length
-      const note = new THREE.Mesh(
-        new THREE.PlaneGeometry(0.14, 0.14),
-        new THREE.MeshStandardMaterial({ color: colors[i % colors.length], roughness: 0.9 })
+    if (!this.corkNotes) {
+      this.corkNotes = new THREE.InstancedMesh(new THREE.PlaneGeometry(0.14, 0.14), new THREE.MeshStandardMaterial({ roughness: 0.9 }), 12)
+      this.corkNotes.count = 0
+      this.corkNotes.frustumCulled = false
+      board.add(this.corkNotes)
+    }
+    const notes = this.corkNotes
+    const animate = this.corkCount > 0
+    const place = (i: number, scale: number) => {
+      const m = new THREE.Matrix4().compose(
+        new THREE.Vector3(-0.36 + (i % 4) * 0.24, 0.2 - Math.floor(i / 4) * 0.22, 0.03),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, ((i * 29) % 11 - 5) * 0.03)),
+        new THREE.Vector3(scale, scale, scale)
       )
-      note.position.set(-0.36 + (i % 4) * 0.24, 0.2 - Math.floor(i / 4) * 0.22, 0.03)
-      note.rotation.z = ((i * 29) % 11 - 5) * 0.03
-      board.add(note)
-      this.corkNotes.push(note)
+      notes.setMatrixAt(i, m)
+      notes.instanceMatrix.needsUpdate = true
+    }
+    while (this.corkCount < target) {
+      const i = this.corkCount++
+      notes.setColorAt(i, new THREE.Color(colors[i % colors.length]))
+      if (notes.instanceColor) notes.instanceColor.needsUpdate = true
+      notes.count = this.corkCount
       if (animate) {
-        note.scale.setScalar(0.01)
-        gsap.to(note.scale, { x: 1, y: 1, z: 1, duration: 0.6, ease: 'back.out(2.5)' })
-      }
+        const pop = { s: 0.01 }
+        place(i, pop.s)
+        gsap.to(pop, { s: 1, duration: 0.6, ease: 'back.out(2.5)', onUpdate: () => place(i, pop.s) })
+      } else place(i, 1)
     }
   }
-
-  // Chalk-style tally marks on the planner's whiteboard, one per epoch,
-  // bundled in groups of five (four bars + a diagonal strike).
   private tallyCount = 0
-  private tallyGroup: THREE.Group | null = null
+  private tallies: THREE.InstancedMesh | null = null
   private syncEpochTallies(epochs: number): void {
     const props = this.scene.getObjectByName('station_planner')
     if (!props) return
-    if (!this.tallyGroup) {
-      this.tallyGroup = new THREE.Group()
-      this.tallyGroup.name = 'epochTallies'
-      props.add(this.tallyGroup)
+    if (!this.tallies) {
+      this.tallies = new THREE.InstancedMesh(new THREE.BoxGeometry(1, 1, 1), new THREE.MeshBasicMaterial({ color: 0x3a4a56 }), 40)
+      this.tallies.name = 'epochTallies'
+      this.tallies.count = 0
+      this.tallies.frustumCulled = false
+      props.add(this.tallies)
     }
     const target = Math.min(epochs, 40)
-    const ink = new THREE.MeshBasicMaterial({ color: 0x3a4a56 })
     while (this.tallyCount < target) {
       const n = this.tallyCount
       const g = Math.floor(n / 5)
@@ -1892,16 +1984,18 @@ class ObservableLab {
       const baseX = 0.16 + (g % 4) * 0.15
       const baseY = 1.5 - Math.floor(g / 4) * 0.16
       const isStrike = inGroup === 4
-      const mark = new THREE.Mesh(
-        new THREE.BoxGeometry(0.012, isStrike ? 0.13 : 0.09, 0.004),
-        ink
+      const m = new THREE.Matrix4().compose(
+        new THREE.Vector3(baseX + (isStrike ? 0.036 : inGroup * 0.024), baseY, -0.525),
+        new THREE.Quaternion().setFromEuler(new THREE.Euler(0, 0, isStrike ? 1.1 : ((n * 13) % 5 - 2) * 0.02)),
+        new THREE.Vector3(0.012, isStrike ? 0.13 : 0.09, 0.004)
       )
-      mark.position.set(baseX + (isStrike ? 0.036 : inGroup * 0.024), baseY, -0.525)
-      mark.rotation.z = isStrike ? 1.1 : ((n * 13) % 5 - 2) * 0.02
-      this.tallyGroup.add(mark)
+      this.tallies.setMatrixAt(n, m)
       this.tallyCount++
     }
+    this.tallies.count = this.tallyCount
+    this.tallies.instanceMatrix.needsUpdate = true
   }
+
 
   private mapGrowthStage(stage: string): number {
     const stages: Record<string, number> = {
@@ -2004,6 +2098,39 @@ class ObservableLab {
     this.patinaSystem?.setDustSuppression(air)
   }
 
+  // This run's organism: seeded by the experiment id, shaped by the growth
+  // record, flowers coloured by who merged what (organismShape.ts). The merge
+  // list comes from the record when the backend sends one (growth.merges),
+  // otherwise from merged contributions the room has seen on the public
+  // contributions endpoint; merges with no known author keep plain flowers.
+  private applyOrganismShape(state: ExperimentState): void {
+    if (!state?.id) return
+    const extra = state as unknown as { growth?: Record<string, unknown>; merges?: unknown }
+    const growth = extra.growth && typeof extra.growth === 'object' ? extra.growth : null
+    let merges = parseMerges(growth?.merges ?? extra.merges)
+    if (!merges.length && this.mergeLog.size) merges = parseMerges([...this.mergeLog.values()])
+    this.overgrowth.configure(shapeFrom(state.id, growth, merges))
+    this.plant.setSeed(seedFromId(state.id))
+  }
+
+  // Merged contributions so far (the endpoint returns the newest 20), read
+  // once on load for flower colours. Nothing is streamed from here.
+  private async loadMergeHistory(): Promise<void> {
+    try {
+      const response = await fetch('/api/experiment/code-contributions?since_epoch=0', { headers: { Accept: 'application/json' } })
+      if (!response.ok || !(response.headers.get('content-type') || '').includes('json')) return
+      const data = (await response.json()) as { contributions?: Array<{ id?: unknown; merged?: unknown; model_id?: unknown; created_at?: unknown }> }
+      for (const c of data.contributions ?? []) {
+        if (c.merged === true && typeof c.id === 'string' && typeof c.model_id === 'string' && typeof c.created_at === 'string') {
+          this.mergeLog.set(c.id, { model_id: c.model_id, merged_at: c.created_at })
+        }
+      }
+      if (this.lastShapeState && !this.devGrowth) this.applyOrganismShape(this.lastShapeState)
+    } catch {
+      // no backend: flowers stay plain
+    }
+  }
+
   // Development only: preview any stage without a backend.
   //   ?growth=0..6&growthProgress=0..1    window.lab.growth(stage, progress)
   private applyDevGrowthPreview(): void {
@@ -2022,7 +2149,16 @@ class ObservableLab {
         badge.style.cssText = 'position:fixed;top:12px;right:12px;z-index:400;padding:6px 10px;border-radius:8px;background:#1f1a14;color:#fff;font:600 12px -apple-system,sans-serif;pointer-events:none'
         document.body.appendChild(badge)
       }
-      badge.textContent = `Dev preview: growth stage ${st}, progress ${pr.toFixed(2)} (not real data)`
+      // the organism this stage's minimums would grow (docs/GROWTH.md), for
+      // the run named by ?devRun= and, if given, ?devMerges=claude,gpt,...
+      const caps = [0, 1, 4, 8, 12, 16, 20][st]
+      const cons = [0, 0, 2, 4, 6, 8, 10][st]
+      const elems = [0, 4, 12, 24, 36, 48, 60][st]
+      const run = q.get('devRun') || 'dev-preview'
+      const merges = (q.get('devMerges') || '').split(',').map(f => Object.entries(BACKEND_TO_FRONTEND_MODEL).find(([, v]) => v === f.trim())?.[0]).filter((m): m is string => !!m).map(model_id => ({ model_id, merged_at: null }))
+      this.overgrowth.configure(shapeFrom(run, { capabilities: caps, constraints: cons, behaviors: elems - caps - cons, merged_contributions: merges.length }, merges))
+      this.plant.setSeed(seedFromId(run))
+      badge.textContent = `Dev preview: run ${run}, growth stage ${st}, progress ${pr.toFixed(2)} (not real data)`
     }
     const stage = q.get('growth')
     if (stage !== null && !Number.isNaN(Number(stage))) show(Number(stage), Number(q.get('growthProgress') ?? 0) || 0, true)
@@ -2597,6 +2733,7 @@ class ObservableLab {
 
     // The specimen's spread through the room
     this.updateGrowthEffects(deltaTime)
+    this.exhibitHall?.update(deltaTime)
 
     // Archive wall: jar orbs float; faster while an epoch computes
     this.archive?.update(deltaTime)

@@ -1,5 +1,5 @@
 import type { Epoch, CommentatorOutput, ChallengerOutput, ReviewerOutput } from '../shared/types'
-import { MODEL_DISPLAY_NAMES, BACKEND_TO_FRONTEND_MODEL, MODEL_PROVIDER_NAMES, WILDCARD_ACCENTS, WILDCARD_DISPLAY_NAMES, providerLogoForModel, type ModelId } from '../shared/types'
+import { modelDisplayName, BACKEND_TO_FRONTEND_MODEL, MODEL_PROVIDER_NAMES, WILDCARD_ACCENTS, WILDCARD_DISPLAY_NAMES, providerLogoForModel, type ModelId } from '../shared/types'
 import { COLORS } from '../scene/colors'
 
 // Accent color for a model (matches the scientist/desk accents) so observers can
@@ -629,10 +629,12 @@ export class TranscriptPanel {
     const servedBy = output && typeof output === 'object'
       ? (output as { served_by?: { model?: unknown; fallback?: unknown } }).served_by
       : undefined
-    const assignedName = MODEL_DISPLAY_NAMES[assigned as ModelId] || assigned
+    // modelDisplayName names panel, fallback and wildcard models alike, so a
+    // stand-in shows as "Claude Sonnet 5.5", not its raw OpenRouter id.
+    const assignedName = modelDisplayName(assigned) || assigned
     if (servedBy?.fallback === true && typeof servedBy.model === 'string' && servedBy.model) {
       const modelId = servedBy.model as ModelId
-      return { modelId, name: MODEL_DISPLAY_NAMES[modelId] || servedBy.model, fallbackFor: assignedName }
+      return { modelId, name: modelDisplayName(servedBy.model) || servedBy.model, fallbackFor: assignedName }
     }
     return { modelId: assigned as ModelId, name: assignedName }
   }

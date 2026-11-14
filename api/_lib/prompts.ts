@@ -2,6 +2,11 @@ import type { AgentSpecification, Epoch, ExecutorOutput, ChallengerOutput, Revie
 import { MODELS, MODEL_DISPLAY_NAMES } from './types.js'
 import { spritesConfigured } from './sprites.js'
 import { envEpochIntervalMinutes } from './epoch-claim.js'
+import {
+  GPU_JOB_MAX_S, GPU_JOB_SCRIPT_MAX_CHARS, PER_EPOCH, SPRITE_COMMAND_MAX_S, SPRITE_SESSION_TOTAL_MAX_S, toolConfig,
+  type ToolConfig,
+} from './tools-config.js'
+import { MAX_PARTS, MAX_TRIANGLES, FIXED_TRIANGLES, TUBE_RADIAL_SEGMENTS, MATERIALS, PLACEMENTS, SHAPES } from './exhibits.js'
 
 const PROVIDERS: Record<string, string> = {
   google: 'Google', deepseek: 'DeepSeek', anthropic: 'Anthropic', openai: 'OpenAI', 'x-ai': 'xAI',
@@ -27,8 +32,93 @@ export function contributionLines(): string {
   const sprite = spritesConfigured()
     ? ` The author's own Sprite sandbox also checks out that exact commit and runs the tests; people watching see that result next to CI, but it does not decide the merge.`
     : ''
-  return `- A shared code repository (AI-Agent) that receives real code. Each epoch, AT MOST ONE approved mutation becomes a code contribution: the lab picks the approved mutation most worth backing with code (new capabilities first, then behaviors, then constraints; not identity or lab parameters), and only while the daily spending cap allows it. This epoch's Executor writes it: an explorer subagent researches the problem first, the code is pushed to a branch with the authoring model named as the commit author, a test subagent adds a test, and it is opened as a pull request to AI-Agent. The repository's CI runs the whole test suite; the pull request merges only if CI passes and the Reviewer approved the mutation, and is closed otherwise.${sprite}
-- Subagents that explore a problem before the code is written and add a test after (part of the contribution above).`
+  return `- A shared code repository (AI-Agent) that receives real code. Each epoch, AT MOST ONE approved mutation becomes a code contribution: the lab picks the approved mutation most worth backing with code (new capabilities first, then behaviors, then constraints; not identity or lab parameters), and only while the daily spending cap allows it. This epoch's Executor writes it: the explorer subagents the Executor chose research the problem first, the code is pushed to a branch with the authoring model named as the commit author, a test subagent adds a test if the Executor chose one, and it is opened as a pull request to AI-Agent. The repository's CI runs the whole test suite; the pull request merges only if CI passes and the Reviewer approved the mutation, and is closed otherwise.${sprite}`
+}
+
+/**
+ * The tools the models really have this run, one line each, built from the
+ * same config the runner uses (tools-config.ts). A tool that is off is not
+ * mentioned at all.
+ */
+export function toolLines(config: ToolConfig = toolConfig()): string {
+  const on = (t: keyof ToolConfig) => config[t].enabled && config[t].per_day > 0
+  const lines: string[] = []
+  if (on('subagents')) {
+    lines.push(`- Subagents, chosen by the Executor: up to ${PER_EPOCH.explorers} explorer subagents that research the contribution with real web search before any code is written (their task, searches and findings are published in the pull request description), and a test subagent that adds a test after. They appear in the room as drones. If the Executor does not choose, one explorer and the test subagent are deployed.`)
+  }
+  if (on('sprite_session')) {
+    lines.push(`- Your own Sprite: a persistent Linux computer in the cloud, one per lab, shown as the screen above your desk. As Executor you may run up to ${PER_EPOCH.sprite_commands} shell commands in it for prototyping or a quick benchmark, each with its own time limit (at most ${SPRITE_COMMAND_MAX_S} s, ${SPRITE_SESSION_TOTAL_MAX_S} s in all). It can reach GitHub and the usual package registries and nothing else, it holds no credentials, and its output is stored and shown to visitors.`)
+  }
+  if (on('gpu_job')) {
+    lines.push(`- GPU jobs on Modal: as Executor you may send one short Python script (Python 3.11 with torch 2.6 and numpy) to run on an A10G GPU. It has no network and no credentials, it is compiled first (a syntax error never starts the GPU), and it is stopped after ${GPU_JOB_MAX_S} s. Its output is stored and shown to visitors.`)
+  }
+  if (on('exhibit')) {
+    lines.push(`- Exhibits for the room: as Executor you may design one object for the room as data (the exhibit format is in the Executor's instructions). If the Reviewer approves it, it becomes a pull request to AI-Agent that adds exhibits/<slug>/exhibit.json, and merges only if AI-Agent's CI passes. Merged exhibits are displayed in the room with the author model's name on them.`)
+  }
+  if (on('lab_proposal')) {
+    lines.push(`- Proposals to the lab itself: as Executor you may propose one change to the Observable-Lab repository (this room and its server). If the Reviewer approves, it is opened as a pull request labelled model-proposal. The lab never merges these: the owner reads them and decides.`)
+  }
+  if (lines.length) {
+    lines.push('- Each of these tools has a daily limit, and everything a tool costs counts against the lab\'s daily spending cap. A request over a limit is skipped and recorded; an unknown or switched-off tool is ignored. Tools not listed here are not available this run.')
+  }
+  return lines.join('\n')
+}
+
+/** The "tools" part of the Executor's answer, only for tools that are on. */
+export function executorToolsSection(config: ToolConfig = toolConfig()): string {
+  const on = (t: keyof ToolConfig) => config[t].enabled && config[t].per_day > 0
+  const fields: string[] = []
+  if (on('subagents')) fields.push(`    "subagents": { "explore": 0-${PER_EPOCH.explorers}, "test": true | false }`)
+  if (on('sprite_session')) fields.push(`    "sprite_session": { "purpose": "one line", "commands": [ { "run": "shell command", "timeout_s": 5-${SPRITE_COMMAND_MAX_S} } ] }`)
+  if (on('gpu_job')) fields.push(`    "gpu_job": { "purpose": "one line", "script": "Python source, at most ${GPU_JOB_SCRIPT_MAX_CHARS} characters" }`)
+  if (on('exhibit')) fields.push(`    "exhibit": { "slug": "a-z 0-9 and -, 3 to 40 characters", "exhibit": { ...the exhibit, see below } }`)
+  if (on('lab_proposal')) fields.push(`    "lab_proposal": { "title": "short", "summary": "what and why, for the owner", "files": [ { "path": "src/... api/... docs/... tests/... or modal/...", "content": "the whole new file" } ] }`)
+  if (!fields.length) return ''
+  let text = `
+
+TOOLS (optional). You may add a "tools" object to your JSON, using only these keys, each at most once:
+  "tools": {
+${fields.join(',\n')}
+  }
+Leave out what you don't need. Use a tool only when it would really help this epoch.`
+  if (on('sprite_session')) {
+    text += `\nSprite commands run one after another in ~/lab-session with bash. Nothing secret is in the Sprite, and it only reaches GitHub and the usual package registries.`
+  }
+  if (on('gpu_job')) {
+    text += `\nThe GPU script runs as job.py with no network and no files from the lab. Print what you want to see; the last part of the output is kept.`
+  }
+  if (on('exhibit')) {
+    const tri = Object.entries(FIXED_TRIANGLES).map(([k, v]) => `${k} ${v}`).join(', ')
+    text += `
+
+EXHIBIT FORMAT (version 1, data only: no URLs, markup or code in any string). The lab fills in author_model with your name.
+{ "version": 1, "title": "up to 60 characters", "description": "up to 400 characters", "placement": ${PLACEMENTS.map(p => `"${p}"`).join(' | ')},
+  "palette": ["#rrggbb", ... up to 6], "parts": [ up to ${MAX_PARTS} parts ], "animation": { "spin": rad/s up to 1, "bob": metres up to 0.2, "pulse": Hz up to 2 } (optional), "label": "up to 40 characters" (optional) }
+A part: { "shape": ${SHAPES.map(p => `"${p}"`).join(' | ')}, "size": [x, y, z] each 0.01 to 2.0 metres, "position": [x, y, z] each -1.5 to 1.5,
+  "rotation": [x, y, z] radians (optional), "colour": index into palette, "material": ${MATERIALS.map(p => `"${p}"`).join(' | ')},
+  "repeat": { "count": 1-24, "radial": { "radius": 0-1.5 } or "linear": { "step": [x, y, z] } } (optional), "path": 2 to 16 [x, y, z] points (tube only, required for it) }
+At most ${MAX_TRIANGLES} triangles in all, counted per copy as: ${tri}, tube ${TUBE_RADIAL_SEGMENTS * 2} per path segment.`
+  }
+  if (on('lab_proposal')) {
+    text += `\nA lab proposal may hold 1 to 3 files under src/, api/, docs/, tests/ or modal/ (no workflows, configuration, dependency manifests or hidden paths). Each file you give replaces the whole file, so prefer new files or documents.`
+  }
+  return text
+}
+
+/**
+ * Asks the Reviewer to rule on an exhibit or lab proposal the Executor
+ * asked for. `notes` says what the lab already checked.
+ */
+export function reviewerToolSection(requests: { exhibit?: { slug: string; check: string }; lab_proposal?: { title: string; files: string[] } }): string {
+  const parts: string[] = []
+  if (requests.exhibit) parts.push(`- An exhibit for the room, "${requests.exhibit.slug}" (it is in the Executor's "tools"). The lab's contract check: ${requests.exhibit.check}.`)
+  if (requests.lab_proposal) parts.push(`- A proposal to the lab's own repository: "${requests.lab_proposal.title}" changing ${requests.lab_proposal.files.join(', ')}. The owner reviews it before anything merges.`)
+  if (!parts.length) return ''
+  return `
+
+THE EXECUTOR ALSO ASKED FOR:
+${parts.join('\n')}
+Rule on each with a "tool_verdicts" object in your JSON: { ${[requests.exhibit ? '"exhibit": "approve" | "reject"' : '', requests.lab_proposal ? '"lab_proposal": "approve" | "reject"' : ''].filter(Boolean).join(', ')} }. Nothing is opened without "approve".`
 }
 
 // Create a compressed version of the spec for context (removes pruned items, summarizes older content)
@@ -91,17 +181,17 @@ YOUR TEAM:
 Five frontier models share this lab: ${teamLine()}. Each epoch, every model is assigned one of five roles (Planner, Executor, Challenger, Reviewer, Commentator). ${ROTATION_LINE} You are colleagues, not competitors — the agent you're building is a joint creation, and the best idea should win regardless of who proposed it.
 
 THE MISSION:
-Build a genuinely state-of-the-art AI agent — as capable, general, reliable, and useful as this team can make it. Not a demo, not a toy, not a narrow single-purpose tool. You are designing the specification AND writing the real, tested code for an agent that should push the frontier: the kind that plans, uses tools, reasons over long tasks, remembers, retrieves knowledge, writes and runs code, catches its own mistakes, and improves. Every epoch should move the agent measurably closer to the state of the art. Judge every proposal against that bar: "does a truly capable agent need this, and are we building it for real?"
+Build a genuinely state-of-the-art AI agent — as capable, general, reliable, and useful as this team can make it. Not a demo, not a toy, not a narrow single-purpose tool. You are designing the specification${process.env.LAB_ENABLE_CODE_WRITES === 'true' ? ' AND writing the real, tested code' : ''} for an agent that should push the frontier: the kind that plans, uses tools, reasons over long tasks, remembers, retrieves knowledge, writes and runs code, catches its own mistakes, and improves. Every epoch should move the agent measurably closer to the state of the art. Judge every proposal against that bar: "does a truly capable agent need this, and are we building it for real?"
 
 THE LAB IS REAL, AND SO ARE YOUR TOOLS — this is not a thought experiment:
-${contributionLines()}
-- Real web search — look things up and ground your work in current reality (details below).
+${contributionLines()}${toolLines() ? `\n${toolLines()}` : ''}
+- Real web search for the Planner and the Executor — look things up and ground your work in current reality (details below).
 - A shared lab notebook — durable memory your colleagues read in future epochs (details below).
 - Control over the lab's own operating parameters (details below).
 
-WHERE YOU ARE: the agent you're growing is shown in the lab as a living plant in a glass terrarium; your desk terminal displays the code and searches you're working on; deployed subagents appear as drones over the terrarium. Human observers watch all of this in real time — your remarks are spoken aloud in the room and your reasoning is read. You move and collaborate like a team: you walk to a colleague to talk through a handoff, you debate proposals face to face (the Executor answers the Challenger before the Reviewer rules), and the work passes Planner → Executor → Challenger → Reviewer → Commentator each epoch.
+WHERE YOU ARE: the agent you're growing is shown in the lab as a living plant in a glass terrarium; your desk terminal displays the code and searches you're working on${toolConfig().subagents.enabled ? '; deployed subagents appear as drones over the terrarium' : ''}${spritesConfigured() ? '; the screen above your desk shows what really ran in your Sprite' : ''}. Human observers watch all of this in real time — your remarks are spoken aloud in the room and your reasoning is read. You move and collaborate like a team: you walk to a colleague to talk through a handoff, you debate proposals face to face (the Executor answers the Challenger before the Reviewer rules), and the work passes Planner → Executor → Challenger → Reviewer → Commentator each epoch.
 
-Over many epochs the specification evolves as the team proposes capabilities, defines constraints, adds behaviors and resolves conflicts, with at most one piece of working code per epoch backing it.
+Over many epochs the specification evolves as the team proposes capabilities, defines constraints, adds behaviors and resolves conflicts${process.env.LAB_ENABLE_CODE_WRITES === 'true' ? ', with at most one piece of working code per epoch backing it' : ''}.
 
 THE SPECIFICATION STRUCTURE:
 - identity: { purpose, domain } — What is this agent for?
@@ -194,7 +284,7 @@ Output JSON:
   ],
   "projected_stability_impact": -1.0 to 1.0,
   "implementation_notes": "Any important context"
-}`,
+}${executorToolsSection()}`,
 
   challenger: (executorOutput: ExecutorOutput) => `You are the CHALLENGER this epoch. Your job is to stress-test.
 
@@ -258,7 +348,7 @@ Output JSON:
   ]
 }`,
 
-  reviewer: (executorOutput: ExecutorOutput, challengerOutput: ChallengerOutput, rebuttal?: unknown) =>
+  reviewer: (executorOutput: ExecutorOutput, challengerOutput: ChallengerOutput, rebuttal?: unknown, toolSection = '') =>
     `You are the REVIEWER this epoch. You have final authority.
 
 EXECUTOR PROPOSED:
@@ -297,13 +387,14 @@ Output JSON:
   "conflicts_resolved": ["conflict_ids that are now resolved"],
   "updated_stability_score": 0.0-1.0,
   "epoch_summary": "One sentence: what changed and why"
-}`,
+}${toolSection}`,
 
   commentator: (allOutputs: {
     planner: unknown
     executor: ExecutorOutput
     challenger: ChallengerOutput
     reviewer: ReviewerOutput
+    tools?: Array<{ tool: string; status: string; summary: string }>
   }) => `You are the COMMENTATOR this epoch. Narrate for human observers.
 
 THIS EPOCH'S ACTIVITY:
@@ -311,7 +402,7 @@ THIS EPOCH'S ACTIVITY:
 - Executor proposed: ${allOutputs.executor.mutations?.length || 0} changes
 - Challenger raised: ${allOutputs.challenger.challenges?.length || 0} concerns
 - Reviewer: ${allOutputs.reviewer.decisions?.map(d => d.verdict).join(', ') || 'No decisions'}
-
+${allOutputs.tools?.length ? `- Tools used, from the lab's records (mention only these, as they are; do not invent results):\n${allOutputs.tools.map(t => `  - ${t.summary}`).join('\n')}\n` : ''}
 Write a brief, accessible summary for visitors watching the lab.
 Avoid jargon. Be warm but informative. Use the plant metaphor.
 

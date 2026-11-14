@@ -1,4 +1,5 @@
 import * as THREE from 'three'
+import { batchStatic } from '../lib/staticBatch'
 
 // A "subagent" drone: spawns when a model deploys a subagent, hovers and flies
 // around/above the central terrarium, then despawns when the subagent is done.
@@ -81,9 +82,12 @@ export class Drone {
         add(new THREE.CylinderGeometry(0.018, 0.018, 0.035, 8), shell, x, 0.01, z)
         const rotor = add(new THREE.BoxGeometry(0.11, 0.004, 0.014), frame, x, 0.031, z)
         rotor.rotation.y = x * z > 0 ? 0.6 : -0.6
+        rotor.userData.noBatch = true // spins on its own
         this.rotors.push(rotor)
       }
     }
+    // body, light, arms and hubs never move against each other: one draw call
+    batchStatic(this.model)
     this.group.add(this.model)
   }
 

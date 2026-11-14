@@ -219,6 +219,9 @@ export class Plant {
   private caustic: THREE.Mesh
   private causticMat: THREE.ShaderMaterial
   private branches: BranchDef[] = []
+  // This run's habit, from the experiment id: where the first branch points,
+  // how attach heights and lengths vary. Counts still come from the record.
+  private seed = 0
   private trunkH = 0.5
   private trunkR = 0.05
   private trunkHealth = 0.8
@@ -319,6 +322,25 @@ export class Plant {
           leafHealth: s.healthScore,
           phase: i * 1.73,
         })
+      }
+    }
+
+    if (this.seed) {
+      let a = this.seed >>> 0
+      const r = () => {
+        a = (a + 0x6d2b79f5) >>> 0
+        let t = a
+        t = Math.imul(t ^ (t >>> 15), t | 1)
+        t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+        return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+      }
+      const turn = r() * Math.PI * 2
+      const hand = r() < 0.5 ? 1 : -1
+      for (const b of this.branches) {
+        b.angle = turn + hand * b.angle + (r() - 0.5) * 0.5
+        b.height = THREE.MathUtils.clamp(b.height + (r() - 0.5) * 0.12, 0.45, 0.96)
+        if (!b.isStump) b.length *= 0.85 + r() * 0.3
+        b.phase += r() * 3
       }
     }
 
@@ -469,6 +491,13 @@ export class Plant {
   // ---------------------------------------------------------------------------
   public getTrunkKeepout(): number {
     return 0.15 + this.state.growthStage * 0.3
+  }
+
+  /** Seed for this run's layout (0 keeps the plain layout). */
+  public setSeed(seed: number): void {
+    if (seed === this.seed) return
+    this.seed = seed >>> 0
+    this.rebuildStructure()
   }
 
   public setState(newState: Partial<PlantState>): void {
