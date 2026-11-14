@@ -3,6 +3,7 @@ import { LAB_HEIGHT } from '../scene/Lab'
 import { STATION_RADIUS } from './Station'
 import { accentForModel, eventRandom, lineageOf, type GrowthEvent } from '../systems/growthEvents'
 import { CEIL, FREE, GrowthSink, LONG_AGO, NEVER, WALL, bud, flower, leafMatrix, ribbon, tube, type Ring } from './growthParts'
+import { soilHeight, type Specimen } from './specimen'
 
 // The growth each real event adds. The base organism (Overgrowth.ts) is the
 // same in every run; on top of it, every event in growth_events grows its own
@@ -21,6 +22,10 @@ import { CEIL, FREE, GrowthSink, LONG_AGO, NEVER, WALL, bud, flower, leafMatrix,
 // Whose: each model follows one of the five base runners, and each new piece
 // starts from the most recent growth by the same model near where it is
 // heading, so a model's work forms its own line through the room.
+//
+// Inside the dome (levels below 3) none of that: the specimen is still one
+// flowering plant, and an event grows on it (specimen.ts). From stage 2 a few
+// rounds go to the runners pressing on the glass instead.
 
 // ---------------------------------------------------------------------------
 // The profile: (r, y) points in order, with what each stretch lies on
@@ -66,7 +71,7 @@ const PROFILE: PSample[] = (() => {
       pts.push(p)
     }
   }
-  add(line([0.2, 0.31], [0.9, 0.31], 14)) // soil in the dome
+  add(line([0.2, 0], [0.9, 0], 14).map(([r]) => [r, soilHeight(r)] as [number, number])) // soil in the dome
   add(arc(0, 0.3, 0.95, 0.04, 0.42, 8)) // up the inside of the glass
   // over the broken rim and down the plinth
   add([[0.95 * Math.cos(0.42) + 0.04, 0.3 + 0.95 * Math.sin(0.42) + 0.06], [1.0, 0.74], [1.07, 0.66], [1.11, 0.5], [1.13, 0.36], [1.22, 0.3], [1.38, 0.2], [1.55, 0.04], [1.66, 0.006]])
@@ -319,7 +324,8 @@ export class EventGrower {
   constructor(
     private sink: GrowthSink,
     anchors: Anchor[],
-    private bays: ExhibitBayRef[]
+    private bays: ExhibitBayRef[],
+    private plant: Specimen | null = null
   ) {
     for (const a of anchors) {
       this.familyAnchors[a.family % 5].push(a)
@@ -340,6 +346,14 @@ export class EventGrower {
    */
   grow(e: GrowthEvent, index: number, level: number, gate: number, t0: number, detail = 1): void {
     const R = eventRandom(e.id)
+    // in the dome it grows on the flowering plant; once the runners press on
+    // the glass (later in stage 2) about a third of the rounds go to them instead
+    const toGlass = level >= 2.4 && e.kind === 'epoch' && eventRandom(e.id + '#glass')() < 0.3
+    if (level < 3 && this.plant && !toGlass) {
+      this.plant.grow(this.sink, e, R, level, gate, t0, detail, this.stats)
+      this.stats.events++
+      return
+    }
     const H = HABITS[e.kind]
     const m = e.magnitude
     const lin = lineageOf(e.model)
@@ -353,7 +367,9 @@ export class EventGrower {
 
     // where it heads: near its model's runner, some way behind the frontier
     const back = H.back * Math.pow(R(), 1.6) * (level < 3 ? 0.35 : 1)
-    const sGuide = Math.max(0.08, Math.min(sCap - 0.02, sFront - back))
+    // after the break-out new growth starts from the rim outward, so the
+    // flower in the broken dome stays a flower
+    const sGuide = Math.max(level >= 3 ? MARK.rim - 0.1 : 0.08, Math.min(sCap - 0.02, sFront - back))
     const thetaRunner = this.runnerAngle(lin.family, sGuide, level, R)
     // spread round the room widens as the plant gets further from the dome
     const spread = (0.2 + 0.3 * Math.min(sGuide, 16)) * (R() + R() + R() - 1.5)
@@ -386,7 +402,8 @@ export class EventGrower {
     // where it starts: the closest growth to there, the same model's preferred
     const start = this.parentFor(e.model, index, thetaGuide, Math.min(sGuide, sTarget), level)
 
-    const g = gate
+    // runners on the glass show once the plant's own runners have reached it
+    const g = toGlass ? Math.max(gate, 2.4) : gate
     const stemC = STEM_YOUNG.clone().lerp(STEM_OLD, 0.15 + R() * 0.3)
     if (accent !== null) stemC.lerp(new THREE.Color(accent), 0.12)
     // older growth has thickened and gone to bark
@@ -443,7 +460,7 @@ export class EventGrower {
     }
     // epochs and setbacks are shoots off the surface; vines hug it with arches
     const onCeiling = sample(start.s).surf === CEIL || start.s > MARK.ceiling
-    if (e.kind === 'epoch' || setback) {
+    if ((e.kind === 'epoch' || setback) && !toGlass) {
       mainOpts.lift = onCeiling ? 'hang' : 'rise'
       mainOpts.rise = Math.min(0.5, len * (0.3 + R() * 0.35)) * (onCeiling ? 1.3 : 1)
       mainOpts.archFreq = 0.45 + R() * 0.5

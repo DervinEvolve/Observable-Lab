@@ -10,6 +10,8 @@ import * as THREE from 'three'
 //   aSurf   the surface it lies on (FREE, WALL, CEIL), for the doll's-house cut
 //   aLife   when it appears and when it starts to wither, in seconds on the
 //           room's clock (LONG_AGO = already there, NEVER = never withers)
+//   aPlant  zero, except on the flowering plant in the dome (specimen.ts):
+//           (1, how far it sways, its sway phase, which part it is)
 
 export const FREE = 0
 export const WALL = 1
@@ -37,8 +39,11 @@ export class GrowthSink {
   prev: number[] = []
   surf: number[] = []
   life: number[] = []
+  plant: number[] = []
   idx: number[] = []
   leaves: LeafSpec[] = []
+  // what vert() writes to aPlant: set while drawing the flowering plant
+  plantAttr: [number, number, number, number] = [0, 0, 0, 0]
 
   get vertexCount(): number {
     return this.pos.length / 3
@@ -53,13 +58,15 @@ export class GrowthSink {
     this.prev.push(prev.x, prev.y, prev.z)
     this.surf.push(surf)
     this.life.push(appear, wither)
+    const a = this.plantAttr
+    this.plant.push(a[0], a[1], a[2], a[3])
     return this.pos.length / 3 - 1
   }
 
   /** Appends another sink's geometry (indices shifted). */
   append(o: GrowthSink): void {
     const base = this.vertexCount
-    for (const k of ['pos', 'nor', 'col', 'grow', 'spine', 'prev', 'surf', 'life'] as const) {
+    for (const k of ['pos', 'nor', 'col', 'grow', 'spine', 'prev', 'surf', 'life', 'plant'] as const) {
       const a = this[k]
       const b = o[k]
       for (let i = 0; i < b.length; i++) a.push(b[i])
@@ -78,6 +85,7 @@ export class GrowthSink {
     geo.setAttribute('aPrev', new THREE.Float32BufferAttribute(this.prev, 3))
     geo.setAttribute('aSurf', new THREE.Float32BufferAttribute(this.surf, 1))
     geo.setAttribute('aLife', new THREE.Float32BufferAttribute(this.life, 2))
+    geo.setAttribute('aPlant', new THREE.Float32BufferAttribute(this.plant, 4))
     geo.setIndex(this.vertexCount > 65535 ? new THREE.Uint32BufferAttribute(this.idx, 1) : new THREE.Uint16BufferAttribute(this.idx, 1))
     geo.computeBoundingSphere()
     return geo

@@ -2719,10 +2719,12 @@ class ObservableLab {
 
     const deltaTime = this.clock.getDelta()
 
-    // Update plant animation (SDF raymarch billboard needs the frame's proj*view)
+    // The plant's spec-side moments (pulse, spores, falling leaves); the
+    // flowering plant itself is drawn by the overgrowth, which shows what the
+    // spec says about it
     this.scannerProjView.multiplyMatrices(this.camera.projectionMatrix, this.camera.matrixWorldInverse)
-    this.plant.setProjView(this.scannerProjView)
-    this.plant.update(deltaTime, this.camera)
+    this.plant.update(deltaTime)
+    this.overgrowth.setSpecSignals(this.plant.signals())
 
     // Update glass terrarium animation (for shatter physics)
     this.glassTerrarium.update(deltaTime)
