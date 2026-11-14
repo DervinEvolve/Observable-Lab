@@ -7,7 +7,7 @@ import { SEED_SPECIFICATION } from '../_lib/seed-spec.js'
 import { getRepoCommitCount } from '../_lib/github-repo.js'
 import type { ExperimentState, Epoch, AgentSpecification } from '../_lib/types.js'
 import { checkDailyBudget, describeRunState, type BudgetStatus } from '../_lib/spend.js'
-import { computeGrowth, growthFactsFor, repoLinks } from '../_lib/growth.js'
+import { computeGrowth, growthEventsFor, growthFactsFor, repoLinks } from '../_lib/growth.js'
 import { getRecentToolRuns } from '../_lib/tool-runs-store.js'
 import { enabledTools } from '../_lib/tools-config.js'
 import { exhibitsHandler } from '../_lib/exhibits-reader.js'
@@ -138,6 +138,8 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
     // What the models' tools really did (Sprite sessions, GPU jobs, subagents,
     // exhibits, proposals), cleaned of anything that looks like a credential.
     const toolRuns = await getRecentToolRuns(exp.id as string, 12)
+    // What each step of the growth really was (docs/GROWTH.md), from stored records.
+    const growthEvents = await growthEventsFor({ id: exp.id as string, current_spec: currentSpec })
 
     const response: ExperimentState = {
       id: exp.id,
@@ -156,7 +158,7 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
       repos: repoLinks(),
     }
 
-    return res.status(200).json({ ...response, tool_runs: toolRuns, tools_enabled: enabledTools() })
+    return res.status(200).json({ ...response, growth_events: growthEvents, tool_runs: toolRuns, tools_enabled: enabledTools() })
   } catch (error) {
     console.error('[API] Error fetching experiment:', error)
     return res.status(500).json({ error: 'Failed to load experiment' })

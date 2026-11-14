@@ -15,6 +15,7 @@ import {
   type MaterialKind,
   type Placement,
 } from '../systems/exhibits'
+import { modelDisplayName } from '../shared/types'
 
 // The exhibit bays around the walls. Each merged exhibit gets a bay with the
 // fixture its placement asks for (a plinth, a slab on the floor, a shelf, a
@@ -134,10 +135,11 @@ const TIERS: Segs[] = [
   { sphere: { width: 10, height: 8 }, cylinder: { radial: 10 }, cone: { radial: 10 }, torus: { radial: 8, tubular: 14 }, capsule: { cap: 4, radial: 10 }, ring: { theta: 16 }, tube: { radial: 6 } },
   { sphere: { width: 8, height: 6 }, cylinder: { radial: 8 }, cone: { radial: 8 }, torus: { radial: 6, tubular: 10 }, capsule: { cap: 2, radial: 8 }, ring: { theta: 12 }, tube: { radial: 4 } },
 ]
-// The room at stage 6 is about 57,000 triangles at its most overgrown, so
-// the exhibits get what is left under the 70,000 budget (fixtures and
-// plaques add under 1,000 more).
-export const EXHIBIT_TRIANGLE_BUDGET = 11000
+// The whole frame at stage 6, with 400 growth events grown and shadow passes
+// counted, is about 62,500 triangles before the exhibits (about 48,300 in the
+// main pass and 14,000 in the sun's shadow map), so the exhibits get what is
+// left under the 70,000 budget (fixtures and plaques add under 1,000 more).
+export const EXHIBIT_TRIANGLE_BUDGET = 6500
 
 function tierTriangles(p: ExhibitPart, t: Segs): number {
   let each: number
@@ -442,6 +444,8 @@ export class ExhibitHall {
   }
 
   public detailTier = 0
+  /** Told where each shown exhibit stands whenever the set changes, so the overgrowth can reach toward them. */
+  public onBaysChanged: ((bays: Array<{ angle: number; model: string | null; mergedAt: number }>) => void) | null = null
 
   private build(selected: ExhibitRecord[]): void {
     const plan = planDetail(selected)
@@ -529,6 +533,7 @@ export class ExhibitHall {
       this.triangleCount += (merged.index?.count ?? 0) / 3
     }
     this.group.visible = shown.length > 0
+    this.onBaysChanged?.(this.bays.map(b => ({ angle: b.angle, model: modelDisplayName(b.record.author_model) ?? b.record.author_model ?? null, mergedAt: Date.parse(b.record.merged_at) || 0 })))
   }
 
   private buildFixture(placement: Placement, frame: THREE.Matrix4, bay: number, out: THREE.BufferGeometry[]): void {

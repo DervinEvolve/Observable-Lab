@@ -61,3 +61,48 @@ The stage is recomputed from the current facts each time, so it can go down: if 
 ```
 
 `merged_contributions` counts every merged contribution, `contributions_with_passing_tests` counts those whose tests passed in CI or in the Sprite, and `sprite_test_passes` counts every contribution, merged or not, whose Sprite run exited 0.
+
+## Growth events
+
+The stage says how far the plant has got. `growth_events` says what each step of it was, so the room can grow one real piece per real event and the plant at any moment is the sum of what happened. It is built on the server from stored records only (`growthEventsFor` in `api/_lib/growth.ts`), oldest first, at most the 400 most recent:
+
+```json
+"growth_events": [
+  { "id": "epoch:3f1c", "kind": "epoch", "epoch": 12, "at": "2026-11-13T09:00:00.000Z", "model": "Claude Opus 4.8", "magnitude": 0.2, "ref": null }
+]
+```
+
+| Field | Meaning |
+|---|---|
+| `id` | Stable: `epoch:<id>`, `contribution:<id>`, `research:<id>` or `tool:<id>`, the row id of the record behind it. |
+| `kind` | `epoch`, `contribution_merged`, `contribution_rejected`, `tests_failed`, `breakthrough` or `exhibit_merged`. |
+| `epoch` | The epoch number it belongs to. |
+| `at` | ISO time the record was stored (epoch completion, contribution creation, tool run). |
+| `model` | Display name of the model behind it (a fallback that answered is the one named), or null. |
+| `magnitude` | 0 to 1, below. |
+| `ref` | Short: `#<pr number>` for a merged contribution, `ci failed` or `sprite failed`, `rejected`, the research verdict (`keep` or `revert`) on an epoch, `keep` on a breakthrough. Otherwise null. A commit sha is not stored, so none is given. |
+
+### Where each kind comes from
+
+- `epoch`: a completed epoch (not the seed, epoch 0) in `epochs`.
+- `contribution_merged`: a `code_contributions` row that merged.
+- `contribution_rejected`: a contribution that opened a pull request, did not merge and has no failing test result. A contribution row that never opened a pull request (code writes switched off, the coder returned no files, an error) is not an event.
+- `tests_failed`: a contribution that did not merge and whose CI failed (`ci_passed` false) or whose Sprite run exited non-zero.
+- `breakthrough`: a research epoch whose Reviewer verdict is KEEP, whose run finished `ok`, and whose measured `val_bpb` beats the best KEEP before it (the first one is judged against the baseline in the spec). When the 400 epoch window is full, the best before the window is unknown, so the first KEEP in the window is not judged. It comes alongside that epoch's own `epoch` event. The score is the generated code's own printed number and stays unverified, as everywhere else.
+- `exhibit_merged`: a `tool_runs` row for the exhibit tool with status `merged`.
+
+### Magnitudes
+
+Deterministic, from stored numbers, rounded to 3 places (`epochMagnitude`, `contributionMagnitude`, `breakthroughMagnitude` and the constants in `api/_lib/growth.ts`):
+
+| Event | Magnitude |
+|---|---|
+| Ordinary epoch | 0.1 to 0.3: 0.1 plus 0.2 times (approved or modified mutations / 4, at most 1). A research KEEP counts as 2, a revert as 0. |
+| Merged contribution | 0.4 to 0.8: 0.4, plus up to 0.3 by lines written (every line of the author's and subagent's files; 400 is full), plus 0.1 if its tests passed in CI or the Sprite. |
+| Rejected contribution, failed tests | 0.2. It shows as a bud that withers, so setbacks are visible. |
+| Breakthrough | 0.8 to 1.0: 0.8 plus 0.2 by the relative improvement over the previous best (5% better is full). |
+| Merged exhibit | 0.3 |
+
+### Cost
+
+One query each on `epochs`, `code_contributions` and `tool_runs`, by `experiment_id`, newest first, `LIMIT 400`, picking only the JSON fields needed (never whole outputs). The result is cached for 60 seconds per experiment and dropped when an epoch finishes. A missing table or column gives fewer events, never an error.

@@ -22,7 +22,7 @@ import { Overgrowth } from './entities/Overgrowth'
 import { ExhibitHall } from './entities/ExhibitHall'
 import { ToolRunsService, parseToolRuns } from './systems/toolRuns'
 import { parseGrowth, growthLevel } from './systems/growth'
-import { parseMerges, seedFromId, shapeFrom, type MergeMark } from './systems/organismShape'
+import { eventLevels, parseGrowthEvents, type GrowthEvent } from './systems/growthEvents'
 import { repoLinksFrom } from './systems/repoLinks'
 import { StationRole, COLORS } from './scene/colors'
 import { UIOverlay } from './systems/UIOverlay'
@@ -61,10 +61,11 @@ class ObservableLab {
   private growthShattered = false // the record says the glass is broken
   private growthTarget = 0
   private devGrowth = false // development preview via ?growth= is in charge
-  // merged contributions seen on the public contributions endpoint, by id,
-  // used for flower colours when the growth record carries no merge list
-  private mergeLog: Map<string, MergeMark> = new Map()
-  private lastShapeState: ExperimentState | null = null
+  // what each step of the growth was (growth_events), and the merge count
+  // the record gives, so merges older than the feed still count
+  private growthEvents: GrowthEvent[] = []
+  private growthMerged = 0
+  private centerSpot: THREE.SpotLight | null = null
   private baseExposure = 1.2
   private baseFog = new THREE.Color(0xf5f2eb)
   private canopyFog = new THREE.Color(0xdde4cc)
@@ -339,6 +340,8 @@ class ObservableLab {
       }
     }
     this.scene.add(this.exhibitHall.group)
+    // a tendril for a merged exhibit reaches toward that exhibit's shelf
+    this.exhibitHall.onBaysChanged = bays => this.overgrowth.setExhibitBays(bays)
     this.exhibitHall.startPolling()
 
     // Set up shatter callback to persist state
@@ -1116,18 +1119,15 @@ class ObservableLab {
     const extra = state as unknown as { growth?: unknown; repos?: unknown }
     const growth = parseGrowth(extra.growth)
     if (growth && !this.devGrowth) {
+      this.growthMerged = growth.merged_contributions ?? 0
+      const raw = (state as unknown as { growth_events?: unknown }).growth_events
+      if (raw !== undefined) this.growthEvents = parseGrowthEvents(raw)
       this.applyGrowth(growthLevel(growth), growth.glass_shattered === true || !!state.glass_shattered)
     }
     // tool runs may also come on the state itself
     const runsOnState = (state as unknown as { tool_runs?: unknown }).tool_runs
     if (runsOnState !== undefined) this.toolRuns?.accept(parseToolRuns(runsOnState))
 
-    if (!this.devGrowth) {
-      const firstShape = !this.lastShapeState
-      this.lastShapeState = state
-      this.applyOrganismShape(state)
-      if (firstShape) void this.loadMergeHistory()
-    }
     if (extra.repos !== undefined) {
       const links = repoLinksFrom(extra.repos)
       this.uiOverlay.setRepoLinks(links)
@@ -1507,9 +1507,6 @@ class ObservableLab {
       }
 
       for (const contribution of data.contributions) {
-        if (contribution.merged && typeof contribution.created_at === 'string') {
-          this.mergeLog.set(contribution.id, { model_id: contribution.model_id, merged_at: contribution.created_at })
-        }
         if (this.streamedContributionIds.has(contribution.id)) continue
         this.streamedContributionIds.add(contribution.id)
 
@@ -1545,7 +1542,6 @@ class ObservableLab {
         }
 
       }
-      if (this.lastShapeState && !this.devGrowth) this.applyOrganismShape(this.lastShapeState)
     } catch (e) {
       console.warn('[ObservableLab] Failed to fetch code contributions:', e)
     }
@@ -2075,7 +2071,18 @@ class ObservableLab {
     this.growthShattered = shattered
     this.growthTarget = level
     this.overgrowth.setTarget(level, first)
+    this.growEvents()
     if (first && (shattered || level >= 3)) this.glassTerrarium.setShatteredState(true)
+  }
+
+  // Every real event grows its own piece (eventGrowth.ts). Where in the arc
+  // each one belongs comes from its epoch and the merges before it, capped by
+  // the stage the record is at now: an event can fill the current stage's
+  // stretch but never pass it.
+  private growEvents(): void {
+    const stage = Math.floor(this.growthTarget)
+    const levels = eventLevels(this.growthEvents, stage + 0.999, this.growthMerged)
+    this.overgrowth.setEvents(this.growthEvents, levels)
   }
 
   // Per-frame: glass pressure, light under the canopy, spores for dust.
@@ -2092,50 +2099,30 @@ class ObservableLab {
     }
     const canopy = this.overgrowth.canopy()
     this.renderer.toneMappingExposure = this.baseExposure - 0.16 * canopy
+    // Once the canopy has closed over the ceiling lamp its light comes through
+    // leaves: the dappled shade on the floor stands in for its hard shadows,
+    // which also keeps the overgrown room inside the frame budget.
+    if (!this.centerSpot) this.centerSpot = (this.scene.getObjectByName('centerSpot') as THREE.SpotLight | undefined) ?? null
+    if (this.centerSpot) {
+      if (this.centerSpot.castShadow && canopy > 0.6) this.centerSpot.castShadow = false
+      else if (!this.centerSpot.castShadow && canopy < 0.4) this.centerSpot.castShadow = true
+    }
     if (this.scene.fog instanceof THREE.Fog) this.scene.fog.color.copy(this.baseFog).lerp(this.canopyFog, canopy)
     const air = this.overgrowth.airborne()
     this.particleSystem?.setSuppression(air)
     this.patinaSystem?.setDustSuppression(air)
   }
 
-  // This run's organism: seeded by the experiment id, shaped by the growth
-  // record, flowers coloured by who merged what (organismShape.ts). The merge
-  // list comes from the record when the backend sends one (growth.merges),
-  // otherwise from merged contributions the room has seen on the public
-  // contributions endpoint; merges with no known author keep plain flowers.
-  private applyOrganismShape(state: ExperimentState): void {
-    if (!state?.id) return
-    const extra = state as unknown as { growth?: Record<string, unknown>; merges?: unknown }
-    const growth = extra.growth && typeof extra.growth === 'object' ? extra.growth : null
-    let merges = parseMerges(growth?.merges ?? extra.merges)
-    if (!merges.length && this.mergeLog.size) merges = parseMerges([...this.mergeLog.values()])
-    this.overgrowth.configure(shapeFrom(state.id, growth, merges))
-    this.plant.setSeed(seedFromId(state.id))
-  }
-
-  // Merged contributions so far (the endpoint returns the newest 20), read
-  // once on load for flower colours. Nothing is streamed from here.
-  private async loadMergeHistory(): Promise<void> {
-    try {
-      const response = await fetch('/api/experiment/code-contributions?since_epoch=0', { headers: { Accept: 'application/json' } })
-      if (!response.ok || !(response.headers.get('content-type') || '').includes('json')) return
-      const data = (await response.json()) as { contributions?: Array<{ id?: unknown; merged?: unknown; model_id?: unknown; created_at?: unknown }> }
-      for (const c of data.contributions ?? []) {
-        if (c.merged === true && typeof c.id === 'string' && typeof c.model_id === 'string' && typeof c.created_at === 'string') {
-          this.mergeLog.set(c.id, { model_id: c.model_id, merged_at: c.created_at })
-        }
-      }
-      if (this.lastShapeState && !this.devGrowth) this.applyOrganismShape(this.lastShapeState)
-    } catch {
-      // no backend: flowers stay plain
-    }
-  }
-
-  // Development only: preview any stage without a backend.
+  // Development only: preview without a backend. Nothing here is real data.
   //   ?growth=0..6&growthProgress=0..1    window.lab.growth(stage, progress)
+  //   ?growthDemo=N[&growthDemoSeed=k]    N made-up growth events (growthDemo.ts);
+  //                                       the stage follows them unless ?growth= is given
+  //   window.lab.growthDemo(n, seed)      the same live: extend the list to see new events grow in
   private applyDevGrowthPreview(): void {
     if (!import.meta.env.DEV) return // development builds only; the minifier drops the rest
     const q = new URLSearchParams(window.location.search)
+    const badgeText = (st: number, pr: number, demo: string) => `Dev preview: growth stage ${st}, progress ${pr.toFixed(2)}${demo} (not real data)`
+    let demoNote = ''
     const show = (stage: number, progress: number, immediate: boolean) => {
       const st = Math.max(0, Math.min(6, Math.floor(stage)))
       const pr = Math.max(0, Math.min(1, progress))
@@ -2149,20 +2136,29 @@ class ObservableLab {
         badge.style.cssText = 'position:fixed;top:12px;right:12px;z-index:400;padding:6px 10px;border-radius:8px;background:#1f1a14;color:#fff;font:600 12px -apple-system,sans-serif;pointer-events:none'
         document.body.appendChild(badge)
       }
-      // the organism this stage's minimums would grow (docs/GROWTH.md), for
-      // the run named by ?devRun= and, if given, ?devMerges=claude,gpt,...
-      const caps = [0, 1, 4, 8, 12, 16, 20][st]
-      const cons = [0, 0, 2, 4, 6, 8, 10][st]
-      const elems = [0, 4, 12, 24, 36, 48, 60][st]
-      const run = q.get('devRun') || 'dev-preview'
-      const merges = (q.get('devMerges') || '').split(',').map(f => Object.entries(BACKEND_TO_FRONTEND_MODEL).find(([, v]) => v === f.trim())?.[0]).filter((m): m is string => !!m).map(model_id => ({ model_id, merged_at: null }))
-      this.overgrowth.configure(shapeFrom(run, { capabilities: caps, constraints: cons, behaviors: elems - caps - cons, merged_contributions: merges.length }, merges))
-      this.plant.setSeed(seedFromId(run))
-      badge.textContent = `Dev preview: run ${run}, growth stage ${st}, progress ${pr.toFixed(2)} (not real data)`
+      badge.textContent = badgeText(st, pr, demoNote)
+    }
+    const demo = async (n: number, seed: number, immediate: boolean) => {
+      const { demoGrowthEvents, demoGrowthRecord } = await import('./systems/growthDemo')
+      const events = demoGrowthEvents(n, seed)
+      const rec = demoGrowthRecord(events)
+      this.growthEvents = events
+      this.growthMerged = rec.merged
+      demoNote = `, ${events.length} made-up growth events (seed ${seed})`
+      const stage = q.get('growth')
+      if (stage !== null && !Number.isNaN(Number(stage))) show(Number(stage), Number(q.get('growthProgress') ?? 0) || 0, immediate)
+      else show(rec.stage, rec.progress, immediate)
+    }
+    const lab = (window as unknown as { lab?: Record<string, unknown> }).lab!
+    lab.growth = (st: number, pr = 0) => show(st, pr, false)
+    lab.growthDemo = (n: number, seed = 1) => demo(n, seed, false)
+    const n = Number(q.get('growthDemo'))
+    if (q.get('growthDemo') !== null && n >= 0) {
+      void demo(Math.min(400, Math.floor(n)), Math.floor(Number(q.get('growthDemoSeed') ?? 1)) || 1, true)
+      return
     }
     const stage = q.get('growth')
     if (stage !== null && !Number.isNaN(Number(stage))) show(Number(stage), Number(q.get('growthProgress') ?? 0) || 0, true)
-    ;(window as unknown as { lab?: Record<string, unknown> }).lab!.growth = (st: number, pr = 0) => show(st, pr, false)
   }
 
   private handleGlassShatter(): void {

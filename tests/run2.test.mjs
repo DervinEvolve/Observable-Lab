@@ -921,6 +921,110 @@ test('GROWTH.md documents the same table as the code', () => {
   assert.deepEqual([computed.stage, computed.progress], [example.stage, example.progress])
 })
 
+test('growth events: stable ids, the magnitude rules, setbacks, breakthroughs, the 400 cap', () => {
+  const t0 = Date.parse('2026-11-01T00:00:00Z')
+  const when = n => new Date(t0 + n * 3600_000).toISOString()
+  const epoch = (n, extra = {}) => ({ id: `e${n}`, epoch_number: n, completed_at: when(n), assigned_executor: 'openai/gpt-6-astra', decisions: [], ...extra })
+  const approve = k => Array.from({ length: k }, () => ({ verdict: 'approve' }))
+
+  const events = growth.buildGrowthEvents({
+    baselineBpb: 0.9,
+    epochs: [
+      epoch(0), // the seed is not work
+      epoch(1, { decisions: approve(4) }),
+      epoch(2, { decisions: [{ verdict: 'reject' }] }),
+      epoch(3, { review_verdict: 'keep', run_status: 'ok', val_bpb: '0.85' }),
+      epoch(4, { review_verdict: 'keep', run_status: 'ok', val_bpb: 0.87 }), // keeps, but does not beat 0.85
+      epoch(5, { review_verdict: 'revert', run_status: 'ok', val_bpb: 0.5 }), // never a breakthrough
+      epoch(6, { executor_served_by: { fallback: true, model: 'x-ai/grok-4.7' } }),
+    ],
+    contributions: [
+      { id: 'c1', epoch_number: 1, model_id: 'openai/gpt-6-astra', merged: true, ci_passed: true, pr_url: 'https://github.com/o/r/pull/42', lines_changed: '400', created_at: when(1.5) },
+      { id: 'c2', epoch_number: 2, model_id: 'openai/gpt-6-astra', merged: true, ci_passed: null, lines_changed: 0, created_at: when(2.5) },
+      { id: 'c3', epoch_number: 3, model_id: 'openai/gpt-6-astra', merged: false, ci_passed: false, created_at: when(3.5) },
+      { id: 'c4', epoch_number: 4, model_id: 'openai/gpt-6-astra', merged: false, ci_passed: null, sprite_ran_at: when(4.4), sprite_exit_code: 2, created_at: when(4.5) },
+      { id: 'c5', epoch_number: 5, model_id: 'openai/gpt-6-astra', merged: false, ci_passed: null, pr_url: 'https://github.com/o/r/pull/43', created_at: when(5.5) },
+      { id: 'c6', epoch_number: 5, model_id: 'openai/gpt-6-astra', merged: false, ci_passed: null, pr_url: null, created_at: when(5.6) }, // never opened a pull request
+    ],
+    exhibits: [{ id: 't1', epoch: 2, model: 'openai/gpt-6-astra', created_at: when(2.7) }],
+  })
+
+  const byId = Object.fromEntries(events.map(e => [e.id, e]))
+  assert.equal(byId['epoch:e0'], undefined)
+  assert.equal(byId['epoch:e1'].magnitude, 0.3)
+  assert.equal(byId['epoch:e2'].magnitude, 0.1)
+  assert.equal(byId['epoch:e3'].magnitude, 0.2)
+  assert.equal(byId['epoch:e3'].ref, 'keep')
+  assert.equal(byId['research:e3'].kind, 'breakthrough')
+  assert.ok(byId['research:e3'].magnitude > 0.8 && byId['research:e3'].magnitude <= 1)
+  assert.equal(byId['research:e4'], undefined)
+  assert.equal(byId['research:e5'], undefined)
+  assert.equal(byId['contribution:c1'].magnitude, 0.8)
+  assert.equal(byId['contribution:c1'].ref, '#42')
+  assert.equal(byId['contribution:c2'].magnitude, 0.4)
+  assert.deepEqual([byId['contribution:c3'].kind, byId['contribution:c3'].magnitude, byId['contribution:c3'].ref], ['tests_failed', 0.2, 'ci failed'])
+  assert.deepEqual([byId['contribution:c4'].kind, byId['contribution:c4'].ref], ['tests_failed', 'sprite failed'])
+  assert.deepEqual([byId['contribution:c5'].kind, byId['contribution:c5'].magnitude], ['contribution_rejected', 0.2])
+  assert.equal(byId['contribution:c6'], undefined) // no pull request, so no setback in the room
+  assert.deepEqual([byId['tool:t1'].kind, byId['tool:t1'].magnitude], ['exhibit_merged', 0.3])
+  assert.equal(byId['epoch:e1'].model, 'GPT-6 Astra')
+  assert.equal(byId['epoch:e6'].model, 'Grok 4.7')
+  for (const e of events) {
+    assert.ok(e.magnitude >= 0 && e.magnitude <= 1 && Number.isFinite(e.magnitude))
+    assert.match(e.at, /^\d{4}-\d\d-\d\dT.*Z$/)
+  }
+  assert.deepEqual(events.map(e => Date.parse(e.at)), events.map(e => Date.parse(e.at)).sort((a, b) => a - b))
+  // Same records, same feed.
+  const again = growth.buildGrowthEvents({ baselineBpb: 0.9, epochs: [epoch(1, { decisions: approve(4) })], contributions: [], exhibits: [] })
+  assert.deepEqual(again, growth.buildGrowthEvents({ baselineBpb: 0.9, epochs: [epoch(1, { decisions: approve(4) })], contributions: [], exhibits: [] }))
+
+  // A full window cannot judge its first KEEP; the cap keeps the newest 400.
+  const kept = growth.buildGrowthEvents({ truncated: true, baselineBpb: 0.9, epochs: [epoch(1, { review_verdict: 'keep', run_status: 'ok', val_bpb: 0.8 }), epoch(2, { review_verdict: 'keep', run_status: 'ok', val_bpb: 0.7 })], contributions: [], exhibits: [] })
+  assert.deepEqual(kept.filter(e => e.kind === 'breakthrough').map(e => e.epoch), [2])
+  const many = growth.buildGrowthEvents({ epochs: Array.from({ length: 450 }, (_, i) => epoch(i + 1)), contributions: [], exhibits: [] })
+  assert.equal(many.length, 400)
+  assert.equal(many[0].epoch, 51)
+  assert.equal(many.at(-1).epoch, 450)
+})
+
+test('GET /api/experiment carries growth_events from one limited query per table, and survives missing tables', async () => {
+  const exp = lab.addExperiment({ status: 'growing', current_epoch: 2 })
+  const when = n => new Date(Date.parse('2026-11-01T00:00:00Z') + n * 3600_000)
+  const seen = []
+  const inner = db.handler
+  db.handler = (text, values) => {
+    if (text.includes('FROM epochs WHERE experiment_id = ? AND completed_at IS NOT NULL')) {
+      seen.push(text)
+      return { rows: [{ id: 'ep1', epoch_number: 1, completed_at: when(1), assigned_executor: 'openai/gpt-6-astra', decisions: [{ verdict: 'approve' }, { verdict: 'modify' }] }] }
+    }
+    if (text.includes('FROM code_contributions WHERE experiment_id = ? ORDER BY')) {
+      seen.push(text)
+      return { rows: [{ id: 'cc1', epoch_number: 1, model_id: 'google/gemini-4-hydrogen', merged: true, ci_passed: true, lines_changed: 100, created_at: when(1.5) }] }
+    }
+    if (text.includes("FROM tool_runs WHERE experiment_id = ? AND tool = 'exhibit'")) { seen.push(text); throw new Error('relation "tool_runs" does not exist') }
+    return inner(text, values)
+  }
+  fakeFetch(() => { throw new Error('no model call expected') })
+  const { default: experiment } = await load('api/experiment/index.js')
+  const res = response()
+  await experiment({ method: 'GET', headers: {}, query: {} }, res)
+  assert.equal(res.code, 200)
+  assert.deepEqual(res.body.growth_events.map(e => e.id), ['epoch:ep1', 'contribution:cc1'])
+  assert.equal(res.body.growth_events[0].magnitude, 0.2)
+  assert.equal(res.body.growth_events[1].magnitude, 0.575)
+  assert.equal(seen.length, 3)
+  for (const text of seen) assert.match(text, /LIMIT \?$/)
+  assert.equal(JSON.stringify(res.body.growth_events).includes('train_py'), false)
+
+  // A second poll inside the cache window asks nothing again.
+  const before = seen.length
+  await experiment({ method: 'GET', headers: {}, query: {} }, response())
+  assert.equal(seen.length, before)
+  // The contract's growth_events field stays documented.
+  assert.match(readFileSync(join(root, 'docs/GROWTH.md'), 'utf8'), /## Growth events/)
+  assert.ok(exp.id)
+})
+
 // ===========================================================================
 // 5. Prompts
 // ===========================================================================
