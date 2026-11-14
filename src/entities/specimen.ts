@@ -1,5 +1,5 @@
 import * as THREE from 'three'
-import { FREE, GrowthSink, LONG_AGO, NEVER, tube, type Ring } from './growthParts'
+import { FREE, GrowthSink, LONG_AGO, NEVER, facets, tube, type Ring } from './growthParts'
 import { accentForModel, rng, type GrowthEvent } from '../systems/growthEvents'
 import type { GrowStats } from './eventGrowth'
 
@@ -8,6 +8,12 @@ import type { GrowStats } from './eventGrowth'
 // up the stem, and a main flower at the top that grows, opens and multiplies
 // as the record's growth level rises (more petals, a second and a third bloom,
 // side buds), with a few smaller flowering stems coming up round it.
+//
+// After the break-out it keeps maturing with the room, quietly: the first
+// blooms go to seed (capsules where the hearts were), the side buds open in a
+// second flush, new flowering shoots come off the upper stem, the stem
+// thickens and goes woody at the foot, the oldest rosette leaves yellow, and
+// seedlings come up in the soil round it.
 //
 // While the plant is in the dome (events at level below 3), every real event
 // grows on this plant: an epoch adds leaves or a leafy side shoot, a merged
@@ -74,7 +80,9 @@ const SOIL = col(0x3d2d20)
 const MOSS = col(0x56692f)
 const NORTH_GREEN = col(0x34c38f)
 const CODE_GOLD = col(0xffc94a)
-const SEED_POD = col(0x9a8150)
+const SEED_POD = col(0x8a7346)
+const WOODY = col(0x7a6444)
+const OLD_LEAF = col(0x9a9548)
 
 interface Life {
   g: number
@@ -316,6 +324,217 @@ function berry(sink: GrowthSink, p: THREE.Vector3, r: number, c: THREE.Color, li
 }
 
 // ---------------------------------------------------------------------------
+// Its offspring: the same flower, cheap enough to scatter through the room
+// ---------------------------------------------------------------------------
+
+/**
+ * Petal tones for a flower grown from someone's merged work: the specimen's
+ * own rose-to-cream petals, drawn toward that model's accent (most at the
+ * base of each petal, a little at the tip), so it reads as the specimen's
+ * offspring in that model's colour. No model: the specimen's own tones.
+ */
+export function offspringTones(accent: number | null, v: number): { tip: THREE.Color; base: THREE.Color } {
+  if (accent === null) return { tip: PETAL_TIP.clone().lerp(CREAM, v * 0.5), base: PETAL_BASE.clone().lerp(PETAL_TIP, 0.25 * v) }
+  const a = new THREE.Color(accent)
+  return { tip: PETAL_TIP.clone().lerp(a, 0.26 + v * 0.1), base: PETAL_BASE.clone().lerp(a, 0.64 + v * 0.1) }
+}
+
+export interface HeadOpts {
+  size: number // petal length
+  open: number // 0 a closed bud .. 1 wide open
+  petals: number
+  tip: THREE.Color
+  base: THREE.Color
+  cup: number // how much the petal edges lift
+  curl: number // how much the petals bend back toward their tips when open
+  fine: boolean // rounded petal tips and a ringed heart (6 triangles a petal), else 4
+  g: number
+  surf: number
+  appear: number
+  wither: number
+  R: () => number
+  rings?: number // 2: a second, smaller ring of petals inside (a doubled bloom)
+}
+
+const frameOf = (axis: THREE.Vector3, ref: THREE.Vector3) => {
+  const z = axis.clone().normalize()
+  const x = ref.clone().addScaledVector(z, -ref.dot(z))
+  if (x.lengthSq() < 1e-6) x.set(1, 0, 0).addScaledVector(z, -z.x)
+  if (x.lengthSq() < 1e-6) x.set(0, 0, 1).addScaledVector(z, -z.z)
+  x.normalize()
+  return { z, x, y: new THREE.Vector3().crossVectors(z, x) }
+}
+
+/**
+ * A closed bud: green sepals holding it, the petal colour showing at the
+ * tip. 10 triangles.
+ */
+export function budHead(sink: GrowthSink, base: THREE.Vector3, axis: THREE.Vector3, size: number, tipC: THREE.Color, surf: number, l: Life): void {
+  const { z, x, y } = frameOf(axis, new THREE.Vector3(1, 0.3, 0.2))
+  const P = [base.clone()]
+  const C = [SEPAL.clone().multiplyScalar(0.9)]
+  for (let i = 0; i < 5; i++) {
+    const a = (i / 5) * Math.PI * 2
+    P.push(base.clone().addScaledVector(z, size * 0.42).addScaledVector(x, Math.cos(a) * size * 0.3).addScaledVector(y, Math.sin(a) * size * 0.3))
+    C.push(SEPAL.clone().lerp(tipC, 0.22))
+  }
+  P.push(base.clone().addScaledVector(z, size))
+  C.push(tipC.clone())
+  const T: number[] = []
+  for (let i = 0; i < 5; i++) {
+    const a = 1 + i
+    const b = 1 + ((i + 1) % 5)
+    T.push(0, b, a, a, b, 6)
+  }
+  facets(sink, P, C, T, base, l.g, surf, l.appear, l.wither)
+}
+
+/**
+ * What is left when the petals have fallen: the dark heart swollen into a
+ * seed capsule, its gold ring dried to a crown, a collar of dry sepals under
+ * it (fine only). 10 triangles, 20 fine.
+ */
+export function seedHead(sink: GrowthSink, base: THREE.Vector3, axis: THREE.Vector3, size: number, fine: boolean, surf: number, l: Life): void {
+  const { z, x, y } = frameOf(axis, new THREE.Vector3(1, 0.3, 0.2))
+  const at = (h: number, r: number, a: number) => base.clone().addScaledVector(z, h * size).addScaledVector(x, Math.cos(a) * r * size).addScaledVector(y, Math.sin(a) * r * size)
+  const P = [base.clone()]
+  const C = [SEPAL.clone().lerp(SEED_POD, 0.6)]
+  const T: number[] = []
+  for (let i = 0; i < 5; i++) {
+    P.push(at(0.32, 0.34, (i / 5) * Math.PI * 2))
+    C.push(SEED_POD.clone())
+  }
+  const top = P.length
+  P.push(at(fine ? 0.74 : 0.7, 0, 0))
+  C.push(HEART_GOLD.clone().lerp(SEED_POD, 0.45))
+  if (fine) {
+    // the crown: a narrower ring under the top, its rays picked out in dried gold
+    const crown = P.length
+    for (let i = 0; i < 5; i++) {
+      P.push(at(0.62, 0.27, (i / 5) * Math.PI * 2 + 0.3))
+      C.push(HEART_GOLD.clone().lerp(SEED_POD, 0.65))
+    }
+    for (let i = 0; i < 5; i++) {
+      const a = 1 + i
+      const b = 1 + ((i + 1) % 5)
+      const c = crown + i
+      const d = crown + ((i + 1) % 5)
+      T.push(0, b, a, a, b, c, c, b, d, c, d, top)
+    }
+    // dry sepals, turned back
+    const dry = SEPAL.clone().lerp(SEED_POD, 0.7)
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2 + 0.6
+      const k = P.length
+      P.push(at(0.08, 0.1, a - 0.35), at(-0.12, 0.5, a), at(0.08, 0.1, a + 0.35))
+      C.push(dry, dry.clone().multiplyScalar(0.85), dry)
+      T.push(k, k + 2, k + 1)
+    }
+  } else {
+    for (let i = 0; i < 5; i++) {
+      const a = 1 + i
+      const b = 1 + ((i + 1) % 5)
+      T.push(0, b, a, a, b, top)
+    }
+  }
+  facets(sink, P, C, T, base, l.g, surf, l.appear, l.wither)
+}
+
+/**
+ * The specimen's flower, made cheap: a ring of cupped petals widest past
+ * the middle with a rounded tip (pointed when not fine), shading from the
+ * petal base out to the tip, round the same dark heart ringed with gold.
+ * Under about a sixth open it is a closed bud.
+ */
+export function flowerHead(sink: GrowthSink, centre: THREE.Vector3, axis: THREE.Vector3, ref: THREE.Vector3, o: HeadOpts): void {
+  const l: Life = { g: o.g, appear: o.appear, wither: o.wither }
+  if (o.open < 0.16) {
+    budHead(sink, centre, axis, o.size * 0.55, o.tip.clone().lerp(o.base, 0.4), o.surf, l)
+    return
+  }
+  const { z, x, y } = frameOf(axis, ref)
+  const R = o.R
+  const open = Math.min(1, o.open)
+  const rings = o.rings ?? 1
+  for (let k = 0; k < rings; k++) {
+    const n = Math.max(4, Math.min(o.fine ? 12 : 6, Math.round(o.petals)) - k)
+    const len = o.size * (1 - 0.24 * k)
+    const width = len * 0.5 * Math.sqrt(8 / n) * lerp(0.8, 1.05, open)
+    const theta0 = lerp(0.3, 1.32 - k * 0.32, open)
+    const curl = lerp(-0.3, o.curl * (1 - k * 0.4), open)
+    const startR = len * lerp(0.05, 0.16 - k * 0.04, open)
+    const tipC = o.tip.clone().lerp(o.base, k * 0.15)
+    const twist = R() * 6.283 + (k * Math.PI) / n
+    for (let i = 0; i < n; i++) {
+      const az = (i / n) * Math.PI * 2 + twist + (R() - 0.5) * 0.14
+      const radial = x.clone().multiplyScalar(Math.cos(az)).addScaledVector(y, Math.sin(az))
+      const side = y.clone().multiplyScalar(Math.cos(az)).addScaledVector(x, -Math.sin(az))
+      const lean = (R() - 0.5) * 0.12 * open
+      const dirAt = (t: number) => {
+        const th = theta0 + lean + curl * t * t
+        return z.clone().multiplyScalar(Math.cos(th)).addScaledVector(radial, Math.sin(th))
+      }
+      const nAt = (t: number) => new THREE.Vector3().crossVectors(dirAt(t), side)
+      const c0 = centre.clone().addScaledVector(radial, startR).addScaledVector(z, startR * 0.3)
+      const c1 = c0.clone().addScaledVector(dirAt(0.27), len * 0.55)
+      const c2 = c1.clone().addScaledVector(dirAt(0.72), len * (o.fine ? 0.31 : 0.45))
+      const jit = 0.95 + R() * 0.1
+      const tone = (t: number) => o.base.clone().lerp(tipC, Math.pow(t, 0.65)).multiplyScalar(jit)
+      const w1 = width
+      const e1 = nAt(0.55).multiplyScalar(o.cup * w1)
+      const P = [c0, c1.clone().addScaledVector(side, -w1).add(e1), c1.clone().addScaledVector(nAt(0.55), -w1 * 0.08), c1.clone().addScaledVector(side, w1).add(e1)]
+      const C = [tone(0), tone(0.55).lerp(tipC, 0.15), tone(0.55), tone(0.55).lerp(tipC, 0.15)]
+      let T: number[]
+      if (o.fine) {
+        // shoulders and a rounded tip
+        const w2 = width * 0.6
+        const e2 = nAt(0.86).multiplyScalar(o.cup * w2)
+        const c3 = c2.clone().addScaledVector(dirAt(0.95), len * 0.14)
+        P.push(c2.clone().addScaledVector(side, -w2).add(e2), c3, c2.clone().addScaledVector(side, w2).add(e2))
+        C.push(tone(0.86).lerp(tipC, 0.2), tone(1), tone(0.86).lerp(tipC, 0.2))
+        T = [0, 1, 2, 0, 2, 3, 1, 4, 2, 2, 4, 5, 2, 5, 6, 2, 6, 3]
+      } else {
+        P.push(c2)
+        C.push(tone(1))
+        T = [0, 1, 2, 0, 2, 3, 1, 4, 2, 2, 4, 3]
+      }
+      facets(sink, P, C, T, centre, o.g, o.surf, o.appear, o.wither)
+    }
+  }
+  // the heart, once there is room to see it (ringed in two tones on the
+  // larger heads)
+  if (open > 0.3) {
+    const fineHeart = o.fine && o.size >= 0.07
+    const hs = fineHeart ? 6 : 5
+    const P = [centre.clone().addScaledVector(z, o.size * 0.14)]
+    const C = [HEART_DARK.clone().lerp(SEPAL, 0.25)]
+    const T: number[] = []
+    const ring = (r: number, h: number, c: THREE.Color, off: number) => {
+      const k = P.length
+      for (let i = 0; i < hs; i++) {
+        const a = (i / hs) * Math.PI * 2 + off
+        P.push(centre.clone().addScaledVector(x, Math.cos(a) * r).addScaledVector(y, Math.sin(a) * r).addScaledVector(z, h))
+        C.push(c.clone())
+      }
+      return k
+    }
+    if (fineHeart) {
+      const a = ring(o.size * 0.1, o.size * 0.1, HEART_DARK, 0)
+      const b = ring(o.size * 0.2, o.size * 0.04, HEART_GOLD, 0)
+      for (let i = 0; i < hs; i++) {
+        const j = (i + 1) % hs
+        T.push(0, a + i, a + j, a + i, b + i, a + j, a + j, b + i, b + j)
+      }
+    } else {
+      // one ring: the dark middle runs out into the gold
+      const b = ring(o.size * 0.19, o.size * 0.05, HEART_GOLD, 0)
+      for (let i = 0; i < hs; i++) T.push(0, b + i, b + ((i + 1) % hs))
+    }
+    facets(sink, P, C, T, centre, o.g, o.surf, o.appear, o.wither)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // The plant
 // ---------------------------------------------------------------------------
 
@@ -425,22 +644,27 @@ export class Specimen {
       const t = i / n
       pts.push(new THREE.Vector3(0, soilHeight(0) + H * t, 0).addScaledVector(lean, leanAmt * H * Math.pow(t, 1.6)).addScaledVector(wob, Math.sin(t * Math.PI) * 0.012))
     }
-    const r0 = 0.0085 + 0.007 * smooth(0, 3, L)
+    // ageing: from the break-out on, a little thicker and woody at the foot
+    const age = smooth(3, 6.5, L)
+    const r0 = 0.0085 + 0.007 * smooth(0, 3, L) + 0.0025 * age
     this.stems = [{ pts, r0, r1: r0 * 0.55, phase: mainPhase, g: -1 }]
     this.attr(1, mainPhase, PART.stem, sink)
     // grounded: a short flare into the soil
     const foot = [new THREE.Vector3(0, soilHeight(0) - 0.012, 0), ...pts]
-    tube(sink, this.stemRings(foot, r0 * 1.5, r0 * 0.55, STEM_FOOT, STEM_TOP, always), 5)
+    tube(sink, this.stemRings(foot, r0 * 1.5, r0 * 0.55, STEM_FOOT.clone().lerp(WOODY, 0.55 * age), STEM_TOP, always), 5)
 
     // --- the rosette of leaves at its foot
     this.attr(0.25, mainPhase, PART.leaf, sink)
     const rosetteSize = 0.11 + 0.06 * (1 - Math.exp(-0.9 * L))
-    for (const lf of rosette) {
-      if (lf.g > L) continue
+    rosette.forEach((lf, i) => {
+      if (lf.g > L) return
       const d = new THREE.Vector3(Math.cos(lf.a), 0.75 + lf.s * 0.2, Math.sin(lf.a))
       const b = new THREE.Vector3(Math.cos(lf.a) * 0.012, soilHeight(0) + 0.006, Math.sin(lf.a) * 0.012)
-      leaf(sink, b, d, UP, { len: rosetteSize * lf.s, width: 0.36, arch: 0.55, droop: 0.95, fold: 0.22, twist: lf.tw, color: LEAF_TONES[lf.tone] }, at(lf.g))
-    }
+      // the oldest leaves yellow and lie flatter as the plant ages
+      const old = i < 5 ? smooth(4.2 + i * 0.35, 5.6 + i * 0.35, L) : 0
+      const tone = LEAF_TONES[lf.tone].clone().lerp(OLD_LEAF, 0.45 * old)
+      leaf(sink, b, d, UP, { len: rosetteSize * lf.s, width: 0.36, arch: 0.55 - 0.2 * old, droop: 0.95 + 0.25 * old, fold: 0.22, twist: lf.tw, color: tone }, at(lf.g))
+    })
 
     // --- leaves in pairs up the stem, each pair turned a quarter from the last
     this.attr(1, mainPhase, PART.leaf, sink)
@@ -469,11 +693,16 @@ export class Specimen {
     const open = 0.4 + 0.6 * smooth(0, 1.1, L)
     const petalLen = 0.07 + 0.058 * (1 - Math.exp(-0.8 * L))
     this.attr(1, mainPhase, PART.petal, sink)
-    bloom(sink, top.clone().addScaledVector(axis, 0.006), axis, lean, { petals: 8, rings: L >= 1.4 ? (L >= 2.3 ? 3 : 2) : 1, ringGates: [-1, 1.4, 2.3], open, size: petalLen, tip: PETAL_TIP, base: PETAL_BASE, cup: 0.18, curl: 0.35, R }, always)
+    // late on the main flower's petals turn back a little more and blush at the tips
+    const late = smooth(4.8, 6.8, L)
+    bloom(sink, top.clone().addScaledVector(axis, 0.006), axis, lean, { petals: 8, rings: L >= 1.4 ? (L >= 2.3 ? 3 : 2) : 1, ringGates: [-1, 1.4, 2.3], open, size: petalLen, tip: PETAL_TIP.clone().lerp(PETAL_BASE, 0.18 * late), base: PETAL_BASE, cup: 0.18, curl: 0.35 + 0.22 * late, R }, always)
 
     // --- the second and third blooms and the side buds, off the upper stem
-    for (const sb of sideBlooms) {
-      if (sb.g > L) continue
+    // the open ones go to seed in time; the buds open in a second flush
+    const SEEDS_AT = [3.7, 4.7, 6.1, 6.6, 7.5]
+    const FLUSH_AT = [0, 0, 3.3, 4.3, 5.3]
+    sideBlooms.forEach((sb, i) => {
+      if (sb.g > L) return
       const s = this.along(0, sb.u)
       const out = new THREE.Vector3(Math.cos(sb.a), 0, Math.sin(sb.a))
       const len = sb.len * (H / 0.6)
@@ -484,8 +713,51 @@ export class Specimen {
       tube(sink, this.stemRings(stalk, s.r * 0.6, s.r * 0.45, STEM_TOP, STEM_TOP, at(sb.g)), 4)
       const ax = p2.clone().sub(p1).normalize().lerp(out, 0.2).normalize()
       const sOpen = sb.open ? 0.15 + 0.85 * smooth(sb.g, sb.g + 0.7, L) : 0.04
+      const first: BloomOpts = { petals: sb.open ? 7 : 6, rings: sb.open && L > sb.g + 0.8 ? 2 : 1, open: sOpen, size: petalLen * (sb.open ? 0.78 : 0.42), tip: PETAL_TIP, base: PETAL_BASE, cup: 0.18, curl: 0.3, R, low: !sb.open }
+      const seeded = L >= SEEDS_AT[i]
+      const flush = !sb.open && L >= FLUSH_AT[i]
+      if (!seeded && !flush) {
+        this.attr(1, mainPhase, PART.petal, sink)
+        bloom(sink, p2, ax, out, first, at(sb.g))
+        return
+      }
+      // R is drawn just as for the first bloom, so nothing after it moves
+      bloom(new GrowthSink(), p2, ax, out, first, at(sb.g))
+      if (seeded) {
+        this.attr(1, mainPhase, PART.stem, sink)
+        seedHead(sink, p2, ax.clone().lerp(UP, 0.3).normalize(), petalLen * 0.5, true, FREE, at(sb.g))
+        return
+      }
+      const f = smooth(FLUSH_AT[i], FLUSH_AT[i] + 0.7, L)
       this.attr(1, mainPhase, PART.petal, sink)
-      bloom(sink, p2, ax, out, { petals: sb.open ? 7 : 6, rings: sb.open && L > sb.g + 0.8 ? 2 : 1, open: sOpen, size: petalLen * (sb.open ? 0.78 : 0.42), tip: PETAL_TIP, base: PETAL_BASE, cup: 0.18, curl: 0.3, R, low: !sb.open }, at(sb.g))
+      bloom(sink, p2, ax, out, { petals: 7, rings: L > FLUSH_AT[i] + 0.8 ? 2 : 1, open: 0.15 + 0.85 * f, size: petalLen * (0.42 + 0.3 * f), tip: PETAL_TIP, base: PETAL_BASE, cup: 0.18, curl: 0.3, R: rng(PLANT_SEED + 10 + i), low: f < 0.4 }, at(sb.g))
+    })
+
+    // the second flush: new flowering shoots off the upper stem, from their
+    // own stream so nothing drawn before them moves
+    {
+      const F = rng(PLANT_SEED + 3)
+      const shoots = [
+        { u: 0.68, g: 4.0 },
+        { u: 0.56, g: 4.8 },
+        { u: 0.8, g: 5.6 },
+      ].map(sh => ({ ...sh, a: leanA + Math.PI + (F() - 0.5) * 2.4, len: 0.1 + F() * 0.04, petals: 6 + Math.floor(F() * 2) }))
+      for (const sh of shoots) {
+        if (sh.g > L) continue
+        const s = this.along(0, sh.u)
+        const out = new THREE.Vector3(Math.cos(sh.a), 0, Math.sin(sh.a))
+        const len = sh.len * (H / 0.6)
+        const p1 = s.p.clone().addScaledVector(out, len * 0.5).addScaledVector(UP, len * 0.3)
+        const p2 = s.p.clone().addScaledVector(out, len * 0.78).addScaledVector(UP, len * 0.9)
+        this.attr(1, mainPhase, PART.stem, sink)
+        tube(sink, this.stemRings([s.p.clone(), p1, p2], s.r * 0.55, s.r * 0.4, STEM_TOP, STEM_TOP, at(sh.g)), 4)
+        const ax = p2.clone().sub(p1).normalize().lerp(out, 0.2).normalize()
+        this.attr(1, mainPhase, PART.leaf, sink)
+        leaf(sink, s.p.clone().lerp(p1, 0.7), out.clone().addScaledVector(UP, 0.5), UP, { len: 0.05, width: 0.32, arch: 0.4, droop: 0.7, fold: 0.25, twist: 0.2, rows: 4, color: LEAF_TONES[2] }, at(sh.g))
+        this.attr(1, mainPhase, PART.petal, sink)
+        const op = 0.04 + 0.96 * smooth(sh.g + 0.15, sh.g + 0.85, L)
+        bloom(sink, p2, ax, out, { petals: sh.petals, rings: 1, open: op, size: petalLen * (0.42 + 0.3 * smooth(sh.g, sh.g + 0.8, L)), tip: PETAL_TIP, base: PETAL_BASE, cup: 0.18, curl: 0.3, R: F, low: op < 0.5 }, at(sh.g))
+      }
     }
 
     // --- the smaller flowering stems coming up round it
@@ -515,9 +787,40 @@ export class Specimen {
       const ax = tipP.clone().sub(sp[sp.length - 2]).normalize().lerp(out, 0.3).normalize()
       const sOpen = 0.08 + 0.92 * smooth(st.g + 0.1, st.g + 0.9, L)
       const tone = st.tone
+      if (L >= [3.4, 4.1, 5.0, 5.7, 6.4][k]) {
+        // gone to seed (R still drawn as for the bloom, so nothing after it moves)
+        bloom(new GrowthSink(), tipP, ax, out, { petals: 6 + (k % 2), rings: 1, open: sOpen, size: 0.01, tip: CREAM, base: CREAM, cup: 0.2, curl: 0.25, R }, life)
+        this.attr(1, st.phase, PART.stem, sink)
+        seedHead(sink, tipP, ax, petalLen * 0.36, true, FREE, life)
+        return
+      }
       this.attr(1, st.phase, PART.petal, sink)
       bloom(sink, tipP, ax, out, { petals: 6 + (k % 2), rings: 1, open: sOpen, size: petalLen * (0.55 + 0.1 * tone), tip: PETAL_TIP.clone().lerp(CREAM, tone * 0.5), base: PETAL_BASE.clone().lerp(PETAL_TIP, 0.25 - tone * 0.25), cup: 0.2, curl: 0.25, R }, life)
     })
+
+    // seedlings: fallen seed coming up in the soil round the mother plant
+    {
+      const F = rng(PLANT_SEED + 4)
+      for (let i = 0; i < 7; i++) {
+        const g = 4.3 + i * 0.36
+        const a = leanA + Math.PI * 0.6 + i * 2.39996 + (F() - 0.5) * 0.5
+        const r = 0.2 + F() * 0.42
+        const tw = F() * 6.28
+        const size = 0.85 + F() * 0.4
+        if (g > L) continue
+        const grown = smooth(g, g + 1.2, L) * size
+        const footP = new THREE.Vector3(Math.cos(a) * r, soilHeight(r) - 0.002, Math.sin(a) * r)
+        const h = 0.012 + 0.03 * grown
+        const tipP = footP.clone().addScaledVector(UP, h)
+        this.attr(0.5, tw, PART.stem, sink)
+        tube(sink, this.stemRings([footP, footP.clone().lerp(tipP, 0.5).add(new THREE.Vector3(0.002, 0, 0.002)), tipP], 0.0028, 0.002, STEM_FOOT, STEM_TOP, at(g)), 3)
+        this.attr(0.5, tw, PART.leaf, sink)
+        for (const side of [-1, 1]) {
+          const d = new THREE.Vector3(Math.cos(tw) * side, 0.7, Math.sin(tw) * side)
+          leaf(sink, tipP, d, UP, { len: 0.022 + 0.026 * grown, width: 0.42, arch: 0.4, droop: 0.6, fold: 0.15, twist: 0, rows: 4, color: LEAF_TONES[(i + (side > 0 ? 3 : 0)) % LEAF_TONES.length].clone().lerp(LEAF_LIGHT, 0.2) }, at(g))
+        }
+      }
+    }
 
     // --- berries on the upper stem for North's accepted experiments (one
     // side) and code-backed spec items (the other); the shader shows as many
@@ -585,7 +888,8 @@ export class Specimen {
     }
     const L0: Life = { g, appear: timeAt(0), wither: witherAt }
     const leafLife = (f: number): Life => ({ g: g + 0.01, appear: animate ? timeAt(f) + 0.35 : LONG_AGO, wither: witherAt })
-    const petal = (accent !== null ? new THREE.Color(accent) : CREAM.clone())
+    // the specimen's own petals, tinted toward the author's accent
+    const tones = offspringTones(accent, 0.5)
 
     if (e.kind === 'epoch') {
       // leaves on a stem, a leafy side shoot, or new leaves at the foot
@@ -641,8 +945,8 @@ export class Specimen {
       // slender flowering stem of its own from the soil. A breakthrough is a
       // larger, doubled bloom on a stronger stalk off the main stem.
       const big = e.kind === 'breakthrough'
-      const tipC = big && accent === null ? col(0xf3d27a) : petal.clone().lerp(CREAM, 0.38)
-      const baseC = big && accent === null ? col(0xd9963a) : petal.clone().multiplyScalar(0.9)
+      const tipC = big && accent === null ? col(0xf3d27a) : tones.tip
+      const baseC = big && accent === null ? col(0xd9963a) : tones.base
       const size = big ? 0.07 + m * 0.035 : (0.036 + m * 0.036) * (0.9 + R() * 0.2)
       // most come up from the soil as stems of their own, so the main
       // flower keeps its head clear
@@ -689,8 +993,8 @@ export class Specimen {
       this.attr(1, ph, PART.petal, sink)
       const bl: Life = { ...life, appear: animate ? timeAt(1) + 0.4 : LONG_AGO }
       if (!big && detail < 1) {
-        // over: gone to seed, a small pod in its colour
-        berry(sink, tip.clone().addScaledVector(dir, 0.01), 0.011, baseC.clone().lerp(SEED_POD, 0.55), bl)
+        // over: gone to seed
+        seedHead(sink, tip, dir, 0.03, false, FREE, bl)
         stats.buds++
       } else {
         bloom(sink, tip, dir, ref, { petals: big ? 9 : 6 + Math.floor(R() * 3), rings: big ? 2 : 1, open: big ? 1 : 0.6 + R() * 0.25, size, tip: tipC, base: baseC, cup: 0.22 + R() * 0.1, curl: 0.15 + R() * 0.2, R, low: !big }, bl)

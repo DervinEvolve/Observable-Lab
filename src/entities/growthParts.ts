@@ -2,8 +2,8 @@ import * as THREE from 'three'
 
 // The buffers the overgrowth is drawn from, shared by the fixed base organism
 // (Overgrowth.ts) and the growth each real event adds (eventGrowth.ts). Stems,
-// flowers, buds and floor cracks all go into one merged mesh; leaves are
-// instanced. Every vertex carries:
+// flowers, buds and floor cracks all go into one merged mesh (the flowers are
+// the specimen's own, specimen.ts); leaves are instanced. Every vertex carries:
 //   aGrow   the growth level at which it is drawn (the stage gate)
 //   aSpine  the point it grows out of
 //   aPrev   where its ring starts before sliding out (the tip of a growing stem)
@@ -102,6 +102,7 @@ export interface Ring {
   c: THREE.Color
   appear: number
   wither: number
+  tw?: number // how far the cross-section has turned about the stem (radians): a slight twist along a stem
 }
 
 const _T = new THREE.Vector3()
@@ -131,7 +132,7 @@ export function tube(sink: GrowthSink, rings: Ring[], radial = 3): void {
     _B.crossVectors(_T, _N).normalize()
     const prev = rings[Math.max(0, i - 1)].p
     for (let j = 0; j < radial; j++) {
-      const th = (j / radial) * Math.PI * 2 + 0.5
+      const th = (j / radial) * Math.PI * 2 + 0.5 + (R.tw ?? 0)
       _O.copy(_N).multiplyScalar(Math.cos(th)).addScaledVector(_B, Math.sin(th))
       _V.copy(R.p).addScaledVector(_O, R.r)
       sink.vert(_V, _O, R.c, R.g, R.p, R.surf, R.appear, R.wither, prev)
@@ -167,6 +168,14 @@ export function ribbon(sink: GrowthSink, rings: Ring[]): void {
     if (_N.lengthSq() < 1e-6) _N.set(_T.y, -_T.x, 0.3).addScaledVector(_T, -_T.dot(_N))
     _N.normalize()
     _B.crossVectors(_T, _N).normalize()
+    if (R.tw) {
+      // turn the strip a little about the stem
+      const c = Math.cos(R.tw)
+      const sn = Math.sin(R.tw)
+      _O.copy(_B).multiplyScalar(c).addScaledVector(_N, sn)
+      _N.multiplyScalar(c).addScaledVector(_B, -sn)
+      _B.copy(_O)
+    }
     const prev = rings[Math.max(0, i - 1)].p
     for (const side of [-1, 1]) {
       // edges lean their normals outward so the strip shades like a rounded stem
@@ -181,63 +190,80 @@ export function ribbon(sink: GrowthSink, rings: Ring[]): void {
   }
 }
 
-export interface FlowerOpts {
-  petals: number // 4..9
-  notch: number // 0.2..0.6: how broad each petal is at its base
-  cup: number // petal tips lift toward the viewer
-  color: THREE.Color
-  heart: THREE.Color
-  g: number
-  surf: number
-  appear: number
-  wither: number
-  twist?: number
+/**
+ * Where to set the rings of a smooth stem through `pts`: a centripetal
+ * Catmull-Rom spline through the points, sampled finely, with a ring wherever
+ * the stem has turned by `maxTurn` radians or run `maxLen` metres since the
+ * last one (never closer than `minLen`). Straight runs stay cheap and bends
+ * get the rings. Each station is its point on the spline and its place
+ * between the input points (0 .. pts.length - 1), for interpolating the rest.
+ */
+export function splineStations(pts: THREE.Vector3[], maxTurn: number, maxLen: number, minLen = 0.02): Array<{ p: THREE.Vector3; f: number }> {
+  const n = pts.length
+  if (n < 2) return pts.map((p, i) => ({ p: p.clone(), f: i }))
+  if (n === 2) return [{ p: pts[0].clone(), f: 0 }, { p: pts[1].clone(), f: 1 }]
+  let chord = 0
+  for (let i = 1; i < n; i++) chord += pts[i].distanceTo(pts[i - 1])
+  if (chord < 1e-5) return [{ p: pts[0].clone(), f: 0 }, { p: pts[n - 1].clone(), f: n - 1 }]
+  const curve = new THREE.CatmullRomCurve3(pts, false, 'centripetal')
+  const N = Math.min((n - 1) * 24, Math.max((n - 1) * 3, Math.ceil(chord / 0.012)))
+  const out: Array<{ p: THREE.Vector3; f: number }> = [{ p: pts[0].clone(), f: 0 }]
+  const lastT = new THREE.Vector3()
+  const t = new THREE.Vector3()
+  const prevP = pts[0].clone()
+  const p = new THREE.Vector3()
+  curve.getPoint(1 / N, p)
+  lastT.subVectors(p, prevP).normalize()
+  let run = 0
+  let turned = 0
+  const prevT = lastT.clone()
+  for (let i = 1; i <= N; i++) {
+    curve.getPoint(i / N, p)
+    const step = p.distanceTo(prevP)
+    if (step > 1e-7) {
+      t.subVectors(p, prevP).divideScalar(step)
+      turned += prevT.angleTo(t)
+      prevT.copy(t)
+    }
+    run += step
+    prevP.copy(p)
+    if (i === N) break
+    if (run >= minLen && (run >= maxLen || turned >= maxTurn)) {
+      out.push({ p: p.clone(), f: (i / N) * (n - 1) })
+      run = 0
+      turned = 0
+    }
+  }
+  // the tip: merge a very short last stretch into it
+  if (out.length > 1 && run < minLen * 0.5) out.pop()
+  out.push({ p: pts[n - 1].clone(), f: n - 1 })
+  return out
 }
 
 /**
- * A ring of petals facing `facing`, one wedge-shaped triangle a petal, gold
- * at the heart, coloured at the rim.
+ * Triangles over the points given (three indices each), each vertex's normal
+ * from the faces round it, so a small shape shades smoothly.
  */
-export function flower(sink: GrowthSink, centre: THREE.Vector3, facing: THREE.Vector3, ref: THREE.Vector3, size: number, o: FlowerOpts): void {
-  const z = facing.clone().normalize()
-  const x = ref.clone().addScaledVector(z, -ref.dot(z))
-  if (x.lengthSq() < 1e-6) x.set(1, 0, 0).addScaledVector(z, -z.x)
-  if (x.lengthSq() < 1e-6) x.set(0, 1, 0).addScaledVector(z, -z.y)
-  x.normalize()
-  const y = new THREE.Vector3().crossVectors(z, x)
-  const n = Math.max(3, Math.round(o.petals))
-  const tw = o.twist ?? 0
-  const half = (Math.PI / n) * (0.6 + o.notch * 0.6)
-  const base = o.color.clone().lerp(o.heart, 0.55)
-  const at = (a: number, r: number, lift: number) => centre.clone().addScaledVector(x, Math.cos(a) * r).addScaledVector(y, Math.sin(a) * r).addScaledVector(z, lift)
-  for (let i = 0; i < n; i++) {
-    const a = (i / n) * Math.PI * 2 + tw
-    const h = sink.vert(at(a, size * 0.06, size * 0.08), z, base, o.g, centre, o.surf, o.appear, o.wither)
-    const l = sink.vert(at(a - half, size, o.cup * size), z, o.color, o.g, centre, o.surf, o.appear, o.wither)
-    const r = sink.vert(at(a + half, size, o.cup * size), z, o.color, o.g, centre, o.surf, o.appear, o.wither)
-    sink.idx.push(h, l, r)
+export function facets(sink: GrowthSink, P: THREE.Vector3[], C: THREE.Color[], tris: number[], spine: THREE.Vector3, g: number, surf: number, appear: number, wither: number): void {
+  const nrm = P.map(() => new THREE.Vector3())
+  for (let k = 0; k < tris.length; k += 3) {
+    const a = tris[k]
+    const b = tris[k + 1]
+    const c = tris[k + 2]
+    _T.subVectors(P[b], P[a])
+    _N.subVectors(P[c], P[a])
+    _B.crossVectors(_T, _N)
+    nrm[a].add(_B)
+    nrm[b].add(_B)
+    nrm[c].add(_B)
   }
-}
-
-/** A closed bud on the end of a stem: 6 triangles. */
-export function bud(sink: GrowthSink, base: THREE.Vector3, dir: THREE.Vector3, size: number, c: THREE.Color, g: number, surf: number, appear: number, wither: number): void {
-  const d = dir.clone().normalize()
-  const side = Math.abs(d.y) < 0.9 ? new THREE.Vector3(0, 1, 0) : new THREE.Vector3(1, 0, 0)
-  const u = new THREE.Vector3().crossVectors(d, side).normalize()
-  const v = new THREE.Vector3().crossVectors(d, u)
-  const b = sink.vert(base, d.clone().negate(), c, g, base, surf, appear, wither)
-  const ring: number[] = []
-  for (let i = 0; i < 3; i++) {
-    const a = (i / 3) * Math.PI * 2
-    const o = u.clone().multiplyScalar(Math.cos(a)).addScaledVector(v, Math.sin(a))
-    ring.push(sink.vert(base.clone().addScaledVector(d, size * 0.42).addScaledVector(o, size * 0.32), o, c, g, base, surf, appear, wither))
+  const base = sink.vertexCount
+  for (let i = 0; i < P.length; i++) {
+    const n = nrm[i]
+    if (n.lengthSq() < 1e-16) n.set(0, 1, 0)
+    sink.vert(P[i], n.normalize(), C[i], g, spine, surf, appear, wither)
   }
-  const t = sink.vert(base.clone().addScaledVector(d, size), d, c, g, base, surf, appear, wither)
-  for (let i = 0; i < 3; i++) {
-    const a = ring[i]
-    const b2 = ring[(i + 1) % 3]
-    sink.idx.push(b, b2, a, a, b2, t)
-  }
+  for (const k of tris) sink.idx.push(base + k)
 }
 
 // Leaf: blade along +Y from its stalk at the origin, face normal +Z, folded
