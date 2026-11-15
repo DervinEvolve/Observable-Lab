@@ -229,8 +229,8 @@ class FakeLab {
     }
 
     // Epochs
-    if (text.includes("followup->>'status' = 'pending'")) {
-      const rows = this.epochs.filter(e => e.experiment_id === v[0] && e.spec_after && e.followup?.status === 'pending')
+    if (text.includes("followup->>'status' IN ('pending', 'awaiting_ci')")) {
+      const rows = this.epochs.filter(e => e.experiment_id === v[0] && e.spec_after && ['pending', 'awaiting_ci'].includes(e.followup?.status))
         .sort((a, b) => a.epoch_number - b.epoch_number).slice(0, 1).map(e => ({ epoch_number: e.epoch_number }))
       return { rows }
     }
@@ -739,10 +739,22 @@ test('a classic epoch: validated output, one contribution, real cost from the le
   const queued = lab.epochs.find(e => e.experiment_id === exp.id && e.epoch_number === 4)
   assert.equal(queued.followup.status, 'pending')
   assert.equal(queued.followup.contribution_mutation_index, 0)
+  // Stage 1: code written and the PR opened; nothing waits for CI here.
+  const stage1 = await followups.runEpochFollowUp(exp.id)
+  assert.equal(stage1.ran, true)
+  assert.equal(stage1.status, 'awaiting_ci')
+  assert.equal(queued.followup.status, 'awaiting_ci')
+  assert.equal(queued.followup.pending.pr_url, 'https://github.example/pr/7')
+  assert.equal(requests.some(r => r.url.includes('/actions/runs')), false)
+  assert.equal(lab.contributions.length, 0)
+  assert.equal(exp.epoch_in_progress, false)
+  // Stage 2 (a later tick): CI is read (no trusted workflow is configured
+  // here, so there is no passing result) and the PR is closed and recorded.
   const followUp = await followups.runEpochFollowUp(exp.id)
   assert.equal(followUp.ran, true)
   assert.equal(followUp.epoch_number, 4)
   assert.equal(queued.followup.status, 'done')
+  assert.equal(queued.followup.result.merged, false)
   assert.equal(exp.epoch_in_progress, false)
   assert.deepEqual(await followups.runEpochFollowUp(exp.id), { ran: false, reason: 'nothing pending' })
 
@@ -1241,4 +1253,41 @@ test('GET /api/experiment/activity serves the latest epoch, one epoch, or the wh
   res = response()
   await activity({ method: 'POST', headers: {}, query: {} }, res)
   assert.equal(res.code, 405)
+})
+
+// ===========================================================================
+// Follow-up timing: deadlines, timeouts and one retry
+// ===========================================================================
+test('a timed-out model call goes straight to the fallback, and a spent deadline makes no request', async () => {
+  const requested = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response(JSON.stringify(CATALOG))
+    const body = JSON.parse(options.body)
+    requested.push(body.model)
+    if (body.model === 'anthropic/claude-fable-5.2') throw new DOMException('The operation timed out.', 'TimeoutError')
+    return completion(body.model, { ok: true })
+  }
+  const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u')
+  assert.deepEqual(requested, ['anthropic/claude-fable-5.2', 'anthropic/claude-sonnet-5.5']) // no second try on the slow model
+  assert.equal(r.servedBy.model, 'anthropic/claude-sonnet-5.5')
+
+  requested.length = 0
+  await assert.rejects(openrouter.callModel('openai/gpt-6-astra', 's', 'u', { deadlineAt: Date.now() + 5_000 }), /Model returned invalid response/)
+  assert.deepEqual(requested, []) // under 20 s left: nothing is started
+})
+
+test('a follow-up that opened no pull request can be retried once', async () => {
+  const exp = lab.addExperiment({ current_epoch: 1 })
+  const ep = { id: uuid(), experiment_id: exp.id, epoch_number: 1, spec_after: classicSpec(), completed_at: new Date(),
+    followup: { status: 'done', contribution_mutation_index: 0, deliverables: false, queued_at: 'x', result: { pr_url: null, merged: false } } }
+  lab.epochs.push(ep)
+  const fake = lab.handle.bind(lab)
+  db.handler = (text, v) => text.startsWith('SELECT id, followup FROM epochs') ? { rows: lab.epochs.filter(e => e.experiment_id === v[0] && e.epoch_number === v[1]) } : fake(text, v)
+  assert.deepEqual(await followups.requeueFollowUp(exp.id, 1), { ok: true })
+  assert.equal(ep.followup.status, 'pending')
+  assert.equal(ep.followup.retries, 1)
+  ep.followup = { ...ep.followup, status: 'done', result: { pr_url: null } }
+  assert.deepEqual(await followups.requeueFollowUp(exp.id, 1), { ok: false, reason: 'already retried' })
+  ep.followup = { status: 'done', contribution_mutation_index: 0, deliverables: false, queued_at: 'x', result: { pr_url: 'https://github.com/x/y/pull/3' } }
+  assert.match((await followups.requeueFollowUp(exp.id, 1)).reason, /a PR was opened/)
 })

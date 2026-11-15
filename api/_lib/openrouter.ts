@@ -330,7 +330,8 @@ async function requestCompletion(
   jsonOnly: boolean,
   webSearch = false,
   maxTokens?: number,
-  assigned = modelId
+  assigned = modelId,
+  timeoutMs = COMPLETION_TIMEOUT_MS
 ): Promise<{ data: any; content: string; citations: WebCitation[]; usage: CallUsage }> {
   const caps = await getModelCapabilities(modelId)
   const requestBody = buildRequestBody(modelId, caps, systemPrompt, userPrompt, { jsonOnly, webSearch, maxTokens })
@@ -344,7 +345,7 @@ async function requestCompletion(
       'X-Title': 'Observable Multi-Agent Lab',
     },
     body: JSON.stringify(requestBody),
-    signal: AbortSignal.timeout(COMPLETION_TIMEOUT_MS),
+    signal: AbortSignal.timeout(timeoutMs),
   });
 
   if (!response.ok) {
@@ -410,7 +411,17 @@ export async function callModel(
   modelId: string,
   systemPrompt: string,
   userPrompt: string,
-  opts: { webSearch?: boolean; maxTokens?: number; noFallback?: boolean } = {}
+  opts: {
+    webSearch?: boolean
+    maxTokens?: number
+    noFallback?: boolean
+    // Longest a single request may run (default OPENROUTER_TIMEOUT_MS, 240 s).
+    timeoutMs?: number
+    // Wall-clock time (ms since epoch) by which the whole call, retries and
+    // fallbacks included, must be over. Each request gets what is left, and
+    // nothing new starts with under MIN_REQUEST_MS remaining.
+    deadlineAt?: number
+  } = {}
 ): Promise<CallModelResult> {
 
   if (!OPENROUTER_API_KEY) {
@@ -437,6 +448,16 @@ export async function callModel(
     usage.requests++
   }
 
+  const MIN_REQUEST_MS = 20_000
+  const requestTimeout = (): number => {
+    const base = opts.timeoutMs ?? COMPLETION_TIMEOUT_MS
+    return opts.deadlineAt ? Math.min(base, opts.deadlineAt - Date.now()) : base
+  }
+  // A request that ran out of time would very likely run out again with the
+  // same prompt, so a timeout goes straight to the fallback instead.
+  const isTimeout = (e: unknown) => e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')
+  let outOfTime = false
+
   // Try up to 3 times with increasing JSON enforcement. Web search and strict
   // json_object mode don't reliably compose, so after the first attempt we
   // DROP web search and turn strict JSON back on — grounding is best-effort,
@@ -444,8 +465,15 @@ export async function callModel(
   for (let attempt = 0; attempt < 3; attempt++) {
     const jsonOnly = attempt > 0;
     const useWeb = opts.webSearch && attempt === 0;
+    const timeoutMs = requestTimeout()
+    if (timeoutMs < MIN_REQUEST_MS) {
+      outOfTime = true
+      lastError = new Error('Model call skipped: out of time')
+      console.warn(`[MODEL] ${modelId}: out of time before attempt ${attempt + 1}`)
+      break
+    }
     try {
-      const result = await requestCompletion(modelId, systemPrompt, userPrompt, jsonOnly, useWeb, opts.maxTokens);
+      const result = await requestCompletion(modelId, systemPrompt, userPrompt, jsonOnly, useWeb, opts.maxTokens, modelId, timeoutMs);
       tally(result.usage)
       data = result.data;
       content = result.content || '';
@@ -457,6 +485,10 @@ export async function callModel(
       if (e instanceof ModelRefusalError) {
         tally(e.usage) // billed, so it counts toward this call's cost
         break // the same prompt gets the same refusal
+      }
+      if (isTimeout(e)) {
+        console.warn(`[MODEL] ${modelId} timed out after ${Math.round(timeoutMs / 1000)} s; not retrying the same model`)
+        break
       }
       if (attempt < 2) {
         console.warn(`[PARSE] Attempt ${attempt + 1} failed for ${modelId}, retrying...`);
@@ -472,7 +504,7 @@ export async function callModel(
   // content or unparseable JSON, e.g. a flaky provider), fall back to a
   // reliable substitute so ONE bad model call can't kill the whole epoch —
   // roles depend on each other, so a dead planner/executor is fatal otherwise.
-  if (parsed === undefined && !opts.noFallback) {
+  if (parsed === undefined && !opts.noFallback && !outOfTime) {
     // A refusal comes from the lab's own policy, so another model from the
     // same lab refuses the same prompt; go straight to a different lab.
     const refusedBy = new Set<string>()
@@ -483,9 +515,14 @@ export async function callModel(
         console.warn(`[MODEL] skipping fallback ${fb}: ${providerOf(fb)} already refused this prompt`);
         continue;
       }
+      const fbTimeout = requestTimeout()
+      if (fbTimeout < MIN_REQUEST_MS) {
+        console.warn(`[MODEL] no time left to try fallback ${fb} for ${modelId}`)
+        break
+      }
       try {
         console.warn(`[MODEL] ${modelId} failed — falling back to ${fb}`);
-        const result = await requestCompletion(fb, systemPrompt, userPrompt, true, false, opts.maxTokens, modelId);
+        const result = await requestCompletion(fb, systemPrompt, userPrompt, true, false, opts.maxTokens, modelId, fbTimeout);
         tally(result.usage)
         parsed = extractJson(result.content || '');
         data = result.data;

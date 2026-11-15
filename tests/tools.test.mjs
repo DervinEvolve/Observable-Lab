@@ -158,8 +158,8 @@ class FakeLab {
     if (text.startsWith("SELECT e.*, (SELECT json_agg")) {
       return { rows: this.experiments.filter(e => e.status !== 'archived').slice(-1).map(e => ({ ...e, recent_epochs: [] })) }
     }
-    if (text.includes("followup->>'status' = 'pending'")) {
-      const rows = this.epochs.filter(e => e.experiment_id === v[0] && e.spec_after && e.followup?.status === 'pending')
+    if (text.includes("followup->>'status' IN ('pending', 'awaiting_ci')")) {
+      const rows = this.epochs.filter(e => e.experiment_id === v[0] && e.spec_after && ['pending', 'awaiting_ci'].includes(e.followup?.status))
         .sort((a, b) => a.epoch_number - b.epoch_number).slice(0, 1).map(e => ({ epoch_number: e.epoch_number }))
       return { rows }
     }
@@ -714,9 +714,18 @@ test('an epoch with every tool on: each runs once, is recorded, costed against t
   assert.equal(lab.epochs[0].followup.status, 'pending')
   assert.equal(lab.epochs[0].followup.contribution_mutation_index, 0)
   assert.equal(lab.epochs[0].followup.deliverables, true)
+  // Stage 1 writes the code and opens the PR; stage 2 (a later tick) reads CI,
+  // merges, and runs the approved exhibit and proposal.
+  const stage1 = await followups.runEpochFollowUp(exp.id)
+  assert.equal(stage1.ran, true)
+  assert.equal(lab.epochs[0].followup.status, 'awaiting_ci')
+  assert.equal(lab.epochs[0].followup.pending.branch, 'epoch-4-capabilities-0')
+  assert.equal(calls.some(c => /\/pulls\/\d+\/merge$/.test(c.url)), false) // nothing merged yet
   const followUp = await followups.runEpochFollowUp(exp.id)
   assert.equal(followUp.ran, true)
   assert.equal(lab.epochs[0].followup.status, 'done')
+  assert.equal(lab.epochs[0].followup.result.merged, true)
+  assert.equal(lab.epochs[0].followup.pending, undefined)
   assert.equal(exp.epoch_in_progress, false)
   const executorName = (await load('api/_lib/types.js')).modelDisplayName(executor)
 
@@ -808,6 +817,7 @@ test('without the Reviewer\'s approval no exhibit or proposal is opened; a resum
   }
   globalThis.fetch = fakeWorld({ models: epochModels(tools, { verdicts: { exhibit: 'maybe' } }), calls })
   await runner.runEpoch(exp.id)
+  await followups.runEpochFollowUp(exp.id)
   await followups.runEpochFollowUp(exp.id)
   const skipped = lab.toolRuns.filter(r => r.status === 'skipped').map(r => [r.tool, r.output_tail])
   assert.deepEqual(skipped.sort(), [['exhibit', 'the Reviewer did not approve it'], ['lab_proposal', 'the Reviewer did not approve it']])

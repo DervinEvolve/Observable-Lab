@@ -106,6 +106,23 @@ export interface ContributionResult {
   ci_excerpt?: string         // failed-run log tail — fed back to the lab so models learn from it
   sprite?: SpriteCheck        // the author's sprite ran the tests on this branch (extra evidence, not a merge gate)
   subagents?: SubagentRun[]   // every subagent deployed for this contribution, including failed ones
+  pending?: PendingContribution // set with deferResolution: the PR is open and waits for resolveContribution
+}
+
+/**
+ * An open pull request whose CI result is read later (resolveContribution),
+ * so writing the code and waiting for CI don't have to share one function
+ * time limit. Plain data, stored on the epoch row between ticks.
+ */
+export interface PendingContribution {
+  pr_number: number
+  pr_url: string
+  head_sha: string
+  branch: string
+  author_model_id: string   // the model that wrote the code (the fallback, if one answered)
+  merge_message: string
+  approved: boolean         // the Reviewer approved the mutation; CI still decides
+  opened_at: string
 }
 
 // Resolves any OpenRouter model id (panel model or wildcard) to the display
@@ -123,7 +140,8 @@ function modelCredit(modelId: string): string {
 async function generateSubagentContribution(
   authorModelId: string,
   description: string,
-  mainFiles: RepoFile[]
+  mainFiles: RepoFile[],
+  deadlineAt?: number
 ): Promise<{ files: RepoFile[]; commit_message: string; cost: number; model: string }> {
   const { output, cost, servedBy } = await callModel(
     authorModelId,
@@ -131,7 +149,7 @@ async function generateSubagentContribution(
     `Parent task: ${description}\n\nFiles just written:\n${mainFiles
       .map(f => `--- ${f.path} ---\n${f.content.slice(0, 2000)}`)
       .join('\n\n')}`,
-    { maxTokens: 16000 } // real test files can be long — never truncate the JSON
+    { maxTokens: 16000, deadlineAt } // real test files can be long — never truncate the JSON
   )
   const subagentOut = output as SubagentOutput
   return { files: subagentOut.files || [], commit_message: subagentOut.commit_message || '', cost, model: servedBy.model }
@@ -141,13 +159,14 @@ async function runExplorerSubagent(
   authorModelId: string,
   description: string,
   tree: string[],
-  angle?: string
+  angle?: string,
+  deadlineAt?: number
 ): Promise<ExplorerReport> {
   const { output, cost, citations, servedBy } = await callModel(
     authorModelId,
     EXPLORER_SYSTEM + (angle ? `\n\n${angle}` : ''),
     `Task to investigate: ${description}\n\nCurrent repo files (top-level):\n${tree.length ? tree.join('\n') : '(empty repo)'}`,
-    { webSearch: true }
+    { webSearch: true, deadlineAt }
   )
   const explorerOut = output as ExplorerOutput
   const str = (v: unknown, max: number) => (typeof v === 'string' ? v.slice(0, max) : '')
@@ -233,6 +252,14 @@ export async function contributeCode(params: {
   deploySubagent?: boolean // older callers: a test subagent (same model) adds a test file
   deployExplorerSubagent?: boolean // older callers: one explorer researches the problem before any code is written
   agentContext?: string // what the agent being built actually is (purpose/domain) — grounds the code in the real product, not a generic toy
+  // Wall-clock time (ms since epoch) by which this request must be done with
+  // model calls. The code-writing call gets up to 7 minutes within it, the
+  // test subagent is skipped when too little is left.
+  deadlineAt?: number
+  // Stop once the PR is open and return it as `pending`; resolveContribution
+  // reads CI and merges or closes later, in another request. Only for an
+  // approved or rejected review (an auto-review needs the generated files).
+  deferResolution?: boolean
 }): Promise<ContributionResult> {
   let cost = 0
   let author = modelCredit(params.authorModelId)
@@ -261,7 +288,8 @@ export async function contributeCode(params: {
     // each takes its own angle and they run side by side.
     if (exploreCount > 0) {
       const settled = await Promise.allSettled(Array.from({ length: exploreCount }, (_, i) =>
-        runExplorerSubagent(params.authorModelId, params.description, tree, exploreCount > 1 ? EXPLORER_ANGLES[i] : undefined)))
+        runExplorerSubagent(params.authorModelId, params.description, tree, exploreCount > 1 ? EXPLORER_ANGLES[i] : undefined,
+          params.deadlineAt ? params.deadlineAt - 6 * 60_000 : undefined)))
       for (const r of settled) {
         if (r.status === 'fulfilled') {
           cost += r.value.cost
@@ -286,7 +314,10 @@ export async function contributeCode(params: {
       `${params.agentContext ? `You're building: ${params.agentContext}\n\n` : ''}${
         explorerFindings ? `A subagent explored this first and found: ${explorerFindings}\n\n` : ''
       }Implement this: ${params.description}\n\nCurrent repo files (top-level, for context — don't collide):\n${tree.length ? tree.join('\n') : '(empty repo)'}`,
-      { maxTokens: 16000 } // a real implementation file mustn't be truncated mid-JSON
+      // A real implementation file mustn't be truncated mid-JSON, and writing
+      // one with reasoning on can take several minutes. A minute is kept back
+      // for pushing the files and opening the PR.
+      { maxTokens: 16000, timeoutMs: 420_000, deadlineAt: params.deadlineAt ? params.deadlineAt - 60_000 : undefined }
     )
     cost += codeCost
     const coder = output as CoderOutput
@@ -333,10 +364,16 @@ export async function contributeCode(params: {
     // landing on the same branch as its own commit, whose Model-Role trailer
     // marks it as the subagent's so it's distinguishable in git history.
     let subagentFiles: RepoFile[] = []
-    if (deployTest) {
+    const timeForTest = !params.deadlineAt || params.deadlineAt - Date.now() > 150_000
+    if (deployTest && !timeForTest) {
+      console.warn('[code-contribution] skipping the test subagent: not enough time left in this request')
+      subagentRuns.push({ kind: 'test', model: params.authorModelId, ok: false, cost: 0 })
+    }
+    if (deployTest && timeForTest) {
       let testRun: SubagentRun = { kind: 'test', model: params.authorModelId, ok: false, cost: 0 }
       try {
-        const subagent = await generateSubagentContribution(params.authorModelId, params.description, coder.files)
+        const subagent = await generateSubagentContribution(params.authorModelId, params.description, coder.files,
+          params.deadlineAt ? params.deadlineAt - 30_000 : undefined)
         cost += subagent.cost
         testRun = { kind: 'test', model: subagent.model, ok: false, cost: subagent.cost }
         const proposed = Array.isArray(subagent.files) ? subagent.files : []
@@ -388,6 +425,19 @@ export async function contributeCode(params: {
     } catch (e) {
       console.warn('[code-contribution] could not read the branch head (merge blocked):', e instanceof Error ? e.message : e)
     }
+    // Deferred: the PR is open; CI runs on GitHub meanwhile and
+    // resolveContribution reads it in a later request.
+    if (params.deferResolution && params.review.mode !== 'auto-review' && headSha) {
+      return {
+        merged: false, ...base, cost, ci_passed: null,
+        pending: {
+          pr_number: pr.number, pr_url: pr.html_url, head_sha: headSha, branch: params.branchName,
+          author_model_id: authorModelId, merge_message: coder.commit_message || params.title,
+          approved: params.review.mode === 'approved', opened_at: new Date().toISOString(),
+        },
+      }
+    }
+
     // The author's sprite checks out this exact commit and runs the tests
     // while CI runs. It has its own hard time limit and never throws; its
     // verdict is shown to viewers but does not decide the merge. It has to
@@ -459,3 +509,54 @@ export async function contributeCode(params: {
   }
 }
 
+
+export type ResolvedContribution =
+  | { status: 'not_ready' }
+  | { status: 'resolved'; merged: boolean; ci_passed: boolean | null; ci_excerpt: string; sprite: SpriteCheck }
+
+/**
+ * Second half of a deferred contribution: read CI for the exact commit, run
+ * the author's Sprite tests on it, then merge (approved and CI passed) or
+ * close. Returns not_ready while CI is still running and `waitIfRunning`.
+ * Never throws for GitHub or Sprite failures; the PR is always resolved
+ * unless it is left open on purpose for a later try.
+ */
+export async function resolveContribution(
+  pending: PendingContribution,
+  opts: { ciWaitMs?: number; waitIfRunning?: boolean } = {},
+): Promise<ResolvedContribution> {
+  let ciPassed: boolean | null = null
+  let ciExcerpt = ''
+  try {
+    const ci = await waitForCIRun(pending.head_sha, opts.ciWaitMs ?? 60_000)
+    if (ci.conclusion === 'success') ciPassed = true
+    else if (ci.conclusion === 'failure') {
+      ciPassed = false
+      ciExcerpt = ci.runId ? await getCIFailureExcerpt(ci.runId) : ''
+    } else if (ci.conclusion === 'timeout' && opts.waitIfRunning) {
+      return { status: 'not_ready' }
+    }
+  } catch (e) {
+    console.warn('[code-contribution] CI check failed (merge blocked):', e instanceof Error ? e.message : e)
+  }
+
+  // The Sprite needs the branch, so it runs before the PR is closed.
+  const sprite: SpriteCheck = await checkContributionInSprite({
+    authorModelId: pending.author_model_id, branch: pending.branch, headSha: pending.head_sha,
+  }).catch(e => ({
+    status: 'error' as const, exit_code: null, duration_ms: null, sprite_name: null, ran_at: null,
+    output_tail: `sprite error: ${e instanceof Error ? e.message : 'unknown'}`.slice(0, 300),
+  }))
+
+  if (ciPassed === true && pending.approved) {
+    try {
+      await mergePullRequest(pending.pr_number, pending.merge_message, pending.head_sha)
+      return { status: 'resolved', merged: true, ci_passed: ciPassed, ci_excerpt: ciExcerpt, sprite }
+    } catch (e) {
+      console.warn('[code-contribution] merge failed, closing as fallback:', e instanceof Error ? e.message : e)
+    }
+  }
+  await closePullRequest(pending.pr_number, pending.branch).catch(() => {})
+  console.log(`[code-contribution] PR closed without merging (CI ${ciPassed === null ? 'gave no result' : ciPassed ? 'passed' : 'failed'}): ${pending.pr_url}`)
+  return { status: 'resolved', merged: false, ci_passed: ciPassed, ci_excerpt: ciExcerpt, sprite }
+}

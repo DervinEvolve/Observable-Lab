@@ -5,7 +5,7 @@ import { runEpoch } from '../_lib/epoch-runner.js'
 import { EpochBusyError } from '../_lib/epoch-claim.js'
 import { BUDGET_PAUSED_STATE, BudgetPausedError } from '../_lib/spend.js'
 import { persistGlassIfBrokenOut } from '../_lib/growth.js'
-import { runEpochFollowUp } from '../_lib/epoch-followup.js'
+import { requeueFollowUp, runEpochFollowUp } from '../_lib/epoch-followup.js'
 
 // POST /api/epoch/run - Force trigger an epoch (operator). Shares the atomic
 // claim with the cron, so the two can never run an epoch at the same time,
@@ -39,6 +39,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     // contribution, approved exhibits and proposals) instead of a new epoch.
     // The cron does this by itself on the next tick; previews have no cron.
     if (req.query.step === 'followup') {
+      // &retry=<epoch> first puts that epoch's follow-up back in the queue,
+      // once, when it ended without opening a pull request.
+      if (typeof req.query.retry === 'string') {
+        const n = Number(req.query.retry)
+        if (!Number.isInteger(n) || n < 1) return res.status(400).json({ error: 'retry must be an epoch number' })
+        const requeued = await requeueFollowUp(experiment.id, n)
+        if (!requeued.ok) return res.status(409).json({ error: `cannot retry epoch ${n}: ${requeued.reason}` })
+      }
       const followUp = await runEpochFollowUp(experiment.id)
       const code = followUp.ran ? 200 : followUp.reason === 'an epoch is in progress' ? 409
         : followUp.reason === 'nothing pending' ? 404 : 429

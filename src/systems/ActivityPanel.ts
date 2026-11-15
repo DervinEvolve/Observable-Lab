@@ -106,7 +106,7 @@ export function renderEpochActivity(a: EpochActivity): string {
       : `<div class="act-none">no searches reported</div>`
     const recorded = r.recorded_sources.length
       ? `<ul class="act-sources">${sourcesHtml(r.recorded_sources)}</ul>`
-      : `<div class="act-none">${r.had_web_access ? 'no pages recorded' : 'no web access on this step'}</div>`
+      : `<div class="act-none">${r.had_web_access ? 'no pages recorded' : 'this role works without web search'}</div>`
     return `
       <div class="act-role">
         <div class="act-who"><span class="act-dot" style="background:${colorFor(r.answered_by)}"></span>
