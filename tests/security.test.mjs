@@ -72,6 +72,7 @@ const PUBLIC_ROUTES = {
   'experiment/code-contributions': ['GET'],
   'experiment/wildcard-transcripts': ['GET'],
   'experiment/exhibits': ['GET'],
+  'experiment/activity': ['GET'],
 }
 function discoverRoutes(directory = 'api') {
   const found = []

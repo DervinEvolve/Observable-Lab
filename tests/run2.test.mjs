@@ -94,13 +94,15 @@ const prompts = await load('api/_lib/prompts.js')
 const researchPrompts = await load('api/_lib/research-prompts.js')
 const logger = await load('api/_lib/research-logger.js')
 const research = await load('api/_lib/research.js')
+const followups = await load('api/_lib/epoch-followup.js')
+const activityLib = await load('api/_lib/activity.js')
 
 // ---------------------------------------------------------------------------
 // In-memory database
 // ---------------------------------------------------------------------------
 const JSON_COLUMNS = new Set(['current_spec', 'role_assignments', 'spec_before', 'spec_after', 'plant_geometry',
   'planner_output', 'executor_output', 'challenger_output', 'executor_rebuttal', 'reviewer_output',
-  'commentator_output', 'research_run', 'log_data', 'files', 'subagent_files', 'web_searches', 'web_sources'])
+  'commentator_output', 'research_run', 'log_data', 'files', 'subagent_files', 'web_searches', 'web_sources', 'followup'])
 const decode = (col, v) => (JSON_COLUMNS.has(col) && typeof v === 'string' ? JSON.parse(v) : v)
 let nextId = 1
 const uuid = () => `00000000-0000-4000-8000-${String(nextId++).padStart(12, '0')}`
@@ -227,6 +229,31 @@ class FakeLab {
     }
 
     // Epochs
+    if (text.includes("followup->>'status' = 'pending'")) {
+      const rows = this.epochs.filter(e => e.experiment_id === v[0] && e.spec_after && e.followup?.status === 'pending')
+        .sort((a, b) => a.epoch_number - b.epoch_number).slice(0, 1).map(e => ({ epoch_number: e.epoch_number }))
+      return { rows }
+    }
+    if (text.startsWith('SELECT MAX(epoch_number) AS n FROM epochs')) {
+      const own = this.epochs.filter(e => e.experiment_id === v[0] && e.epoch_number > 0)
+      return { rows: [{ n: own.length ? Math.max(...own.map(e => e.epoch_number)) : null }] }
+    }
+    if (text.startsWith('SELECT * FROM epochs WHERE experiment_id = ? AND epoch_number BETWEEN ? AND ?')) {
+      return { rows: this.epochs.filter(e => e.experiment_id === v[0] && e.epoch_number >= v[1] && e.epoch_number <= v[2]).sort((a, b) => a.epoch_number - b.epoch_number) }
+    }
+    if (text.includes('FROM model_calls WHERE experiment_id = ? AND epoch_number BETWEEN ? AND ? GROUP BY')) {
+      const groups = new Map()
+      for (const c of this.modelCalls.filter(c => c.experiment_id === v[0] && c.epoch_number >= v[1] && c.epoch_number <= v[2])) {
+        const key = `${c.epoch_number}|${c.model_id}|${c.purpose}`
+        const g = groups.get(key) ?? { epoch_number: c.epoch_number, model_id: c.model_id, purpose: c.purpose, requests: 0, cost_usd: 0, prompt_tokens: 0, completion_tokens: 0 }
+        g.requests++; g.cost_usd += c.cost_usd; g.prompt_tokens += c.prompt_tokens; g.completion_tokens += c.completion_tokens
+        groups.set(key, g)
+      }
+      return { rows: [...groups.values()] }
+    }
+    if (text.includes('FROM code_contributions WHERE experiment_id = ? AND epoch_number BETWEEN')) {
+      return { rows: this.contributions.filter(c => c.experiment_id === v[0]).map(c => ({ ...c, author_name: 'Claude Fable 5.2' })) }
+    }
     if (text.startsWith('SELECT * FROM epochs WHERE experiment_id = ? AND epoch_number = ? LIMIT 1')) {
       return { rows: this.epochs.filter(e => e.experiment_id === v[0] && e.epoch_number === v[1]) }
     }
@@ -706,6 +733,19 @@ test('a classic epoch: validated output, one contribution, real cost from the le
   assert.equal(result.success, true)
   assert.equal(result.epochNumber, 4)
 
+  // The epoch queues its contribution instead of running it (it would not
+  // fit in the same 800 s request); the follow-up runs it on its own.
+  assert.equal(requests.filter(r => r.url.includes('api.github.com')).length, 0)
+  const queued = lab.epochs.find(e => e.experiment_id === exp.id && e.epoch_number === 4)
+  assert.equal(queued.followup.status, 'pending')
+  assert.equal(queued.followup.contribution_mutation_index, 0)
+  const followUp = await followups.runEpochFollowUp(exp.id)
+  assert.equal(followUp.ran, true)
+  assert.equal(followUp.epoch_number, 4)
+  assert.equal(queued.followup.status, 'done')
+  assert.equal(exp.epoch_in_progress, false)
+  assert.deepEqual(await followups.runEpochFollowUp(exp.id), { ran: false, reason: 'nothing pending' })
+
   // Exactly one branch was created: the capability (highest value), not the constraint.
   const branches = requests.filter(r => r.method === 'POST' && r.url.endsWith('/git/refs'))
   assert.equal(branches.length, 1)
@@ -749,8 +789,13 @@ test('no contribution when the budget runs out mid-epoch', async () => {
   const exp = lab.addExperiment({ current_epoch: 3 })
   const requests = fakeFetch(epochAnswers(), { github: fakeGitHub() })
   await runner.runEpoch(exp.id)
+  const followUp = await followups.runEpochFollowUp(exp.id)
+  assert.equal(followUp.ran, false)
+  assert.equal(followUp.reason, 'daily budget reached')
   assert.equal(requests.filter(r => r.url.includes('api.github.com')).length, 0)
-  assert.ok(logs.some(l => /Skipping the code contribution: daily budget reached/.test(l)))
+  assert.ok(logs.some(l => /Not running epoch 4's follow-up: daily budget reached/.test(l)))
+  // Still queued, for when the budget allows.
+  assert.equal(lab.epochs.find(e => e.experiment_id === exp.id).followup.status, 'pending')
 })
 
 test('over budget, an epoch never starts: no claim, no model call', async () => {
@@ -1128,4 +1173,72 @@ test('commit authors are the models on observable-lab.invalid; the owner commits
   const claudeMd = readFileSync(join(root, 'CLAUDE.md'), 'utf8')
   assert.match(claudeMd, /claude-fable-5-2@observable-lab\.invalid/)
   assert.match(claudeMd, /39844362\+DervinEvolve@users\.noreply\.github\.com/)
+})
+
+// ===========================================================================
+// Research record: what each model did beside what it said it did
+// ===========================================================================
+test('the activity record puts claimed searches beside recorded citations and flags the gaps', () => {
+  const a = activityLib.buildEpochActivity({
+    epoch: {
+      epoch_number: 2, started_at: '2026-11-15T00:00:00Z', completed_at: '2026-11-15T00:10:00Z',
+      role_assignments: { planner: 'deepseek/deepseek-v4-pro-0813', executor: 'anthropic/claude-fable-5.2', challenger: 'openai/gpt-6-astra', reviewer: 'x-ai/grok-4.7', commentator: 'google/gemini-4-hydrogen' },
+      planner_output: {
+        direction: 'd', web_searches: ['AI agent futures'],
+        web_sources: [{ url: 'https://www.forethought.org/research/x', title: 'Forethought' }, { url: 'javascript:alert(1)', title: 'bad' }],
+      },
+      executor_output: { mutations: [], web_searches: ['tool use patterns'], web_sources: [] },
+      challenger_output: { challenges: [], web_searches: ['I looked this up'] },
+      reviewer_output: { decisions: [], served_by: { model: 'anthropic/claude-sonnet-5.5', assigned: 'x-ai/grok-4.7', fallback: true } },
+      followup: { status: 'done', result: { pr_url: 'https://github.com/x/y/pull/1', merged: false, ci_passed: false } },
+    },
+    toolRuns: [{ tool: 'sprite_session', model: 'anthropic/claude-fable-5.2', request_summary: 'check node', status: 'ok', exit_code: 0, duration_ms: 900, cost_usd: '0.001', output_tail: '$ curl https://example.com\nGITHUB_TOKEN=ghp_abcdefghijklmnopqrstuvwxyz0123456789', created_at: '2026-11-15T00:05:00Z' }],
+    contributions: [{ author_name: 'Claude Fable 5.2', branch: 'epoch-2-capabilities-0', pr_url: 'https://github.com/x/y/pull/1', merged: true, ci_passed: null, sprite_exit_code: 0, sprite_ran_at: '2026-11-15T00:09:00Z', explorer_task: 'Researching tools', web_searches: ['q1'], web_sources: [{ url: 'https://docs.example.com/a', title: 'Docs' }] }],
+    spend: [{ model_id: 'anthropic/claude-fable-5.2', purpose: 'followup', requests: '3', cost_usd: '0.31', prompt_tokens: '9000', completion_tokens: '2000' }, { model_id: 'deepseek/deepseek-v4-pro-0813', purpose: 'epoch', requests: '1', cost_usd: '0.01', prompt_tokens: '1000', completion_tokens: '100' }],
+  })
+  const role = name => a.roles.find(r => r.role === name)
+  assert.deepEqual(role('planner').recorded_sources, [{ url: 'https://www.forethought.org/research/x', title: 'Forethought', domain: 'forethought.org' }]) // the javascript: link is dropped
+  assert.deepEqual(role('planner').flags, [])
+  assert.deepEqual(role('executor').flags, ['reported web searches, but no cited pages were recorded'])
+  assert.equal(role('challenger').had_web_access, false)
+  assert.deepEqual(role('challenger').flags, ['reported web searches on a step that had no web access'])
+  assert.equal(role('reviewer').fallback, true)
+  assert.equal(role('reviewer').answered_by_name, 'Claude Sonnet 5.5')
+  assert.match(a.tools[0].output_tail, /\$ curl https:\/\/example\.com/) // the command it ran is kept
+  assert.doesNotMatch(a.tools[0].output_tail, /ghp_abcdefghijklmnopqrstuvwxyz0123456789/) // credentials are not
+  assert.equal(a.contributions[0].sprite_tests, 'passed')
+  assert.deepEqual(a.contributions[0].flags, ['merged without a passing CI record'])
+  assert.equal(a.spend[0].model_name, 'Claude Fable 5.2')
+  assert.deepEqual(a.totals, { cost_usd: 0.32, searches_claimed: 4, sources_recorded: 2, flags: 3 })
+  assert.deepEqual(a.follow_up, { status: 'done', pr_url: 'https://github.com/x/y/pull/1', merged: false, ci_passed: false })
+})
+
+test('GET /api/experiment/activity serves the latest epoch, one epoch, or the whole run, to anyone', async () => {
+  const exp = lab.addExperiment({ current_epoch: 3 })
+  lab.epochs.push({ id: uuid(), experiment_id: exp.id, epoch_number: 0, role_assignments: {}, completed_at: new Date() })
+  lab.epochs.push({ id: uuid(), experiment_id: exp.id, epoch_number: 1, role_assignments: { planner: 'deepseek/deepseek-v4-pro-0813' }, planner_output: { web_searches: ['x'], web_sources: [{ url: 'https://a.example/1', title: 'A' }] }, completed_at: new Date() })
+  lab.epochs.push({ id: uuid(), experiment_id: exp.id, epoch_number: 2, role_assignments: { planner: 'x-ai/grok-4.7' }, planner_output: { direction: 'd' }, completed_at: new Date() })
+  lab.modelCalls.push({ experiment_id: exp.id, epoch_number: 2, purpose: 'epoch', model_id: 'x-ai/grok-4.7', cost_usd: 0.02, prompt_tokens: 10, completion_tokens: 5, created_at: new Date() })
+  const { default: activity } = await load('api/experiment/activity.js')
+
+  let res = response()
+  await activity({ method: 'GET', headers: {}, query: {} }, res)
+  assert.equal(res.code, 200)
+  assert.deepEqual(res.body.epochs.map(e => e.epoch_number), [2])
+  assert.equal(res.body.epochs[0].spend[0].model_name, 'Grok 4.7')
+
+  res = response()
+  await activity({ method: 'GET', headers: {}, query: { epoch: '1' } }, res)
+  assert.equal(res.body.epochs[0].roles[0].recorded_sources[0].domain, 'a.example')
+
+  res = response()
+  await activity({ method: 'GET', headers: {}, query: { all: 'true' } }, res)
+  assert.deepEqual(res.body.epochs.map(e => e.epoch_number), [1, 2]) // the seed record is not an epoch of work
+
+  res = response()
+  await activity({ method: 'GET', headers: {}, query: { epoch: '-3' } }, res)
+  assert.equal(res.code, 400)
+  res = response()
+  await activity({ method: 'POST', headers: {}, query: {} }, res)
+  assert.equal(res.code, 405)
 })
