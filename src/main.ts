@@ -103,6 +103,7 @@ class ObservableLab {
 
   // State tracking
   private currentEpoch: number = 0
+  private appliedRolesKey = '' // role assignments the cards currently show
   private activeStationIndex: number = -1
   private liveExperiment: boolean = false // true once real backend state arrives (disables the local demo cycle)
   private streamedContributionIds: Set<string> = new Set() // real code contributions already streamed into a terminal
@@ -1255,17 +1256,20 @@ class ObservableLab {
       this.uiOverlay.hideLiveStatus()
     }
 
-    // Update scientist roles if epoch changed
-    // Use the LATEST COMPLETED epoch's role assignments (what they DID), not next epoch's (what they WILL do)
+    // Role cards follow the epoch on screen: while one is running, its roles
+    // (so the cards agree with the live text bar); between epochs, the roles
+    // of the one that just finished.
+    const shownRoles = this.rolesToShow(state)
+    if (shownRoles) {
+      const key = JSON.stringify(shownRoles)
+      if (key !== this.appliedRolesKey) {
+        this.appliedRolesKey = key
+        this.updateScientistRoles(shownRoles)
+      }
+    }
+
     if (state.current_epoch !== this.currentEpoch) {
       this.currentEpoch = state.current_epoch
-      const latestCompletedEpoch = state.recent_epochs.find(e => e.completed_at && e.role_assignments)
-      if (latestCompletedEpoch) {
-        this.updateScientistRoles(latestCompletedEpoch.role_assignments)
-      } else {
-        // Fallback to next epoch's assignments if no completed epochs
-        this.updateScientistRoles(state.role_assignments)
-      }
 
       // Generate tasks from spec changes
       this.generateTasksFromSpecChanges(state)
@@ -1279,6 +1283,7 @@ class ObservableLab {
       this.checkForLiveCodeContributions(state.current_epoch)
 
       // Stream what each panel model actually browsed this epoch
+      const latestCompletedEpoch = state.recent_epochs.find(e => e.completed_at && e.role_assignments)
       if (latestCompletedEpoch) {
         this.streamEpochBrowsing(latestCompletedEpoch)
       }
@@ -2050,6 +2055,18 @@ class ObservableLab {
     })
     this.activeStationIndex = -1
     if (import.meta.env.DEV) console.log('All stations deactivated')
+  }
+
+  // The running epoch's stored roles (its record exists a moment after it
+  // starts; until then the next-epoch assignment the server sends is the same
+  // thing), else the latest finished epoch's, else the next epoch's.
+  private rolesToShow(state: ExperimentState): Record<string, string> | null {
+    if (state.epoch_in_progress) {
+      const running = state.recent_epochs.find(e => !e.completed_at && e.role_assignments)
+      return (running?.role_assignments ?? state.role_assignments ?? null) as Record<string, string> | null
+    }
+    const finished = state.recent_epochs.find(e => e.completed_at && e.role_assignments)
+    return (finished?.role_assignments ?? state.role_assignments ?? null) as Record<string, string> | null
   }
 
   private updateScientistRoles(roleAssignments: Record<string, string>): void {
