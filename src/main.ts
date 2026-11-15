@@ -29,6 +29,7 @@ import { UIOverlay } from './systems/UIOverlay'
 import { LightingController } from './systems/LightingController'
 import { ParticleSystem } from './systems/ParticleSystem'
 import { TranscriptPanel } from './systems/TranscriptPanel'
+import { ActivityPanel } from './systems/ActivityPanel'
 import { PatinaSystem } from './lib/patina'
 import { batchStatic } from './lib/staticBatch'
 import { getStateManager } from './api/StateManager'
@@ -508,6 +509,8 @@ class ObservableLab {
 
     // Initialize TranscriptPanel (hidden by default)
     this.transcriptPanel = new TranscriptPanel()
+    // What each model did, beside what it said (the research record); it keeps itself up to date
+    new ActivityPanel()
 
     // Initialize PatinaSystem
     this.patinaSystem = new PatinaSystem()

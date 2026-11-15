@@ -26,7 +26,7 @@ function compile(directory) {
   }
 }
 compile('api')
-for (const path of ['src/systems/TranscriptPanel.ts', 'src/shared/types.ts', 'src/scene/colors.ts']) {
+for (const path of ['src/systems/TranscriptPanel.ts', 'src/systems/ActivityPanel.ts', 'src/shared/types.ts', 'src/scene/colors.ts']) {
   const output = ts.transpileModule(readFileSync(join(root, path), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
   }).outputText.replace(/from '([^']+)'/g, (whole, specifier) => specifier.startsWith('.') ? `from '${specifier}.js'` : whole)
@@ -512,4 +512,25 @@ test('contribution commits are authored by the answering model, committed by the
     delete process.env.OPENROUTER_API_KEY
     delete process.env.LAB_ENABLE_CODE_WRITES
   }
+})
+
+test('the activity panel shows model text as text and links only to http(s) pages', async () => {
+  const { renderEpochActivity, safeHref } = await load('src/systems/ActivityPanel.js')
+  assert.equal(safeHref('javascript:alert(1)'), null)
+  assert.equal(safeHref('data:text/html,x'), null)
+  assert.equal(safeHref('https://example.com/a'), 'https://example.com/a')
+  const html = renderEpochActivity({
+    epoch_number: 3, follow_up: { status: 'pending' },
+    roles: [{
+      role: 'planner', assigned_model: 'x-ai/grok-4.7', answered_by: 'x-ai/grok-4.7', answered_by_name: '<img src=x onerror=alert(1)>',
+      fallback: false, had_web_access: true, claimed_searches: ['"><script>alert(1)</script>'],
+      recorded_sources: [{ url: 'javascript:alert(1)', title: '<b>t</b>', domain: 'x' }, { url: 'https://ok.example/p', title: 'ok', domain: 'ok.example' }],
+      flags: ['<i>f</i>'],
+    }],
+    tools: [{ tool: 'sprite_session', model_name: 'M', request: '<x>', status: 'ok', exit_code: 0, output_tail: '</pre><script>1</script>' }],
+    contributions: [], spend: [], totals: { cost_usd: 0, searches_claimed: 1, sources_recorded: 2, flags: 1 },
+  })
+  assert.doesNotMatch(html, /<script|<img|<b>t<\/b>|<i>f<\/i>|href="javascript/i)
+  assert.match(html, /href="https:\/\/ok\.example\/p" target="_blank" rel="noopener noreferrer nofollow"/)
+  assert.match(html, /queued, runs at the next hourly check/)
 })
