@@ -149,7 +149,7 @@ async function generateSubagentContribution(
     `Parent task: ${description}\n\nFiles just written:\n${mainFiles
       .map(f => `--- ${f.path} ---\n${f.content.slice(0, 2000)}`)
       .join('\n\n')}`,
-    { maxTokens: 16000, deadlineAt } // real test files can be long — never truncate the JSON
+    { maxTokens: 24000, effort: 'low', deadlineAt } // real test files can be long — never truncate the JSON
   )
   const subagentOut = output as SubagentOutput
   return { files: subagentOut.files || [], commit_message: subagentOut.commit_message || '', cost, model: servedBy.model }
@@ -317,7 +317,11 @@ export async function contributeCode(params: {
       // A real implementation file mustn't be truncated mid-JSON, and writing
       // one with reasoning on can take several minutes. A minute is kept back
       // for pushing the files and opening the PR.
-      { maxTokens: 16000, timeoutMs: 420_000, deadlineAt: params.deadlineAt ? params.deadlineAt - 60_000 : undefined }
+      // Low reasoning effort and a large output budget: a whole file wrapped
+      // in JSON is long, and reasoning shares max_tokens with it (at medium
+      // effort and 32k tokens Claude Fable was cut off twice). Only what is
+      // generated is billed.
+      { maxTokens: 48000, effort: 'low', timeoutMs: 420_000, deadlineAt: params.deadlineAt ? params.deadlineAt - 60_000 : undefined }
     )
     cost += codeCost
     const coder = output as CoderOutput

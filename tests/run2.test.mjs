@@ -1291,3 +1291,28 @@ test('a follow-up that opened no pull request can be retried once', async () => 
   ep.followup = { status: 'done', contribution_mutation_index: 0, deliverables: false, queued_at: 'x', result: { pr_url: 'https://github.com/x/y/pull/3' } }
   assert.match((await followups.requeueFollowUp(exp.id, 1)).reason, /a PR was opened/)
 })
+
+test('an answer cut off at max_tokens is billed but never parsed from the reasoning, and goes straight to the fallback', async () => {
+  const requested = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response(JSON.stringify(CATALOG))
+    const body = JSON.parse(options.body)
+    requested.push(body)
+    if (body.model === 'anthropic/claude-fable-5.2') {
+      return new Response(JSON.stringify({
+        model: body.model,
+        choices: [{ finish_reason: 'length', message: { content: '', reasoning: 'thinking... {"note": "a stray fragment"} ...' } }],
+        usage: { prompt_tokens: 5000, completion_tokens: 32000, completion_tokens_details: { reasoning_tokens: 30000 }, cost: 1.3 },
+      }))
+    }
+    return completion(body.model, { files: [{ path: 'src/a.ts', content: 'x' }] }, { prompt_tokens: 100, completion_tokens: 100, cost: 0.02 })
+  }
+  const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u', { maxTokens: 48000, effort: 'low' })
+  assert.deepEqual(requested.map(b => b.model), ['anthropic/claude-fable-5.2', 'anthropic/claude-sonnet-5.5'])
+  assert.deepEqual(r.output.files, [{ path: 'src/a.ts', content: 'x' }]) // not the stray fragment
+  assert.ok(Math.abs(r.cost - 1.32) < 1e-9) // the cut-off answer still counts
+  // Low effort and the larger budget reach the request.
+  assert.deepEqual(requested[0].reasoning, { effort: 'low' })
+  assert.equal(requested[0].max_tokens, 96000)
+  assert.ok(logs.some(l => /cut off at max_tokens \(32000 completion tokens, 30000 reasoning\)/.test(l)))
+})

@@ -56,6 +56,19 @@ export class ModelRefusalError extends Error {
   }
 }
 
+/**
+ * The answer was cut off at the output limit (finish_reason "length"),
+ * usually because reasoning used most of max_tokens. It is billed, it is not
+ * the answer, and the same request would be cut off again, so it is not
+ * retried on the same model.
+ */
+export class ModelTruncatedError extends Error {
+  constructor(readonly modelId: string, readonly usage: CallUsage) {
+    super(`${modelId} was cut off at the output limit`)
+    this.name = 'ModelTruncatedError'
+  }
+}
+
 /** The lab part of a model ID: "anthropic" for "anthropic/claude-fable-5.2". */
 export function providerOf(modelId: string): string {
   return modelId.split('/')[0]
@@ -234,6 +247,7 @@ export interface CompletionOptions {
   jsonOnly: boolean
   webSearch: boolean
   maxTokens?: number
+  effort?: string // reasoning effort to ask for; default medium
 }
 
 /**
@@ -264,7 +278,7 @@ export function buildRequestBody(
 
   if (supported.has('temperature')) body.temperature = 0.7
 
-  const effort = supported.has('reasoning') ? pickEffort(caps?.supported_efforts) : undefined
+  const effort = supported.has('reasoning') ? pickEffort(caps?.supported_efforts, opts.effort ?? WANTED_EFFORT) : undefined
   if (effort) body.reasoning = { effort }
 
   // A truncated answer is unparseable JSON, which throws the work away.
@@ -331,10 +345,11 @@ async function requestCompletion(
   webSearch = false,
   maxTokens?: number,
   assigned = modelId,
-  timeoutMs = COMPLETION_TIMEOUT_MS
+  timeoutMs = COMPLETION_TIMEOUT_MS,
+  effort?: string
 ): Promise<{ data: any; content: string; citations: WebCitation[]; usage: CallUsage }> {
   const caps = await getModelCapabilities(modelId)
-  const requestBody = buildRequestBody(modelId, caps, systemPrompt, userPrompt, { jsonOnly, webSearch, maxTokens })
+  const requestBody = buildRequestBody(modelId, caps, systemPrompt, userPrompt, { jsonOnly, webSearch, maxTokens, effort })
 
   const response = await fetch(CHAT_URL, {
     method: 'POST',
@@ -371,6 +386,12 @@ async function requestCompletion(
     const reason = choice.native_finish_reason || choice.finish_reason
     console.warn(`[MODEL] ${modelId} refused the request (finish_reason=${choice.finish_reason}, native=${choice.native_finish_reason ?? 'n/a'})`)
     throw new ModelRefusalError(modelId, String(reason), usage)
+  }
+  // Cut off at the output limit: whatever is in content or reasoning is not
+  // the answer (a stray JSON fragment from the reasoning once parsed as one).
+  if (choice.finish_reason === 'length') {
+    console.warn(`[MODEL] ${modelId} was cut off at max_tokens (${usage.completion_tokens} completion tokens, ${usage.reasoning_tokens} reasoning)`)
+    throw new ModelTruncatedError(modelId, usage)
   }
   // Some models (e.g. reasoning models) return the answer in content, but if
   // content is empty and reasoning holds the text, fall back to it so we don't
@@ -421,6 +442,9 @@ export async function callModel(
     // fallbacks included, must be over. Each request gets what is left, and
     // nothing new starts with under MIN_REQUEST_MS remaining.
     deadlineAt?: number
+    // Reasoning effort to ask for (default medium). Code writing uses low:
+    // the answer is long, and reasoning shares its output budget.
+    effort?: string
   } = {}
 ): Promise<CallModelResult> {
 
@@ -473,7 +497,7 @@ export async function callModel(
       break
     }
     try {
-      const result = await requestCompletion(modelId, systemPrompt, userPrompt, jsonOnly, useWeb, opts.maxTokens, modelId, timeoutMs);
+      const result = await requestCompletion(modelId, systemPrompt, userPrompt, jsonOnly, useWeb, opts.maxTokens, modelId, timeoutMs, opts.effort);
       tally(result.usage)
       data = result.data;
       content = result.content || '';
@@ -485,6 +509,10 @@ export async function callModel(
       if (e instanceof ModelRefusalError) {
         tally(e.usage) // billed, so it counts toward this call's cost
         break // the same prompt gets the same refusal
+      }
+      if (e instanceof ModelTruncatedError) {
+        tally(e.usage) // billed; the same request would be cut off again
+        break
       }
       if (isTimeout(e)) {
         console.warn(`[MODEL] ${modelId} timed out after ${Math.round(timeoutMs / 1000)} s; not retrying the same model`)
@@ -522,7 +550,7 @@ export async function callModel(
       }
       try {
         console.warn(`[MODEL] ${modelId} failed — falling back to ${fb}`);
-        const result = await requestCompletion(fb, systemPrompt, userPrompt, true, false, opts.maxTokens, modelId, fbTimeout);
+        const result = await requestCompletion(fb, systemPrompt, userPrompt, true, false, opts.maxTokens, modelId, fbTimeout, opts.effort);
         tally(result.usage)
         parsed = extractJson(result.content || '');
         data = result.data;
@@ -535,6 +563,7 @@ export async function callModel(
           tally(e.usage)
           refusedBy.add(providerOf(fb))
         }
+        if (e instanceof ModelTruncatedError) tally(e.usage)
       }
     }
   }
