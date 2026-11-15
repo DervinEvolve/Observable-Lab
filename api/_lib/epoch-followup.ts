@@ -214,7 +214,9 @@ async function stageOne(experimentId: string, epochNumber: number, epoch: Record
         if (!pendingPr) {
           // No PR was opened (no usable files, or a GitHub error): record it now.
           result.merged = false
-          result.note = contribution.files.length ? 'the pull request could not be opened' : 'the model returned no usable files'
+          result.note = contribution.error
+          ? `no pull request: ${contribution.error}`.slice(0, 500)
+          : contribution.files.length ? 'the pull request could not be opened' : 'the model returned no usable files'
           await persistContribution(experimentId, epochNumber, roles.executor, branchName, contribution)
         }
       }

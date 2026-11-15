@@ -22,7 +22,8 @@
   "dependencies": {
     "@vercel/postgres": "^0.10.0",
     "gsap": "^3.14.2",
-    "three": "^0.182.0"
+    "three": "^0.182.0",
+    "undici": "^6.21.3"
   },
   "devDependencies": {
     "@types/three": "^0.182.0",

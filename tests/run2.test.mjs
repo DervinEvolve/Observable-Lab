@@ -1316,3 +1316,50 @@ test('an answer cut off at max_tokens is billed but never parsed from the reason
   assert.equal(requested[0].max_tokens, 96000)
   assert.ok(logs.some(l => /cut off at max_tokens \(32000 completion tokens, 30000 reasoning\)/.test(l)))
 })
+
+test('a request that Node\'s fetch gives up on (no headers in 300 s) counts as a timeout and goes to the fallback', async () => {
+  const requested = []
+  const dispatchers = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response(JSON.stringify(CATALOG))
+    const body = JSON.parse(options.body)
+    requested.push(body.model)
+    dispatchers.push(options.dispatcher)
+    if (body.model === 'anthropic/claude-fable-5.2') throw new TypeError('fetch failed', { cause: { code: 'UND_ERR_HEADERS_TIMEOUT' } })
+    return completion(body.model, { ok: true })
+  }
+  const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u')
+  assert.deepEqual(requested, ['anthropic/claude-fable-5.2', 'anthropic/claude-sonnet-5.5']) // not asked again
+  assert.equal(r.servedBy.model, 'anthropic/claude-sonnet-5.5')
+  // Every model request carries the dispatcher with the 300 s limits switched off.
+  assert.ok(dispatchers.every(d => d && typeof d.dispatch === 'function'))
+  assert.equal(openrouter.isTimeoutError(new TypeError('fetch failed', { cause: { code: 'UND_ERR_BODY_TIMEOUT' } })), true)
+  assert.equal(openrouter.isTimeoutError(new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } })), false)
+})
+
+test('an answer in the wrong shape goes to the fallback instead of ending the call as a success', async () => {
+  const requested = []
+  fakeFetch(body => {
+    requested.push(body.model)
+    if (body.model === 'deepseek/deepseek-v4-pro-0813') return completion(body.model, { note: 'a stray fragment' })
+    return completion(body.model, { files: [{ path: 'src/a.ts', content: 'x' }] })
+  })
+  const accept = p => Array.isArray(p?.files) && p.files.length > 0
+  const r = await openrouter.callModel('deepseek/deepseek-v4-pro-0813', 's', 'u', { accept })
+  assert.deepEqual(requested, ['deepseek/deepseek-v4-pro-0813', 'anthropic/claude-sonnet-5.5'])
+  assert.deepEqual(r.output.files, [{ path: 'src/a.ts', content: 'x' }])
+  // With no fallback allowed, the wrong shape is a failure that says so.
+  await assert.rejects(openrouter.callModel('deepseek/deepseek-v4-pro-0813', 's', 'u', { accept, noFallback: true }), /expected shape/)
+})
+
+test('time kept back for a fallback: the assigned model never takes the fallback\'s share', async () => {
+  const requested = []
+  fakeFetch(body => {
+    requested.push(body.model)
+    return completion(body.model, { files: [{ path: 'src/a.ts', content: 'x' }] })
+  })
+  // 130 s left and 120 s kept back: too little for the assigned model, enough for a fallback.
+  const r = await openrouter.callModel('openai/gpt-6-astra', 's', 'u', { deadlineAt: Date.now() + 130_000, fallbackReserveMs: 120_000, timeoutMs: 420_000 })
+  assert.deepEqual(requested, ['anthropic/claude-sonnet-5.5'])
+  assert.equal(r.servedBy.fallback, true)
+})

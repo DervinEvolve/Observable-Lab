@@ -534,3 +534,42 @@ test('the activity panel shows model text as text and links only to http(s) page
   assert.match(html, /href="https:\/\/ok\.example\/p" target="_blank" rel="noopener noreferrer nofollow"/)
   assert.match(html, /queued, runs at the next hourly check/)
 })
+
+test('one disallowed generated path is dropped, and the allowed files are still written', async () => {
+  const copy = join(build, 'paths-test')
+  cpSync(join(build, 'api'), join(copy, 'api'), { recursive: true })
+  process.env.OPENROUTER_API_KEY = 'test-only-openrouter-placeholder'
+  process.env.LAB_ENABLE_CODE_WRITES = 'true'
+  delete process.env.LAB_REQUIRED_CI_WORKFLOW_IDS
+  const { contributeCode } = await import(pathToFileURL(join(copy, 'api/_lib/code-contribution.js')).href)
+  const requests = []
+  globalThis.fetch = async (url, options = {}) => {
+    const target = String(url)
+    const method = options.method || 'GET'
+    requests.push({ url: target, method, body: options.body ? String(options.body) : '' })
+    if (target.endsWith('/api/v1/models')) return new Response('unavailable', { status: 503 })
+    if (target.includes('openrouter.ai')) {
+      const { model } = JSON.parse(options.body)
+      const content = JSON.stringify({
+        files: [{ path: './src/agent.ts', content: 'export const x = 1\n' }, { path: 'vitest.config.ts', content: 'export default {}\n' }],
+        files_to_delete: ['package.json'], commit_message: 'feat: add x', pr_summary: 'adds x',
+      })
+      return new Response(JSON.stringify({ model, choices: [{ message: { content } }], usage: { total_tokens: 10 } }))
+    }
+    if (method === 'GET' && target.includes('/git/ref/heads/')) return new Response(JSON.stringify({ object: { sha: 'base-sha' } }))
+    if (method === 'GET' && target.includes('/git/trees/')) return new Response(JSON.stringify({ tree: [] }))
+    if (method === 'GET' && target.includes('/contents/')) return new Response('{}', { status: 404 })
+    if (method === 'POST' && target.endsWith('/pulls')) return new Response(JSON.stringify({ number: 6, html_url: 'https://github.example/pr/6' }))
+    return new Response('{}')
+  }
+  try {
+    const result = await contributeCode({ authorModelId: 'anthropic/claude-fable-5.2', branchName: 'epoch-8-capabilities-0', title: 'add x', description: 'add x', review: { mode: 'approved' } })
+    const puts = requests.filter(r => r.method === 'PUT' && r.url.includes('/contents/'))
+    assert.deepEqual(puts.map(r => decodeURIComponent(r.url.split('/contents/')[1].split('?')[0])), ['src/agent.ts']) // './' tidied, the config file dropped
+    assert.equal(requests.some(r => r.method === 'DELETE' && r.url.includes('/contents/package.json')), false)
+    assert.equal(result.pr_url, 'https://github.example/pr/6')
+  } finally {
+    delete process.env.OPENROUTER_API_KEY
+    delete process.env.LAB_ENABLE_CODE_WRITES
+  }
+})

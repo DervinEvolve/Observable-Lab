@@ -1,3 +1,4 @@
+import { Agent } from 'undici'
 import { recordModelCall } from './spend.js'
 import { FALLBACK_MODELS } from './types.js'
 
@@ -337,6 +338,20 @@ export function usageFromResponse(data: any, caps: ModelCapabilities | null): Ca
   return { cost_usd: 0, cost_source: 'none', prompt_tokens, completion_tokens, reasoning_tokens }
 }
 
+// Node's fetch gives up after 300 s without response headers (undici's headersTimeout), with a
+// TypeError that is not a timeout. OpenRouter answers a non-streaming request only when the model
+// is done, and writing a whole code file can take longer than that. Each request has its own
+// AbortSignal deadline, so the dispatcher's own timeouts are switched off.
+const MODEL_DISPATCHER = new Agent({ headersTimeout: 0, bodyTimeout: 0 })
+
+/** A request that ran out of time: our own deadline, or one of undici's timeouts. */
+export function isTimeoutError(e: unknown): boolean {
+  if (!(e instanceof Error)) return false
+  if (e.name === 'TimeoutError' || e.name === 'AbortError') return true
+  const code = (e as Error & { cause?: { code?: unknown } }).cause?.code
+  return code === 'UND_ERR_HEADERS_TIMEOUT' || code === 'UND_ERR_BODY_TIMEOUT' || code === 'UND_ERR_CONNECT_TIMEOUT'
+}
+
 async function requestCompletion(
   modelId: string,
   systemPrompt: string,
@@ -361,7 +376,8 @@ async function requestCompletion(
     },
     body: JSON.stringify(requestBody),
     signal: AbortSignal.timeout(timeoutMs),
-  });
+    dispatcher: MODEL_DISPATCHER,
+  } as RequestInit);
 
   if (!response.ok) {
     // Log full error server-side only, return generic message to client
@@ -445,6 +461,13 @@ export async function callModel(
     // Reasoning effort to ask for (default medium). Code writing uses low:
     // the answer is long, and reasoning shares its output budget.
     effort?: string
+    // Time kept back from the assigned model's requests so a fallback can
+    // still run before deadlineAt (code writing, where one request is long).
+    fallbackReserveMs?: number
+    // Whether a parsed answer has the shape the caller needs. A parsed answer
+    // that fails it counts as no answer: the assigned model is not asked
+    // again (it answered, just wrongly) and the fallbacks are tried.
+    accept?: (parsed: unknown) => boolean
   } = {}
 ): Promise<CallModelResult> {
 
@@ -473,13 +496,15 @@ export async function callModel(
   }
 
   const MIN_REQUEST_MS = 20_000
-  const requestTimeout = (): number => {
+  const requestTimeout = (reserve = 0): number => {
     const base = opts.timeoutMs ?? COMPLETION_TIMEOUT_MS
-    return opts.deadlineAt ? Math.min(base, opts.deadlineAt - Date.now()) : base
+    return opts.deadlineAt ? Math.min(base, opts.deadlineAt - Date.now() - reserve) : base
   }
   // A request that ran out of time would very likely run out again with the
   // same prompt, so a timeout goes straight to the fallback instead.
-  const isTimeout = (e: unknown) => e instanceof Error && (e.name === 'TimeoutError' || e.name === 'AbortError')
+  const isTimeout = isTimeoutError
+  const reserve = opts.noFallback ? 0 : opts.fallbackReserveMs ?? 0
+  let wrongShape = false
   let outOfTime = false
 
   // Try up to 3 times with increasing JSON enforcement. Web search and strict
@@ -489,9 +514,10 @@ export async function callModel(
   for (let attempt = 0; attempt < 3; attempt++) {
     const jsonOnly = attempt > 0;
     const useWeb = opts.webSearch && attempt === 0;
-    const timeoutMs = requestTimeout()
+    const timeoutMs = requestTimeout(reserve)
     if (timeoutMs < MIN_REQUEST_MS) {
-      outOfTime = true
+      // Out of time for the assigned model; the reserve, if any, is for a fallback.
+      outOfTime = reserve === 0
       lastError = new Error('Model call skipped: out of time')
       console.warn(`[MODEL] ${modelId}: out of time before attempt ${attempt + 1}`)
       break
@@ -503,6 +529,12 @@ export async function callModel(
       content = result.content || '';
       if (result.citations.length) citations = result.citations; // keep first-attempt sources
       parsed = extractJson(content);
+      if (parsed !== undefined && opts.accept && !opts.accept(parsed)) {
+        parsed = undefined
+        wrongShape = true
+        lastError = new Error('Model answer did not have the expected shape')
+        console.warn(`[MODEL] ${modelId} answered, but not in the expected shape; trying a fallback`)
+      }
       break;
     } catch (e) {
       lastError = e as Error;
@@ -553,6 +585,17 @@ export async function callModel(
         const result = await requestCompletion(fb, systemPrompt, userPrompt, true, false, opts.maxTokens, modelId, fbTimeout, opts.effort);
         tally(result.usage)
         parsed = extractJson(result.content || '');
+        if (parsed !== undefined && opts.accept && !opts.accept(parsed)) {
+          parsed = undefined
+          wrongShape = true
+          lastError = new Error('Model answer did not have the expected shape')
+          console.warn(`[MODEL] fallback ${fb} answered, but not in the expected shape`)
+          continue
+        }
+        if (parsed === undefined) {
+          lastError = new Error('Model answer could not be parsed')
+          continue
+        }
         data = result.data;
         answeredBy = fb;
         console.log(`[MODEL] fallback ${fb} succeeded for ${modelId}'s call`);
@@ -570,7 +613,9 @@ export async function callModel(
 
   if (parsed === undefined) {
     if (cost > 0) console.warn(`[MODEL] ${modelId} gave no usable answer after $${cost.toFixed(4)} of billed attempts`)
-    throw new Error('Model returned invalid response');
+    // Say why, so the record can tell a timeout from a cut-off from a wrong answer.
+    const why = lastError?.message ? `: ${lastError.message}` : wrongShape ? ': wrong shape' : ''
+    throw new Error(`Model returned invalid response${why}`.slice(0, 300));
   }
 
   const fallback = answeredBy !== modelId;

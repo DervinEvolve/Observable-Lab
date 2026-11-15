@@ -290,7 +290,7 @@ export async function contributeCode(params: {
     if (exploreCount > 0) {
       const settled = await Promise.allSettled(Array.from({ length: exploreCount }, (_, i) =>
         runExplorerSubagent(params.authorModelId, params.description, tree, exploreCount > 1 ? EXPLORER_ANGLES[i] : undefined,
-          params.deadlineAt ? params.deadlineAt - 6 * 60_000 : undefined)))
+          params.deadlineAt ? params.deadlineAt - 7.5 * 60_000 : undefined)))
       for (const r of settled) {
         if (r.status === 'fulfilled') {
           cost += r.value.cost
@@ -322,7 +322,18 @@ export async function contributeCode(params: {
       // in JSON is long, and reasoning shares max_tokens with it (at medium
       // effort and 32k tokens Claude Fable was cut off twice). Only what is
       // generated is billed.
-      { maxTokens: 48000, effort: 'low', timeoutMs: 420_000, deadlineAt: params.deadlineAt ? params.deadlineAt - 60_000 : undefined }
+      // Two minutes are kept back from the assigned model so a fallback can
+      // still write the code when it times out, and only an answer with files
+      // counts (anything else goes to the fallback instead of ending silently).
+      {
+        maxTokens: 48000, effort: 'low', timeoutMs: 420_000,
+        deadlineAt: params.deadlineAt ? params.deadlineAt - 60_000 : undefined,
+        fallbackReserveMs: params.deadlineAt ? 120_000 : undefined,
+        accept: (p) => {
+          const files = (p as { files?: unknown } | null)?.files
+          return Array.isArray(files) && files.some(f => typeof f?.path === 'string' && typeof f?.content === 'string')
+        },
+      }
     )
     cost += codeCost
     const coder = output as CoderOutput
@@ -345,15 +356,30 @@ export async function contributeCode(params: {
       return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns, error: reason }
     }
 
-    // Validate the whole generated batch before the first repository write.
+    // Validate the generated batch before the first repository write. A file
+    // outside the allowed paths is dropped on its own (and logged) rather
+    // than throwing away every other file with it; nothing is written when
+    // no allowed file is left.
     if (!Array.isArray(coder.files) || (coder.files_to_delete !== undefined && !Array.isArray(coder.files_to_delete))) {
       throw new Error('Generated contribution has a malformed file list')
     }
-    for (const file of coder.files) {
-      assertContributionPath(file?.path)
-      if (typeof file.content !== 'string') throw new Error('Generated contribution file content is not text')
+    const dropped: string[] = []
+    const allowed = (path: unknown): path is string => {
+      try {
+        assertContributionPath(path)
+        return true
+      } catch (e) {
+        dropped.push(`${String(path).slice(0, 120)} (${e instanceof Error ? e.message : 'not allowed'})`)
+        return false
+      }
     }
-    for (const path of coder.files_to_delete || []) assertContributionPath(path)
+    const tidy = (path: unknown) => (typeof path === 'string' ? path.replace(/^(\.\/)+/, '') : path)
+    coder.files = coder.files
+      .map(f => ({ ...f, path: tidy(f?.path) as string }))
+      .filter(f => allowed(f.path) && (typeof f.content === 'string' || (dropped.push(`${f.path} (content is not text)`), false)))
+    coder.files_to_delete = (coder.files_to_delete || []).map(tidy).filter(allowed)
+    if (dropped.length) console.warn(`[code-contribution] dropped ${dropped.length} generated path(s): ${dropped.join('; ')}`)
+    if (!coder.files.length) throw new Error(`No allowed files to write: ${dropped.join('; ')}`.slice(0, 1500))
     await createBranch(params.branchName)
     for (const file of coder.files) {
       await upsertFileOnBranch(params.branchName, file.path, file.content, coderMessage)
