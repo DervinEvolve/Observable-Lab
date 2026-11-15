@@ -48,6 +48,8 @@ async function createOrPatchTable(): Promise<void> {
   await sql`ALTER TABLE code_contributions ADD COLUMN IF NOT EXISTS sprite_output_tail TEXT`
   await sql`ALTER TABLE code_contributions ADD COLUMN IF NOT EXISTS sprite_name TEXT`
   await sql`ALTER TABLE code_contributions ADD COLUMN IF NOT EXISTS sprite_ran_at TIMESTAMP WITH TIME ZONE`
+  // Why the contribution stopped short of a pull request, when it did.
+  await sql`ALTER TABLE code_contributions ADD COLUMN IF NOT EXISTS error TEXT`
 }
 
 export async function persistContribution(
@@ -64,7 +66,7 @@ export async function persistContribution(
       INSERT INTO code_contributions (
         experiment_id, epoch_number, model_id, author_name, branch, pr_url, merged, files, subagent_files,
         explorer_task, explorer_findings, web_searches, web_sources, ci_passed, ci_excerpt,
-        sprite_exit_code, sprite_duration_ms, sprite_output_tail, sprite_name, sprite_ran_at
+        sprite_exit_code, sprite_duration_ms, sprite_output_tail, sprite_name, sprite_ran_at, error
       ) VALUES (
         ${experimentId}, ${epochNumber}, ${modelId}, ${result.author}, ${branch},
         ${result.pr_url || null}, ${result.merged},
@@ -73,7 +75,7 @@ export async function persistContribution(
         ${JSON.stringify(result.web_searches || [])}, ${JSON.stringify(result.web_sources || [])},
         ${result.ci_passed ?? null}, ${result.ci_excerpt || null},
         ${sprite?.exit_code ?? null}, ${sprite?.duration_ms ?? null}, ${sprite?.output_tail ?? null},
-        ${sprite?.sprite_name ?? null}, ${sprite?.ran_at ?? null}
+        ${sprite?.sprite_name ?? null}, ${sprite?.ran_at ?? null}, ${result.error ?? null}
       )
     `
   } catch (e) {
@@ -102,6 +104,7 @@ export interface ContributionRow {
   sprite_output_tail: string | null
   sprite_name: string | null
   sprite_ran_at: string | null
+  error: string | null
   created_at: string
 }
 
@@ -129,7 +132,7 @@ export async function getRecentContributions(experimentId: string, sinceEpoch = 
     const result = await sql`
       SELECT id, epoch_number, model_id, author_name, branch, pr_url, merged, files, subagent_files,
         explorer_task, explorer_findings, web_searches, web_sources, ci_passed, ci_excerpt,
-        sprite_exit_code, sprite_duration_ms, sprite_output_tail, sprite_name, sprite_ran_at, created_at
+        sprite_exit_code, sprite_duration_ms, sprite_output_tail, sprite_name, sprite_ran_at, error, created_at
       FROM code_contributions
       WHERE experiment_id = ${experimentId} AND epoch_number >= ${sinceEpoch}
       ORDER BY created_at DESC
@@ -153,7 +156,7 @@ export async function getRecentSpriteRuns(experimentId: string, limit = 5): Prom
     await ensureTable()
     const result = await sql`
       SELECT id, epoch_number, model_id, author_name, branch, pr_url, merged, ci_passed,
-        sprite_exit_code, sprite_duration_ms, sprite_output_tail, sprite_name, sprite_ran_at, created_at
+        sprite_exit_code, sprite_duration_ms, sprite_output_tail, sprite_name, sprite_ran_at, error, created_at
       FROM code_contributions
       WHERE experiment_id = ${experimentId} AND sprite_ran_at IS NOT NULL
       ORDER BY sprite_ran_at DESC

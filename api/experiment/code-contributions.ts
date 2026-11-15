@@ -35,6 +35,7 @@ function contributionView(row: ContributionRow) {
   return {
     ...rest,
     ci_excerpt: row.ci_excerpt ? sanitizeOutput(row.ci_excerpt) : null,
+    error: row.error ? sanitizeOutput(row.error) : null,
     sprite: spriteView({ sprite_exit_code, sprite_duration_ms, sprite_output_tail, sprite_name, sprite_ran_at }),
   }
 }

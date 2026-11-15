@@ -107,6 +107,7 @@ export interface ContributionResult {
   sprite?: SpriteCheck        // the author's sprite ran the tests on this branch (extra evidence, not a merge gate)
   subagents?: SubagentRun[]   // every subagent deployed for this contribution, including failed ones
   pending?: PendingContribution // set with deferResolution: the PR is open and waits for resolveContribution
+  error?: string              // why nothing reached a pull request, when it did not
 }
 
 /**
@@ -338,7 +339,10 @@ export async function contributeCode(params: {
     const coderMessage = withModelTrailers(coder.commit_message || params.title, coderModel)
 
     if (!coder.files?.length) {
-      return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns }
+      const keys = coder && typeof coder === 'object' ? Object.keys(coder).slice(0, 8).join(', ') : typeof coder
+      const reason = `the coder (${coderServedBy.model}) returned no files${keys ? ` (fields: ${keys})` : ''}`
+      console.warn('[code-contribution] ' + reason)
+      return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns, error: reason }
     }
 
     // Validate the whole generated batch before the first repository write.
@@ -508,8 +512,9 @@ export async function contributeCode(params: {
       return { merged: false, ...base, cost, ci_passed: ciPassed }
     }
   } catch (error) {
-    console.warn('[code-contribution] failed (non-fatal):', error instanceof Error ? error.message : error)
-    return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns }
+    const reason = error instanceof Error ? error.message : String(error)
+    console.warn('[code-contribution] failed (non-fatal):', reason)
+    return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns, error: reason.slice(0, 2000) }
   }
 }
 
