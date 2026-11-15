@@ -8,6 +8,7 @@ import {
 } from '../_lib/epoch-claim.js'
 import { BUDGET_PAUSED_STATE, BudgetPausedError, describeBudget } from '../_lib/spend.js'
 import { persistGlassIfBrokenOut } from '../_lib/growth.js'
+import { runEpochFollowUp } from '../_lib/epoch-followup.js'
 
 // GET /api/epoch/tick - Cron endpoint (hourly) to run the next epoch when it is due.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
@@ -53,6 +54,18 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (await clearStaleClaim(experiment.id, staleMinutes)) {
         console.warn(`[CRON] Cleared stale epoch flag after ${Math.round(minutesInProgress)} minutes for experiment ${experiment.id}`)
       }
+    }
+
+    // A finished epoch's queued work (its code contribution, approved
+    // exhibits and proposals) gets a tick of its own before the next epoch,
+    // so neither has to share the 800 s function limit with the other.
+    const followUp = await runEpochFollowUp(experiment.id)
+    if (followUp.ran || followUp.reason !== 'nothing pending') {
+      console.log(`[CRON] Follow-up for epoch ${followUp.epoch_number ?? '?'}: ${followUp.ran ? followUp.status : followUp.reason}`)
+      if (followUp.ran || followUp.reason === 'an epoch is in progress') {
+        return res.status(200).json({ message: 'Ran the previous epoch\'s follow-up', experiment_id: experiment.id, follow_up: followUp })
+      }
+      // Budget spent: the epoch below will pause for the same reason.
     }
 
     // Cadence: measured from the end of the last epoch, with a small

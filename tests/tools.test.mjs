@@ -69,6 +69,7 @@ const load = path => import(pathToFileURL(join(build, path)).href)
 const { db } = await import(fakePgUrl)
 const openrouter = await load('api/_lib/openrouter.js')
 const runner = await load('api/_lib/epoch-runner.js')
+const followups = await load('api/_lib/epoch-followup.js')
 const prompts = await load('api/_lib/prompts.js')
 const toolsConfig = await load('api/_lib/tools-config.js')
 const requests = await load('api/_lib/tool-requests.js')
@@ -86,7 +87,7 @@ const { default: experimentHandler } = await load('api/experiment/index.js')
 // In-memory database: just what the classic epoch and the tool paths query.
 // ---------------------------------------------------------------------------
 const JSON_COLUMNS = new Set(['current_spec', 'role_assignments', 'spec_before', 'spec_after', 'plant_geometry',
-  'planner_output', 'executor_output', 'challenger_output', 'executor_rebuttal', 'reviewer_output', 'commentator_output'])
+  'planner_output', 'executor_output', 'challenger_output', 'executor_rebuttal', 'reviewer_output', 'commentator_output', 'followup'])
 let nextId = 1
 const uuid = () => `00000000-0000-4000-8000-${String(nextId++).padStart(12, '0')}`
 
@@ -156,6 +157,11 @@ class FakeLab {
     if (text.startsWith('SELECT * FROM experiments WHERE id = ?')) return { rows: this.experiments.filter(e => e.id === v[0]) }
     if (text.startsWith("SELECT e.*, (SELECT json_agg")) {
       return { rows: this.experiments.filter(e => e.status !== 'archived').slice(-1).map(e => ({ ...e, recent_epochs: [] })) }
+    }
+    if (text.includes("followup->>'status' = 'pending'")) {
+      const rows = this.epochs.filter(e => e.experiment_id === v[0] && e.spec_after && e.followup?.status === 'pending')
+        .sort((a, b) => a.epoch_number - b.epoch_number).slice(0, 1).map(e => ({ epoch_number: e.epoch_number }))
+      return { rows }
     }
     if (text.startsWith('SELECT * FROM epochs WHERE experiment_id = ? AND epoch_number = ? LIMIT 1')) {
       return { rows: this.epochs.filter(e => e.experiment_id === v[0] && e.epoch_number === v[1]) }
@@ -701,6 +707,17 @@ test('an epoch with every tool on: each runs once, is recorded, costed against t
   const result = await runner.runEpoch(exp.id)
   assert.equal(result.success, true)
   const executor = result.newSpec && lab.epochs[0].role_assignments.executor
+
+  // The epoch itself opens nothing: the contribution, exhibit and proposal are
+  // queued on its row and run in their own request (epoch-followup.ts).
+  assert.equal(calls.some(c => c.method === 'POST' && c.url.endsWith('/pulls')), false)
+  assert.equal(lab.epochs[0].followup.status, 'pending')
+  assert.equal(lab.epochs[0].followup.contribution_mutation_index, 0)
+  assert.equal(lab.epochs[0].followup.deliverables, true)
+  const followUp = await followups.runEpochFollowUp(exp.id)
+  assert.equal(followUp.ran, true)
+  assert.equal(lab.epochs[0].followup.status, 'done')
+  assert.equal(exp.epoch_in_progress, false)
   const executorName = (await load('api/_lib/types.js')).modelDisplayName(executor)
 
   // Every tool use is a row, refusals included.
@@ -764,7 +781,8 @@ test('an epoch with every tool on: each runs once, is recorded, costed against t
   const commentatorPrompt = systems.find(s => s.includes('You are the COMMENTATOR'))
   assert.match(commentatorPrompt, /Tools used, from the lab's records/)
   assert.match(commentatorPrompt, /ran 1 command\(s\) in its Sprite \(exit codes 0\)/)
-  assert.match(commentatorPrompt, /exhibit "planner-orrery": merged/)
+  assert.match(commentatorPrompt, /goes to AI-Agent as a pull request/)
+  assert.match(commentatorPrompt, /exhibit or lab proposal the Reviewer approved is opened after this epoch/)
 
   // Every outbound request had a timeout.
   for (const c of calls) assert.ok(c.signal instanceof AbortSignal, `${c.method} ${c.url}`)
@@ -790,6 +808,7 @@ test('without the Reviewer\'s approval no exhibit or proposal is opened; a resum
   }
   globalThis.fetch = fakeWorld({ models: epochModels(tools, { verdicts: { exhibit: 'maybe' } }), calls })
   await runner.runEpoch(exp.id)
+  await followups.runEpochFollowUp(exp.id)
   const skipped = lab.toolRuns.filter(r => r.status === 'skipped').map(r => [r.tool, r.output_tail])
   assert.deepEqual(skipped.sort(), [['exhibit', 'the Reviewer did not approve it'], ['lab_proposal', 'the Reviewer did not approve it']])
   assert.equal(calls.some(c => c.url.includes('exhibit/') || c.url.includes('lab-owner')), false)

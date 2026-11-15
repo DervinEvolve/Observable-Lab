@@ -5,9 +5,8 @@ import { runResearchEpoch } from './research-epoch.js'
 import { getExperimentStatus, getGrowthStage } from './seed-spec.js'
 import { generatePlantFromSpec } from './plant-generator.js'
 import { answeredModel, callModel as callOpenRouter } from './openrouter.js'
-import { contributeCode } from './code-contribution.js'
-import { contributionBranchName } from './branch-names.js'
-import { persistContribution, getRecentCIFailures } from './code-contributions-store.js'
+import { getRecentCIFailures } from './code-contributions-store.js'
+import type { EpochFollowUp } from './epoch-followup.js'
 import { addNotebookNote, getRecentNotebook } from './notebook.js'
 import { logEpochForResearch } from './research-logger.js'
 import { claimEpoch, releaseEpoch, EpochBusyError } from './epoch-claim.js'
@@ -42,9 +41,8 @@ import { MODEL_DISPLAY_NAMES, modelDisplayName } from './types.js'
 import { toolConfig } from './tools-config.js'
 import { planTools, type ToolPlan } from './tool-requests.js'
 import { prepareExhibit } from './exhibits.js'
-import { recordToolRun } from './tool-runs-store.js'
 import {
-  alreadyRan, readToolVerdicts, recentToolContext, recordIgnored, runDeliverables, runSideTools, subagentAllowance,
+  alreadyRan, recentToolContext, recordIgnored, runSideTools,
   type EpochToolContext, type ToolOutcome,
 } from './epoch-tools.js'
 
@@ -179,7 +177,7 @@ function applyMutations(
 // Finds the exact capabilities/behaviors item a given mutation+decision
 // touched, so a merged code contribution can tag that specific leaf/branch
 // (code_pr_url) rather than just existing somewhere in the abstract spec.
-function findMutatedSpecItem(
+export function findMutatedSpecItem(
   newSpec: AgentSpecification,
   mutation: Mutation,
   decision: ReviewerDecision
@@ -501,76 +499,38 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     // An entry whose type couldn't be mapped matches no branch and is skipped.
     const newSpec = applyMutations(specBefore, mutations as unknown as Mutation[], decisions, epochNumber)
 
-    // 10b. At most ONE code contribution per epoch: the approved mutation most
-    // worth backing with code becomes a pull request on AI-Agent (the
-    // explorer and test subagents the Executor chose, the code, CI, and the
-    // author's Sprite when configured). Only when today's spend allows it.
-    // Best-effort: a code-side failure never blocks the spec pipeline.
+    // 10b. Post-review work: the one code contribution (the approved mutation
+    // most worth backing with code) and any exhibit or lab proposal the
+    // Reviewer approved. It does not run here. With reasoning on, the five
+    // roles already use most of the 800 s function limit, and the
+    // contribution (explorer, code, test, CI, Sprite) can take as long again,
+    // so doing both in one request overran it. It is queued on the epoch row
+    // and runs in its own request on the next tick (epoch-followup.ts).
     const candidate = pickContributionCandidate(mutations, decisions, challengerOutput.challenges)
-    // An exhibit or lab proposal the Reviewer approved goes out alongside the
-    // code contribution (each waits on its own CI or nothing at all).
-    const deliverables: Promise<ToolOutcome[]> = toolPlan && toolCtx
-      ? runDeliverables(toolCtx, toolPlan, readToolVerdicts(reviewerOutput), toolsAlreadyRun,
-        executorModel !== roleAssignments.executor ? (modelDisplayName(roleAssignments.executor) || roleAssignments.executor) : undefined)
-      : Promise.resolve([])
-    if (candidate) {
-      const { mutation, decision } = candidate
-      const budget = await checkDailyBudget()
-      if (!budget.allowed) {
-        console.warn(`[Epoch ${epochNumber}] Skipping the code contribution: ${describeBudget(budget)}`)
-      } else {
-        try {
-          const agentContext = `${newSpec.identity.purpose || 'An autonomous agent'}${
-            newSpec.identity.domain ? ` (domain: ${newSpec.identity.domain})` : ''
-          }`
-          // Throws (and skips the contribution) unless target is one of the
-          // allowed mutation targets and the index is a small integer.
-          const branchName = contributionBranchName(epochNumber, mutation.target, decision.mutation_index)
-          // The Executor chose its subagents (or got the default), within today's limit.
-          const chosen = toolPlan?.subagents ?? { explore: 1, test: true, chosen: false }
-          const subagents = await subagentAllowance(chosen)
-          if (subagents.note) console.warn(`[Epoch ${epochNumber}] subagents trimmed: ${subagents.note}`)
-          const result = await contributeCode({
-            authorModelId: roleAssignments.executor,
-            branchName,
-            title: `Epoch ${epochNumber}: ${mutation.target}: ${mutation.path}`,
-            description: `${mutation.rationale}\n\nSpec field: ${mutation.target}.${mutation.path}\nProposed value: ${JSON.stringify(decision.modified_value ?? mutation.value)}`,
-            review: { mode: 'approved' }, // Reviewer already approved this mutation
-            subagents: { explore: subagents.explore, test: subagents.test },
-            agentContext,
-          })
-          for (const run of result.subagents ?? []) {
-            await recordToolRun({
-              experimentId, epoch: epochNumber, model: run.model, tool: run.kind === 'explore' ? 'subagent_explore' : 'subagent_test',
-              requestSummary: run.kind === 'explore' ? (run.task || 'explore') : `test for ${branchName}`,
-              status: run.ok ? 'ok' : 'error', costUsd: run.cost,
-              detail: { branch: branchName, pr_url: result.pr_url ?? null, chosen_by_executor: chosen.chosen, files: run.files ?? [] },
-            })
-          }
-          // The ledger already holds these calls; this keeps the in-memory total honest too.
-          totalCost += result.cost
-          await persistContribution(experimentId, epochNumber, roleAssignments.executor, branchName, result)
-          if (result.merged) {
-            console.log(`[Epoch ${epochNumber}] Code contribution merged: ${result.pr_url}`)
-            // Tag the exact leaf/branch this PR backs, so the plant can render
-            // it in a distinct "real code" color instead of the plain default.
-            const item = findMutatedSpecItem(newSpec, mutation, decision)
-            if (item) item.code_pr_url = result.pr_url
-          } else if (result.ci_passed === false) {
-            console.log(`[Epoch ${epochNumber}] Code contribution failed CI: ${result.pr_url}`)
-            // Durable memory of the failure — short note; the full log excerpt
-            // is already injected into next epoch's context separately.
-            const firstError = (result.ci_excerpt || '').split('\n').find(l => /FAIL|Error/.test(l))?.slice(0, 180) || 'see CI logs'
-            await addNotebookNote(experimentId, epochNumber, 'CI (system)',
-              `PR "${mutation.target}: ${mutation.path}" FAILED the test suite and was closed. ${firstError}`)
-          }
-        } catch (e) {
-          console.warn(`[Epoch ${epochNumber}] Code contribution failed (non-fatal):`, e instanceof Error ? e.message : e)
-        }
-      }
+    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal))
+    const followup: EpochFollowUp = {
+      status: candidate || hasDeliverables ? 'pending' : 'none',
+      contribution_mutation_index: candidate ? candidate.decision.mutation_index : null,
+      deliverables: hasDeliverables,
+      queued_at: new Date().toISOString(),
+    }
+    // A resumed epoch whose follow-up already started keeps that record.
+    const prior = (existingEpoch as { followup?: EpochFollowUp } | undefined)?.followup
+    await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS followup JSONB`
+    if (!prior || prior.status === 'pending' || prior.status === 'none') {
+      await sql`UPDATE epochs SET followup = ${JSON.stringify(followup)} WHERE id = ${epochId}`
     }
 
-    const toolOutcomes: ToolOutcome[] = [...(await sideTools), ...(await deliverables)]
+    const toolOutcomes: Array<{ tool: string; status: string; summary: string }> = [...(await sideTools)]
+    if (candidate) {
+      toolOutcomes.push({
+        tool: 'code_contribution', status: 'queued',
+        summary: `after this epoch, the approved ${candidate.mutation.target} change goes to AI-Agent as a pull request; CI decides the merge`,
+      })
+    }
+    if (hasDeliverables) {
+      toolOutcomes.push({ tool: 'deliverables', status: 'queued', summary: 'any exhibit or lab proposal the Reviewer approved is opened after this epoch' })
+    }
 
     // Always a number in 0..1 (a string or 85 from a model would break the
     // DECIMAL(4,3) stability_delta column and the lighting).

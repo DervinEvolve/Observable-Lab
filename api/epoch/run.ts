@@ -5,6 +5,7 @@ import { runEpoch } from '../_lib/epoch-runner.js'
 import { EpochBusyError } from '../_lib/epoch-claim.js'
 import { BUDGET_PAUSED_STATE, BudgetPausedError } from '../_lib/spend.js'
 import { persistGlassIfBrokenOut } from '../_lib/growth.js'
+import { runEpochFollowUp } from '../_lib/epoch-followup.js'
 
 // POST /api/epoch/run - Force trigger an epoch (operator). Shares the atomic
 // claim with the cron, so the two can never run an epoch at the same time,
@@ -33,6 +34,16 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     }
 
     const experiment = experimentResult.rows[0]
+
+    // ?step=followup runs the oldest finished epoch's queued work (its code
+    // contribution, approved exhibits and proposals) instead of a new epoch.
+    // The cron does this by itself on the next tick; previews have no cron.
+    if (req.query.step === 'followup') {
+      const followUp = await runEpochFollowUp(experiment.id)
+      const code = followUp.ran ? 200 : followUp.reason === 'an epoch is in progress' ? 409
+        : followUp.reason === 'nothing pending' ? 404 : 429
+      return res.status(code).json({ experiment_id: experiment.id, follow_up: followUp })
+    }
 
     console.log(`[EPOCH] Manually triggering epoch ${experiment.current_epoch + 1} for experiment ${experiment.id}`)
 
