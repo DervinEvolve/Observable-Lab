@@ -38,6 +38,7 @@ The Executor also gets a small menu of tools. Each one is off unless I've switch
 - **Sprite sessions.** Each lab's model has its own Sprite, a Linux computer in the cloud, shown as the screen above its desk. The Executor can run up to four shell commands there to try something out or time it. The Sprite can reach GitHub and the usual package registries, holds no credentials, and its output is stored and shown.
 - **GPU jobs.** One short Python script on a Modal GPU, with the network blocked, no credentials inside and a 120-second limit. The script has to compile before any GPU time starts.
 - **Exhibits.** The Executor can design a small object for the room as a data file. If the Reviewer approves it, it goes to AI-Agent as a pull request, and it appears in the room once it merges.
+- **Memory.** Every round, each role gets a few lines from the lab's knowledge graph (described below): the most connected parts of the specification, who changed what lately, the open conflicts, and whether their code has landed. A role can also ask the graph up to three questions. The answers go to the colleagues who speak after it in that round, and each question is saved.
 - **Proposals to this repository.** A model can propose a change to the lab itself. These open as pull requests labelled `model-proposal`, and I review and merge them myself, because this repository deploys the site and its server holds the lab's keys.
 
 Every tool has a daily limit, and what it costs counts against the same daily spending cap as the model calls (`LAB_DAILY_BUDGET_USD`, $15 by default). OpenRouter reports the real cost of each model call; Sprite and GPU time are my estimates from how long they ran. When the cap is reached, the lab pauses until midnight UTC.
@@ -50,7 +51,50 @@ The second loop tries **ML research**, influenced by [Karpathy's autoresearch](h
 
 Each training run gets a fresh Sandbox. Network access is blocked, credentials stay outside it, and the dataset cache is read-only. The default training budget is 300 seconds, followed by a bounded grace period for startup and evaluation. The controller stops the Sandbox after each run. I tested the isolation with a live CPU run. Independent evaluation of model quality is still unfinished.
 
-## The record so far
+## Run 2 so far
+
+Run 2 started on 15 November 2026 with the newest model from each lab, and a round runs every three hours. These notes cover rounds 1 to 19, from the stored record.
+
+- **The specification grows by about one capability a round.** It started with a tool registry and a loop for reading tool results. By round 19 it had 20 capabilities, among them sandboxed Python, revisable plans, an observation store, retrieval, subagent delegation, web research, browser use, MCP connectors, code navigation, paired evaluation and an inference bridge. It also has 20 constraints and 20 behaviors.
+- **The Reviewer almost never says yes or no.** Of 66 proposed changes, the Reviewer approved 4 as written, asked for changes to 62 and rejected none. The changes still go in, rewritten. I want to see whether a stricter Reviewer prompt changes that.
+- **The Challenger finds real problems.** It raised 52 challenges, 22 of them marked critical, and the group recorded 28 conflicts between parts of the specification. 15 of those are still open.
+- **Grok is quieter than the rotation suggests.** Nine times Grok 4.7 gave no usable answer, and each time Claude Sonnet 5.5 answered instead: four times as Executor, twice in the rebuttal, twice as Challenger and once as Reviewer. Any comparison between the labs has to account for that.
+- **They noticed when they drifted.** In round 17, Grok 4.7 as Planner said: "We can reach the outside world and still cannot find a function we wrote, or treat a failing check as unfinished. Next machine is navigation plus a closed check loop, not another connector." The next additions turned inward: code navigation, then evaluation.
+- **None of their code has landed yet.** There have been 20 code attempts and no merged pull request. The early ones failed in the lab's code-writing step (time limits and answers cut off at the output limit), which I've fixed. The latest fail because the lab's token for AI-Agent can't create branches. Both problems are in my setup, not in the models' work.
+- **They've started asking about it.** In round 18, DeepSeek V4 Pro asked the lab's memory: "Has any AgentRuntime implementation actually merged in the AI-Agent repo?" In round 19, GPT-6 Astra asked: "Did epoch 18 ship a working evaluation runner or only partial statistics/report components?"
+- **Their search reports and the record mostly agree.** The models said they ran 45 web searches, and OpenRouter recorded 135 cited pages. In 8 turns a model said it searched but no citation was recorded. The activity panel flags those.
+- **Cost.** The 19 rounds cost $42.37 in model calls, about $2.20 a round.
+
+## The knowledge graph
+
+<p align="center"><img src="docs/assets/kg-overview.webp" width="880" alt="The knowledge graph overlay: ten cluster bubbles for models, epochs, what they said, capabilities, constraints, behaviors, conflicts, notebook notes, cited sites and code, with the models' recalls listed on the right."></p>
+
+*The graph button opens this view. Each bubble is one kind of thing in the record, and a line between two bubbles gets heavier the more links they share. Conflicts are drawn in red.*
+
+The graph is built from the stored record only: who proposed, changed or challenged which part of the specification, the conflicts between parts, the notes the models leave each other, the sites they cited, what each model said in each round, and its code attempts. Nothing in it is generated for the picture.
+
+<p align="center"><img src="docs/assets/kg-models.webp" width="720" alt="The Models cluster opened, showing each lab's model as a node with its logo."></p>
+
+*Opening a bubble packs its nodes inside it, with the most connected in the middle. Model nodes carry their lab's logo; the sources are recorded in [PROVIDER_LOGO_SOURCES.json](docs/PROVIDER_LOGO_SOURCES.json).*
+
+You can search for:
+
+- **A part of the agent**, like `memory`, `MCP`, `browser` or `evaluation`. Capabilities, constraints and behaviors are listed with the conflicts they're in.
+- **What a model said**, like `outside world`. Every role's remark and reasoning in every round is searchable.
+- **A model**, like `Claude` or `Grok`, to see every round it played, everything it proposed or challenged, and what it wrote.
+- **A site** the models cited, or a round, like `epoch 12`.
+
+<p align="center"><img src="docs/assets/kg-search.webp" width="880" alt="Searching outside world finds Grok 4.7 as Planner in round 17, with its remark, its reasoning and a button to open it in J-space."></p>
+
+*Clicking a node shows what it says and everything it links to. Clicking one of those walks there.*
+
+<p align="center"><img src="docs/assets/kg-recall.webp" width="880" alt="A recall replay: a gold path runs from GPT-6 Astra's node through the records its question found, with the question as a caption."></p>
+
+*When a model asks the lab's memory a question, the graph can replay it: a pulse leaves the model's node and steps through each record its question found.*
+
+The same graph is public JSON at `/api/experiment/graph`, with `?q=` to search and `?focus=<id>&depth=2` to walk it, so other agents can use it too.
+
+## Run 1: the research record
 
 <p align="center"><img src="docs/assets/lab-room.png" width="880" alt="Observable Lab displaying stored experiment state, with model role labels, scientists at desks and the specification plant."></p>
 
@@ -68,7 +112,7 @@ The training program calculates and reports its own score. I save that result as
 
 I also want to run each change several times. That would help me see whether an improvement repeats or came from a lucky run. [The research notes](docs/RESEARCH_NOTES.md#the-two-experiments-in-the-code) describe the scoring and dataset setup in more detail.
 
-## What I'm taking from the early rounds
+## What I'm taking from run 1
 
 Looking back through the saved notes, a few things seem worth carrying into the next run:
 
@@ -82,7 +126,7 @@ Looking back through the saved notes, a few things seem worth carrying into the 
 
 ## Running it again
 
-I'm planning a fresh run soon with updated models. For that run, I want fixed model versions, a clearly recorded dataset, separate checking of the scores and repeated runs for each promising change. I'll keep this early run available alongside the new results.
+Run 2 is the fresh run I planned, with the newest models. For the research loop I still want fixed model versions, a clearly recorded dataset, separate checking of the scores and repeated runs for each promising change. Run 1 stays available alongside the new results.
 
 ## Watching the room
 
@@ -91,6 +135,14 @@ I'm planning a fresh run soon with updated models. For that run, I want fixed mo
 *Hon AI Research is my project name. The About panel explains how to read the room.*
 
 The room regularly checks for updates to the saved experiment. When I run it locally without a connected experiment, it plays a preview of the scientists moving around and working at their desks. The corner label reads **Simulation: no experiment connected**. That is the mode shown in the GIF.
+
+The buttons in the bottom right corner open, from the top: the knowledge graph, **What each model did** (the searches each model reported beside the pages OpenRouter recorded it citing, its tool runs, its pull request and its cost) and the experiment log.
+
+<p align="center"><img src="docs/assets/jspace.webp" width="880" alt="The J-space panel showing Grok 4.7's round 17 turn: the ideas in its reasoning, what it said, and its full reasoning."></p>
+
+*J-space, opened here from the graph for Grok's round 17 turn.*
+
+Each scientist's name card has a **J-space** button. It shows the ideas in that model's reasoning text and what it then said. It's drawn from the model's own text, not from its internal activations, which a cloud model doesn't share. The graph can open any model's turn in J-space too.
 
 Each model's Sprite is the screen above its desk. When a model runs commands there, or the tests for its pull request run there, the screen plays back the stored output. A Sprite is created the first time it's needed. I still need to record the full connected flow, including subagent work.
 
