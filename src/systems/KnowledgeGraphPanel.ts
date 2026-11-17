@@ -58,6 +58,7 @@ export class KnowledgeGraphPanel {
   private selected: string | null = null
   private hovered: string | null = null
   private matches = new Set<string>()
+  private topMatches = new Set<string>() // the best few, the only matches labelled on the canvas
   private view = { x: 0, y: 0, k: 1 }
   private alpha = 0
   private raf = 0
@@ -208,46 +209,82 @@ export class KnowledgeGraphPanel {
     el.innerHTML = (this.data?.clusters ?? []).map(c => `<span><i style="background:${TYPE_COLOR[c.id]}"></i>${esc(c.label)} ${c.count}</span>`).join('')
   }
 
-  // ---- layout: clusters as anchors on a ring, nodes of open clusters around their anchor ----
-  private anchor(type: NodeType): { x: number; y: number } {
-    const list = this.data?.clusters ?? []
-    const i = Math.max(0, list.findIndex(c => c.id === type))
-    const a = (i / Math.max(1, list.length)) * Math.PI * 2 - Math.PI / 2
-    const R = 330
-    return { x: Math.cos(a) * R, y: Math.sin(a) * R }
+  // ---- layout: every cluster keeps its own area on a ring; open clusters pack their nodes inside it ----
+  private anchors = new Map<NodeType, { x: number; y: number; r: number }>()
+  private hullLabels: Array<{ type: NodeType; x0: number; y0: number; x1: number; y1: number }> = []
+
+  /** The radius a cluster takes: a bubble when closed, room for all its nodes when open. */
+  private clusterRadius(c: GCluster): number {
+    return this.expanded.has(c.id) ? 32 + 19 * Math.sqrt(c.count) : 22 + 5 * Math.sqrt(c.count)
   }
 
+  private anchor(type: NodeType): { x: number; y: number } {
+    return this.anchors.get(type) ?? { x: 0, y: 0 }
+  }
+
+  /** Place the clusters around a ring, each taking an arc as wide as it is, and their nodes in a sunflower. */
   private layout(reset: boolean): void {
     if (!this.data) return
+    const list = this.data.clusters
+    const GAP = 46
+    const sizes = list.map(c => this.clusterRadius(c))
+    const around = sizes.reduce((t, r) => t + 2 * r + GAP, 0)
+    // Neighbours on the ring are a chord apart, not an arc: widen the ring until every pair clears.
+    let ring = Math.max(250, around / (2 * Math.PI))
+    const place = (R: number) => {
+      const total = sizes.reduce((t, r) => t + 2 * r + GAP, 0)
+      let angle = -Math.PI / 2
+      return sizes.map(r => {
+        const half = ((r + GAP / 2) / total) * 2 * Math.PI // half of this cluster's share of the full turn
+        angle += half
+        const at = { x: Math.cos(angle) * R, y: Math.sin(angle) * R, r }
+        angle += half
+        return at
+      })
+    }
+    let spots = place(ring)
+    for (let tries = 0; tries < 30; tries++) {
+      const clash = spots.some((a, i) => {
+        const b = spots[(i + 1) % spots.length]
+        return spots.length > 1 && Math.hypot(a.x - b.x, a.y - b.y) < a.r + b.r + GAP
+      })
+      if (!clash) break
+      ring *= 1.08
+      spots = place(ring)
+    }
+    list.forEach((c, i) => this.anchors.set(c.id, spots[i]))
+
     const keep = new Set<string>()
-    for (const c of this.data.clusters) {
+    for (const c of list) {
       const p = this.anchor(c.id)
       if (this.expanded.has(c.id)) {
-        const members = this.data.nodes.filter(n => n.type === c.id)
+        // Most connected in the middle, then outward in a sunflower, so the area fills evenly.
+        const members = this.data.nodes.filter(n => n.type === c.id).sort((x, y) => y.degree - x.degree || (y.epoch ?? 0) - (x.epoch ?? 0))
         members.forEach((n, i) => {
           keep.add(n.id)
-          if (!this.bodies.has(n.id) || reset) {
-            const a = (i / members.length) * Math.PI * 2
-            const rr = 40 + Math.sqrt(members.length) * 14
-            this.bodies.set(n.id, { id: n.id, x: p.x + Math.cos(a) * rr, y: p.y + Math.sin(a) * rr, vx: 0, vy: 0, r: 6 + Math.min(10, Math.sqrt(n.degree) * 2.2), cluster: c.id, isCluster: false, node: n })
-          } else {
-            const b = this.bodies.get(n.id) as Body
-            b.node = n
-            b.r = 6 + Math.min(10, Math.sqrt(n.degree) * 2.2)
-          }
+          const rad = 19 * Math.sqrt(i + 0.35)
+          const ang = i * 2.39996
+          const tx = p.x + Math.cos(ang) * rad, ty = p.y + Math.sin(ang) * rad
+          const r = 5 + Math.min(6, Math.sqrt(n.degree) * 1.4)
+          const b = this.bodies.get(n.id)
+          if (!b || reset) this.bodies.set(n.id, { id: n.id, x: reset ? tx : p.x, y: reset ? ty : p.y, vx: tx, vy: ty, r, cluster: c.id, isCluster: false, node: n })
+          else { b.node = n; b.r = r; b.vx = tx; b.vy = ty }
         })
       } else {
         const id = `cluster:${c.id}`
         keep.add(id)
+        const r = 22 + 5 * Math.sqrt(c.count)
         const b = this.bodies.get(id)
-        if (!b || reset) this.bodies.set(id, { id, x: p.x, y: p.y, vx: 0, vy: 0, r: 22 + Math.sqrt(c.count) * 5, cluster: c.id, isCluster: true, count: c.count })
-        else { b.count = c.count; b.r = 22 + Math.sqrt(c.count) * 5 }
+        if (!b || reset) this.bodies.set(id, { id, x: p.x, y: p.y, vx: p.x, vy: p.y, r, cluster: c.id, isCluster: true, count: c.count })
+        else { b.count = c.count; b.r = r; b.vx = p.x; b.vy = p.y }
       }
     }
     for (const id of [...this.bodies.keys()]) if (!keep.has(id)) this.bodies.delete(id)
     if (reset) this.fit(false)
+    else if (!this.selected) this.fitSoon = true
     this.kick(1)
   }
+  private fitSoon = false
 
   /** The body an edge end is drawn at: the node if its cluster is open, else its cluster's bubble. */
   private endOf(id: string): Body | undefined {
@@ -261,52 +298,27 @@ export class KnowledgeGraphPanel {
     cancelAnimationFrame(this.raf)
     const step = () => {
       if (!this.isOpen) return
-      if (this.alpha > 0.01) this.tick()
+      const moving = this.tick()
       this.draw()
-      if (this.alpha > 0.01 || this.drag || this.anim) this.raf = requestAnimationFrame(step)
+      if (moving || this.drag || this.anim) this.raf = requestAnimationFrame(step)
     }
     this.raf = requestAnimationFrame(step)
   }
 
-  private tick(): void {
-    if (!this.data) return
-    const list = [...this.bodies.values()]
-    const a = this.alpha
-    // Repulsion between every pair (a few hundred bodies at most).
-    for (let i = 0; i < list.length; i++) {
-      for (let j = i + 1; j < list.length; j++) {
-        const p = list[i], q = list[j]
-        let dx = q.x - p.x, dy = q.y - p.y
-        let d2 = dx * dx + dy * dy
-        if (d2 < 0.01) { dx = 0.1; dy = 0.1; d2 = 0.02 }
-        const min = p.r + q.r + 14
-        const f = (900 + (d2 < min * min ? 4000 : 0)) / d2
-        const d = Math.sqrt(d2)
-        p.vx -= (dx / d) * f * a; p.vy -= (dy / d) * f * a
-        q.vx += (dx / d) * f * a; q.vy += (dy / d) * f * a
-      }
+  /** Glide every body toward its place (kept in vx, vy). Returns whether anything is still moving. */
+  private tick(): boolean {
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches
+    let moving = false
+    if (this.fitSoon) { this.fitSoon = false; this.fit(false) }
+    for (const b of this.bodies.values()) {
+      if (this.drag?.mode === 'node' && this.drag.id === b.id) continue
+      const dx = b.vx - b.x, dy = b.vy - b.y
+      if (Math.abs(dx) + Math.abs(dy) < 0.3) { b.x = b.vx; b.y = b.vy; continue }
+      const k = reduce ? 1 : 0.18
+      b.x += dx * k; b.y += dy * k
+      moving = true
     }
-    // Springs along the edges that are drawn.
-    for (const e of this.data.edges) {
-      const p = this.endOf(e.source), q = this.endOf(e.target)
-      if (!p || !q || p === q || p.isCluster || q.isCluster) continue
-      const dx = q.x - p.x, dy = q.y - p.y
-      const d = Math.sqrt(dx * dx + dy * dy) || 1
-      const f = (d - 90) * 0.012 * a
-      p.vx += (dx / d) * f; p.vy += (dy / d) * f
-      q.vx -= (dx / d) * f; q.vy -= (dy / d) * f
-    }
-    // Each body is pulled toward its cluster's anchor, so the groups stay readable.
-    for (const b of list) {
-      const p = this.anchor(b.cluster)
-      const k = b.isCluster ? 0.05 : 0.012
-      b.vx += (p.x - b.x) * k * a
-      b.vy += (p.y - b.y) * k * a
-      if (this.drag?.mode === 'node' && this.drag.id === b.id) { b.vx = b.vy = 0; continue }
-      b.vx *= 0.82; b.vy *= 0.82
-      b.x += b.vx; b.y += b.vy
-    }
-    this.alpha *= 0.985
+    return moving
   }
 
   // ---- drawing ----
@@ -345,55 +357,102 @@ export class KnowledgeGraphPanel {
     const focus = this.hovered ?? this.selected
     const near = focus ? this.neighbours(focus) : null
     const lit = (id: string) => !focus || id === focus || near!.has(id)
+    const k = this.view.k
 
-    // Edges: one line per pair of drawn ends, heavier when several edges share it.
-    const pairs = new Map<string, { p: Body; q: Body; n: number; on: boolean; kind: string }>()
-    for (const e of this.data.edges) {
-      const p = this.endOf(e.source), q = this.endOf(e.target)
-      if (!p || !q || p === q) continue
-      const key = p.id < q.id ? `${p.id}|${q.id}` : `${q.id}|${p.id}`
-      const on = !focus || ((e.source === focus || e.target === focus) && (lit(e.source) && lit(e.target)))
-      const cur = pairs.get(key)
-      if (cur) { cur.n++; cur.on ||= on } else pairs.set(key, { p, q, n: 1, on, kind: e.kind })
+    // 1. The open clusters' areas, each with its name and how many it holds (click the name to close it).
+    this.hullLabels = []
+    for (const c of this.data.clusters) {
+      if (!this.expanded.has(c.id)) continue
+      const p = this.anchor(c.id)
+      const r = (this.anchors.get(c.id)?.r ?? 40) + 10
+      const [x, y] = this.toScreen(p.x, p.y)
+      const color = TYPE_COLOR[c.id]
+      ctx.beginPath(); ctx.arc(x, y, r * k * dpr, 0, Math.PI * 2)
+      ctx.fillStyle = `${color}12`; ctx.fill()
+      ctx.strokeStyle = `${color}55`; ctx.lineWidth = 1.5 * dpr; ctx.stroke()
+      const text = `${c.label}  ${c.count}  ×`
+      ctx.font = `650 ${13 * dpr}px Inter, -apple-system, sans-serif`
+      const w = ctx.measureText(text).width
+      const ly = y - r * k * dpr - 10 * dpr
+      ctx.fillStyle = 'rgba(18,18,20,0.85)'
+      ctx.fillRect(x - w / 2 - 6 * dpr, ly - 9 * dpr, w + 12 * dpr, 20 * dpr)
+      ctx.fillStyle = color; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+      ctx.fillText(text, x, ly + 1 * dpr)
+      this.hullLabels.push({ type: c.id, x0: (x - w / 2 - 6 * dpr) / dpr, y0: (ly - 9 * dpr) / dpr, x1: (x + w / 2 + 6 * dpr) / dpr, y1: (ly + 11 * dpr) / dpr })
     }
-    for (const { p, q, n, on, kind } of pairs.values()) {
+
+    // 2. Links. At rest, one line between each pair of clusters, as heavy as the links they share;
+    //    with a node in focus, its own links to each neighbour (or to the neighbour's closed cluster).
+    const bundle = new Map<string, { a: NodeType; b: NodeType; n: number; conflict: number }>()
+    for (const e of this.data.edges) {
+      const ta = this.byId.get(e.source)?.type, tb = this.byId.get(e.target)?.type
+      if (!ta || !tb || ta === tb) continue
+      const key = ta < tb ? `${ta}|${tb}` : `${tb}|${ta}`
+      const cur = bundle.get(key) ?? { a: ta, b: tb, n: 0, conflict: 0 }
+      cur.n++
+      if (e.kind === 'conflicts') cur.conflict++
+      bundle.set(key, cur)
+    }
+    for (const { a, b, n, conflict } of bundle.values()) {
+      const p = this.anchor(a), q = this.anchor(b)
       const [x1, y1] = this.toScreen(p.x, p.y), [x2, y2] = this.toScreen(q.x, q.y)
-      ctx.strokeStyle = kind === 'conflicts' ? `rgba(229,115,115,${on ? 0.75 : 0.12})` : `rgba(245,242,235,${on ? (focus ? 0.7 : 0.22) : 0.05})`
-      ctx.lineWidth = Math.min(6, 0.8 + Math.log2(n + 1)) * dpr * (on && focus ? 1.3 : 1)
+      ctx.strokeStyle = conflict > n / 2 ? `rgba(229,115,115,${focus ? 0.08 : 0.4})` : `rgba(245,242,235,${focus ? 0.05 : 0.16})`
+      ctx.lineWidth = Math.min(10, 1 + Math.log2(n + 1) * 1.2) * dpr
       ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
     }
+    if (focus) {
+      const from = this.endOf(focus)
+      if (from) {
+        const [x1, y1] = this.toScreen(from.x, from.y)
+        for (const e of this.data.edges) {
+          if (e.source !== focus && e.target !== focus) continue
+          const to = this.endOf(e.source === focus ? e.target : e.source)
+          if (!to || to === from) continue
+          const [x2, y2] = this.toScreen(to.x, to.y)
+          ctx.strokeStyle = e.kind === 'conflicts' ? 'rgba(229,115,115,0.85)' : 'rgba(255,255,255,0.7)'
+          ctx.lineWidth = 1.6 * dpr
+          ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
+        }
+      }
+    }
 
-    // Bodies.
-    for (const b of this.bodies.values()) {
+    // 3. Bubbles and nodes. Node labels that would overlap one already drawn are skipped (hover shows them).
+    const placed: Array<[number, number, number, number]> = []
+    const order = [...this.bodies.values()].sort((p, q) => Number(q.id === focus) - Number(p.id === focus) || Number(this.topMatches.has(q.id)) - Number(this.topMatches.has(p.id)))
+    for (const b of order) {
       const [x, y] = this.toScreen(b.x, b.y)
-      const r = b.r * Math.max(0.6, Math.min(1.6, this.view.k)) * dpr
+      const r = b.r * Math.max(0.6, Math.min(1.6, k)) * dpr
       const on = b.isCluster ? !focus || [...(near ?? [])].some(id => this.byId.get(id)?.type === b.cluster) || this.byId.get(focus)?.type === b.cluster : lit(b.id)
       const color = b.isCluster ? TYPE_COLOR[b.cluster] : colorOf(b.node as GNode)
-      ctx.globalAlpha = on ? 1 : 0.22
+      ctx.globalAlpha = on ? 1 : 0.2
       ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2)
       ctx.fillStyle = b.isCluster ? `${color}33` : color
       ctx.fill()
       ctx.lineWidth = (b.id === this.selected ? 3 : this.matches.has(b.id) ? 2.5 : b.isCluster ? 2 : 1) * dpr
       ctx.strokeStyle = b.id === this.selected ? '#FFFFFF' : this.matches.has(b.id) ? '#FFD54F' : b.isCluster ? color : 'rgba(0,0,0,0.5)'
       ctx.stroke()
-      if (!b.isCluster && b.node?.type === 'conflict' && b.node.meta.resolved !== true) {
+      if (!b.isCluster && b.node?.type === 'conflict' && b.node.meta.resolved !== true && r > 6 * dpr) {
         ctx.fillStyle = '#121214'; ctx.font = `700 ${Math.round(r * 1.1)}px Inter, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
         ctx.fillText('!', x, y + dpr)
       }
-      // Labels: always for bubbles; for nodes when zoomed in, highlighted, or well connected.
+      // Labels: always for closed bubbles; for nodes only when they are the focus, its neighbours,
+      // search matches, or when zoomed in far enough to have room.
       const showLabel = b.isCluster
         ? on
         : focus
           ? b.id === focus || near!.has(b.id)
-          : this.matches.size ? this.matches.has(b.id) : this.view.k > 1.35 || (b.node?.degree ?? 0) >= 7 || b.node?.type === 'model'
+          : this.matches.size ? this.topMatches.has(b.id) : k > 1.6 || b.node?.type === 'model'
       if (showLabel) {
         const text = b.isCluster ? `${this.data.clusters.find(c => c.id === b.cluster)?.label ?? b.cluster}  ${b.count}` : (b.node?.label ?? '')
         const size = (b.isCluster ? 14 : 12) * dpr
         ctx.font = `${b.isCluster ? 650 : 500} ${size}px Inter, -apple-system, sans-serif`
         ctx.textAlign = 'center'; ctx.textBaseline = 'top'
-        const t = text.length > 42 ? `${text.slice(0, 40)}…` : text
+        const t = text.length > 38 ? `${text.slice(0, 36)}…` : text
         const w = ctx.measureText(t).width
-        ctx.fillStyle = 'rgba(18,18,20,0.78)'
+        const box: [number, number, number, number] = [x - w / 2 - 4 * dpr, y + r + 3 * dpr, x + w / 2 + 4 * dpr, y + r + size + 9 * dpr]
+        if (!b.isCluster && b.id !== focus && placed.some(o => box[0] < o[2] && box[2] > o[0] && box[1] < o[3] && box[3] > o[1])) { ctx.globalAlpha = 1; continue }
+        placed.push(box)
+        ctx.fillStyle = 'rgba(18,18,20,0.82)'
         ctx.fillRect(x - w / 2 - 4 * dpr, y + r + 3 * dpr, w + 8 * dpr, size + 6 * dpr)
         ctx.fillStyle = on ? '#F5F2EB' : 'rgba(245,242,235,0.45)'
         ctx.fillText(t, x, y + r + 6 * dpr)
@@ -510,6 +569,10 @@ export class KnowledgeGraphPanel {
       this.drag = null
       c.classList.remove('dragging')
       if (d && !d.moved) {
+        const rect = c.getBoundingClientRect()
+        const lx = e.clientX - rect.left, ly = e.clientY - rect.top
+        const label = this.hullLabels.find(h => lx >= h.x0 && lx <= h.x1 && ly >= h.y0 && ly <= h.y1)
+        if (label) { this.expand(label.type, true); return }
         const b = this.hit(e.clientX, e.clientY)
         if (b?.isCluster) this.expand(b.cluster, true)
         else if (b) this.select(b.id, false)
@@ -537,11 +600,11 @@ export class KnowledgeGraphPanel {
   }
 
   private fit(redraw = true): void {
-    const list = [...this.bodies.values()]
-    if (!list.length) return
+    const areas = [...this.anchors.values()]
+    if (!areas.length) return
     const r = this.canvas.getBoundingClientRect()
-    const xs = list.map(b => b.x), ys = list.map(b => b.y)
-    const w = Math.max(...xs) - Math.min(...xs) + 160, h = Math.max(...ys) - Math.min(...ys) + 160
+    const xs = areas.flatMap(a => [a.x - a.r - 30, a.x + a.r + 30]), ys = areas.flatMap(a => [a.y - a.r - 40, a.y + a.r + 40])
+    const w = Math.max(...xs) - Math.min(...xs) + 40, h = Math.max(...ys) - Math.min(...ys) + 40
     const top = r.width < 760 ? 120 : 110 // the title band
     const bottom = r.width < 760 ? 56 : 64 // the legend and the zoom buttons
     this.view.k = Math.max(0.25, Math.min(1.6, Math.min(r.width / w, (r.height - top - bottom) / h)))
@@ -554,8 +617,8 @@ export class KnowledgeGraphPanel {
     const b = this.bodies.get(id)
     if (!b) return
     this.view.k = Math.max(this.view.k, 1.1)
-    this.view.x = -b.x * this.view.k
-    this.view.y = -b.y * this.view.k
+    this.view.x = -b.vx * this.view.k
+    this.view.y = -b.vy * this.view.k
   }
 
   private expand(type: NodeType, toggle = false): void {
@@ -570,14 +633,11 @@ export class KnowledgeGraphPanel {
     const n = this.byId.get(id)
     if (!n) return
     this.selected = id
-    let changed = !this.expanded.has(n.type)
+    // Only the node's own cluster opens; its neighbours stay in their clusters (the side list names them all).
+    const changed = !this.expanded.has(n.type)
     this.expanded.add(n.type)
-    for (const m of this.neighbours(id)) {
-      const t = this.byId.get(m)?.type
-      if (t && !this.expanded.has(t) && this.data!.clusters.find(c => c.id === t)!.count <= 60) { this.expanded.add(t); changed = true }
-    }
     if (changed) this.layout(false)
-    if (center) { for (let i = 0; i < 60 && changed; i++) this.tick(); this.centerOn(id) }
+    if (center) this.centerOn(id)
     this.showNode(id)
     this.kick(0.2)
   }
@@ -679,6 +739,7 @@ export class KnowledgeGraphPanel {
   private runSearch(): void {
     const q = this.search.value.trim().toLowerCase()
     this.matches.clear()
+    this.topMatches.clear()
     if (!q || !this.data) { this.results.innerHTML = ''; this.draw(); return }
     const terms = q.split(/[^a-z0-9_]+/).filter(w => w.length > 1 && !COMMON.has(w))
     const hits = this.data.nodes.map(n => {
@@ -688,6 +749,7 @@ export class KnowledgeGraphPanel {
       return { n, s: s + (s && (head.includes(q) || body.includes(q)) ? 4 : 0) }
     }).filter(h => h.s > 0).sort((a, b) => b.s - a.s || b.n.degree - a.n.degree).slice(0, 12)
     for (const h of hits) { this.matches.add(h.n.id); this.expanded.add(h.n.type) }
+    this.topMatches = new Set(hits.slice(0, 6).map(h => h.n.id))
     this.layout(false)
     this.results.innerHTML = hits.length
       ? `<div class="kg-section">${hits.length} match${hits.length > 1 ? 'es' : ''}</div><div class="kg-links">${hits.map(h => this.linkButton(h.n.id, h.n.epoch ? `epoch ${h.n.epoch}` : '')).join('')}</div>`
