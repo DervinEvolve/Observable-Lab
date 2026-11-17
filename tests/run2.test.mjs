@@ -7,7 +7,7 @@
 // fake that understands the queries the lab makes.
 import assert from 'node:assert/strict'
 import { after, beforeEach, test } from 'node:test'
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -409,7 +409,8 @@ test('the panel is the newest flagship from each lab, one per lab, with the chos
   scan('api'); scan('src'); scan('tests')
   // modelLabels.ts maps provider prefixes of archived run 1 records to plain names; it names no model.
   offenders.splice(0, offenders.length, ...offenders.filter(p => p !== join('src', 'systems', 'modelLabels.ts')))
-  if (OLD.test(readFileSync(join(root, 'CLAUDE.md'), 'utf8'))) offenders.push('CLAUDE.md')
+  // A local, untracked project notes file is checked too when it is there.
+  if (existsSync(join(root, 'CLAUDE.md')) && OLD.test(readFileSync(join(root, 'CLAUDE.md'), 'utf8'))) offenders.push('CLAUDE.md')
   assert.deepEqual(offenders.filter(p => !p.endsWith('run2.test.mjs')), [])
 })
 
@@ -1182,9 +1183,11 @@ test('commit authors are the models on observable-lab.invalid; the owner commits
   assert.doesNotMatch(evil.name, /[<>\n]/)
   assert.match(evil.email, /^[a-z0-9-]+@observable-lab\.invalid$/)
 
-  const claudeMd = readFileSync(join(root, 'CLAUDE.md'), 'utf8')
-  assert.match(claudeMd, /claude-fable-5-2@observable-lab\.invalid/)
-  assert.match(claudeMd, /39844362\+DervinEvolve@users\.noreply\.github\.com/)
+  if (existsSync(join(root, 'CLAUDE.md'))) {
+    const notes = readFileSync(join(root, 'CLAUDE.md'), 'utf8')
+    assert.match(notes, /claude-fable-5-2@observable-lab\.invalid/)
+    assert.match(notes, /39844362\+DervinEvolve@users\.noreply\.github\.com/)
+  }
 })
 
 // ===========================================================================

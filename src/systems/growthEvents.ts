@@ -165,7 +165,7 @@ function providerFor(model: string): FrontendModelId | null {
   return map[lab] ?? null
 }
 
-/** The CLAUDE.md accent of the model named in an event (display name or id), or null. */
+/** The palette accent of the model named in an event (display name or id), or null. */
 export function accentForModel(model: string | null): number | null {
   if (!model) return null
   const f = frontendFor(model) ?? providerFor(model)
