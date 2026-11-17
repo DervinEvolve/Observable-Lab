@@ -34,7 +34,12 @@ const KIND_TEXT: Record<string, [string, string]> = {
   mentions: ['mentions', 'mentioned by'], added_in: ['added in', 'added'], built_in: ['built in', 'code'],
   said: ['said', 'said by'], said_in: ['said in', 'what was said'],
 }
+import { PROVIDER_LOGOS } from '../shared/types'
+
 const REFRESH_MS = 120_000
+// The credited provider logos the room already ships (public/logos, sources in docs/PROVIDER_LOGO_SOURCES.json).
+const LOGO_SRC = PROVIDER_LOGOS as Record<string, string>
+const labOf = (n: GNode): string => String(n.detail).split('/')[0]
 // Words that say nothing about what is being looked for (the server's search drops the same).
 const COMMON = new Set(['the', 'in', 'on', 'of', 'to', 'and', 'or', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'has', 'have', 'had', 'any', 'did', 'do', 'does', 'what', 'which', 'who', 'how', 'why', 'when', 'where', 'still', 'by', 'it', 'its', 'for', 'with', 'from', 'that', 'this', 'actually', 'about', 'we', 'our', 'us', 'there', 'yet', 'ever', 'so', 'far'])
 
@@ -211,6 +216,23 @@ export class KnowledgeGraphPanel {
 
   // ---- layout: every cluster keeps its own area on a ring; open clusters pack their nodes inside it ----
   private anchors = new Map<NodeType, { x: number; y: number; r: number }>()
+  private logos = new Map<string, HTMLImageElement>()
+
+  /** The lab's logo image for a model node, loaded once; null until it has loaded (the coloured dot shows meanwhile). */
+  private logoFor(n: GNode): HTMLImageElement | null {
+    const lab = labOf(n)
+    const src = LOGO_SRC[lab]
+    if (!src) return null
+    let img = this.logos.get(lab)
+    if (!img) {
+      img = new Image()
+      img.decoding = 'async'
+      img.onload = () => this.draw()
+      img.src = src
+      this.logos.set(lab, img)
+    }
+    return img.complete && img.naturalWidth > 0 ? img : null
+  }
   private hullLabels: Array<{ type: NodeType; x0: number; y0: number; x1: number; y1: number }> = []
 
   /** The radius a cluster takes: a bubble when closed, room for all its nodes when open. */
@@ -265,7 +287,7 @@ export class KnowledgeGraphPanel {
           const rad = 19 * Math.sqrt(i + 0.35)
           const ang = i * 2.39996
           const tx = p.x + Math.cos(ang) * rad, ty = p.y + Math.sin(ang) * rad
-          const r = 5 + Math.min(6, Math.sqrt(n.degree) * 1.4)
+          const r = n.type === 'model' ? 13 : 5 + Math.min(6, Math.sqrt(n.degree) * 1.4)
           const b = this.bodies.get(n.id)
           if (!b || reset) this.bodies.set(n.id, { id: n.id, x: reset ? tx : p.x, y: reset ? ty : p.y, vx: tx, vy: ty, r, cluster: c.id, isCluster: false, node: n })
           else { b.node = n; b.r = r; b.vx = tx; b.vy = ty }
@@ -426,8 +448,15 @@ export class KnowledgeGraphPanel {
       const color = b.isCluster ? TYPE_COLOR[b.cluster] : colorOf(b.node as GNode)
       ctx.globalAlpha = on ? 1 : 0.2
       ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2)
-      ctx.fillStyle = b.isCluster ? `${color}33` : color
+      const logo = !b.isCluster && b.node?.type === 'model' ? this.logoFor(b.node) : null
+      ctx.fillStyle = b.isCluster ? `${color}33` : logo ? '#F5F2EB' : color
       ctx.fill()
+      if (logo) {
+        const s = r * 1.25
+        ctx.drawImage(logo, x - s / 2, y - s / 2, s, s)
+        ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2)
+        ctx.lineWidth = 2.5 * dpr; ctx.strokeStyle = color; ctx.stroke()
+      }
       ctx.lineWidth = (b.id === this.selected ? 3 : this.matches.has(b.id) ? 2.5 : b.isCluster ? 2 : 1) * dpr
       ctx.strokeStyle = b.id === this.selected ? '#FFFFFF' : this.matches.has(b.id) ? '#FFD54F' : b.isCluster ? color : 'rgba(0,0,0,0.5)'
       ctx.stroke()
@@ -692,7 +721,15 @@ export class KnowledgeGraphPanel {
   private linkButton(id: string, note: string): string {
     const n = this.byId.get(id)
     if (!n) return ''
-    return `<button data-go="${esc(id)}"><span class="kg-dot" style="background:${colorOf(n)}"></span>${esc(n.label)} <span class="kg-tag">${esc(n.type)}${note ? ` · ${esc(note)}` : ''}</span></button>`
+    return `<button data-go="${esc(id)}">${this.markHtml(n, 15)}${esc(n.label)} <span class="kg-tag">${esc(n.type)}${note ? ` · ${esc(note)}` : ''}</span></button>`
+  }
+
+  /** A model's credited logo, or the coloured dot every other kind of node uses. */
+  private markHtml(n: GNode, size: number): string {
+    const src = n.type === 'model' ? LOGO_SRC[labOf(n)] : undefined
+    return src
+      ? `<img src="${esc(src)}" alt="" width="${size}" height="${size}" style="vertical-align:-${Math.round(size / 4)}px;margin-right:7px;background:#F5F2EB;border-radius:50%;padding:2px;border:2px solid ${colorOf(n)}">`
+      : `<span class="kg-dot" style="background:${colorOf(n)}"></span>`
   }
 
   private bindLinks(root: HTMLElement): void {
@@ -721,7 +758,7 @@ export class KnowledgeGraphPanel {
     if (typeof n.meta.element_id === 'string') meta.push(n.meta.element_id)
     const pr = typeof n.meta.pr_url === 'string' && /^https:\/\/github\.com\//.test(n.meta.pr_url) ? n.meta.pr_url : null
     this.side.innerHTML = `
-      <div class="kg-h"><span class="kg-dot" style="background:${colorOf(n)}"></span>${esc(n.label)}</div>
+      <div class="kg-h">${this.markHtml(n, 22)}${esc(n.label)}</div>
       <div class="kg-tag">${esc(n.type)}</div>
       ${meta.length ? `<div class="kg-meta">${esc(meta.join(' · '))}</div>` : ''}
       ${n.detail && n.type !== 'model' ? `<div class="kg-section">What it says</div><div class="kg-detail">${esc(n.detail)}</div>` : ''}
