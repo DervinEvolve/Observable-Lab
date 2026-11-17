@@ -18,7 +18,7 @@
 import { sanitizeOutput } from './sprites.js'
 import { modelDisplayName } from './types.js'
 
-export type NodeType = 'model' | 'epoch' | 'capability' | 'constraint' | 'behavior' | 'conflict' | 'source' | 'note' | 'code'
+export type NodeType = 'model' | 'epoch' | 'capability' | 'constraint' | 'behavior' | 'conflict' | 'source' | 'note' | 'code' | 'turn'
 
 export interface GraphNode {
   id: string
@@ -32,7 +32,7 @@ export interface GraphNode {
 
 export type EdgeKind =
   | 'played' | 'proposed' | 'changed' | 'removed' | 'challenged' | 'conflicts' | 'found_in'
-  | 'cites' | 'wrote' | 'noted_in' | 'mentions' | 'added_in' | 'built_in'
+  | 'cites' | 'wrote' | 'noted_in' | 'mentions' | 'added_in' | 'built_in' | 'said' | 'said_in'
 
 export interface GraphEdge {
   source: string
@@ -76,9 +76,9 @@ export interface ContributionRowLike {
 
 export const CLUSTER_LABELS: Record<NodeType, string> = {
   model: 'Models', epoch: 'Epochs', capability: 'Capabilities', constraint: 'Constraints', behavior: 'Behaviors',
-  conflict: 'Conflicts', source: 'Cited sites', note: 'Notebook notes', code: 'Code',
+  conflict: 'Conflicts', source: 'Cited sites', note: 'Notebook notes', code: 'Code', turn: 'What they said',
 }
-const ORDER: NodeType[] = ['model', 'epoch', 'capability', 'constraint', 'behavior', 'conflict', 'note', 'source', 'code']
+const ORDER: NodeType[] = ['model', 'epoch', 'turn', 'capability', 'constraint', 'behavior', 'conflict', 'note', 'source', 'code']
 
 const ROLES: Array<{ role: string; column: keyof EpochRowLike; assign: string }> = [
   { role: 'planner', column: 'planner_output', assign: 'planner' },
@@ -193,6 +193,20 @@ export function buildGraph(input: { epochs: EpochRowLike[]; contributions?: Cont
       const who = answered(out, assigned)
       const m = model(who)
       if (r.role !== 'rebuttal') edge(m.id, ep.id, 'played', e.n, r.role)
+
+      // What the model said and its reasoning this turn: the text the J-space lens shows, searchable.
+      const said = [clean(out.remark, 400), clean(out.summary, 600), clean(out.highlight, 300)].filter(Boolean).join(' ')
+      const reasoning = clean(out.reasoning, 900)
+      if (said || reasoning) {
+        const tn = node(`turn:${e.n}:${r.role}`, 'turn', `${m.label} as ${r.role}, epoch ${e.n}`,
+          [said, reasoning ? `Reasoning: ${reasoning}` : ''].filter(Boolean).join('\n'), e.n, { role: r.role, model: who, remark: said.slice(0, 400) })
+        edge(m.id, tn.id, 'said', e.n, r.role)
+        edge(tn.id, ep.id, 'said_in', e.n)
+        for (const id of new Set(tn.detail.match(ELEMENT_ID) ?? [])) {
+          const el = element(id, null)
+          if (el) edge(tn.id, el.id, 'mentions', e.n)
+        }
+      }
 
       // Notebook notes: the memory the models leave each other.
       const note = clean(out.notebook, 500)
@@ -352,7 +366,7 @@ export function neighbourhood(g: KnowledgeGraph, seeds: string[], depth = 1, max
 const KIND_TEXT: Record<EdgeKind, string> = {
   played: 'played', proposed: 'proposed', changed: 'changed', removed: 'removed', challenged: 'challenged',
   conflicts: 'conflicts with', found_in: 'found in', cites: 'cites', wrote: 'wrote', noted_in: 'noted in',
-  mentions: 'mentions', added_in: 'added in', built_in: 'built in',
+  mentions: 'mentions', added_in: 'added in', built_in: 'built in', said: 'said', said_in: 'said in',
 }
 
 function linksOf(g: KnowledgeGraph, id: string, max: number): string[] {
@@ -402,6 +416,34 @@ export function memorySummary(g: KnowledgeGraph, latestEpoch: number): string {
     open.length ? 'Open conflicts:\n' + open.map(c => `- ${c.detail.slice(0, 200)}`).join('\n') : '',
     codeLine,
   ].filter(Boolean).join('\n')
+}
+
+/** The nodes a recall question lands on, best first: what the animation in the graph view walks through. */
+export function recallHits(g: KnowledgeGraph, q: string, limit = 4): string[] {
+  return searchGraph(g, q, limit).map(h => h.node.id)
+}
+
+export interface RecallEvent { epoch: number; model: string; model_name: string; role: string; question: string; hits: string[]; at: string | null }
+
+/** Recall tool runs (tool_runs rows with tool 'recall') as one event per question, newest first. Stored hits
+ *  are used when the run recorded them; older runs are matched against the graph as it is now. */
+export function recallEvents(g: KnowledgeGraph, rows: Array<Record<string, unknown>>, limit = 30): RecallEvent[] {
+  const ids = new Set(g.nodes.map(n => n.id))
+  const out: RecallEvent[] = []
+  for (const r of rows) {
+    const detail = obj(r.detail)
+    const questions = Array.isArray(detail.questions) ? detail.questions.filter((q): q is string => typeof q === 'string') : String(r.request_summary ?? '').split(' | ')
+    const stored = Array.isArray(detail.hits) ? detail.hits : []
+    questions.forEach((q, i) => {
+      const question = clean(q, 160)
+      if (!question) return
+      const hits = (Array.isArray(stored[i]) ? (stored[i] as unknown[]).filter((x): x is string => typeof x === 'string') : recallHits(g, question)).filter(id => ids.has(id))
+      const model = typeof r.model === 'string' ? r.model : ''
+      out.push({ epoch: Number(r.epoch) || 0, model, model_name: modelDisplayName(model) ?? model.split('/').pop() ?? model, role: typeof detail.role === 'string' ? detail.role : '', question, hits, at: r.created_at ? String(r.created_at) : null })
+    })
+    if (out.length >= limit) break
+  }
+  return out.slice(0, limit)
 }
 
 /** The recall questions a role asked in its output: up to three short strings. */

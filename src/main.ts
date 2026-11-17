@@ -278,7 +278,17 @@ class ObservableLab {
     // The same readout at reading size; closing it presses the active J-space button, so the lens,
     // the button and the panel stay in step.
     this.jspaceReadout = new JSpaceReadout(() => {
-      ;(document.querySelector('.jspace-btn.active') as HTMLButtonElement | null)?.click()
+      const active = document.querySelector('.jspace-btn.active') as HTMLButtonElement | null
+      if (active) active.click()
+      else { this.jspaceLens?.detach(); this.jspaceReadout?.hide() }
+    })
+    // "Open in J-space" from the knowledge graph: one turn's words, on that model's scientist if it has one.
+    window.addEventListener('lab:open-jspace', (e) => {
+      const d = (e as CustomEvent<{ model: string; title: string; remark: string; reasoning: string }>).detail
+      const frontend = (BACKEND_TO_FRONTEND_MODEL as Record<string, string>)[d.model]
+      const scientist = this.scientists.find(s => s.getModelId() === frontend)
+      if (scientist) this.jspaceLens?.attach(scientist.group, d.title, d.reasoning, d.remark)
+      this.jspaceReadout?.show(d.title, d.reasoning, d.remark || '…')
     })
     this.wireJSpaceToggle = (scientist) => {
       const lens = this.jspaceLens!

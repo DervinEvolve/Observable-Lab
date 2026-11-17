@@ -9,18 +9,19 @@
 // Clicking a bubble opens it into its nodes; clicking a node shows what it is
 // and everything it links to, and clicking one of those walks there.
 
-type NodeType = 'model' | 'epoch' | 'capability' | 'constraint' | 'behavior' | 'conflict' | 'source' | 'note' | 'code'
+type NodeType = 'model' | 'epoch' | 'capability' | 'constraint' | 'behavior' | 'conflict' | 'source' | 'note' | 'code' | 'turn'
 
 interface GNode { id: string; type: NodeType; label: string; detail: string; epoch: number | null; degree: number; meta: Record<string, string | number | boolean | null> }
 interface GEdge { source: string; target: string; kind: string; epoch: number | null; label: string }
 interface GCluster { id: NodeType; label: string; count: number }
-interface GraphData { nodes: GNode[]; edges: GEdge[]; clusters: GCluster[]; epochs?: number }
+interface Recall { epoch: number; model: string; model_name: string; role: string; question: string; hits: string[] }
+interface GraphData { nodes: GNode[]; edges: GEdge[]; clusters: GCluster[]; epochs?: number; recalls?: Recall[] }
 
 interface Body { id: string; x: number; y: number; vx: number; vy: number; r: number; cluster: NodeType; isCluster: boolean; node?: GNode; count?: number }
 
 const TYPE_COLOR: Record<NodeType, string> = {
   model: '#E8E4D9', epoch: '#B5A642', capability: '#7CB342', constraint: '#64B5F6', behavior: '#FFB74D',
-  conflict: '#E57373', note: '#C9B79C', source: '#8FC1FF', code: '#B39DDB',
+  conflict: '#E57373', note: '#C9B79C', source: '#8FC1FF', code: '#B39DDB', turn: '#78C8FF',
 }
 const PROVIDER_COLOR: Record<string, string> = {
   google: '#4285F4', deepseek: '#10A37F', anthropic: '#D97706', openai: '#9C8CF0', 'x-ai': '#1DA1F2', 'z-ai': '#B0BEC5', cohere: '#E91E63',
@@ -31,6 +32,7 @@ const KIND_TEXT: Record<string, [string, string]> = {
   removed: ['removed', 'removed by'], challenged: ['challenged', 'challenged by'], conflicts: ['conflicts with', 'in conflict'],
   found_in: ['found in', 'where it was found'], cites: ['cites', 'cited by'], wrote: ['wrote', 'written by'], noted_in: ['noted in', 'notes'],
   mentions: ['mentions', 'mentioned by'], added_in: ['added in', 'added'], built_in: ['built in', 'code'],
+  said: ['said', 'said by'], said_in: ['said in', 'what was said'],
 }
 const REFRESH_MS = 120_000
 // Words that say nothing about what is being looked for (the server's search drops the same).
@@ -61,6 +63,9 @@ export class KnowledgeGraphPanel {
   private raf = 0
   private loadedAt = 0
   private isOpen = false
+  // The recall replay: the path a model's question took through the graph, walked one hop at a time.
+  private anim: { path: string[]; caption: string; start: number; hop: number; queue: Recall[] } | null = null
+  private caption: HTMLDivElement
   private drag: { mode: 'pan' | 'node'; id?: string; sx: number; sy: number; vx: number; vy: number; moved: boolean } | null = null
 
   constructor() {
@@ -101,6 +106,12 @@ export class KnowledgeGraphPanel {
       #kg-overlay .kg-empty { font-size: 13px; color: rgba(245,242,235,0.65); line-height: 1.5; padding: 10px 0; }
       #kg-overlay .kg-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
       #kg-overlay a { color: #8FC1FF; }
+      #kg-overlay .kg-caption { position: absolute; left: 50%; top: 118px; transform: translateX(-50%); max-width: min(640px, calc(100% - 32px)); background: rgba(10,12,16,0.9); border: 1px solid rgba(255,213,79,0.45); border-radius: 12px; padding: 9px 13px; font-size: 13.5px; line-height: 1.45; color: #F5F2EB; display: none; pointer-events: none; }
+      #kg-overlay .kg-caption b { color: #FFD54F; font-weight: 650; }
+      #kg-overlay .kg-recall { display: flex; gap: 8px; align-items: flex-start; }
+      #kg-overlay .kg-recall button.kg-play { flex: 0 0 auto; background: rgba(255,213,79,0.14); border: 1px solid rgba(255,213,79,0.45); color: #FFD54F; border-radius: 8px; padding: 4px 8px; font-size: 12px; cursor: pointer; }
+      #kg-overlay .kg-recall .kg-q { font-size: 13px; line-height: 1.4; }
+      #kg-overlay .kg-js { background: rgba(120,200,255,0.12); border: 1px solid rgba(120,200,255,0.45); color: #78C8FF; border-radius: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer; margin-top: 10px; }
       @media (max-width: 760px) {
         #kg-overlay { inset: 0; border-radius: 0; grid-template-columns: 1fr; grid-template-rows: 55% 45%; }
         #kg-overlay .kg-side { border-left: none; border-top: 1px solid rgba(255,255,255,0.08); }
@@ -125,6 +136,7 @@ export class KnowledgeGraphPanel {
         <canvas aria-label="Graph of models, epochs and the parts of the agent spec, with lines for what happened between them. Use the search and the list on the right to explore it by keyboard."></canvas>
         <div class="kg-top"><div><div class="kg-title">Knowledge graph</div>
           <div class="kg-sub">Who proposed, changed or challenged which part of the agent, the conflicts between parts, the notes the models leave each other and the sites they cited. Built from the stored record only. The models read this same graph as memory each epoch.</div></div></div>
+        <div class="kg-caption" aria-live="polite"></div>
         <div class="kg-legend"></div>
         <div class="kg-zoom"><button data-zin aria-label="Zoom in">+</button><button data-zout aria-label="Zoom out">−</button><button data-fit>Fit</button></div>
       </div>
@@ -140,6 +152,7 @@ export class KnowledgeGraphPanel {
     this.status = this.side
     this.results = this.overlay.querySelector('.kg-results') as HTMLDivElement
     this.search = this.overlay.querySelector('input') as HTMLInputElement
+    this.caption = this.overlay.querySelector('.kg-caption') as HTMLDivElement
 
     ;(this.overlay.querySelector('.kg-close') as HTMLButtonElement).addEventListener('click', () => this.close())
     ;(this.overlay.querySelector('[data-zin]') as HTMLButtonElement).addEventListener('click', () => this.zoomBy(1.25))
@@ -250,7 +263,7 @@ export class KnowledgeGraphPanel {
       if (!this.isOpen) return
       if (this.alpha > 0.01) this.tick()
       this.draw()
-      if (this.alpha > 0.01 || this.drag) this.raf = requestAnimationFrame(step)
+      if (this.alpha > 0.01 || this.drag || this.anim) this.raf = requestAnimationFrame(step)
     }
     this.raf = requestAnimationFrame(step)
   }
@@ -387,6 +400,69 @@ export class KnowledgeGraphPanel {
       }
       ctx.globalAlpha = 1
     }
+    this.drawRecall(dpr)
+  }
+
+  /** The recall replay: a gold trail through the nodes already reached, and a pulse travelling to the next. */
+  private drawRecall(dpr: number): void {
+    const a = this.anim
+    if (!a) return
+    const ctx = this.ctx
+    const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches
+    const HOP = 750
+    const elapsed = performance.now() - a.start
+    const hop = reduce ? a.path.length - 1 : Math.min(a.path.length - 1, Math.floor(elapsed / HOP))
+    const pos = (id: string) => { const b = this.endOf(id) ?? this.bodies.get(id); return b ? this.toScreen(b.x, b.y) : null }
+    ctx.lineWidth = 2.5 * dpr
+    ctx.strokeStyle = 'rgba(255,213,79,0.85)'
+    for (let i = 0; i < hop; i++) {
+      const p = pos(a.path[i]), q = pos(a.path[i + 1])
+      if (!p || !q) continue
+      ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(q[0], q[1]); ctx.stroke()
+    }
+    for (let i = 0; i <= hop; i++) {
+      const p = pos(a.path[i])
+      if (!p) continue
+      ctx.beginPath(); ctx.arc(p[0], p[1], (i === 0 ? 16 : 13) * dpr, 0, Math.PI * 2)
+      ctx.strokeStyle = 'rgba(255,213,79,0.9)'; ctx.lineWidth = 2.5 * dpr; ctx.stroke()
+    }
+    if (!reduce && hop < a.path.length - 1) {
+      const p = pos(a.path[hop]), q = pos(a.path[hop + 1])
+      if (p && q) {
+        const t = (elapsed % HOP) / HOP
+        const e = t * t * (3 - 2 * t)
+        const x = p[0] + (q[0] - p[0]) * e, y = p[1] + (q[1] - p[1]) * e
+        ctx.strokeStyle = 'rgba(255,213,79,0.5)'; ctx.lineWidth = 2 * dpr
+        ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(x, y); ctx.stroke()
+        const g = ctx.createRadialGradient(x, y, 0, x, y, 14 * dpr)
+        g.addColorStop(0, 'rgba(255,236,150,1)'); g.addColorStop(1, 'rgba(255,213,79,0)')
+        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 14 * dpr, 0, Math.PI * 2); ctx.fill()
+      }
+    }
+    // Hold the finished path a moment, then go on to the next recall in the queue, if any.
+    if (elapsed > (reduce ? 2600 : HOP * (a.path.length - 1) + 1800)) {
+      const next = a.queue.shift()
+      if (next) this.playRecall(next, a.queue)
+      else { this.anim = null; this.caption.style.display = 'none'; this.draw() }
+    }
+  }
+
+  /** Replay one recall: open the clusters it touches and walk from the model to each node it found. */
+  playRecall(r: Recall, queue: Recall[] = []): void {
+    if (!this.data) return
+    const modelId = `model:${r.model}`
+    const path = [modelId, ...r.hits].filter(id => this.byId.has(id))
+    if (path.length < 2) { const next = queue.shift(); if (next) this.playRecall(next, queue); return }
+    let changed = false
+    for (const id of path) {
+      const t = this.byId.get(id)!.type
+      if (!this.expanded.has(t)) { this.expanded.add(t); changed = true }
+    }
+    if (changed) { this.layout(false); for (let i = 0; i < 80; i++) this.tick() }
+    this.caption.innerHTML = `<b>${esc(r.model_name)}</b>${r.role ? ` (${esc(r.role)}, epoch ${r.epoch})` : ` (epoch ${r.epoch})`} asked the lab's memory: “${esc(r.question)}”`
+    this.caption.style.display = 'block'
+    this.anim = { path, caption: r.question, start: performance.now(), hop: 0, queue }
+    this.kick(0.15)
   }
 
   // ---- interaction ----
@@ -513,11 +589,44 @@ export class KnowledgeGraphPanel {
     this.side.innerHTML = `
       <div class="kg-section">What is in it</div>
       <div class="kg-detail">${this.data.nodes.length} things and ${this.data.edges.length} links from ${this.data.epochs ?? 'the'} epochs. Click a bubble to open it, a dot to see what it links to, or search above.</div>
+      ${this.recallSection()}
       <div class="kg-section">Most connected</div>
       <div class="kg-links">${top.map(n => this.linkButton(n.id, `${n.degree} links`)).join('')}</div>
       <div class="kg-section">For agents</div>
       <div class="kg-detail">The same graph as JSON: <a href="/api/experiment/graph" target="_blank" rel="noopener">/api/experiment/graph</a>, with <code>?q=</code> to search and <code>?focus=&lt;id&gt;&amp;depth=2</code> to walk it.</div>`
     this.bindLinks(this.side)
+    this.bindRecalls(this.side)
+  }
+
+  private recallSection(): string {
+    const list = this.data?.recalls ?? []
+    if (!list.length) return '<div class="kg-section">The models\' recalls</div><div class="kg-detail">None yet. When a model asks the lab\'s memory a question, it appears here and you can watch where it went.</div>'
+    return `<div class="kg-section">The models' recalls (${list.length})</div>
+      <button class="kg-js" data-playall>▶ Watch them recall</button>
+      ${list.slice(0, 8).map((r, i) => `<div class="kg-recall"><button class="kg-play" data-play="${i}" aria-label="Replay this recall">▶</button><div class="kg-q"><b>${esc(r.model_name)}</b>, epoch ${r.epoch}: “${esc(r.question)}”</div></div>`).join('')}`
+  }
+
+  private bindRecalls(root: HTMLElement): void {
+    const list = this.data?.recalls ?? []
+    root.querySelector<HTMLButtonElement>('[data-playall]')?.addEventListener('click', () => {
+      const queue = [...list].reverse()
+      const first = queue.shift()
+      if (first) this.playRecall(first, queue)
+    })
+    root.querySelectorAll<HTMLButtonElement>('[data-play]').forEach(b => b.addEventListener('click', () => this.playRecall(list[Number(b.dataset.play)])))
+  }
+
+  /** Ask the room to open J-space with this model's words (main.ts listens for lab:open-jspace). */
+  private openJSpace(n: GNode): void {
+    let turn = n
+    if (n.type === 'model') {
+      const turns = (this.data?.nodes ?? []).filter(t => t.type === 'turn' && t.meta.model === n.detail).sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0))
+      if (!turns.length) return
+      turn = turns[0]
+    }
+    const [said, reasoning] = turn.detail.split('\nReasoning: ')
+    this.close()
+    window.dispatchEvent(new CustomEvent('lab:open-jspace', { detail: { model: String(turn.meta.model ?? ''), title: turn.label, remark: said ?? '', reasoning: reasoning ?? '' } }))
   }
 
   private linkButton(id: string, note: string): string {
@@ -557,9 +666,11 @@ export class KnowledgeGraphPanel {
       ${meta.length ? `<div class="kg-meta">${esc(meta.join(' · '))}</div>` : ''}
       ${n.detail && n.type !== 'model' ? `<div class="kg-section">What it says</div><div class="kg-detail">${esc(n.detail)}</div>` : ''}
       ${pr ? `<div class="kg-detail"><a href="${esc(pr)}" target="_blank" rel="noopener">Open the pull request</a></div>` : ''}
+      ${n.type === 'turn' || n.type === 'model' ? `<button class="kg-js" data-jspace>◉ Open ${n.type === 'model' ? 'its latest turn' : 'this turn'} in J-space</button>` : ''}
       ${[...groups.entries()].map(([k, list]) => `<div class="kg-section">${esc(k)} (${list.length})</div><div class="kg-links">${list.slice(0, 40).map(l => this.linkButton(l.id, l.note)).join('')}</div>`).join('') || '<div class="kg-empty">No links yet.</div>'}
       <div class="kg-actions"><button data-back>Overview</button></div>`
     this.bindLinks(this.side)
+    this.side.querySelector<HTMLButtonElement>('[data-jspace]')?.addEventListener('click', () => this.openJSpace(n))
     this.side.scrollIntoView({ block: 'start', behavior: matchMedia('(prefers-reduced-motion: reduce)').matches ? 'auto' : 'smooth' })
     ;(this.side.querySelector('[data-back]') as HTMLButtonElement).addEventListener('click', () => { this.selected = null; this.showOverview(); this.draw() })
   }

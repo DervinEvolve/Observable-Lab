@@ -1,5 +1,5 @@
 import { sql } from '@vercel/postgres'
-import { buildGraph, type ContributionRowLike, type EpochRowLike, type KnowledgeGraph } from './knowledge-graph.js'
+import { buildGraph, recallEvents, type ContributionRowLike, type EpochRowLike, type KnowledgeGraph, type RecallEvent } from './knowledge-graph.js'
 
 // Loads the knowledge graph of one experiment from the stored epochs and code
 // contributions (knowledge-graph.ts builds it). Kept for a minute per
@@ -39,4 +39,14 @@ export async function loadGraph(experimentId: string, fresh = false): Promise<Kn
   const graph = buildGraph({ epochs, contributions })
   cache = { at: Date.now(), experimentId, graph }
   return graph
+}
+
+/** The models' recent recall questions and the nodes they landed on, for the graph view's replay. */
+export async function loadRecalls(experimentId: string, graph: KnowledgeGraph): Promise<RecallEvent[]> {
+  const rows = await rowsOrEmpty(sql`
+    SELECT epoch, model, request_summary, detail, created_at FROM tool_runs
+    WHERE experiment_id = ${experimentId} AND tool = 'recall' AND status = 'ok'
+    ORDER BY created_at DESC LIMIT 30
+  `)
+  return recallEvents(graph, rows)
 }

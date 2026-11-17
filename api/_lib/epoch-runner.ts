@@ -8,7 +8,7 @@ import { answeredModel, callModel as callOpenRouter } from './openrouter.js'
 import { getRecentCIFailures } from './code-contributions-store.js'
 import type { EpochFollowUp } from './epoch-followup.js'
 import { addNotebookNote, getRecentNotebook } from './notebook.js'
-import { memorySummary, recall, recallQuestions } from './knowledge-graph.js'
+import { memorySummary, recall, recallHits, recallQuestions } from './knowledge-graph.js'
 import { loadGraph } from './knowledge-graph-store.js'
 import { recordToolRun } from './tool-runs-store.js'
 import { logEpochForResearch } from './research-logger.js'
@@ -362,7 +362,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
       await recordToolRun({
         experimentId, epoch: epochNumber, model: who, tool: 'recall',
         requestSummary: questions.join(' | '), status: 'ok', durationMs: 0, costUsd: 0,
-        outputTail: answers, detail: { role, questions },
+        outputTail: answers, detail: { role, questions, hits: questions.map(q => recallHits(graph, q)) },
       })
     }
   }

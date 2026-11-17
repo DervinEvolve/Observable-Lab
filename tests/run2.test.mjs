@@ -1375,7 +1375,7 @@ test('the knowledge graph is built from the stored record: who changed which ele
   const epochs = [{
     epoch_number: 16,
     role_assignments: { planner: 'google/gemini-4-hydrogen', executor: 'x-ai/grok-4.7', challenger: 'anthropic/claude-fable-5.2', reviewer: 'openai/gpt-6-astra', commentator: 'deepseek/deepseek-v4-pro-0813' },
-    planner_output: { notebook: 'Pin cap_mcp_connectors_16 tool hashes.', web_sources: [{ url: 'https://modelcontextprotocol.io/spec', title: 'MCP spec' }] },
+    planner_output: { remark: 'We can reach the outside world now; next, connectors.', reasoning: 'MCP closes the gap to external services.', notebook: 'Pin cap_mcp_connectors_16 tool hashes.', web_sources: [{ url: 'https://modelcontextprotocol.io/spec', title: 'MCP spec' }] },
     executor_output: { served_by: { model: 'anthropic/claude-sonnet-5.5', fallback: true }, mutations: [{ type: 'add', path: 'capabilities[new]', value: { id: 'cap_mcp_connectors_16' } }, { type: 'add', path: 'constraints[new]', value: { id: 'con_mcp_authority_16' } }] },
     challenger_output: { challenges: [{ mutation_index: 0, severity: 'critical', issue: 'x' }] },
     reviewer_output: { decisions: [{ mutation_index: 0, verdict: 'modify' }, { mutation_index: 1, verdict: 'approve' }] },
@@ -1394,7 +1394,19 @@ test('the knowledge graph is built from the stored record: who changed which ele
   assert.ok(has('note:16:planner', 'el:cap_mcp_connectors_16', 'mentions'))
   assert.ok(has('model:google/gemini-4-hydrogen', 'src:modelcontextprotocol.io', 'cites'))
   assert.ok(has('code:16:epoch-16-capabilities-0', 'epoch:16', 'built_in'))
-  assert.deepEqual(g.clusters.map(c => c.id), ['model', 'epoch', 'capability', 'constraint', 'conflict', 'note', 'source', 'code'])
+  assert.deepEqual(g.clusters.map(c => c.id), ['model', 'epoch', 'turn', 'capability', 'constraint', 'conflict', 'note', 'source', 'code'])
+  // What the models said (the J-space text) is searchable, and credited to whoever said it.
+  assert.equal(kg.searchGraph(g, 'outside world')[0].node.id, 'turn:16:planner')
+  assert.ok(has('model:google/gemini-4-hydrogen', 'turn:16:planner', 'said', 'planner'))
+  assert.match(g.nodes.find(n => n.id === 'turn:16:planner').detail, /outside world[\s\S]*Reasoning: MCP closes/)
+  // Recall events: stored hits are kept; older runs without them are matched now; unknown ids are dropped.
+  const events = kg.recallEvents(g, [
+    { epoch: 18, model: 'deepseek/deepseek-v4-pro-0813', request_summary: 'mcp pinning', detail: JSON.stringify({ role: 'Planner', questions: ['mcp pinning'] }), created_at: 'x' },
+    { epoch: 19, model: 'openai/gpt-6-astra', request_summary: 'q', detail: { role: 'Executor', questions: ['q one'], hits: [['el:con_mcp_authority_16', 'el:nope']] } },
+  ])
+  assert.equal(events[0].model_name, 'DeepSeek V4 Pro')
+  assert.equal(events[0].hits[0], 'el:cap_mcp_connectors_16')
+  assert.deepEqual(events[1].hits, ['el:con_mcp_authority_16'])
 
   // Search, walking and the memory the models read.
   assert.equal(kg.searchGraph(g, 'mcp connectors')[0].node.id, 'el:cap_mcp_connectors_16')

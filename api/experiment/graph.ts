@@ -1,7 +1,7 @@
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { sql } from '@vercel/postgres'
 import { neighbourhood, searchGraph } from '../_lib/knowledge-graph.js'
-import { loadGraph } from '../_lib/knowledge-graph-store.js'
+import { loadGraph, loadRecalls } from '../_lib/knowledge-graph-store.js'
 
 // GET /api/experiment/graph                    the whole knowledge graph of the run
 // GET /api/experiment/graph?q=memory           the best matches and what they link to
@@ -34,7 +34,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       if (!graph.nodes.some(n => n.id === focus)) return res.status(404).json({ error: 'No such node' })
       return res.status(200).json({ experiment_id: exp.id, focus, ...neighbourhood(graph, [focus], depth, 120), clusters: graph.clusters })
     }
-    return res.status(200).json({ experiment_id: exp.id, epochs: graph.epochs, nodes: graph.nodes, edges: graph.edges, clusters: graph.clusters })
+    const recalls = await loadRecalls(exp.id, graph)
+    return res.status(200).json({ experiment_id: exp.id, epochs: graph.epochs, nodes: graph.nodes, edges: graph.edges, clusters: graph.clusters, recalls })
   } catch (error) {
     console.error('[API] Error building the knowledge graph:', error instanceof Error ? error.message : error)
     return res.status(500).json({ error: 'Failed to build the knowledge graph' })

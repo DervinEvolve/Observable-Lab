@@ -210,9 +210,9 @@ export class UIOverlay {
 
         .jspace-btn {
           display: block;
-          margin: 4px auto 0;
-          padding: 2px 8px;
-          font-size: 9px;
+          margin: 5px auto 0;
+          padding: 3px 10px;
+          font-size: 11px;
           font-weight: 700;
           letter-spacing: 0.4px;
           font-family: 'SF Mono', 'Courier New', monospace;
@@ -221,7 +221,8 @@ export class UIOverlay {
           border: 1px solid var(--accent-color);
           border-radius: 999px;
           cursor: pointer;
-          opacity: 0.75;
+          opacity: 1;
+          background: rgba(255,255,255,0.75);
           transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
           pointer-events: auto;
         }
