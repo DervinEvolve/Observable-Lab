@@ -30,6 +30,8 @@ import { LightingController } from './systems/LightingController'
 import { ParticleSystem } from './systems/ParticleSystem'
 import { TranscriptPanel } from './systems/TranscriptPanel'
 import { ActivityPanel } from './systems/ActivityPanel'
+import { KnowledgeGraphPanel } from './systems/KnowledgeGraphPanel'
+import { JSpaceReadout } from './systems/JSpaceReadout'
 import { PatinaSystem } from './lib/patina'
 import { batchStatic } from './lib/staticBatch'
 import { getStateManager } from './api/StateManager'
@@ -82,6 +84,7 @@ class ObservableLab {
   private lastState: ExperimentState | null = null
   private trainingRig: TrainingRig | null = null
   private jspaceLens: JSpaceLens | null = null
+  private jspaceReadout: JSpaceReadout | null = null
   private wireJSpaceToggle: ((scientist: Scientist) => boolean) | null = null
   // Latest real reasoning/remark per frontend model id, for the J-space lens
   private latestVoice = new Map<string, { reasoning: string; remark: string }>()
@@ -272,10 +275,16 @@ class ObservableLab {
     // (callback wired after UIOverlay exists — see init)
     this.jspaceLens = new JSpaceLens()
     this.scene.add(this.jspaceLens.group)
+    // The same readout at reading size; closing it presses the active J-space button, so the lens,
+    // the button and the panel stay in step.
+    this.jspaceReadout = new JSpaceReadout(() => {
+      ;(document.querySelector('.jspace-btn.active') as HTMLButtonElement | null)?.click()
+    })
     this.wireJSpaceToggle = (scientist) => {
       const lens = this.jspaceLens!
       if (lens.attachedTo === scientist.group) {
         lens.detach()
+        this.jspaceReadout?.hide()
         return false
       }
       const modelId = scientist.getModelId()
@@ -290,6 +299,7 @@ class ObservableLab {
         voice?.reasoning ?? '',
         voice?.remark ?? 'Nothing on the workspace yet — check back after this researcher speaks.'
       )
+      this.jspaceReadout?.show(name, voice?.reasoning ?? '', voice?.remark ?? 'Nothing yet. Check back after this researcher speaks.')
       return true
     }
 
@@ -511,6 +521,7 @@ class ObservableLab {
     this.transcriptPanel = new TranscriptPanel()
     // What each model did, beside what it said (the research record); it keeps itself up to date
     new ActivityPanel()
+    new KnowledgeGraphPanel()
 
     // Initialize PatinaSystem
     this.patinaSystem = new PatinaSystem()

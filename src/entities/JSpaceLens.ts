@@ -19,6 +19,8 @@ import gsap from 'gsap'
 
 const W = 512
 const H = 300
+// The canvas is drawn at twice its layout size, so the small panel's text stays sharp.
+const SCALE = 2
 
 export class JSpaceLens {
   public group: THREE.Group
@@ -45,11 +47,12 @@ export class JSpaceLens {
     this.group.visible = false
 
     this.canvas = document.createElement('canvas')
-    this.canvas.width = W
-    this.canvas.height = H
+    this.canvas.width = W * SCALE
+    this.canvas.height = H * SCALE
     this.ctx = this.canvas.getContext('2d')!
     this.texture = new THREE.CanvasTexture(this.canvas)
-    this.texture.minFilter = THREE.LinearFilter
+    this.texture.minFilter = THREE.LinearMipmapLinearFilter
+    this.texture.anisotropy = 8
 
     this.panel = new THREE.Mesh(
       new THREE.PlaneGeometry(0.92, 0.54),
@@ -106,6 +109,7 @@ export class JSpaceLens {
     const t = this.time
 
     // panel
+    ctx.setTransform(SCALE, 0, 0, SCALE, 0, 0)
     ctx.clearRect(0, 0, W, H)
     ctx.fillStyle = 'rgba(13, 17, 23, 0.94)'
     ctx.beginPath()

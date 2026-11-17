@@ -8,6 +8,9 @@ import { answeredModel, callModel as callOpenRouter } from './openrouter.js'
 import { getRecentCIFailures } from './code-contributions-store.js'
 import type { EpochFollowUp } from './epoch-followup.js'
 import { addNotebookNote, getRecentNotebook } from './notebook.js'
+import { memorySummary, recall, recallQuestions } from './knowledge-graph.js'
+import { loadGraph } from './knowledge-graph-store.js'
+import { recordToolRun } from './tool-runs-store.js'
 import { logEpochForResearch } from './research-logger.js'
 import { claimEpoch, releaseEpoch, EpochBusyError } from './epoch-claim.js'
 import {
@@ -336,6 +339,34 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     sharedContext += `\n\nRECENT TOOL RUNS (what really ran, from the lab's records):\n${toolHistory}`
   }
 
+  // The lab's knowledge graph (knowledge-graph.ts): a few lines of memory for
+  // every role, and answers to the recall questions each role may ask, added
+  // to the context of the roles that speak after it. Built from stored rows
+  // only; if it cannot be built, the epoch goes on without it.
+  const graph = await loadGraph(experimentId, true).catch((e) => {
+    console.warn(`[Epoch ${epochNumber}] knowledge graph unavailable (non-fatal):`, e instanceof Error ? e.message : e)
+    return null
+  })
+  const memory = graph ? memorySummary(graph, epochNumber - 1) : ''
+  if (memory) {
+    sharedContext += `\n\nLAB MEMORY (from the lab's knowledge graph of the stored record; ask it more with "recall"):\n${memory}`
+  }
+  const answerRecall = async (role: string, modelId: string, output: unknown, fresh: boolean) => {
+    if (!graph) return
+    const questions = recallQuestions(output)
+    if (!questions.length) return
+    const who = answeredModel(output, modelId)
+    const answers = questions.map(q => `Q: ${q}\n${recall(graph, q)}`).join('\n')
+    sharedContext += `\n\nMEMORY RECALL (the ${role} asked the lab's record; answers for everyone who speaks after them):\n${answers}`
+    if (fresh) {
+      await recordToolRun({
+        experimentId, epoch: epochNumber, model: who, tool: 'recall',
+        requestSummary: questions.join(' | '), status: 'ok', durationMs: 0, costUsd: 0,
+        outputTail: answers, detail: { role, questions },
+      })
+    }
+  }
+
   // Each role's system prompt opens by naming which model, specifically, is
   // speaking — so they inhabit their own identity in the shared lab.
   const ctxFor = (modelId: string) =>
@@ -395,6 +426,9 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
         UPDATE epochs SET planner_output = ${JSON.stringify(plannerOutput)} WHERE id = ${epochId}
       `
       await saveNote('Planner', roleAssignments.planner, plannerOutput)
+      await answerRecall('Planner', roleAssignments.planner, plannerOutput, true)
+    } else {
+      await answerRecall('Planner', roleAssignments.planner, plannerOutput, false)
     }
 
     // 7. EXECUTOR
@@ -413,6 +447,9 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
         UPDATE epochs SET executor_output = ${JSON.stringify(executorOutput)} WHERE id = ${epochId}
       `
       await saveNote('Executor', roleAssignments.executor, executorOutput)
+      await answerRecall('Executor', roleAssignments.executor, executorOutput, true)
+    } else {
+      await answerRecall('Executor', roleAssignments.executor, executorOutput, false)
     }
 
     // 7b. The Executor's tool choices. Unknown or switched-off tools are
@@ -441,6 +478,9 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
         UPDATE epochs SET challenger_output = ${JSON.stringify(challengerOutput)} WHERE id = ${epochId}
       `
       await saveNote('Challenger', roleAssignments.challenger, challengerOutput)
+      await answerRecall('Challenger', roleAssignments.challenger, challengerOutput, true)
+    } else {
+      await answerRecall('Challenger', roleAssignments.challenger, challengerOutput, false)
     }
 
     // 8b. REBUTTAL — the Executor answers the Challenger before the Reviewer
@@ -489,6 +529,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
         UPDATE epochs SET reviewer_output = ${JSON.stringify(reviewerOutput)} WHERE id = ${epochId}
       `
       await saveNote('Reviewer', roleAssignments.reviewer, reviewerOutput)
+      await answerRecall('Reviewer', roleAssignments.reviewer, reviewerOutput, true)
     }
 
     // 10. Apply approved mutations to spec. Model output is untyped JSON:

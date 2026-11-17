@@ -200,6 +200,7 @@ Frame rate:   60fps on mid-range hardware
 ```
 GET  /api/experiment          # Current state
 GET  /api/experiment/history  # Epoch history
+GET  /api/experiment/graph    # Knowledge graph of the record (?q= search, ?focus=<id>&depth=N); the models read it as memory
 POST /api/experiment/seed     # Start new experiment
 WS   /api/experiment/stream   # Real-time updates
 ```

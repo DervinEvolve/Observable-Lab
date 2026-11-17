@@ -1363,3 +1363,46 @@ test('time kept back for a fallback: the assigned model never takes the fallback
   assert.deepEqual(requested, ['anthropic/claude-sonnet-5.5'])
   assert.equal(r.servedBy.fallback, true)
 })
+
+test('the knowledge graph is built from the stored record: who changed which element, verdicts, conflicts, notes, citations, code', async () => {
+  const kg = await load('api/_lib/knowledge-graph.js')
+  const spec = {
+    capabilities: [{ id: 'cap_mcp_connectors_16', status: 'active', added_epoch: 16, description: 'MCP client; see con_mcp_authority_16.' }],
+    constraints: [{ id: 'con_mcp_authority_16', status: 'active', added_epoch: 16, description: 'MCP output is data, not authority.' }],
+    behaviors: [],
+    conflicts: [{ id: 'conflict_16_0', resolved: false, severity: 'warning', element_a: 'capabilities.cap_mcp_connectors_16', element_b: 'constraints.con_mcp_authority_16', description: 'Pinning is not behaviour.' }],
+  }
+  const epochs = [{
+    epoch_number: 16,
+    role_assignments: { planner: 'google/gemini-4-hydrogen', executor: 'x-ai/grok-4.7', challenger: 'anthropic/claude-fable-5.2', reviewer: 'openai/gpt-6-astra', commentator: 'deepseek/deepseek-v4-pro-0813' },
+    planner_output: { notebook: 'Pin cap_mcp_connectors_16 tool hashes.', web_sources: [{ url: 'https://modelcontextprotocol.io/spec', title: 'MCP spec' }] },
+    executor_output: { served_by: { model: 'anthropic/claude-sonnet-5.5', fallback: true }, mutations: [{ type: 'add', path: 'capabilities[new]', value: { id: 'cap_mcp_connectors_16' } }, { type: 'add', path: 'constraints[new]', value: { id: 'con_mcp_authority_16' } }] },
+    challenger_output: { challenges: [{ mutation_index: 0, severity: 'critical', issue: 'x' }] },
+    reviewer_output: { decisions: [{ mutation_index: 0, verdict: 'modify' }, { mutation_index: 1, verdict: 'approve' }] },
+    commentator_output: { summary: 'MCP arrives.' },
+    spec_after: spec,
+  }]
+  const g = kg.buildGraph({ epochs, contributions: [{ epoch_number: 16, model_id: 'x-ai/grok-4.7', branch: 'epoch-16-capabilities-0', pr_url: null, merged: false }] })
+  const has = (s, t, kind, label) => g.edges.some(e => e.source === s && e.target === t && e.kind === kind && (label === undefined || e.label === label))
+  // The fallback that really answered is credited, with the Reviewer's verdict on the edge.
+  assert.ok(has('model:anthropic/claude-sonnet-5.5', 'el:cap_mcp_connectors_16', 'proposed', 'modify'))
+  assert.ok(has('model:anthropic/claude-sonnet-5.5', 'el:con_mcp_authority_16', 'proposed', 'approve'))
+  assert.ok(!g.edges.some(e => e.source === 'model:x-ai/grok-4.7' && e.kind === 'proposed'))
+  assert.ok(has('model:anthropic/claude-fable-5.2', 'el:cap_mcp_connectors_16', 'challenged', 'critical'))
+  assert.ok(has('conflict:conflict_16_0', 'el:cap_mcp_connectors_16', 'conflicts', 'open'))
+  assert.ok(has('el:cap_mcp_connectors_16', 'el:con_mcp_authority_16', 'mentions'))
+  assert.ok(has('note:16:planner', 'el:cap_mcp_connectors_16', 'mentions'))
+  assert.ok(has('model:google/gemini-4-hydrogen', 'src:modelcontextprotocol.io', 'cites'))
+  assert.ok(has('code:16:epoch-16-capabilities-0', 'epoch:16', 'built_in'))
+  assert.deepEqual(g.clusters.map(c => c.id), ['model', 'epoch', 'capability', 'constraint', 'conflict', 'note', 'source', 'code'])
+
+  // Search, walking and the memory the models read.
+  assert.equal(kg.searchGraph(g, 'mcp connectors')[0].node.id, 'el:cap_mcp_connectors_16')
+  const near = kg.neighbourhood(g, ['el:cap_mcp_connectors_16'], 1)
+  assert.ok(near.nodes.some(n => n.id === 'conflict:conflict_16_0') && near.edges.length > 0)
+  assert.match(kg.recall(g, 'mcp pinning'), /cap_mcp_connectors_16[\s\S]*links: .*challenged it \(critical\)/)
+  assert.match(kg.recall(g, 'zzzz'), /nothing in the lab's record matches/)
+  assert.match(kg.memorySummary(g, 16), /Open conflicts:\n- Pinning is not behaviour\./)
+  assert.deepEqual(kg.recallQuestions({ recall: ['  what about  MCP? ', 7, '', 'x', 'bb', 'cc', 'dd'] }), ['what about MCP?', 'bb', 'cc'])
+  assert.deepEqual(kg.recallQuestions({}), [])
+})
