@@ -33,6 +33,8 @@ const KIND_TEXT: Record<string, [string, string]> = {
   mentions: ['mentions', 'mentioned by'], added_in: ['added in', 'added'], built_in: ['built in', 'code'],
 }
 const REFRESH_MS = 120_000
+// Words that say nothing about what is being looked for (the server's search drops the same).
+const COMMON = new Set(['the', 'in', 'on', 'of', 'to', 'and', 'or', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'has', 'have', 'had', 'any', 'did', 'do', 'does', 'what', 'which', 'who', 'how', 'why', 'when', 'where', 'still', 'by', 'it', 'its', 'for', 'with', 'from', 'that', 'this', 'actually', 'about', 'we', 'our', 'us', 'there', 'yet', 'ever', 'so', 'far'])
 
 const esc = (s: string): string => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
 const colorOf = (n: GNode): string => (n.type === 'model' ? PROVIDER_COLOR[String(n.detail).split('/')[0]] ?? TYPE_COLOR.model : TYPE_COLOR[n.type])
@@ -567,7 +569,7 @@ export class KnowledgeGraphPanel {
     const q = this.search.value.trim().toLowerCase()
     this.matches.clear()
     if (!q || !this.data) { this.results.innerHTML = ''; this.draw(); return }
-    const terms = q.split(/[^a-z0-9_]+/).filter(w => w.length > 1)
+    const terms = q.split(/[^a-z0-9_]+/).filter(w => w.length > 1 && !COMMON.has(w))
     const hits = this.data.nodes.map(n => {
       const head = `${n.label} ${n.id}`.toLowerCase(), body = n.detail.toLowerCase()
       let s = 0

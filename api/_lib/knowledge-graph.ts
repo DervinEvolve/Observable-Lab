@@ -71,6 +71,7 @@ export interface ContributionRowLike {
   pr_url?: string | null
   merged?: boolean | null
   ci_passed?: boolean | null
+  error?: string | null
 }
 
 export const CLUSTER_LABELS: Record<NodeType, string> = {
@@ -275,8 +276,10 @@ export function buildGraph(input: { epochs: EpochRowLike[]; contributions?: Cont
   for (const c of input.contributions ?? []) {
     const n = Number(c.epoch_number)
     if (!Number.isFinite(n) || !c.branch) continue
-    const status = c.merged ? 'merged' : c.pr_url ? (c.ci_passed === false ? 'CI failed' : 'open or closed') : 'no pull request'
-    const cn = node(`code:${n}:${c.branch}`, 'code', `${c.branch} (${status})`, clean(c.pr_url ?? '', 200), n,
+    const status = c.merged ? 'merged' : c.pr_url ? (c.ci_passed === false ? 'CI failed' : 'not merged') : 'no pull request'
+    const why = clean(c.error ?? '', 300)
+    const detail = `Code for the AI-Agent repo, epoch ${n}${c.author_name ? `, by ${c.author_name}` : ''}: ${c.merged ? 'merged into main' : c.pr_url ? `pull request ${c.pr_url}, not merged${c.ci_passed === false ? ' (CI failed)' : ''}` : 'no pull request was opened'}.${why ? ` Why: ${why}` : ''}`
+    const cn = node(`code:${n}:${c.branch}`, 'code', `${c.branch} (${status})`, detail, n,
       { merged: c.merged === true, pr_url: c.pr_url ?? null, author: c.author_name ?? null })
     if (c.model_id) edge(model(c.model_id).id, cn.id, 'wrote', n, 'code')
     if (nodes.has(`epoch:${n}`)) edge(cn.id, `epoch:${n}`, 'built_in', n)
@@ -291,13 +294,16 @@ export function buildGraph(input: { epochs: EpochRowLike[]; contributions?: Cont
   return { nodes: list, edges, clusters, epochs: epochs.length }
 }
 
-const words = (q: string): string[] => q.toLowerCase().split(/[^a-z0-9_]+/).filter(w => w.length > 1)
+// Words that say nothing about what is being looked for.
+const COMMON = new Set(['the', 'in', 'on', 'of', 'to', 'and', 'or', 'a', 'an', 'is', 'are', 'was', 'were', 'be', 'been', 'has', 'have', 'had', 'any', 'did', 'do', 'does', 'what', 'which', 'who', 'how', 'why', 'when', 'where', 'still', 'by', 'it', 'its', 'for', 'with', 'from', 'that', 'this', 'actually', 'about', 'we', 'our', 'us', 'there', 'yet', 'ever', 'so', 'far'])
+const words = (q: string): string[] => q.toLowerCase().split(/[^a-z0-9_]+/).filter(w => w.length > 1 && !COMMON.has(w))
 
 /** Nodes that match a query, best first: label and id hits count three times a hit in the text. */
 export function searchGraph(g: KnowledgeGraph, q: string, limit = 12): Array<{ node: GraphNode; score: number }> {
   const terms = words(q)
   if (!terms.length) return []
   const phrase = q.toLowerCase().trim()
+  const codeQuestion = /\b(merg\w*|pull requests?|prs?|ci|branch\w*|commit\w*|repo\w*|landed)\b/.test(phrase)
   const hits: Array<{ node: GraphNode; score: number }> = []
   for (const n of g.nodes) {
     const head = `${n.label} ${n.id}`.toLowerCase()
@@ -313,6 +319,8 @@ export function searchGraph(g: KnowledgeGraph, q: string, limit = 12): Array<{ n
     if (!score) continue
     if (all) score += terms.length
     if (phrase.length > 3 && (head.includes(phrase) || body.includes(phrase))) score += 4
+    // A question about merges, pull requests, CI or the repo is about the code records: those first, newest first.
+    if (codeQuestion && n.type === 'code') score += 6 + (n.epoch ?? 0) / 1000
     hits.push({ node: n, score: score + Math.min(2, n.degree / 10) })
   }
   return hits.sort((a, b) => b.score - a.score || a.node.id.localeCompare(b.node.id)).slice(0, limit)
@@ -381,10 +389,18 @@ export function memorySummary(g: KnowledgeGraph, latestEpoch: number): string {
     .slice(-8)
     .map(e => `e${e.epoch}: ${byId.get(e.source)?.label} ${KIND_TEXT[e.kind]} ${byId.get(e.target)?.meta.element_id ?? byId.get(e.target)?.label} (${e.label})`)
   const open = g.nodes.filter(n => n.type === 'conflict' && n.meta.resolved !== true).slice(0, 5)
+  const code = g.nodes.filter(n => n.type === 'code')
+  const merged = code.filter(n => n.meta.merged === true).length
+  const prs = code.filter(n => typeof n.meta.pr_url === 'string' && n.meta.pr_url).length
+  const lastWhy = [...code].sort((a, b) => (b.epoch ?? 0) - (a.epoch ?? 0)).find(n => n.meta.merged !== true && n.detail.includes(' Why: '))
+  const codeLine = code.length
+    ? `Code for the AI-Agent repo: ${code.length} attempts, ${prs} opened a pull request, ${merged} merged.${lastWhy ? ` Latest failure (e${lastWhy.epoch}): ${lastWhy.detail.split(' Why: ')[1].slice(0, 200)}` : ''}`
+    : ''
   return [
     'Most connected parts of the spec: ' + hubs.map(h => `${h.meta.element_id} (${h.degree} links)`).join(', ') + '.',
     recent.length ? 'Recent changes:\n' + recent.map(r => `- ${r}`).join('\n') : '',
     open.length ? 'Open conflicts:\n' + open.map(c => `- ${c.detail.slice(0, 200)}`).join('\n') : '',
+    codeLine,
   ].filter(Boolean).join('\n')
 }
 

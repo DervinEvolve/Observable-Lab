@@ -1382,7 +1382,7 @@ test('the knowledge graph is built from the stored record: who changed which ele
     commentator_output: { summary: 'MCP arrives.' },
     spec_after: spec,
   }]
-  const g = kg.buildGraph({ epochs, contributions: [{ epoch_number: 16, model_id: 'x-ai/grok-4.7', branch: 'epoch-16-capabilities-0', pr_url: null, merged: false }] })
+  const g = kg.buildGraph({ epochs, contributions: [{ epoch_number: 16, model_id: 'x-ai/grok-4.7', author_name: 'Grok 4.7', branch: 'epoch-16-capabilities-0', pr_url: null, merged: false, error: 'createBranch failed: 403 Resource not accessible by personal access token' }] })
   const has = (s, t, kind, label) => g.edges.some(e => e.source === s && e.target === t && e.kind === kind && (label === undefined || e.label === label))
   // The fallback that really answered is credited, with the Reviewer's verdict on the edge.
   assert.ok(has('model:anthropic/claude-sonnet-5.5', 'el:cap_mcp_connectors_16', 'proposed', 'modify'))
@@ -1405,4 +1405,8 @@ test('the knowledge graph is built from the stored record: who changed which ele
   assert.match(kg.memorySummary(g, 16), /Open conflicts:\n- Pinning is not behaviour\./)
   assert.deepEqual(kg.recallQuestions({ recall: ['  what about  MCP? ', 7, '', 'x', 'bb', 'cc', 'dd'] }), ['what about MCP?', 'bb', 'cc'])
   assert.deepEqual(kg.recallQuestions({}), [])
+  // The models can see that their code has not landed, and why.
+  assert.match(g.nodes.find(n => n.id === 'code:16:epoch-16-capabilities-0').detail, /no pull request was opened\. Why: createBranch failed: 403/)
+  assert.match(kg.memorySummary(g, 16), /Code for the AI-Agent repo: 1 attempts, 0 opened a pull request, 0 merged\. Latest failure \(e16\): createBranch failed: 403/)
+  assert.match(kg.recall(g, 'has any AgentRuntime code merged into the AI-Agent repo'), /^  - \[code, e16\][^\n]*\n?.*no pull request was opened/)
 })
