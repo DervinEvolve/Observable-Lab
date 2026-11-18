@@ -31,6 +31,7 @@ import { ParticleSystem } from './systems/ParticleSystem'
 import { TranscriptPanel } from './systems/TranscriptPanel'
 import { ActivityPanel } from './systems/ActivityPanel'
 import { KnowledgeGraphPanel } from './systems/KnowledgeGraphPanel'
+import { TrainedChatPanel } from './systems/TrainedChatPanel'
 import { JSpaceReadout } from './systems/JSpaceReadout'
 import { PatinaSystem } from './lib/patina'
 import { batchStatic } from './lib/staticBatch'
@@ -510,6 +511,9 @@ class ObservableLab {
       gpu_job: run => {
         if (run.resultLine) this.trainingRig?.showJob(run.summary ?? 'GPU job', run.resultLine, run.modelName, run.status)
       },
+      tinker_train: run => {
+        if (run.resultLine) this.trainingRig?.showJob(run.summary ?? 'Tinker training', run.resultLine, run.modelName, run.status, 45, 'Tinker training')
+      },
       explorer: run => {
         // the contribution's own drone may already carry this task
         if (run.task && !this.drones.some(d => !d.dead && d.lockedTask === run.task)) void this.spawnRealSubagentDrone(run.modelName, run.task, true)
@@ -532,6 +536,8 @@ class ObservableLab {
     // What each model did, beside what it said (the research record); it keeps itself up to date
     new ActivityPanel()
     new KnowledgeGraphPanel()
+    // "Talk to what they trained": shows itself only when the server says the visitor chat is on
+    new TrainedChatPanel()
 
     // Initialize PatinaSystem
     this.patinaSystem = new PatinaSystem()

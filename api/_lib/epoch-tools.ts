@@ -8,8 +8,9 @@
  *    A GPU job that names the weights asked for in the same answer waits for
  *    that fetch, and the two share the one wait a job always had; any other
  *    job starts at once.
- *  - deliverables (an exhibit, a lab proposal) run after the Reviewer, and
- *    only when the Reviewer approved them in "tool_verdicts".
+ *  - deliverables (an exhibit, a lab proposal, a Tinker training run) run
+ *    after the Reviewer, and only when the Reviewer approved them in
+ *    "tool_verdicts".
  *
  * Every use is checked against its per-day limit and today's budget first,
  * stored in tool_runs (refusals as "skipped"), and its estimated cost is
@@ -28,6 +29,8 @@ import { GPU_JOB_WORST_CASE_S, estimateGpuCost, gpuJobWaitMs, gpuWaitAfterFetch,
 import { describeFetch, estimateWeightsFetchCost, weightsLabel, type WeightsFetchResult } from './weights.js'
 import { contributeExhibit } from './exhibit-contribution.js'
 import { openLabProposal } from './lab-proposals.js'
+import { TINKER_TOOL } from './tinker.js'
+import { runTinkerTrain, tinkerRequestSummary, tinkerWorstCaseUsd } from './tinker-run.js'
 
 export interface EpochToolContext {
   experimentId: string
@@ -40,7 +43,8 @@ export interface EpochToolContext {
 /** One line per tool use, for the Commentator and the logs. Built from what actually happened. */
 export interface ToolOutcome {
   tool: string
-  status: ToolRunStatus
+  /** "started": a training run that is still going; its record is written when its result is collected. */
+  status: ToolRunStatus | 'started'
   summary: string
 }
 
@@ -251,14 +255,14 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
   return out
 }
 
-export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal', 'approve' | 'reject'>>
+export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal' | 'tinker_train', 'approve' | 'reject'>>
 
 /** The Reviewer's verdicts on tool deliverables; anything but an explicit "approve" is a no. */
 export function readToolVerdicts(reviewerOutput: unknown): ToolVerdicts {
   const raw = reviewerOutput && typeof reviewerOutput === 'object' ? (reviewerOutput as Record<string, unknown>).tool_verdicts : undefined
   const out: ToolVerdicts = {}
   if (!raw || typeof raw !== 'object') return out
-  for (const key of ['exhibit', 'lab_proposal'] as const) {
+  for (const key of ['exhibit', 'lab_proposal', 'tinker_train'] as const) {
     const v = String((raw as Record<string, unknown>)[key] ?? '').toLowerCase()
     if (v === 'approve' || v === 'reject') out[key] = v
   }
@@ -313,6 +317,25 @@ export async function runDeliverables(
         outputTail: r.error ?? null, detail: { pr_url: r.pr_url ?? null, files: p.files.map(f => f.path) },
       })
       out.push({ tool: 'lab_proposal', status: r.status === 'opened' ? 'opened' : 'error', summary: `${author}'s proposal to the lab repository: ${r.status === 'opened' ? 'opened for the owner to review' : `not opened (${r.error})`}` })
+    })())
+  }
+
+  // A Tinker training run (tinker-run.ts). The Reviewer must have approved
+  // it; then the runs-per-day limit and the lab's budget are checked here,
+  // against the most the run could cost, and the Tinker caps in tinker-run.
+  // A run still training when the wait ends writes its record when a later
+  // tick collects it (collectTinkerRuns), so it is not in tool_runs yet; the
+  // epoch's one row in tinker_runs is what stops a second run.
+  if (plan.tinker_train && !done(TINKER_TOOL)) {
+    const request = plan.tinker_train
+    const summary = tinkerRequestSummary(request.base_model, request.examples.length, request.purpose)
+    tasks.push((async () => {
+      if (verdicts.tinker_train !== 'approve') return void out.push(await skip(ctx, TINKER_TOOL, summary, 'the Reviewer did not approve it'))
+      const ok = await allowed(TINKER_TOOL, config, tinkerWorstCaseUsd(request))
+      if (!ok.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, ok.reason))
+      const outcome = await runTinkerTrain(ctx, request)
+      if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_TOOL, summary, outcome.summary))
+      out.push(outcome)
     })())
   }
 

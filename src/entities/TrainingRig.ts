@@ -223,8 +223,10 @@ export class TrainingRig {
    * A stored GPU job: the corner lights up for a while and its result line
    * stays on the ticket beside the gauge. `purpose` is what the model asked
    * for, `line` the last line the job printed (self-reported), `by` the model.
+   * A Tinker training run uses the same ticket under its own `title`; its
+   * line is the held-out loss the lab measured.
    */
-  public showJob(purpose: string, line: string, by: string, status: string, holdS = 45): void {
+  public showJob(purpose: string, line: string, by: string, status: string, holdS = 45, title = 'GPU job'): void {
     const ctx = this.ticketCanvas.getContext('2d')
     if (!ctx) return
     ctx.fillStyle = '#f4ecd8'
@@ -236,7 +238,7 @@ export class TrainingRig {
     ctx.textAlign = 'left'
     ctx.fillStyle = '#5a5044'
     ctx.font = '600 20px Georgia, serif'
-    ctx.fillText(`GPU job · ${by}`.slice(0, 44), 18, 36)
+    ctx.fillText(`${title} · ${by}`.slice(0, 44), 18, 36)
     ctx.fillStyle = status === 'ok' ? '#4a7a34' : '#a33d2f'
     ctx.textAlign = 'right'
     ctx.fillText(status, 494, 36)

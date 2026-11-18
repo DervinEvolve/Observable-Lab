@@ -11,6 +11,7 @@ import { runEpochFollowUp } from '../_lib/epoch-followup.js'
 import { loadTickExperiment, researchAlongside, type TickSlot } from '../_lib/experiment-modes.js'
 import { ensureResearchExperiment, type ResearchActivation } from '../_lib/research-alongside.js'
 import { ResearchRunPendingError } from '../_lib/research.js'
+import { collectTinkerRuns } from '../_lib/tinker-run.js'
 
 type TickBody = Record<string, unknown>
 
@@ -108,6 +109,12 @@ async function advance(experiment: Record<string, any>, slot: TickSlot): Promise
       console.warn(`${tag} Cleared stale epoch flag after ${Math.round(minutesInProgress)} minutes for experiment ${experiment.id}`)
     }
   }
+
+  // Tinker training runs that were still going when their follow-up ended:
+  // their results are collected here, whatever else this tick does. With
+  // LAB_ENABLE_TINKER off this does nothing, not even a query.
+  const collected = await collectTinkerRuns(experiment.id)
+  if (collected.length) console.log(`${tag} Collected ${collected.length} Tinker training run(s)`)
 
   // A finished epoch's queued work (its code contribution, approved
   // exhibits and proposals) gets a tick of its own before the next epoch,

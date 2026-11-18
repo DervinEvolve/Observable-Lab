@@ -5,14 +5,16 @@
 //     like the Sprite test runs (SpritesService);
 //   - a GPU job: the compute corner lights up and the job's last output line
 //     goes on the ticket beside its gauge (TrainingRig.showJob);
-//   - an explorer subagent: a drone carrying the explorer's own task text.
+//   - an explorer subagent: a drone carrying the explorer's own task text;
+//   - a Tinker training run: the same ticket as a GPU job, under its own
+//     title, with the held-out loss the lab measured (docs/TOOLS.md).
 // Skipped requests and runs still going are not shown, and nothing here is
 // simulated. The rows come on GET /api/experiment as `tool_runs` (the 12
 // most recent, newest first).
 
 import { BACKEND_TO_FRONTEND_MODEL, modelDisplayName, type FrontendModelId } from '../shared/types'
 
-export type ToolRunKind = 'sprite_session' | 'gpu_job' | 'explorer'
+export type ToolRunKind = 'sprite_session' | 'gpu_job' | 'explorer' | 'tinker_train'
 
 export interface ToolRun {
   id: string
@@ -39,6 +41,7 @@ const KIND_ALIASES: Record<string, ToolRunKind> = {
   sprite_session: 'sprite_session',
   gpu_job: 'gpu_job',
   subagent_explore: 'explorer',
+  tinker_train: 'tinker_train',
 }
 
 // Control characters and ANSI codes out; length capped. The server cleans
@@ -99,6 +102,17 @@ export function parseToolRuns(raw: unknown): ToolRun[] {
       const tail = cleanText(o.output_tail, 4000)
       const last = tail?.split('\n').map(l => l.trim()).filter(Boolean).pop()
       const line = cleanText(last, 200)
+      if (!line) continue
+      run.resultLine = line
+    } else if (kind === 'tinker_train') {
+      // the line is the lab's own measurement, from the stored record; a run
+      // that did not finish shows the stored reason instead
+      const measured = detail.measured && typeof detail.measured === 'object' ? (detail.measured as Record<string, unknown>) : {}
+      const before = measured.holdout_loss_before
+      const after = measured.holdout_loss_after
+      const line = status === 'ok' && typeof before === 'number' && typeof after === 'number' && Number.isFinite(before) && Number.isFinite(after)
+        ? `held-out loss ${before.toFixed(2)} to ${after.toFixed(2)}, measured by the lab`
+        : cleanText(cleanText(o.output_tail, 4000)?.split('\n').map(l => l.trim()).filter(Boolean).pop(), 200)
       if (!line) continue
       run.resultLine = line
     } else {

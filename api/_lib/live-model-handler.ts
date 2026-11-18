@@ -29,6 +29,9 @@ import {
   LIVE_MODEL_PURPOSE, bearerLiveKey, checkLiveKey, liveModelSpentTodayUsd, recordLiveCall, reserveLiveCall, settleLiveCall,
   type LiveCallRecord, type LiveKeyGrant,
 } from './live-model-keys.js'
+import { liveTrainedStatus } from './tinker.js'
+import { getAdapter, listAdapters, type AdapterTarget } from './tinker-store.js'
+import { adapterSlugOf, asksForAdapter, buildTrainedRequest, runTrainedCall, type TrainedRequest } from './live-trained.js'
 
 const CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions'
 
@@ -101,7 +104,18 @@ export async function handleLiveModel(req: VercelRequest, res: VercelResponse) {
     return fail(res, key.status, key.status === 401 ? 'invalid_api_key' : 'key_limit_reached', key.reason)
   }
 
-  if (req.method === 'GET') return res.status(200).json(liveModelList())
+  if (req.method === 'GET') {
+    const list = liveModelList()
+    // The lab's own adapters, while LAB_ENABLE_LIVE_TRAINED is on and some are kept.
+    if (liveTrainedStatus().enabled) {
+      try {
+        for (const { adapter } of await listAdapters()) list.data.push({ id: adapter.model_id, object: 'model', owned_by: 'lab' })
+      } catch (e) {
+        console.warn('[live-model] could not list trained adapters:', e instanceof Error ? e.message : e)
+      }
+    }
+    return res.status(200).json(list)
+  }
   if (req.method !== 'POST') return fail(res, 405, 'method_not_allowed', 'Use POST for chat completions and GET for the model list.')
 
   // ---- the request, through the allowlist ----
@@ -119,11 +133,36 @@ export async function handleLiveModel(req: VercelRequest, res: VercelResponse) {
   if (size > LIVE_MAX_BODY_BYTES) {
     return fail(res, 413, 'invalid_request_error', `The request is larger than ${LIVE_MAX_BODY_BYTES / 1024} KB.`)
   }
-  const first = checkLiveRequest(raw)
-  if (!first.ok) return fail(res, first.status, first.type, first.message)
-  const caps = await getModelCapabilities(first.model).catch(() => null)
-  const built = buildLiveRequest(raw, caps)
-  if (!built.ok) return fail(res, built.status, built.type, built.message)
+  // A model in the lab's own namespace ("lab/<name>") is an adapter the lab
+  // trained. Only while LAB_ENABLE_LIVE_TRAINED is on: otherwise the request
+  // goes on to the allowlist below, which refuses it like any unknown model.
+  let trained: { target: AdapterTarget; request: TrainedRequest } | null = null
+  if (asksForAdapter(raw) && liveTrainedStatus().enabled) {
+    const slug = adapterSlugOf((raw as { model: unknown }).model)
+    let target: AdapterTarget | null = null
+    try {
+      target = slug ? await getAdapter(slug) : null
+    } catch (e) {
+      console.warn('[live-model] could not read the trained adapters:', e instanceof Error ? e.message : e)
+      return fail(res, 503, 'endpoint_unavailable', 'The lab could not look up that adapter just now.')
+    }
+    if (!target) return fail(res, 400, 'model_not_allowed', 'No trained adapter with that name is kept (adapters expire). GET <base>/models lists the ones that are.')
+    const request = buildTrainedRequest(raw)
+    if (!request.ok) return fail(res, request.status, request.type, request.message)
+    trained = { target, request }
+  }
+
+  let first: { ok: true; model: string } | null = null
+  let built: Extract<ReturnType<typeof buildLiveRequest>, { ok: true }> | null = null
+  if (!trained) {
+    const checked = checkLiveRequest(raw)
+    if (!checked.ok) return fail(res, checked.status, checked.type, checked.message)
+    const caps = await getModelCapabilities(checked.model).catch(() => null)
+    const request = buildLiveRequest(raw, caps)
+    if (!request.ok) return fail(res, request.status, request.type, request.message)
+    first = checked
+    built = request
+  }
 
   // ---- today's money: the lab's cap first, then this endpoint's own ----
   const budget = await checkDailyBudget()
@@ -157,7 +196,8 @@ export async function handleLiveModel(req: VercelRequest, res: VercelResponse) {
     return fail(res, grant.status, grant.status === 401 ? 'invalid_api_key' : 'key_limit_reached', grant.reason)
   }
 
-  return runCall(res, grant, first.model, built.body, built.dropped)
+  if (trained) return runTrainedCall(res, grant, trained.target, trained.request)
+  return runCall(res, grant, first!.model, built!.body, built!.dropped)
 }
 
 async function runCall(res: VercelResponse, key: LiveKeyGrant, model: string, body: Record<string, unknown>, dropped: string[]) {

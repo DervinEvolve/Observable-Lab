@@ -9,11 +9,14 @@
  *
  * The lab model endpoint (LAB_ENABLE_LIVE_MODEL) is reported here too, as
  * liveModelToolStatus: it is part of a Sprite session, not a tool of its own.
+ * Tinker training (LAB_ENABLE_TINKER) is a tool; its settings and dollar
+ * caps live in tinker.ts.
  */
 import { spritesConfigured } from './sprites.js'
 import { liveModelStatus, type LiveModelStatus } from './live-model.js'
+import { liveTrainedStatus, tinkerStatus } from './tinker.js'
 
-export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal'] as const
+export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train'] as const
 export type ToolName = (typeof TOOL_NAMES)[number]
 
 /** Per-epoch limits. Not tunable: one of each kind per epoch at most. */
@@ -25,6 +28,7 @@ export const PER_EPOCH = {
   weights: 1,             // public weights fetched for GPU jobs
   exhibits: 1,
   lab_proposals: 1,
+  tinker_runs: 1,         // LoRA fine-tuning runs on Tinker
 } as const
 
 /** Sprite session limits. */
@@ -137,6 +141,7 @@ export function toolConfig(): ToolConfig {
   const gpuJobs = flag('LAB_ENABLE_GPU_JOBS') && has('GPU_JOBS_START_URL') && has('GPU_JOBS_STATUS_URL') && has('GPU_JOBS_TOKEN')
   const licenses = weightsLicenses()
   if (flag('LAB_ENABLE_WEIGHTS')) warnAboutLicenses(licenses)
+  const tinker = tinkerStatus()
   return {
     subagents: status(code, 'LAB_ENABLE_CODE_WRITES is not true', intEnv('LAB_SUBAGENTS_PER_DAY', 24, 0, 200)),
     sprite_session: status(
@@ -169,6 +174,9 @@ export function toolConfig(): ToolConfig {
       !flag('LAB_ENABLE_LAB_PROPOSALS') ? 'LAB_ENABLE_LAB_PROPOSALS is not true' : 'LAB_PROPOSALS_GITHUB_TOKEN or LAB_PROPOSALS_GITHUB_OWNER is not set',
       intEnv('LAB_LAB_PROPOSALS_PER_DAY', 1, 0, 5),
     ),
+    // Tinker training (tinker.ts): a fine-tuning run by the lab's own runner
+    // on Modal. Its dollar caps are separate settings; this is the count.
+    tinker_train: status(tinker.enabled, tinker.off_reason ?? '', intEnv('LAB_TINKER_PER_DAY', 2, 0, 10)),
   }
 }
 
@@ -186,9 +194,22 @@ export function liveModelToolStatus(config: ToolConfig = toolConfig()): LiveMode
   return { enabled: true }
 }
 
-/** The enabled tool names, for the public state and logs. "live_model" is added when Sprite sessions offer the lab model endpoint. */
-export function enabledTools(config: ToolConfig = toolConfig()): Array<ToolName | 'live_model'> {
-  const tools: Array<ToolName | 'live_model'> = TOOL_NAMES.filter(name => config[name].enabled && config[name].per_day > 0)
+/**
+ * Trained adapters on the lab model endpoint ("lab/<name>", live-trained.ts):
+ * needs its own switch and a Tinker key on this server, AND the endpoint
+ * being offered to Sprite sessions.
+ */
+export function liveTrainedToolStatus(config: ToolConfig = toolConfig()): LiveModelStatus {
+  const own = liveTrainedStatus()
+  if (!own.enabled) return own
+  const endpoint = liveModelToolStatus(config)
+  return endpoint.enabled ? { enabled: true } : { enabled: false, off_reason: `the lab model endpoint is off (${endpoint.off_reason ?? 'not configured'})` }
+}
+
+/** The enabled tool names, for the public state and logs. "live_model" is added when Sprite sessions offer the lab model endpoint, "live_trained" when that endpoint also answers for trained adapters. */
+export function enabledTools(config: ToolConfig = toolConfig()): Array<ToolName | 'live_model' | 'live_trained'> {
+  const tools: Array<ToolName | 'live_model' | 'live_trained'> = TOOL_NAMES.filter(name => config[name].enabled && config[name].per_day > 0)
   if (liveModelToolStatus(config).enabled) tools.push('live_model')
+  if (liveTrainedToolStatus(config).enabled) tools.push('live_trained')
   return tools
 }

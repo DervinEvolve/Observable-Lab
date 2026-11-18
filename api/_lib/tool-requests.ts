@@ -11,6 +11,7 @@ import { normalizeGpuScript } from './gpu-jobs.js'
 import { normalizeWeightsRef, normalizeWeightsRequest, type WeightsRef, type WeightsRequest } from './weights.js'
 import { isValidSlug } from './exhibits.js'
 import { normalizeProposal, type ProposalRequest } from './lab-proposals.js'
+import { normalizeTinkerRequest, type TinkerRequest } from './tinker.js'
 
 /** What the contribution gets when the Executor does not choose: one explorer and the test writer, as before. */
 export const DEFAULT_SUBAGENTS = { explore: 1, test: true } as const
@@ -22,6 +23,7 @@ export interface ToolPlan {
   weights?: WeightsRequest
   exhibit?: { slug: string; exhibit: unknown }
   lab_proposal?: ProposalRequest
+  tinker_train?: TinkerRequest
   ignored: Array<{ tool: string; reason: string }>
 }
 
@@ -104,6 +106,13 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
     const checked = normalizeProposal(req.lab_proposal)
     if ('error' in checked) plan.ignored.push({ tool: 'lab_proposal', reason: checked.error })
     else plan.lab_proposal = checked.proposal
+  }
+
+  if (!off('tinker_train')) {
+    // Strict: a request that is not exactly what the lab accepts is refused whole, with the reason.
+    const checked = normalizeTinkerRequest(req.tinker_train)
+    if ('error' in checked) plan.ignored.push({ tool: 'tinker_train', reason: checked.error })
+    else plan.tinker_train = checked.request
   }
   return plan
 }

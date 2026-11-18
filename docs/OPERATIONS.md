@@ -46,6 +46,7 @@ These are made at runtime, like the earlier table-creation helpers, and are also
 - `conflicts`: gains `spec_conflict_id`, the id the specification uses, so a resolved conflict updates its row.
 - `tool_runs`: new table, one row per tool use the Executor chose, including refused ones (`api/_lib/tool-runs-store.ts`, [TOOLS.md](TOOLS.md#the-record)). Created at runtime; it is not in `schema.sql`, whose owner may add it.
 - `live_model_keys` and `live_model_calls`: new tables for the lab model endpoint (`api/_lib/live-model-keys.ts`). They are created the first time a key is made or checked, so they do not exist while `LAB_ENABLE_LIVE_MODEL` is off. They are not in `schema.sql` either.
+- `tinker_runs`, `tinker_spend_days`, `trained_chat_rate` and `trained_chat_calls`: new tables for Tinker training and the chat with trained adapters (`api/_lib/tinker-store.ts`, [Tinker training](#tinker-training)). They are created the first time one of those is used, so they do not exist while all three Tinker switches are off. They are not in `schema.sql` either.
 
 ### Starting run 2
 
@@ -102,6 +103,8 @@ The mark stays on the row. So if I turn the flag off in the middle of a day, wha
 - Missing or short configuration returns 503. Missing or incorrect authorization returns 401 before database, model, Sprites, or compute work.
 - The guard covers manual epochs, clearing stuck epochs, seeding/resetting/patching experiments, the persisted glass state, debug views, North runs, and all Sprites routes. `?confirm=true` remains an extra action check; it is not authentication.
 - Ordinary experiment state (now including recent `tool_runs`, cleaned of anything that looks like a credential), merged exhibits (`GET /api/experiment?view=exhibits`), contribution records, and wildcard transcripts remain public observer endpoints. Review their contents before using private research or code in a connected deployment. Only put material intended for viewers in that experiment.
+
+- `/api/experiment/trained-chat` is public by design: it is the visitor chat with adapters the models trained ([Tinker training](#tinker-training)). While `LAB_ENABLE_TRAINED_CHAT` is off, which is the default, a GET says `{"enabled":false,"adapters":[]}` and a POST answers 503, and neither touches the database or the network. When it is on it is the one public route that spends money, so it has a rate limit per visitor and its own small daily cap.
 
 - `/api/live-model/v1/chat/completions` (and `/api/live-model/v1/models`, which `vercel.json` rewrites to it) is neither a public route nor an operator route. It takes a scoped key that the lab makes for one Sprite session. While `LAB_ENABLE_LIVE_MODEL` is off it answers 503 to everyone. When it is on it answers 401 to anything that is not a live scoped key, and that includes the operator secret.
 
@@ -255,6 +258,106 @@ Two things to keep in mind while it is on:
 
 - I do not run `create`, `create_all` or `setup` on `/api/sprites` while an epoch's Sprite session is running. Setting a Sprite up again puts its egress policy back to `defaults`, which takes the lab's host away from the running session. Its remaining calls then fail, and the record still says `offered: true`.
 - The egress rule works through DNS, and the lab's host resolves to addresses Vercel shares between many sites. While a session has the rule, code in the Sprite may be able to reach another Vercel site through those addresses. I have not tested that, and a custom domain would not change it. [TOOLS.md](TOOLS.md#the-lab-model-endpoint) has the detail.
+
+## Tinker training
+
+`LAB_ENABLE_TINKER` (default false) lets the Executor ask for one LoRA fine-tuning run on [Tinker](https://tinker-docs.thinkingmachines.ai/) on data it writes into its answer; the Reviewer approves it and my own runner on Modal does it. `LAB_ENABLE_LIVE_TRAINED` and `LAB_ENABLE_TRAINED_CHAT` (both default false) let a trained adapter be talked to, by the models through the lab model endpoint and by visitors in the room. What each does, checks and records is in [TOOLS.md](TOOLS.md#tinker-training). With all three off nothing changes: the prompts, the routes and the tick behave as before, and nothing calls Modal or Tinker.
+
+I approved Tinker fine-tuning with chat at $2 a run and $10 a UTC day. Those are the defaults.
+
+**Where the Tinker key lives.** In exactly two places, under exactly these names:
+
+1. The Modal secret `oblab-tinker-auth`, key `TINKER_API_KEY`. Only the training function in `modal/tinker_jobs.py` is given it.
+2. The Vercel environment variable `TINKER_API_KEY`, marked Sensitive, Production only. One file reads it, `api/_lib/tinker-chat.ts`, to call Tinker's OpenAI-compatible endpoint for the lab model endpoint and the visitor chat.
+
+Tinker has no scoped keys and no per-key spending limit, and its terms do not allow handing a key on. So the key is never sent to a Sprite, a GPU job, a prompt, a response, a log or a record, and the guard that stops server credentials leaving (`assertNoSecrets`) treats it as one. The caps below are the lab's own, held in the database.
+
+**1. Tinker.** Create the account and organisation at tinker-console.thinkingmachines.ai, add a prepaid balance (requests are refused until the organisation has one; $10 covers many runs at these sizes), and create an API key. I keep the balance small: it is the one limit Tinker itself enforces.
+
+**2. Modal secrets.** From my Mac. `read -s` keeps the values out of the shell history.
+
+```
+read -s TINKER_API_KEY
+modal secret create oblab-tinker-auth TINKER_API_KEY="$TINKER_API_KEY"
+JOBS_TOKEN=$(openssl rand -hex 32)
+modal secret create oblab-tinker-jobs-auth JOBS_TOKEN="$JOBS_TOKEN"
+echo "$JOBS_TOKEN"   # this one goes in Vercel as TINKER_JOBS_TOKEN
+unset TINKER_API_KEY
+```
+
+`JOBS_TOKEN` is not the Tinker key. It only lets the lab server reach the runner's two endpoints, which do not have the Tinker secret at all.
+
+**3. Deploy the runner.** From this repository:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py
+```
+
+This creates the app `oblab-tinker` with three functions: `train` (the run), and the `start` and `status` endpoints. Modal prints the two endpoint URLs; they go in Vercel as `TINKER_JOBS_START_URL` and `TINKER_JOBS_STATUS_URL`. The first deploy builds the training image (the Tinker SDK 0.39.1, its cookbook 0.6.1 and CPU torch), which takes a few minutes.
+
+**4. Smoke test, before any model can use it.** This calls the deployed `train` function directly with my Modal login on 20 made-up examples. On a development machine the same job counted about 1,400 tokens, a tenth of a cent at the published prices; its budget is 5 cents and the runner cannot pass it. The adapter it saves expires after an hour.
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py
+```
+
+What I expect: `"status": "ok"`, `n_train` 18 and `n_holdout` 2, `steps_done` 6, a `holdout_loss_after` well below `holdout_loss_before`, a `sampler_path` that starts with `tinker://` and contains `/sampler_weights/`, and two samples. If it says `"status": "error"` with `"stage": "client"`, the Modal secret or the Tinker balance is the first thing to check. The result never contains the key.
+
+Then the chat path, against the adapter the smoke test just saved (its path is the last line it prints):
+
+```
+read -s TINKER_API_KEY
+ADAPTER='tinker://...the sampler_path printed above...'
+curl -sS https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1/chat/completions \
+  -H "Authorization: Bearer $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d "{\"model\": \"$ADAPTER\", \"messages\": [{\"role\": \"user\", \"content\": \"What is the lab code for the colour teal?\"}], \"max_completion_tokens\": 40, \"reasoning_effort\": false}"
+unset TINKER_API_KEY
+```
+
+What I expect: a `chat.completion` whose `choices[0].message.content` is a short direct answer (the trained code for teal is OL-184, if teal was not one of the two held-out examples the adapter should know it), no `reasoning_content` to speak of, and a `usage` with `prompt_tokens` and `completion_tokens`. This is the call the server makes for both chat switches, so if it fails here they stay off.
+
+Last, the endpoints, with the token from step 2:
+
+```
+read -s JOBS_TOKEN
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$TINKER_JOBS_START_URL" -H 'Content-Type: application/json' -d '{}'                                      # 401
+curl -sS -o /dev/null -w '%{http_code}\n' -X POST "$TINKER_JOBS_START_URL" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' -d '{}'  # 400
+```
+
+**5. Vercel.** Set these for Production and redeploy:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LAB_ENABLE_TINKER` | false | The training tool. Only the exact value `true` turns it on, and only with the three settings below. |
+| `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL` | none | The two URLs Modal printed in step 3. https only. |
+| `TINKER_JOBS_TOKEN` | none | The `JOBS_TOKEN` from step 2. Sensitive. |
+| `LAB_TINKER_BASE_MODELS` | `Qwen/Qwen3.5-4B` | Comma separated, from `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.6-35B-A3B`. Anything else is left out; a list with nothing usable turns the tool off. |
+| `LAB_TINKER_RUN_USD` | 2 | The most one run may cost, by the estimate. Never more than 5. |
+| `LAB_TINKER_DAILY_USD` | 10 | The most all Tinker use may cost per UTC day, by the estimate: runs, adapter calls through the lab model endpoint, and visitor chat. Never more than 50. |
+| `LAB_TINKER_PER_DAY` | 2 | Runs per UTC day, 0 to 10. |
+| `LAB_TINKER_TTL_DAYS` | 14 | How long an adapter is kept, 1 to 30 days. |
+| `LAB_TINKER_POLL_MAX_MS` | 300000 | How long the follow-up waits for a run, at most 480000. A run still going is collected by a later tick. |
+| `TINKER_API_KEY` | none | The Tinker key, Sensitive, Production. Needed only for the next two switches. |
+| `LAB_ENABLE_LIVE_TRAINED` | false | Kept adapters answer on the lab model endpoint as `lab/<name>`. Needs `LAB_ENABLE_LIVE_MODEL=true` and `TINKER_API_KEY`. |
+| `LAB_ENABLE_TRAINED_CHAT` | false | The visitor chat in the room. Needs `TINKER_API_KEY`. |
+| `LAB_TINKER_CHAT_DAILY_USD` | 1 | The most all visitor chat may cost per UTC day, by the estimate, inside the $10. Never more than 10. |
+
+I turn them on one at a time: `LAB_ENABLE_TINKER` first, and the two chat switches only after a model's run has left a kept adapter and I have read its samples.
+
+**Vercel functions.** The visitor chat is one new function, `api/experiment/trained-chat.ts` (the project now has 19; `vercel.json` gives it 60 s). Adapters on the lab model endpoint use the existing function and its `/models` rewrite. The tick collects finished runs inside the existing cron function.
+
+**What I check after turning the tool on.**
+
+- `GET /api/experiment` lists `tinker_train` in `tools_enabled`.
+- After the first approved request, the `tool_runs` row with tool `tinker_train` has the dataset hash, both held-out losses under `detail.measured`, the estimated cost under `detail.cost`, and the adapter's name. A request that was refused is a `skipped` row with the reason.
+- `SELECT status, slug, base_model, reserved_usd, cost_usd, expires_at FROM tinker_runs ORDER BY created_at DESC` shows every run, and `SELECT * FROM tinker_spend_days ORDER BY day DESC` shows what was set aside and spent per day. `reserved_usd` goes back to 0 once a run is collected.
+- With the visitor chat on, `curl -s https://<host>/api/experiment/trained-chat` says `"enabled": true` and lists the kept adapters. With it off the same call says `{"enabled":false,"adapters":[]}`.
+
+**The estimate against the bill.** The ledger's Tinker rows are my estimate. The bill is Tinker's: `tinker billing usage <start> <end>` (two UTC hour timestamps), or the console, some hours later. I compare the two after the first few runs. If the bill is higher than the ledger, the price table in `api/_lib/tinker.ts` is out of date (Tinker's current one is at tinker-docs.thinkingmachines.ai/tinker/models.json) and needs the new numbers; the runner is sent the prices with every request, so that is a Vercel redeploy and no Modal deploy.
+
+**Things I know are not checked from the development machine.** It cannot reach Modal or Tinker, so nothing has run there. What was checked: the runner file compiles and imports on Python 3.9; its whole flow ran locally against the real Tinker cookbook 0.6.1 and the real Qwen3.5 tokenizer, with only the training service replaced by a stand-in; and the SDK calls it makes match the signatures of the installed `tinker` 0.39.1. What steps 3 and 4 are the first real test of: the image build, the Modal secret reaching the function, a real training client, the loss values Tinker returns, the save with a time to live, and sampling. The chat call in step 4 is the first real test that Tinker's OpenAI-compatible endpoint serves a LoRA checkpoint by its path and takes `"reasoning_effort": false` for these base models; its documentation says both, and says the endpoint is in beta.
+
+**Turning it off.** Set `LAB_ENABLE_TINKER` to anything but `true` and redeploy: the models are no longer told about it, requests are ignored, and the tick stops asking Modal about runs. A run already training carries on at Modal and is not collected while the switch is off; its money stays set aside until that UTC day ends. `LAB_ENABLE_TRAINED_CHAT` and `LAB_ENABLE_LIVE_TRAINED` turn off the same way: the panel's button disappears, the chat route answers 503, and the lab model endpoint refuses `lab/` models like any unknown model. To stop everything at once, delete `TINKER_API_KEY` in Vercel and the `oblab-tinker-auth` secret in Modal, or revoke the key in the Tinker console. `modal app stop oblab-tinker` takes the runner down. Adapters expire by themselves; `tinker checkpoint list` and `tinker checkpoint delete` (or the console) remove them sooner.
 
 ## Model proposals to this repository
 

@@ -19,6 +19,9 @@
     },
     "api/live-model/v1/chat/completions.ts": {
       "maxDuration": 120
+    },
+    "api/experiment/trained-chat.ts": {
+      "maxDuration": 60
     }
   },
   "rewrites": [

@@ -74,6 +74,9 @@ const PUBLIC_ROUTES = {
   'experiment/exhibits': ['GET'],
   'experiment/activity': ['GET'],
   'experiment/graph': ['GET'],
+  // The visitor chat with trained adapters (api/_lib/trained-chat.ts). Public
+  // by design and off by default; its own test below holds it to that.
+  'experiment/trained-chat': ['GET', 'POST'],
 }
 // Routes authorised by a scoped key the lab itself issues (the lab model
 // endpoint, api/_lib/live-model.ts). They are neither public nor operator
@@ -152,6 +155,55 @@ test('a scoped-key route that is switched on refuses everything but a live scope
         await handler({ method, headers: { authorization: `Bearer labk_${'0'.repeat(64)}` }, query: {}, body: {} }, res)
         assert.ok([401, 503].includes(res.code), `${route} ${method} with an unissued key got ${res.code}`)
       }
+    }
+    assert.equal(outbound, 0)
+  } finally {
+    process.env = saved
+  }
+})
+
+test('the visitor chat route does nothing while it is switched off, and fails closed when it cannot count', async () => {
+  let outbound = 0
+  globalThis.fetch = async () => { outbound++; throw new Error('Unexpected outbound request') }
+  const saved = { ...process.env }
+  const { default: handler } = await load('api/experiment/trained-chat.js')
+  const body = { adapter: 'e12-0a1b2c3d', messages: [{ role: 'user', content: 'hello' }] }
+  const post = async headers => {
+    const res = response()
+    await handler({ method: 'POST', headers: { 'content-type': 'application/json', ...headers }, query: {}, body }, res)
+    return res
+  }
+  try {
+    // Off (the default): GET says so, POST is refused, with or without any credential, and nothing is read or sent.
+    delete process.env.LAB_ENABLE_TRAINED_CHAT
+    process.env.TINKER_API_KEY = 'test-only-tinker-placeholder-000000'
+    for (const authorization of [undefined, `Bearer ${operator}`]) {
+      const get = response()
+      await handler({ method: 'GET', headers: { authorization }, query: {}, body: {} }, get)
+      assert.equal(get.code, 200)
+      assert.deepEqual(get.body, { enabled: false, adapters: [] })
+      assert.equal(get.headers['Cache-Control'], 'no-store')
+      const res = await post({ authorization })
+      assert.equal(res.code, 503)
+      assert.equal(res.body.error, 'off')
+    }
+    // The flag alone is not enough: without a Tinker key on the server it is still off.
+    process.env.LAB_ENABLE_TRAINED_CHAT = 'true'
+    delete process.env.TINKER_API_KEY
+    assert.equal((await post({})).code, 503)
+    // On, but there is no database here, so a message cannot be counted: refused, and nothing is sent.
+    process.env.TINKER_API_KEY = 'test-only-tinker-placeholder-000000'
+    const closed = await post({ 'x-real-ip': '203.0.113.9', 'user-agent': 'test' })
+    assert.equal(closed.code, 503)
+    assert.equal(JSON.stringify(closed.body).includes('203.0.113.9'), false)
+    // A malformed request is refused before anything is counted.
+    const bad = response()
+    await handler({ method: 'POST', headers: { 'content-type': 'application/json' }, query: {}, body: { adapter: 'e12-0a1b2c3d', messages: [{ role: 'system', content: 'x' }] } }, bad)
+    assert.equal(bad.code, 400)
+    for (const method of ['PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+      const res = response()
+      await handler({ method, headers: {}, query: {}, body }, res)
+      assert.equal(res.code, 405)
     }
     assert.equal(outbound, 0)
   } finally {

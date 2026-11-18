@@ -1,6 +1,6 @@
 import { sql } from '@vercel/postgres'
 import { getRoleAssignments } from './role-rotation.js'
-import { getSharedContext, reviewerToolSection, ROLE_PROMPTS } from './prompts.js'
+import { getSharedContext, reviewerToolSection, tinkerReviewFacts, ROLE_PROMPTS } from './prompts.js'
 import { runResearchEpoch } from './research-epoch.js'
 import { getExperimentStatus, getGrowthStage } from './seed-spec.js'
 import { generatePlantFromSpec } from './plant-generator.js'
@@ -524,6 +524,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
             })(),
           } : undefined,
           lab_proposal: toolPlan?.lab_proposal ? { title: toolPlan.lab_proposal.title, files: toolPlan.lab_proposal.files.map(f => f.path) } : undefined,
+          tinker_train: toolPlan?.tinker_train ? tinkerReviewFacts(toolPlan.tinker_train) : undefined,
         })),
         'Make final decisions on each proposed mutation.'
       )
@@ -552,7 +553,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     // so doing both in one request overran it. It is queued on the epoch row
     // and runs in its own request on the next tick (epoch-followup.ts).
     const candidate = pickContributionCandidate(mutations, decisions, challengerOutput.challenges)
-    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal))
+    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal || toolPlan.tinker_train))
     const followup: EpochFollowUp = {
       status: candidate || hasDeliverables ? 'pending' : 'none',
       contribution_mutation_index: candidate ? candidate.decision.mutation_index : null,
@@ -574,7 +575,12 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
       })
     }
     if (hasDeliverables) {
-      toolOutcomes.push({ tool: 'deliverables', status: 'queued', summary: 'any exhibit or lab proposal the Reviewer approved is opened after this epoch' })
+      toolOutcomes.push({
+        tool: 'deliverables', status: 'queued',
+        summary: toolPlan?.tinker_train
+          ? 'any exhibit or lab proposal the Reviewer approved is opened after this epoch, and an approved Tinker training run is started then'
+          : 'any exhibit or lab proposal the Reviewer approved is opened after this epoch',
+      })
     }
 
     // Always a number in 0..1 (a string or 85 from a model would break the

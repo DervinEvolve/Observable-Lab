@@ -12,6 +12,7 @@ In a classic epoch the Executor may return an optional `tools` object next to it
 | `weights` | `LAB_ENABLE_WEIGHTS=true` | GPU jobs switched on, and `modal/gpu_jobs.py` deployed from a version that has the fetcher | 1 | `LAB_WEIGHTS_PER_DAY` (2) |
 | `exhibit` | `LAB_ENABLE_EXHIBITS=true` | `LAB_ENABLE_CODE_WRITES=true`, `AI_AGENT_GITHUB_TOKEN`, `AI_AGENT_GITHUB_OWNER`, `LAB_REQUIRED_CI_WORKFLOW_IDS` | 1 | `LAB_EXHIBITS_PER_DAY` (2) |
 | `lab_proposal` | `LAB_ENABLE_LAB_PROPOSALS=true` | `LAB_PROPOSALS_GITHUB_TOKEN`, `LAB_PROPOSALS_GITHUB_OWNER` | 1 | `LAB_LAB_PROPOSALS_PER_DAY` (1) |
+| `tinker_train` | `LAB_ENABLE_TINKER=true` | `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL`, `TINKER_JOBS_TOKEN`, and `modal/tinker_jobs.py` deployed with its two Modal secrets | 1 | `LAB_TINKER_PER_DAY` (2), and the dollar caps in [Tinker training](#tinker-training) |
 
 A Sprite session can also come with [the lab model endpoint](#the-lab-model-endpoint) (`LAB_ENABLE_LIVE_MODEL=true`). It is not a tool the Executor asks for, so it is not in this table.
 
@@ -21,7 +22,7 @@ Web search is not on this menu: the Planner and Executor calls, and the explorer
 
 - **Side tools** (`sprite_session`, `gpu_job`, `weights`) start as soon as the Executor has answered and run while the Challenger, the rebuttal and the Reviewer talk. The runner waits for them before the Commentator, who is given a one-line summary of each, built from the stored records. Weights asked for are fetched before that epoch's GPU job starts.
 - **Subagents** are part of the epoch's one code contribution, after the Reviewer.
-- **Deliverables** (`exhibit`, `lab_proposal`) run after the Reviewer, alongside the code contribution, and only when the Reviewer answered `"tool_verdicts": { "exhibit": "approve" }` or `{ "lab_proposal": "approve" }`. Anything else is a no.
+- **Deliverables** (`exhibit`, `lab_proposal`, `tinker_train`) run after the Reviewer, alongside the code contribution, and only when the Reviewer answered `"tool_verdicts": { "exhibit": "approve" }`, `{ "lab_proposal": "approve" }` or `{ "tinker_train": "approve" }`. Anything else is a no. A Tinker training run can outlast the follow-up that starts it; a later tick collects its result.
 - The recent runs (not the skipped ones) go into the next epoch's shared context as `RECENT TOOL RUNS`, so the models see what really happened.
 
 ## Subagents
@@ -122,6 +123,74 @@ Then it downloads that exact commit, small files first. Every file must be the s
 
 The research loop (`modal/research_runner.py`) does not get the shelf. Its kept scores compare runs that all start from nothing, and I did not want to change what those numbers mean.
 
+## Tinker training
+
+While `LAB_ENABLE_TINKER=true`, the Executor may ask for one fine-tuning run on [Tinker](https://tinker-docs.thinkingmachines.ai/), the training service from Thinking Machines. It is LoRA only: a small adapter is trained on top of an open-weight base model, and the base model's own weights are not changed. The model does not write a training script. It writes the data and a few bounded settings, and my own code does the rest.
+
+```
+"tinker_train": {
+  "purpose": "one line",
+  "base_model": "Qwen/Qwen3.5-4B",
+  "examples": [ { "messages": [ { "role": "user", "content": "..." }, { "role": "assistant", "content": "..." } ] }, ... ],
+  "settings": { "rank": 16, "learning_rate": 0.0002, "epochs": 2, "batch_size": 8 }
+}
+```
+
+**What a request may hold.** It is read strictly (`api/_lib/tinker.ts`), and anything that is not exactly this refuses the whole request with a reason. Nothing is cut to fit.
+
+- `base_model` is optional and must be on my allowlist, `LAB_TINKER_BASE_MODELS`. The default list is `Qwen/Qwen3.5-4B`, the cheapest current chat model to train on Tinker's price table and the one Tinker's own first tutorial uses. I can also allow `Qwen/Qwen3.5-9B` and `Qwen/Qwen3.6-35B-A3B`. Those three are the models I have a published price and a chat format for; an id that is not one of them is left out of the list, and a list with nothing usable turns the tool off. None of the three was marked as retiring when I read the table on 18 November 2026.
+- `examples`: 10 to 2000 different conversations. Each is 2 to 12 messages: an optional system message, then user and assistant in turn, ending with the assistant. Text only. At most 6000 bytes of text in one example and 120000 in all. The dataset is part of the Executor's answer, which the Challenger and the Reviewer read whole, so in practice it is as large as an answer can be, a few hundred short examples at most. Two identical examples are refused, because a copy could land on both sides of the held-out split.
+- `settings` are optional and bounded: `rank` 8, 16 or 32 (default 16), `learning_rate` 0.00001 to 0.0005 (default 0.0002), `epochs` 1 to 3 (default 2), `batch_size` 1 to 16 (default 8), and at most 600 optimizer steps in all.
+- Only the last assistant message of each example is trained on. That is how Tinker's cookbook says to train a chat model whose format puts a thinking block before each answer; earlier assistant turns are context.
+
+**Who approves it.** The Reviewer, the same way it rules on an exhibit: it is told the base model, the number of examples and bytes, the settings, the number of steps and my estimate of the most the run could cost, and nothing starts unless it answers `"tool_verdicts": { "tinker_train": "approve" }`. Like the other deliverables, the run happens after the epoch, in the follow-up.
+
+**The cost, before.** Tinker returns no cost with a call, its billing page lags by hours, and its keys cannot carry a spending limit. So every dollar figure for Tinker in this lab is an **estimate**: token counts times the price Tinker published, per million tokens, copied into `api/_lib/tinker.ts` on 18 November 2026 (for `Qwen/Qwen3.5-4B`: train $0.737, sample $1.005, prefill $0.33). It is never a billed amount, and the records say so.
+
+Before a run starts, the server works out the most it could cost from the text alone: one token for every 3 bytes of text plus some for the chat format, every epoch over the whole dataset, two passes over the largest examples the held-out slice could hold (a forward pass by a training client is billed at the train price), the samples at their longest, and a quarter on top. Then, in this order:
+
+1. If that is over `LAB_TINKER_RUN_USD` (default $2), the run is refused.
+2. The runs-per-day limit (`LAB_TINKER_PER_DAY`, default 2) and the lab's own daily budget are checked, against that same worst case.
+3. The estimate is set aside under `LAB_TINKER_DAILY_USD` (default $10 per UTC day) in the database, by one conditional UPDATE that only succeeds while spent plus set aside plus this amount stays within the cap. Two requests arriving together cannot both pass it. This is the same idea as the lab model endpoint's keys.
+4. One row is written to `tinker_runs` for the epoch. The table allows one per epoch, so a follow-up that is run twice cannot start two.
+
+**The run, by lab code.** The server sends the examples, the settings, the amount set aside, the prices and a random value it has just made up (`split_salt`) to `modal/tinker_jobs.py`, my own runner on Modal. The Tinker key is a Modal secret there, given to the training function only. The runner:
+
+1. Checks the request again against its own copy of the limits.
+2. Splits the dataset by a hash of `split_salt` and each example's position: about a tenth is held out, at least 2 and at most 200 examples. The model wrote its request before that value existed, so it cannot know which examples are held out.
+3. Counts real tokens. If the real plan would cost more than the amount set aside, it refuses before anything is trained.
+4. Measures the base model's loss on the held-out examples.
+5. Trains, one batch at a time. It stops early at 600 steps, after 30 minutes of training, or when the tokens counted so far, plus what the last measurement and the samples still need, would pass the amount set aside.
+6. Measures the trained adapter's loss on the same held-out examples.
+7. Saves the adapter for sampling with a time to live (`LAB_TINKER_TTL_DAYS`, default 14), and samples up to three short completions on held-out prompts.
+
+The loss is the mean cross-entropy per trained token, each held-out example counted once. Lower is better. It is **measured by the lab**, on examples the lab chose. That is a different kind of number from the scores in the research loop, which generated code reports about itself and which stay marked unverified.
+
+**The cost, after.** The runner returns the tokens it counted, and the amount set aside is replaced by those tokens times the published prices. A run that failed part way is charged for the tokens it had used. A run whose usage is unknown, because the runner was lost, its answer was unusable or its start was never confirmed, is charged the whole amount set aside, so the record errs high. A run that is known not to have started costs nothing and its money is given back. The estimate is written to `model_calls` as `tool/tinker_train` with `cost_source` `estimate`, so the lab's daily cap counts it.
+
+**Waiting.** The follow-up polls for `LAB_TINKER_POLL_MAX_MS` (default 300000, at most 480000). A run that is still training then carries on at Modal for up to 45 minutes in all, its money stays set aside, and the next hourly tick collects the result and writes the record. If nothing comes back long after its time limit, the run is closed as lost.
+
+**The record.** A `tool_runs` row with tool `tinker_train`, so it is in the public state and the activity panel like a GPU job, and a `tinker_runs` row. Between them: the base model, the dataset's SHA-256, size and number of examples, the settings, the split value, how many examples were trained on and held out, the held-out loss before and after (labelled as measured by the lab), the first and last training loss, steps planned and done and why it stopped early if it did, the tokens counted, the estimated cost and what was set aside, the adapter's name and checkpoint path, when it expires, and the samples. A refusal is stored too, with its reason: by the Reviewer, by a cap, by the strict reading, or by the runner.
+
+**Limits to keep in mind.** The held-out loss says how well the adapter fits data like the data the model wrote. It is not a test of general ability, and near copies in the dataset make it look better than it is; only exact copies are refused. The estimate before a run assumes three bytes a token, which is generous for prose and too low for text that is mostly digits, and that is why the runner's real count has the last word. Tinker keeps checkpoints free up to 100 GB or 100 checkpoints per organisation; the time to live is what keeps the lab under that.
+
+**What the models are told.** One line in the shared context and the field in the Executor's instructions, only while the tool is on: what it does, the allowlisted base models, the data and settings limits, the per-run and daily caps, that it is LoRA only, that the scores are measured by the lab on a slice it chooses, that results and adapters are public, and that adapters expire. Nothing about what to train or why.
+
+## Talking to a trained adapter
+
+A kept adapter can be talked to in two places. Both go from this server straight to Tinker's OpenAI-compatible endpoint, with the adapter's checkpoint path as the model (Tinker runs it on the base model it was trained on) and `"reasoning_effort": false`, so the base model answers directly, the way the adapter was trained. One file reads the Tinker key for this, `api/_lib/tinker-chat.ts`, and it goes into one Authorization header.
+
+**On the lab model endpoint** (`LAB_ENABLE_LIVE_TRAINED=true`, with the endpoint itself on). `GET <base>/models` lists each kept adapter as `lab/<name>`, and a call that names one is answered by it. The same scoped key authorises the call and the same limits of that key count it. An adapter takes text messages only (system, user, assistant), at most 1024 tokens of answer, and an optional temperature; tools and every other field are dropped and named in `X-Lab-Dropped-Fields`. The most the call could cost is set aside under `LAB_TINKER_DAILY_USD` first, then replaced by the tokens Tinker reports at the published prices. That estimate goes on the ledger as purpose `live_model` with `cost_source` `estimate`, so `LAB_LIVE_MODEL_DAILY_USD` counts it too, and the answer carries `X-Lab-Cost-Basis: estimate`. The models are told this as a fact, in the same line as the tool, only while it is really on.
+
+**In the room** (`LAB_ENABLE_TRAINED_CHAT=true`). A small panel, "Talk to what they trained", lists the kept adapters with their base model, epoch, the model that wrote the data and the held-out loss the lab measured, and has a chat box. Beside it, always: "A small model fine-tuned by the lab's AI models on data they wrote. Replies are not reviewed." It goes through a public route, `/api/experiment/trained-chat`, and since anyone can call that, everything about a call is bounded (`api/_lib/trained-chat.ts`):
+
+- a message is at most 500 characters, a conversation at most 8 turns, a reply at most 200 tokens;
+- one visitor may send 10 messages in ten minutes and 40 in a UTC day. A visitor is remembered only as a keyed hash of the address and the browser string, new every day. No address is stored or logged;
+- all visitor chat together may cost `LAB_TINKER_CHAT_DAILY_USD` a day (default $1), counted inside `LAB_TINKER_DAILY_USD` and the lab's daily budget, set aside before each call in the same way as a run. At the cap the chat says so in a plain sentence and opens again at 00:00 UTC;
+- what a visitor writes is sent to Tinker to be answered and is not stored or logged by the lab. A call leaves one row of counts in `trained_chat_calls` (which adapter, how many turns and characters, tokens, the estimated cost) and one line on the spend ledger as purpose `trained_chat`.
+
+The models are not told about the visitor chat.
+
 ## Exhibits
 
 `"exhibit": { "slug": "...", "exhibit": { ... } }`. See [EXHIBITS.md](EXHIBITS.md) for the contract, the pull request and how the room reads them. Exhibit pull requests cost no model or compute money beyond AI-Agent's CI.
@@ -136,6 +205,8 @@ The token is `LAB_PROPOSALS_GITHUB_TOKEN`, a fine-grained token for that one rep
 
 Before a tool runs, the server checks its daily limit and today's spend. A Sprite session, GPU job or weights fetch is refused when today's spend plus its worst case (240 s of Sprite time, 210 s of GPU time, or 960 s of fetch time) would pass `LAB_DAILY_BUDGET_USD`. Afterwards its estimated cost is written to the `model_calls` ledger as model `tool/sprite_session`, `tool/gpu_job` or `tool/weights` with `cost_source` `estimate`, so the daily cap, the cron's pause and the epoch's `cost_usd` all include it.
 
+Tinker is counted differently, because Tinker reports no cost per call: a training run, a call to a trained adapter and a visitor chat message each have the most they could cost set aside first, under their own daily caps, and are then written to the ledger as token counts at Tinker's published prices (`tool/tinker_train`, or the adapter's `lab/<name>`), again with `cost_source` `estimate`. [Tinker training](#tinker-training) has the detail.
+
 ## The record
 
-`tool_runs` is created at runtime: `experiment_id`, `epoch`, `model`, `tool`, `request_summary`, `status` (`ok`, `failed`, `error`, `timeout`, `skipped`, `opened`, `merged`, `closed`), `exit_code`, `duration_ms`, `cost_usd`, `output_tail` (cleaned, at most 4 KB), `detail` (small JSON: commands, slug, pull request URL) and `created_at`. `GET /api/experiment` returns the 12 most recent for the current experiment as `tool_runs`, cleaned again on the way out, and the switched-on tools as `tools_enabled`. `tools_enabled` also lists `live_model` while Sprite sessions come with the lab model endpoint.
+`tool_runs` is created at runtime: `experiment_id`, `epoch`, `model`, `tool`, `request_summary`, `status` (`ok`, `failed`, `error`, `timeout`, `skipped`, `opened`, `merged`, `closed`), `exit_code`, `duration_ms`, `cost_usd`, `output_tail` (cleaned, at most 4 KB), `detail` (small JSON: commands, slug, pull request URL) and `created_at`. `GET /api/experiment` returns the 12 most recent for the current experiment as `tool_runs`, cleaned again on the way out, and the switched-on tools as `tools_enabled`. `tools_enabled` also lists `live_model` while Sprite sessions come with the lab model endpoint, and `live_trained` while that endpoint also answers for trained adapters. A Tinker training run has a second, fuller row in `tinker_runs`, and the money set aside and spent on Tinker per UTC day is in `tinker_spend_days`.
