@@ -65,6 +65,21 @@ const compactCss = (o: string, captionWidth: string): string => `
         ${o}.replaying .kg-top { display: none; }
         ${o} .kg-caption { align-self: flex-start; margin: 8px 0 0 12px; max-width: ${captionWidth}; padding: 7px 10px; font-size: 0.78125rem; line-height: 1.4; overflow: hidden; }
         ${o} .kg-caption span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }`
+/**
+ * Little height left while typing (the keyboard is up): on a phone held upright the results get most of it;
+ * on one held sideways the title goes and each result takes one line. Applied by media query where the keyboard
+ * shrinks the page, and by class (set in syncViewport) where it only covers it, as on iOS and current Android.
+ */
+const lowCss = (o: string): string => `
+        ${o} { grid-template-rows: minmax(0, 2fr) minmax(0, 3fr); }
+        ${o} .kg-top, ${o} .kg-zoom { display: none; }
+        ${o} .kg-searchbar { padding: 6px 12px; }`
+const flatCss = (o: string): string => `
+        ${o} .kg-top { display: none; }
+        ${o} .kg-searchbar { padding: 4px 10px; }
+        ${o} .kg-scroll { padding-top: 0; }
+        ${o} .kg-results .kg-section { margin-top: 4px; }
+        ${o} .kg-results button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }`
 const MIN_K = 0.1
 const MAX_K = 4
 
@@ -227,17 +242,10 @@ export class KnowledgeGraphPanel {
         #kg-overlay .kg-results .kg-tag { grid-column: 2; }
       }
       /* With the keyboard up there is little height left: give it to the graph and the results. */
-      @media (max-height: 420px) and (max-width: 519px) {
-        #kg-overlay { grid-template-rows: minmax(0, 2fr) minmax(0, 3fr); }
-        #kg-overlay .kg-top, #kg-overlay .kg-zoom { display: none; }
-      }
-      @media (max-height: 260px) and (min-width: 520px) {
-        #kg-overlay .kg-top { display: none; }
-        #kg-overlay .kg-searchbar { padding: 4px 10px; }
-        #kg-overlay .kg-scroll { padding-top: 0; }
-        #kg-overlay .kg-results .kg-section { margin-top: 4px; }
-        #kg-overlay .kg-results button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      }`
+      @media (max-height: 420px) and (max-width: 519px) { ${lowCss('#kg-overlay')} }
+      @media (max-height: 260px) and (min-width: 520px) { ${flatCss('#kg-overlay')} }
+      ${lowCss('#kg-overlay.low')}
+      ${flatCss('#kg-overlay.flat')}`
     document.head.appendChild(style)
 
     this.toggle = document.createElement('button')
@@ -349,7 +357,7 @@ export class KnowledgeGraphPanel {
     this.hovered = null
     if (this.searchTimer) { window.clearTimeout(this.searchTimer); this.searchTimer = 0; this.runSearch() } // keep query and results in step
     for (const undo of this.session.splice(0)) undo()
-    this.overlay.classList.remove('open', 'cramped')
+    this.overlay.classList.remove('open', 'cramped', 'low', 'flat')
     this.overlay.style.removeProperty('--kg-vh')
     this.overlay.style.removeProperty('--kg-vt')
     this.toggle.setAttribute('aria-expanded', 'false')
@@ -371,11 +379,19 @@ export class KnowledgeGraphPanel {
     }
   }
 
-  /** Keep the full-screen layouts inside what is actually visible (the keyboard covers the rest). */
+  /**
+   * The stylesheet sizes the full-screen layouts to the screen (100dvh), so a rotation needs nothing from here.
+   * Only the on-screen keyboard does: it shrinks the visual viewport and not the layout one, so while it is up
+   * the visible height and offset are handed to the stylesheet.
+   */
   private syncViewport = (): void => {
     const vv = window.visualViewport
     const s = this.overlay.style
-    if (vv && Math.abs(vv.scale - 1) < 0.01) {
+    const covered = !!vv && Math.abs(vv.scale - 1) < 0.01 && (vv.height < window.innerHeight - 1 || vv.offsetTop > 0.5)
+    const narrow = window.innerWidth < 520
+    this.overlay.classList.toggle('low', covered && narrow && vv.height <= 560)
+    this.overlay.classList.toggle('flat', covered && !narrow && vv.height <= 260)
+    if (vv && covered) {
       s.setProperty('--kg-vh', `${vv.height}px`)
       s.setProperty('--kg-vt', `${vv.offsetTop}px`)
     } else {
