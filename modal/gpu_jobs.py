@@ -121,6 +121,9 @@ image = (
     .apt_install("gcc=4:12.2.0-3", "g++=4:12.2.0-3", "libc6-dev")
     .pip_install("numpy==2.4.6")
     .pip_install("torch==2.6.0", index_url="https://download.pytorch.org/whl/cu124")
+    # Modal imports this whole module in run_job's container too, and the top of
+    # the file imports fastapi: without this line run_job never started.
+    .pip_install("fastapi==0.162.0")
 )
 
 web_image = modal.Image.from_registry(PYTHON_BASE_IMAGE).pip_install("fastapi[standard]==0.162.0")
