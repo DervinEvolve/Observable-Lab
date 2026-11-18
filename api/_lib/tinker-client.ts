@@ -30,7 +30,7 @@ function authHeaders(): Record<string, string> {
  * whose answer was lost can be found again (findTinkerCall), and a start
  * sent twice for one name starts one run.
  */
-export function tinkerJobBody(request: TinkerRequest, opts: { splitSalt: string; budgetUsd: number; label: string; runId: string }): Record<string, unknown> {
+export function tinkerJobBody(request: TinkerRequest, opts: { splitSalt: string; budgetUsd: number; label: string; runId: string; exportWeights?: boolean }): Record<string, unknown> {
   return {
     run_id: opts.runId,
     train: {
@@ -47,7 +47,50 @@ export function tinkerJobBody(request: TinkerRequest, opts: { splitSalt: string;
       samples: TINKER_SAMPLE_COUNT,
       sample_max_tokens: TINKER_SAMPLE_MAX_TOKENS,
       label: opts.label,
+      // Asked for only while adapters can be kept: the runner also saves the
+      // weights in the form Tinker lets be downloaded, which can only be done
+      // while the run is open. Without it a kept adapter has no copy.
+      ...(opts.exportWeights ? { export: true } : {}),
     },
+  }
+}
+
+/** The lab's name for one attempt to keep ("k") or unkeep ("u") an adapter at the runner. */
+export function keepJobId(kind: 'k' | 'u', slug: string, nonce: string): string {
+  return `${kind}-${slug}-${nonce}`
+}
+
+/**
+ * The body for keeping an adapter: the runner sets the sampler checkpoint's
+ * time to live on Tinker and, when the run saved weights for download,
+ * copies them to the lab's own Volume with the manifest given here. All of
+ * it is the lab's own record of the run; nothing in it was written for this
+ * request by a model except the one-line reason inside the manifest.
+ */
+export function tinkerKeepBody(opts: {
+  jobId: string
+  slug: string
+  baseModel: string
+  samplerPath: string
+  externalPath: string | null
+  ttlSeconds: number
+  maxBytes: number
+  manifest: Record<string, unknown>
+}): Record<string, unknown> {
+  return {
+    run_id: opts.jobId,
+    keep: {
+      slug: opts.slug, base_model: opts.baseModel, sampler_path: opts.samplerPath, external_path: opts.externalPath,
+      ttl_seconds: opts.ttlSeconds, max_bytes: opts.maxBytes, manifest: opts.manifest,
+    },
+  }
+}
+
+/** The body for unkeeping: the checkpoint's time to live goes back to the usual one, and the copy is removed only when asked. */
+export function tinkerUnkeepBody(opts: { jobId: string; slug: string; samplerPath: string; ttlSeconds: number; removeCopy: boolean }): Record<string, unknown> {
+  return {
+    run_id: opts.jobId,
+    unkeep: { slug: opts.slug, sampler_path: opts.samplerPath, ttl_seconds: opts.ttlSeconds, remove_copy: opts.removeCopy },
   }
 }
 

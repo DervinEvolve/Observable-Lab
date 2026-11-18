@@ -24,6 +24,7 @@
  * The Tinker API key is never read in this file.
  */
 import { createHash, randomBytes } from 'node:crypto'
+import { ADAPTER_NAME_MAX, ADAPTER_NAME_MIN, readAdapterName } from './tinker-names.js'
 
 export const TINKER_TOOL = 'tinker_train'
 
@@ -116,6 +117,18 @@ export const DEFAULT_TINKER_TTL_DAYS = 14
 export const TINKER_MAX_TTL_DAYS = 30
 export const DEFAULT_TINKER_WAIT_MS = 300_000
 export const TINKER_MAX_WAIT_MS = 480_000
+/** Adapters that may be marked to keep at one time (LAB_TINKER_KEEP_MAX), and the most the environment can ask for. */
+export const DEFAULT_TINKER_KEEP_MAX = 10
+export const TINKER_HARD_KEEP_MAX = 40
+/** How long a kept adapter stays on Tinker, counted from the day it is kept (LAB_TINKER_KEEP_DAYS). */
+export const DEFAULT_TINKER_KEEP_DAYS = 365
+export const TINKER_MIN_KEEP_DAYS = 30
+export const TINKER_MAX_KEEP_DAYS = 3650
+/** The most one exported copy of an adapter may weigh (LAB_TINKER_KEEP_MAX_MB), and the runner's own ceiling. */
+export const DEFAULT_TINKER_KEEP_MAX_MB = 1024
+export const TINKER_HARD_KEEP_MAX_MB = 4096
+/** How long a request waits for the runner to keep or unkeep an adapter before a later tick collects it. */
+export const TINKER_KEEP_WAIT_MS = 45_000
 
 // ---------------------------------------------------------------------------
 // Switches and settings
@@ -143,6 +156,31 @@ export function liveTrainedFlag(): boolean {
 /** The visitor chat with trained adapters. */
 export function trainedChatFlag(): boolean {
   return flag('LAB_ENABLE_TRAINED_CHAT')
+}
+/** A training request may name its adapter (tinker-names.ts). */
+export function tinkerNamesFlag(): boolean {
+  return flag('LAB_ENABLE_TINKER_NAMES')
+}
+/** Adapters can be marked to keep (tinker-keep.ts). */
+export function tinkerKeepFlag(): boolean {
+  return flag('LAB_ENABLE_TINKER_KEEP')
+}
+function wholeEnv(name: string, fallback: number, lo: number, hi: number): number {
+  const raw = (process.env[name] || '').trim()
+  const n = raw ? Number(raw) : NaN
+  return Number.isInteger(n) ? Math.min(hi, Math.max(lo, n)) : fallback
+}
+/** LAB_TINKER_KEEP_MAX: how many adapters may be kept at one time. Default 10, 0 to 40. */
+export function tinkerKeepMax(): number {
+  return wholeEnv('LAB_TINKER_KEEP_MAX', DEFAULT_TINKER_KEEP_MAX, 0, TINKER_HARD_KEEP_MAX)
+}
+/** LAB_TINKER_KEEP_DAYS: how long a kept adapter stays on Tinker from the day it is kept. Default 365, 30 to 3650. */
+export function tinkerKeepDays(): number {
+  return wholeEnv('LAB_TINKER_KEEP_DAYS', DEFAULT_TINKER_KEEP_DAYS, TINKER_MIN_KEEP_DAYS, TINKER_MAX_KEEP_DAYS)
+}
+/** LAB_TINKER_KEEP_MAX_MB: the most one exported copy may weigh. Default 1024, 1 to 4096. */
+export function tinkerKeepMaxMb(): number {
+  return wholeEnv('LAB_TINKER_KEEP_MAX_MB', DEFAULT_TINKER_KEEP_MAX_MB, 1, TINKER_HARD_KEEP_MAX_MB)
 }
 
 export interface TinkerBaseModels {
@@ -215,6 +253,18 @@ export function tinkerStatus(): TinkerStatus {
   return { enabled: true }
 }
 
+/**
+ * May adapters be marked to keep? Keeping is done by the lab's runner on
+ * Modal (it holds the Tinker key), so the runner must be configured. Training
+ * need not be on: adapters trained earlier can still be kept.
+ */
+export function tinkerKeepStatus(): TinkerStatus {
+  if (!tinkerKeepFlag()) return { enabled: false, off_reason: 'LAB_ENABLE_TINKER_KEEP is not true' }
+  if (!tinkerJobsConfigured()) return { enabled: false, off_reason: 'TINKER_JOBS_START_URL, TINKER_JOBS_STATUS_URL or TINKER_JOBS_TOKEN is not set' }
+  if (!(tinkerKeepMax() > 0)) return { enabled: false, off_reason: 'LAB_TINKER_KEEP_MAX is 0' }
+  return { enabled: true }
+}
+
 /** May the lab model endpoint answer for trained adapters? (The endpoint itself must be on too.) */
 export function liveTrainedStatus(): TinkerStatus {
   if (!liveTrainedFlag()) return { enabled: false, off_reason: 'LAB_ENABLE_LIVE_TRAINED is not true' }
@@ -247,6 +297,10 @@ export interface TinkerRequest {
   /** SHA-256 of the examples exactly as the lab read them (JSON, in order). */
   dataset_sha256: string
   dataset_bytes: number
+  /** A display name for the adapter, when names are on and the model gave a usable one (tinker-names.ts). */
+  name?: string
+  /** Why the name the model gave was refused. The run goes on without a name. */
+  name_refused?: string
 }
 
 function isPlainObject(v: unknown): v is Record<string, unknown> {
@@ -327,7 +381,10 @@ export function plannedSteps(n: number, settings: Pick<TinkerSettings, 'epochs' 
  */
 export function normalizeTinkerRequest(raw: unknown, allowed: string[] = tinkerBaseModels().models): { request: TinkerRequest } | { error: string } {
   if (!isPlainObject(raw)) return { error: 'not an object with "examples"' }
-  const extra = onlyKeys(raw, ['purpose', 'base_model', 'examples', 'settings'])
+  // "name" is a field only while names are on. While they are off it is an
+  // unknown field like any other, and refuses the request as it always did.
+  const names = tinkerNamesFlag()
+  const extra = onlyKeys(raw, names ? ['purpose', 'base_model', 'examples', 'settings', 'name'] : ['purpose', 'base_model', 'examples', 'settings'])
   if (extra) return { error: `unknown field: ${extra}` }
   if (!allowed.length) return { error: 'no base model is allowed' }
   const base = raw.base_model === undefined || raw.base_model === null || raw.base_model === '' ? allowed[0] : raw.base_model
@@ -359,11 +416,16 @@ export function normalizeTinkerRequest(raw: unknown, allowed: string[] = tinkerB
     return { error: `these settings need ${steps} optimizer steps and a run may take ${TINKER_MAX_STEPS}: raise batch_size or lower epochs` }
   }
   const purpose = typeof raw.purpose === 'string' ? raw.purpose.replace(/\s+/g, ' ').trim().slice(0, 200) : ''
+  // The name is optional and never decides the run: a name that is refused
+  // is left off, with the reason, and the request stands.
+  const named = names && raw.name !== undefined && raw.name !== null && raw.name !== '' ? readAdapterName(raw.name) : null
   return {
     request: {
       purpose, base_model: base, examples, settings: checked.settings,
       dataset_sha256: createHash('sha256').update(JSON.stringify(examples), 'utf8').digest('hex'),
       dataset_bytes: bytes,
+      ...(named && 'name' in named ? { name: named.name } : {}),
+      ...(named && 'error' in named ? { name_refused: named.error } : {}),
     },
   }
 }
@@ -467,6 +529,13 @@ export function isSamplerPath(v: unknown): v is string {
   return typeof v === 'string' && v.length <= 320 && SAMPLER_PATH.test(v)
 }
 
+/** Weights saved for use outside Tinker, as Tinker names them. Only these can be downloaded. */
+export const EXTERNAL_PATH = /^tinker:\/\/[A-Za-z0-9][A-Za-z0-9._:-]{0,200}\/external_weights\/[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/
+
+export function isExternalPath(v: unknown): v is string {
+  return typeof v === 'string' && v.length <= 320 && EXTERNAL_PATH.test(v)
+}
+
 export interface TinkerSample { prompt: string; completion: string }
 
 export interface TinkerRunResult {
@@ -489,6 +558,8 @@ export interface TinkerRunResult {
   ttl_seconds: number | null
   samples: TinkerSample[]
   wall_seconds: number | null
+  /** The weights saved for download, when the lab asked the runner for them (adapters can be kept) and the save worked. */
+  external_path?: string
 }
 
 const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
@@ -526,16 +597,16 @@ export function normalizeTinkerResult(raw: unknown): TinkerRunResult {
     const completion = short(s.completion, 600)
     if (prompt) samples.push({ prompt, completion })
   }
-  return { ...base, status: 'ok', sampler_path: r.sampler_path, samples }
+  return { ...base, status: 'ok', sampler_path: r.sampler_path, samples, ...(isExternalPath(r.external_path) ? { external_path: r.external_path } : {}) }
 }
 
 /** One line for the stored record and the next epoch's context. Says what was measured, by whom, and that the cost is an estimate. */
-export function describeTinkerRun(r: TinkerRunResult, baseModel: string, slug: string | null, costUsd: number, expiresAt: string | null): string {
+export function describeTinkerRun(r: TinkerRunResult, baseModel: string, slug: string | null, costUsd: number, expiresAt: string | null, name: string | null = null): string {
   const cost = `estimated cost $${costUsd.toFixed(4)} (token counts at Tinker's published prices of ${TINKER_PRICE_TABLE_DATE}, not a billed amount)`
   if (r.status === 'ok') {
     const loss = `LAB-MEASURED held-out loss ${r.holdout_loss_before!.toFixed(4)} before training, ${r.holdout_loss_after!.toFixed(4)} after, on ${r.n_holdout ?? '?'} examples the lab held out`
     const steps = `${r.steps_done ?? '?'} of ${r.steps_planned ?? '?'} steps${r.stopped_early ? ` (stopped early: ${r.stopped_early})` : ''}`
-    const adapter = slug ? `adapter lab/${slug} on ${baseModel}${expiresAt ? `, kept until ${expiresAt.slice(0, 10)}` : ''}` : `adapter on ${baseModel}`
+    const adapter = slug ? `adapter lab/${slug}${name ? ` named "${name}"` : ''} on ${baseModel}${expiresAt ? `, kept until ${expiresAt.slice(0, 10)}` : ''}` : `adapter on ${baseModel}`
     return `${loss}; ${steps}; ${adapter}; ${cost}`
   }
   if (r.status === 'refused') return `refused by the runner${r.stage ? ` (${r.stage})` : ''}: ${r.reason}; ${cost}`
@@ -574,10 +645,13 @@ export function newSplitSalt(): string {
  * to train. `liveTrained` adds the fact that kept adapters answer on the lab
  * model endpoint.
  */
-export function tinkerNote(opts: { perDay: number; liveTrained: boolean }): string {
+export function tinkerNote(opts: { perDay: number; liveTrained: boolean; names?: boolean }): string {
   const models = tinkerBaseModels().models.join(', ')
+  const named = opts.names
+    ? ` You may give the adapter a display name with "name": ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters, only letters, digits, spaces, hyphens, apostrophes and dots. The name is a label shown beside the adapter's lab id; the lab id stays its identity. A name that another adapter still alive has, that looks like a web address, or that reads like a real model or product name is refused with the reason stored, and the run goes on without a name.`
+    : ''
   const live = opts.liveTrained
     ? ` While an adapter is kept, the lab model endpoint also answers for it as the model "lab/<name>", with the name from the run's record: text messages only, no tools.`
     : ''
-  return `Tinker training: as Executor you may ask for one LoRA fine-tuning run of an open-weight model on Tinker, a training service. LoRA only: the base model's own weights are not changed. The base model is one of: ${models}. You write the training data into your answer as chat conversations: ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} different examples, each 2 to ${TINKER_MAX_MESSAGES} messages (an optional system message, then user and assistant in turn, ending with the assistant), at most ${TINKER_MAX_EXAMPLE_BYTES} bytes of text in one example and ${TINKER_MAX_DATASET_BYTES} in all. Only the last assistant message of each example is trained on. Settings are bounded: rank ${TINKER_RANKS.join(', ')}; learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}; epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}; batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}; at most ${TINKER_MAX_STEPS} optimizer steps. A request that breaks any of this is refused whole, with the reason stored. The run needs the Reviewer's approval and happens after the epoch, run by the lab's own code: your answer supplies data and settings and no code. The lab estimates the most the run could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} a run or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC), at most ${opts.perDay} run${opts.perDay === 1 ? '' : 's'} a day, inside the lab's daily spending cap. Costs are estimates from Tinker's published prices, because Tinker reports no cost per call. The lab holds out about a tenth of the examples, chosen by the lab after the request so that you cannot know which, and measures the loss on them before and after training: that score is measured by the lab, not reported by you. A few completions on held-out prompts are sampled and stored. The dataset's size and hash, the settings, both scores, the samples and the adapter's name are public. The adapter is kept for ${tinkerTtlDays()} days and then expires.${live}`
+  return `Tinker training: as Executor you may ask for one LoRA fine-tuning run of an open-weight model on Tinker, a training service. LoRA only: the base model's own weights are not changed. The base model is one of: ${models}. You write the training data into your answer as chat conversations: ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} different examples, each 2 to ${TINKER_MAX_MESSAGES} messages (an optional system message, then user and assistant in turn, ending with the assistant), at most ${TINKER_MAX_EXAMPLE_BYTES} bytes of text in one example and ${TINKER_MAX_DATASET_BYTES} in all. Only the last assistant message of each example is trained on. Settings are bounded: rank ${TINKER_RANKS.join(', ')}; learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}; epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}; batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}; at most ${TINKER_MAX_STEPS} optimizer steps. A request that breaks any of this is refused whole, with the reason stored. The run needs the Reviewer's approval and happens after the epoch, run by the lab's own code: your answer supplies data and settings and no code. The lab estimates the most the run could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} a run or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC), at most ${opts.perDay} run${opts.perDay === 1 ? '' : 's'} a day, inside the lab's daily spending cap. Costs are estimates from Tinker's published prices, because Tinker reports no cost per call. The lab holds out about a tenth of the examples, chosen by the lab after the request so that you cannot know which, and measures the loss on them before and after training: that score is measured by the lab, not reported by you. A few completions on held-out prompts are sampled and stored. The dataset's size and hash, the settings, both scores, the samples and the adapter's name are public. The adapter is kept for ${tinkerTtlDays()} days and then expires.${live}${named}`
 }
