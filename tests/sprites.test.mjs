@@ -187,6 +187,17 @@ test('exec sends cmd as repeated query params and reads the exit status from its
   reply = () => new Response('plain text, no marker')
   assert.equal((await execInSprite('claude', 'x')).exitCode, null)
 
+  // Terminal style line endings and stream framing bytes still give the exit status.
+  reply = nonce => new Response(` Test Files  47 passed (47)\r\n\r\n__EXIT_${nonce}:0\r\n`)
+  result = await execInSprite('claude', 'npm test')
+  assert.equal(result.exitCode, 0)
+  assert.equal(result.output, ' Test Files  47 passed (47)')
+  reply = nonce => new Response(`\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u0012ok\n\u0001\u0000\u0000\u0000\u0000\u0000\u0000\u001a__EXIT_${nonce}:1\n`)
+  result = await execInSprite('claude', 'npm test')
+  assert.equal(result.exitCode, 1)
+  reply = nonce => new Response(`no trailing newline\u001b[0m\n__EXIT_${nonce}:2\n`)
+  assert.equal((await execInSprite('claude', 'x')).exitCode, 2)
+
   // A marker printed by the command itself (wrong nonce) is ignored.
   reply = nonce => new Response(`__EXIT_0123456789abcdef:0\nreal failure\n__EXIT_${nonce}:1`)
   result = await execInSprite('claude', 'x')

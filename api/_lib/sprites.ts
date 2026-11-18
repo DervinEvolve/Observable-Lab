@@ -272,8 +272,13 @@ export function parseExecBody(body: string, contentType = ''): { output: string;
 /**
  * Find the wrapper's exit marker (the last one) and remove it from the output.
  * Returns null when it is missing, e.g. the process was killed before it ran.
+ * Line endings and control bytes are evened out first: the exec endpoint can
+ * answer with terminal style \r\n lines or stream framing bytes, and before
+ * this every real run came back as "no exit status" with the marker in plain
+ * sight.
  */
-export function takeExitMarker(output: string, nonce: string): { output: string; exitCode: number | null } {
+export function takeExitMarker(raw: string, nonce: string): { output: string; exitCode: number | null } {
+  const output = raw.replace(ANSI, '').replace(/\r\n?/g, '\n').replace(CONTROL, '')
   const marker = new RegExp(`(?:^|\\n)__EXIT_${nonce}:(\\d{1,3})[ \\t]*(?=\\n|$)`, 'g')
   let last: RegExpExecArray | null = null
   for (let m = marker.exec(output); m; m = marker.exec(output)) last = m
@@ -289,7 +294,8 @@ export function takeExitMarker(output: string, nonce: string): { output: string;
 function wrapperScript(nonce: string): string {
   return [
     '( if command -v timeout >/dev/null 2>&1; then timeout -k 5 "$1" bash -lc "$2"; else bash -lc "$2"; fi ) 2>&1',
-    `echo "__EXIT_${nonce}:$?"`,
+    // On its own line even when the output did not end with a newline.
+    `s=$?; printf '\\n__EXIT_${nonce}:%s\\n' "$s"`,
   ].join('\n')
 }
 
