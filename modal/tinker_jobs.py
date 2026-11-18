@@ -169,6 +169,18 @@ MANIFEST_NAME = "lab_manifest.json"
 KEEP_FILE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99}){0,3}"
 KEEP_TIMEOUT_S = 900
 DOWNLOAD_TIMEOUT_S = 300
+# Converting a copy to PEFT needs the base model's config and the names and
+# shapes of its weights, never the weights. The runner reads those from the
+# public Hugging Face repository: config.json, and the header of each
+# safetensors file. A header is a few hundred KB; the weights are gigabytes.
+HF_HOST = "https://huggingface.co"
+HF_TIMEOUT_S = 60
+HF_REVISION_PATTERN = r"[0-9a-f]{40}"
+BASE_SHARD_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,150}\.safetensors"
+BASE_LISTING_MAX_BYTES = 8 * 1024 * 1024
+BASE_CONFIG_MAX_BYTES = 1024 * 1024
+BASE_HEADERS_MAX_BYTES = 64 * 1024 * 1024
+BASE_MAX_SHARDS = 200
 
 app = modal.App(APP_NAME)
 
@@ -743,8 +755,12 @@ def list_files(folder: str) -> list:
     return sorted(out, key=lambda item: item["path"])
 
 
-def write_manifest(folder: str, manifest: dict, files: list, fmt: str, source, note, clock=time.time) -> None:
-    """The lab's manifest of the run, with what the copy holds, beside the weights."""
+def write_manifest(folder: str, manifest: dict, files: list, fmt: str, source, note, clock=time.time, revision=None) -> None:
+    """The lab's manifest of the run, with what the copy holds, beside the weights.
+
+    `revision` is the base model revision on Hugging Face whose weight names a
+    PEFT copy was converted against, when the conversion said which.
+    """
     body = dict(manifest)
     body.update({
         "copy": {
@@ -752,6 +768,8 @@ def write_manifest(folder: str, manifest: dict, files: list, fmt: str, source, n
             "copied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock())), "note": note,
         },
     })
+    if isinstance(revision, str) and re.fullmatch(HF_REVISION_PATTERN, revision) is not None:
+        body["copy"]["base_model_revision"] = revision
     with open(os.path.join(folder, MANIFEST_NAME), "w", encoding="utf-8") as handle:
         json.dump(body, handle, indent=2, sort_keys=True)
         handle.write("\n")
@@ -809,10 +827,10 @@ def copy_weights(job: dict, deps, root: str, scratch: str, clock=time.time, log=
                 return {"status": "error", "reason": "the weights are larger than the %d bytes a copy may weigh" % job["max_bytes"]}
             left -= got
 
-        fmt, note, source = "tinker", None, raw
+        fmt, note, source, revision = "tinker", None, raw, None
         converted = os.path.join(scratch, "peft")
         try:
-            deps.to_peft(job["base_model"], raw, converted)
+            revision = deps.to_peft(job["base_model"], raw, converted)
             if list_files(converted):
                 fmt, source = "peft", converted
             else:
@@ -827,9 +845,14 @@ def copy_weights(job: dict, deps, root: str, scratch: str, clock=time.time, log=
         if size > job["max_bytes"]:
             return {"status": "error", "reason": "the copy is %d bytes and may weigh %d" % (size, job["max_bytes"])}
 
+        # A folder left half written by a runner that was stopped is cleared
+        # first. Only one keep runs at a time, so none of them is in use.
+        for name in os.listdir(root):
+            if name.startswith(".incoming-"):
+                shutil.rmtree(os.path.join(root, name), ignore_errors=True)
         incoming = os.path.join(root, ".incoming-%s-%d" % (slug, int(clock() * 1000)))
         shutil.copytree(source, incoming, symlinks=False)
-        write_manifest(incoming, job["manifest"], files, fmt, external, note, clock)
+        write_manifest(incoming, job["manifest"], files, fmt, external, note, clock, revision if fmt == "peft" else None)
         if os.path.isdir(final):
             shutil.rmtree(final)
         os.replace(incoming, final)
@@ -846,8 +869,9 @@ def keep_core(job, make_deps, root=KEPT_DIR, clock=time.time, log=print) -> dict
     object with: set_ttl(path, ttl_seconds); checkpoint_count() -> how many
     checkpoints the account holds, or None; external_urls(path) -> {file:
     signed url}; fetch(url, target, max_bytes) -> bytes written, or None when
-    the file is larger; to_peft(base_model, source, target); commit(); and
-    secrets() -> values to scrub from error text.
+    the file is larger; to_peft(base_model, source, target) -> the base model
+    revision the conversion read, or None; commit(); and secrets() -> values
+    to scrub from error text.
 
     The adapter is kept when its time to live was set: that is what keeps it
     answering. The copy is reported beside it and never undoes the keep.
@@ -963,6 +987,99 @@ def download_capped(url: str, target: str, max_bytes: int, opener=None) -> Optio
     return written
 
 
+def read_https(url: str, max_bytes: int, first: Optional[int] = None, opener=None) -> bytes:
+    """Reads an https address, at most max_bytes of it. With `first`, reads exactly max_bytes starting at that byte.
+
+    A range must be answered as a range (206, starting where it was asked
+    to): a server that sends the whole file instead is not read. Redirects
+    are followed, as Hugging Face sends its files from another host, but only
+    to https. Raises on anything else.
+    """
+    if not url.startswith("https://"):
+        raise ValueError("not an https address")
+    headers = {"User-Agent": "observable-lab-runner"}
+    if first is not None:
+        headers["Range"] = "bytes=%d-%d" % (first, first + max_bytes - 1)
+    request = urllib.request.Request(url, headers=headers)
+    with (opener or urllib.request.urlopen)(request, timeout=HF_TIMEOUT_S) as response:
+        if not str(response.geturl()).startswith("https://"):
+            raise ValueError("redirected to an address that is not https")
+        if first is not None:
+            content_range = str(response.headers.get("Content-Range", ""))
+            if response.status != 206 or not content_range.startswith("bytes %d-" % first):
+                raise ValueError("the server did not answer with the byte range asked for")
+        data = response.read(max_bytes + 1)
+    if first is not None and len(data) != max_bytes:
+        raise ValueError("the server sent %d bytes of a range of %d" % (len(data), max_bytes))
+    if len(data) > max_bytes:
+        raise ValueError("more than %d bytes" % max_bytes)
+    return data
+
+
+def base_model_headers(base_model: str, folder: str, read=read_https) -> str:
+    """Writes what a PEFT conversion reads of a base model into `folder`, without its weights. Returns the revision read.
+
+    The folder gets the repository's config.json and, for each safetensors
+    file at its top, a file of the same name and the same length that holds
+    the real header (the names, types and shapes of the weights) and nothing
+    after it: the rest is a hole, which takes no room on disk. The cookbook's
+    conversion opens these to list names and shapes and never reads a weight.
+    Everything is read at one revision, the one the listing names.
+    """
+    if base_model not in RENDERERS:
+        raise ValueError("base_model is not one this runner trains")
+    listing = json.loads(read("%s/api/models/%s?blobs=true" % (HF_HOST, base_model), BASE_LISTING_MAX_BYTES).decode("utf-8"))
+    revision = listing.get("sha") if isinstance(listing, dict) else None
+    if not isinstance(revision, str) or re.fullmatch(HF_REVISION_PATTERN, revision) is None:
+        raise ValueError("Hugging Face named no revision for the base model")
+    shards = []
+    for item in listing.get("siblings") or []:
+        name = item.get("rfilename") if isinstance(item, dict) else None
+        if isinstance(name, str) and re.fullmatch(BASE_SHARD_PATTERN, name) is not None:
+            if not _is_int(item.get("size")) or item["size"] < 8:
+                raise ValueError("Hugging Face gave no size for %s" % name)
+            shards.append((name, item["size"]))
+    if not shards or len(shards) > BASE_MAX_SHARDS:
+        raise ValueError("the base model has %d safetensors files at its top" % len(shards))
+    resolve = "%s/%s/resolve/%s/" % (HF_HOST, base_model, revision)
+
+    config = read(resolve + "config.json", BASE_CONFIG_MAX_BYTES)
+    if not isinstance(json.loads(config.decode("utf-8")), dict):
+        raise ValueError("the base model's config.json is not an object")
+    os.makedirs(folder, exist_ok=True)
+    with open(os.path.join(folder, "config.json"), "wb") as out:
+        out.write(config)
+
+    left = BASE_HEADERS_MAX_BYTES
+    for name, size in sorted(shards):
+        length = int.from_bytes(read(resolve + name, 8, first=0), "little")
+        if length < 2 or 8 + length > size or length > left:
+            raise ValueError("the header of %s is %d bytes, more than the lab reads" % (name, length))
+        left -= length
+        header = read(resolve + name, length, first=8)
+        if not isinstance(json.loads(header.decode("utf-8")), dict):
+            raise ValueError("the header of %s is not an object" % name)
+        target = os.path.join(folder, name)
+        with open(target, "wb") as out:
+            out.write(length.to_bytes(8, "little"))
+            out.write(header)
+        os.truncate(target, size)
+    return revision
+
+
+def name_base_model(folder: str, base_model: str) -> None:
+    """Puts the base model's real name in a converted adapter's config, where the conversion wrote the folder it read from."""
+    path = os.path.join(folder, "adapter_config.json")
+    with open(path, encoding="utf-8") as handle:
+        config = json.load(handle)
+    if not isinstance(config, dict):
+        raise ValueError("the converted adapter_config.json is not an object")
+    config["base_model_name_or_path"] = base_model
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(config, handle, indent=2)
+        handle.write("\n")
+
+
 class KeepDeps:
     """Tinker's checkpoint calls and the Volume, as keep_core and unkeep_core use them. The SDK reads TINKER_API_KEY itself."""
 
@@ -990,11 +1107,22 @@ class KeepDeps:
     def fetch(self, url: str, target: str, max_bytes: int) -> Optional[int]:
         return download_capped(url, target, max_bytes)
 
-    def to_peft(self, base_model: str, source: str, target: str) -> None:
+    def to_peft(self, base_model: str, source: str, target: str) -> Optional[str]:
         from tinker_cookbook import weights
 
-        # Reads the base model's configuration from Hugging Face (no weights). No code from the repository is run.
-        weights.build_lora_adapter(base_model=base_model, adapter_path=source, output_path=target, trust_remote_code=False)
+        # The cookbook's conversion, given a base model's name, downloads the
+        # whole repository, weights and all (gigabytes). It reads only the
+        # config and the names and shapes of the weights, so it is given a
+        # folder that holds just those (base_model_headers). No code from the
+        # repository is run. Returns the base model revision that was read.
+        stub = tempfile.mkdtemp(prefix="oblab-base-")
+        try:
+            revision = base_model_headers(base_model, stub)
+            weights.build_lora_adapter(base_model=stub, adapter_path=source, output_path=target, trust_remote_code=False)
+            name_base_model(target, base_model)
+            return revision
+        finally:
+            shutil.rmtree(stub, ignore_errors=True)
 
     def commit(self) -> None:
         kept_volume.commit()
