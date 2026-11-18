@@ -19,11 +19,12 @@ import { getRoleAssignments } from './role-rotation.js'
 import { generatePlantFromSpec } from './plant-generator.js'
 import { addNotebookNote, getRecentNotebook } from './notebook.js'
 import { releaseEpoch } from './epoch-claim.js'
-import { epochSpend } from './spend.js'
+import { epochSpend, recordModelCall } from './spend.js'
+import { researchAlongside } from './experiment-modes.js'
 import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
-  provenanceOf, provenanceTrailers, putResearchFile, startResearchRun, writeFindingPage,
+  provenanceOf, provenanceTrailers, putResearchFile, researchGpuCostUsd, startResearchRun, writeFindingPage,
   type ResearchRunResult,
 } from './research.js'
 import {
@@ -206,6 +207,17 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         throw new Error(`GPU run still in progress at poll deadline (call ${callId}) — epoch will resume next tick`)
       }
       runResult = awaited
+      // Beside run 2, research has its own daily cap and the GPU time counts
+      // against it: an estimate from the runner's measured time, written to
+      // the ledger once, when the result first arrives.
+      if (researchAlongside()) {
+        const gpuCost = researchGpuCostUsd(runResult, RESEARCH_BUDGET_S)
+        await recordModelCall({
+          model: 'tool/research_gpu_run', assigned: roleAssignments.executor, cost_usd: gpuCost, cost_source: 'estimate',
+          prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0,
+        })
+        totalCost += gpuCost
+      }
       await sql`
         UPDATE epochs SET research_run = ${JSON.stringify({ call_id: callId, budget_s: RESEARCH_BUDGET_S, result: runResult })}
         WHERE id = ${epochId}

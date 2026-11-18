@@ -1199,8 +1199,11 @@ class ObservableLab {
     {
       const inProg = state.recent_epochs.find(e => !e.completed_at)
       const training = !!(state.epoch_in_progress && inProg?.research_run?.call_id && !inProg?.research_run?.result)
-      this.trainingRig?.setActive(training)
-      const research = state.current_spec.meta.research
+      // Research running beside this experiment reports its GPU run and its
+      // scores in `research`; the rack shows those.
+      const side = state.research
+      this.trainingRig?.setActive(training || side?.gpu_running === true)
+      const research = state.current_spec.meta.research ?? side
       this.trainingRig?.setResearch(research?.best_bpb ?? null, research?.baseline_bpb ?? null)
     }
 

@@ -10,9 +10,17 @@
  * The experiment/epoch for a call comes from an async context set by whoever
  * starts the work (runEpoch, runAndPersistNorth), so callModel's callers do
  * not have to pass it through.
+ *
+ * With LAB_RESEARCH_ALONGSIDE on there are two caps. Every row already
+ * carries its experiment, and an experiment's mode never changes, so the
+ * split is a join at read time: LAB_RESEARCH_DAILY_BUDGET_USD counts the
+ * rows of research experiments (the GPU run estimate included), and
+ * LAB_DAILY_BUDGET_USD counts every other row. With the flag off there is
+ * one cap over all rows, as before.
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { sql } from '@vercel/postgres'
+import { researchAlongside, type ExperimentMode } from './experiment-modes.js'
 
 export interface SpendContext {
   experimentId?: string
@@ -147,12 +155,40 @@ export function nextUtcMidnight(now: Date): Date {
   return new Date(utcDayStart(now).getTime() + 24 * 60 * 60 * 1000)
 }
 
-export async function spentTodayUsd(now: Date = new Date()): Promise<number> {
+export const DEFAULT_RESEARCH_DAILY_BUDGET_USD = 40
+
+/** The research experiment's own cap, used only while LAB_RESEARCH_ALONGSIDE is on. */
+export function researchDailyBudgetUsd(): number {
+  const raw = (process.env.LAB_RESEARCH_DAILY_BUDGET_USD ?? '').trim()
+  if (!raw) return DEFAULT_RESEARCH_DAILY_BUDGET_USD
+  const n = Number(raw)
+  return Number.isFinite(n) && n >= 0 ? n : DEFAULT_RESEARCH_DAILY_BUDGET_USD
+}
+
+/**
+ * Today's spend (UTC). With no scope, every row. With a scope, only the rows
+ * of that kind of experiment: `research` is rows whose experiment is in
+ * research mode, `classic` is every other row (rows with no experiment too).
+ */
+export async function spentTodayUsd(now: Date = new Date(), scope?: ExperimentMode): Promise<number> {
   await ensureSpendTable()
-  const r = await sql`
+  const since = utcDayStart(now).toISOString()
+  const r = scope === 'research'
+    ? await sql`
+      SELECT COALESCE(SUM(m.cost_usd), 0) AS total
+      FROM model_calls m JOIN experiments e ON e.id = m.experiment_id
+      WHERE m.created_at >= ${since} AND jsonb_typeof(e.current_spec->'meta'->'research') = 'object'
+    `
+    : scope === 'classic'
+    ? await sql`
+      SELECT COALESCE(SUM(m.cost_usd), 0) AS total
+      FROM model_calls m LEFT JOIN experiments e ON e.id = m.experiment_id
+      WHERE m.created_at >= ${since} AND jsonb_typeof(e.current_spec->'meta'->'research') IS DISTINCT FROM 'object'
+    `
+    : await sql`
     SELECT COALESCE(SUM(cost_usd), 0) AS total
     FROM model_calls
-    WHERE created_at >= ${utcDayStart(now).toISOString()}
+    WHERE created_at >= ${since}
   `
   return Number(r.rows[0]?.total) || 0
 }
@@ -163,28 +199,45 @@ export interface BudgetStatus {
   budget_usd: number
   resumes_at: string        // next UTC midnight
   reason?: string
+  scope?: ExperimentMode    // which cap this is, when there are two
 }
 
 export const BUDGET_PAUSED_STATE = 'paused: daily budget reached'
+export const RESEARCH_BUDGET_REACHED = 'research daily budget reached'
+export const RESEARCH_BUDGET_PAUSED_STATE = `paused: ${RESEARCH_BUDGET_REACHED}`
+
+/** The run state for a budget pause: research names its own cap. */
+export function budgetPausedState(status: BudgetStatus): string {
+  return status.reason === RESEARCH_BUDGET_REACHED ? RESEARCH_BUDGET_PAUSED_STATE : BUDGET_PAUSED_STATE
+}
 
 /**
  * May the lab spend more today? Fails closed: if the ledger can't be read,
  * nothing new starts, because the cap could not be checked.
+ *
+ * `scope` says whose work is asking. It only matters while
+ * LAB_RESEARCH_ALONGSIDE is on: then research is held to its own cap and
+ * its own spend, and everything else to LAB_DAILY_BUDGET_USD and the spend
+ * that is not research. With the flag off both scopes are the one cap over
+ * all spend.
  */
-export async function checkDailyBudget(now: Date = new Date()): Promise<BudgetStatus> {
-  const budget = dailyBudgetUsd()
+export async function checkDailyBudget(now: Date = new Date(), scope: ExperimentMode = 'classic'): Promise<BudgetStatus> {
+  const split = researchAlongside()
+  const research = split && scope === 'research'
+  const budget = research ? researchDailyBudgetUsd() : dailyBudgetUsd()
   const resumes_at = nextUtcMidnight(now).toISOString()
+  const which = split ? { scope } : {}
   let spent: number
   try {
-    spent = await spentTodayUsd(now)
+    spent = await spentTodayUsd(now, split ? scope : undefined)
   } catch (e) {
     console.warn('[spend] could not read today\'s spend:', e instanceof Error ? e.message : e)
-    return { allowed: false, spent_usd: null, budget_usd: budget, resumes_at, reason: 'spend ledger unavailable' }
+    return { allowed: false, spent_usd: null, budget_usd: budget, resumes_at, reason: 'spend ledger unavailable', ...which }
   }
   if (spent >= budget) {
-    return { allowed: false, spent_usd: spent, budget_usd: budget, resumes_at, reason: 'daily budget reached' }
+    return { allowed: false, spent_usd: spent, budget_usd: budget, resumes_at, reason: research ? RESEARCH_BUDGET_REACHED : 'daily budget reached', ...which }
   }
-  return { allowed: true, spent_usd: spent, budget_usd: budget, resumes_at }
+  return { allowed: true, spent_usd: spent, budget_usd: budget, resumes_at, ...which }
 }
 
 export class BudgetPausedError extends Error {
@@ -205,8 +258,8 @@ export function describeRunState(
   budget: BudgetStatus | null
 ): { run_state: string; resumes_at?: string } {
   if (exp.epoch_in_progress) return { run_state: 'running epoch' }
-  if (budget && !budget.allowed && budget.reason === 'daily budget reached') {
-    return { run_state: BUDGET_PAUSED_STATE, resumes_at: budget.resumes_at }
+  if (budget && !budget.allowed && (budget.reason === 'daily budget reached' || budget.reason === RESEARCH_BUDGET_REACHED)) {
+    return { run_state: budgetPausedState(budget), resumes_at: budget.resumes_at }
   }
   if (exp.status === 'failing') return { run_state: 'failing: stability below 0.2, epochs continue' }
   return { run_state: 'waiting for next epoch' }

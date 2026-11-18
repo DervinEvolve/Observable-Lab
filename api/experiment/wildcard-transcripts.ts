@@ -11,7 +11,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const experimentResult = await sql`
-      SELECT id FROM experiments WHERE status != 'archived' ORDER BY created_at DESC LIMIT 1
+      SELECT id FROM experiments WHERE status != 'archived'
+      ORDER BY (jsonb_typeof(current_spec->'meta'->'research') IS NOT DISTINCT FROM 'object'), created_at DESC LIMIT 1
     `
     const experiment = experimentResult.rows[0]
     if (!experiment) {

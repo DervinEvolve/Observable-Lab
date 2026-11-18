@@ -13,6 +13,7 @@ import { loadGraph } from './knowledge-graph-store.js'
 import { recordToolRun } from './tool-runs-store.js'
 import { logEpochForResearch } from './research-logger.js'
 import { claimEpoch, releaseEpoch, EpochBusyError } from './epoch-claim.js'
+import { budgetScopeFor } from './experiment-modes.js'
 import {
   BudgetPausedError, checkDailyBudget, describeBudget, epochSpend, setSpendEpoch, withSpendContext,
 } from './spend.js'
@@ -224,7 +225,8 @@ export interface EpochRunResult {
  * experiment and epoch. The claim is released however the epoch ends.
  */
 export async function runEpoch(experimentId: string): Promise<EpochRunResult> {
-  const budget = await checkDailyBudget()
+  // One cap for everything, or research's own cap when it runs alongside (spend.ts).
+  const budget = await checkDailyBudget(new Date(), await budgetScopeFor(experimentId))
   if (!budget.allowed) {
     console.warn(`[Epoch] Not starting an epoch for ${experimentId}: ${describeBudget(budget)}`)
     throw new BudgetPausedError(budget)

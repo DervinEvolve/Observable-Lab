@@ -27,7 +27,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
   try {
     const exp = (await sql`
-      SELECT id, current_epoch FROM experiments WHERE status <> 'archived' ORDER BY created_at DESC LIMIT 1
+      SELECT id, current_epoch FROM experiments WHERE status <> 'archived'
+      ORDER BY (jsonb_typeof(current_spec->'meta'->'research') IS NOT DISTINCT FROM 'object'), created_at DESC LIMIT 1
     `).rows[0]
     if (!exp) return res.status(404).json({ error: 'No active experiment' })
 

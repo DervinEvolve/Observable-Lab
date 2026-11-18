@@ -3,9 +3,10 @@ import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { sql } from '@vercel/postgres'
 import { runEpoch } from '../_lib/epoch-runner.js'
 import { EpochBusyError } from '../_lib/epoch-claim.js'
-import { BUDGET_PAUSED_STATE, BudgetPausedError } from '../_lib/spend.js'
+import { BudgetPausedError, budgetPausedState } from '../_lib/spend.js'
 import { persistGlassIfBrokenOut } from '../_lib/growth.js'
 import { requeueFollowUp, runEpochFollowUp } from '../_lib/epoch-followup.js'
+import { researchAlongside } from '../_lib/experiment-modes.js'
 
 // POST /api/epoch/run - Force trigger an epoch (operator). Shares the atomic
 // claim with the cron, so the two can never run an epoch at the same time,
@@ -18,18 +19,32 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 
   try {
-    // The newest active experiment (anything not archived, failing included).
-    const experimentResult = await sql`
-      SELECT * FROM experiments
-      WHERE status <> 'archived'
-      ORDER BY created_at DESC
+    // The classic experiment, or the only active one (anything not archived,
+    // failing included). ?mode=research means the research experiment
+    // instead, while it runs beside the classic one (LAB_RESEARCH_ALONGSIDE).
+    const wantResearch = req.query.mode === 'research'
+    if (wantResearch && !researchAlongside()) {
+      return res.status(400).json({ error: 'mode=research needs LAB_RESEARCH_ALONGSIDE=true' })
+    }
+    const experimentResult = wantResearch
+      ? await sql`
+        SELECT * FROM experiments
+        WHERE status <> 'archived' AND jsonb_typeof(current_spec->'meta'->'research') = 'object'
+        ORDER BY created_at DESC
+        LIMIT 1
+      `
+      : await sql`
+      SELECT * FROM experiments WHERE status <> 'archived'
+      ORDER BY (jsonb_typeof(current_spec->'meta'->'research') IS NOT DISTINCT FROM 'object'), created_at DESC
       LIMIT 1
     `
 
     if (!experimentResult.rows[0]) {
       return res.status(404).json({
-        error: 'No active experiment found',
-        hint: 'POST to /api/experiment to seed a new experiment first',
+        error: wantResearch ? 'No active research experiment found' : 'No active experiment found',
+        hint: wantResearch
+          ? 'The tick starts one when LAB_RESEARCH_ALONGSIDE is on'
+          : 'POST to /api/experiment to seed a new experiment first',
       })
     }
 
@@ -64,14 +79,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       }
       if (e instanceof BudgetPausedError) {
         return res.status(429).json({
-          error: BUDGET_PAUSED_STATE,
+          error: budgetPausedState(e.status),
           reason: e.status.reason,
           resumes_at: e.status.resumes_at,
         })
       }
       throw e
     }
-    await persistGlassIfBrokenOut(experiment.id)
+    if (!wantResearch) await persistGlassIfBrokenOut(experiment.id)
 
     return res.status(200).json({
       success: true,

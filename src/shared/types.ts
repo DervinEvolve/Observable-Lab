@@ -417,6 +417,24 @@ export interface ExperimentState {
   resumes_at?: string // ISO time a budget pause ends (next UTC midnight)
   growth?: ExperimentGrowthRecord
   repos?: { lab: string; specimen: string; research: string }
+  research?: ResearchAlongside // the research experiment running beside this one, when there is one
+}
+
+// The research experiment in brief, while it runs beside the classic one
+// (LAB_RESEARCH_ALONGSIDE). Its full state is GET /api/experiment?mode=research.
+export interface ResearchAlongside {
+  id: string
+  status: string
+  current_epoch: number
+  epoch_in_progress: boolean
+  gpu_running: boolean // the epoch in progress has started a GPU run that has not answered yet
+  run_state: string // "running epoch", "waiting for next epoch", "paused: research daily budget reached", ...
+  resumes_at?: string
+  baseline_bpb: number | null
+  best_bpb: number | null
+  best_epoch: number | null
+  target_bpb: number | null
+  last_run: ResearchMeta['last_run'] | null
 }
 
 // How far the specimen has taken over the room (api/_lib/growth.ts, docs/GROWTH.md).

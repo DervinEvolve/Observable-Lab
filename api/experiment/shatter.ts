@@ -15,7 +15,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const experimentResult = await sql`
       SELECT id, glass_shattered FROM experiments
       WHERE status != 'archived'
-      ORDER BY created_at DESC
+      ORDER BY (jsonb_typeof(current_spec->'meta'->'research') IS NOT DISTINCT FROM 'object'), created_at DESC
       LIMIT 1
     `
 

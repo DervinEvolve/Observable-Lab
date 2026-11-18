@@ -13,6 +13,7 @@
 
 import { requireGitHubName, requireHttpsUrl } from './config.js'
 import { labCommitIdentityFields, modelTrailers } from './commit-identity.js'
+import { modalGpuUsdPerSecond } from './tools-config.js'
 
 const API_BASE = 'https://api.github.com'
 const BRANCH = 'main'
@@ -307,6 +308,23 @@ export interface ResearchRunResult {
   harness_sha256?: string
   budget_s?: number
   train_wall_seconds?: number // measured by the runner around train.py
+}
+
+// Seconds charged for a run whose own time never came back: the training
+// budget plus the runner's grace for startup and evaluation and a minute for
+// the sandbox to start. Errs high.
+export const RESEARCH_RUN_OVERHEAD_S = 180
+
+/**
+ * What a research run's GPU time is recorded as, in dollars. An estimate:
+ * the runner's whole measured time at the Modal GPU rate (tools-config.ts,
+ * LAB_MODAL_GPU_USD_PER_SECOND), which counts the CPU-only preparation at
+ * the GPU rate too, so it errs high. Modal's bill is not read back.
+ */
+export function researchGpuCostUsd(run: Pick<ResearchRunResult, 'wall_seconds'> | undefined, budgetS: number): number {
+  const wall = run?.wall_seconds
+  const seconds = typeof wall === 'number' && Number.isFinite(wall) && wall >= 0 ? wall : budgetS + RESEARCH_RUN_OVERHEAD_S
+  return seconds * modalGpuUsdPerSecond()
 }
 
 export async function startResearchRun(trainPy: string, budgetS: number): Promise<string> {

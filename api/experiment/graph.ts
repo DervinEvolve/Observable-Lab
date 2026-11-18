@@ -15,7 +15,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'GET') return res.status(405).json({ error: 'Method not allowed' })
   try {
     const exp = (await sql`
-      SELECT id FROM experiments WHERE status <> 'archived' ORDER BY created_at DESC LIMIT 1
+      SELECT id FROM experiments WHERE status <> 'archived'
+      ORDER BY (jsonb_typeof(current_spec->'meta'->'research') IS NOT DISTINCT FROM 'object'), created_at DESC LIMIT 1
     `).rows[0]
     if (!exp) return res.status(404).json({ error: 'No active experiment' })
     const graph = await loadGraph(exp.id)

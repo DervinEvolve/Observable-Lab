@@ -209,8 +209,10 @@ class FakeLab {
     if (text.startsWith('SELECT * FROM experiments WHERE id = ?') || text.startsWith('SELECT id, current_epoch, current_spec, glass_shattered FROM experiments WHERE id = ?')) {
       return { rows: this.experiments.filter(e => e.id === v[0]) }
     }
-    if (/FROM experiments e? ?WHERE e?\.?status <> 'archived' ORDER BY (e\.)?created_at DESC LIMIT 1/.test(text) || text.startsWith("SELECT id FROM experiments WHERE status <> 'archived'") || text.startsWith("SELECT * FROM experiments WHERE status <> 'archived'")) {
-      const active = this.experiments.filter(e => e.status !== 'archived').sort((a, b) => b.created_at - a.created_at)
+    // The classic experiment first, then the newest (experiment-modes.ts).
+    if (/FROM experiments e? ?WHERE e?\.?status <> 'archived' ORDER BY \(jsonb_typeof\((e\.)?current_spec->'meta'->'research'\) IS NOT DISTINCT FROM 'object'\), (e\.)?created_at DESC LIMIT 1/.test(text) || text.startsWith("SELECT id FROM experiments WHERE status <> 'archived'") || text.startsWith("SELECT * FROM experiments WHERE status <> 'archived'")) {
+      const isResearch = e => Boolean(e.current_spec?.meta?.research)
+      const active = this.experiments.filter(e => e.status !== 'archived').sort((a, b) => isResearch(a) - isResearch(b) || b.created_at - a.created_at)
       return {
         rows: active.slice(0, 1).map(e => {
           const own = this.epochs.filter(p => p.experiment_id === e.id).sort((a, b) => b.epoch_number - a.epoch_number)
@@ -879,7 +881,7 @@ test('the tick skips with a logged reason when the budget is spent, and the publ
   assert.notEqual(res.body.experiment_id, older.id)
   assert.ok(logs.some(l => /\[CRON\] Skipping epoch 6: daily budget reached \(\$3\.20 of \$3\.00/.test(l)), logs.join('\n'))
   const pick = lab.queries.find(q => q.text.includes('as last_epoch_at FROM experiments e'))
-  assert.match(pick.text, /ORDER BY e\.created_at DESC LIMIT 1$/)
+  assert.match(pick.text, /ORDER BY \(jsonb_typeof\(e\.current_spec->'meta'->'research'\) IS NOT DISTINCT FROM 'object'\), e\.created_at DESC LIMIT 1$/)
 
   const { default: experiment } = await load('api/experiment/index.js')
   const state = response()

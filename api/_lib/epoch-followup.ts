@@ -25,6 +25,7 @@ import { contributionBranchName } from './branch-names.js'
 import { persistContribution } from './code-contributions-store.js'
 import { addNotebookNote } from './notebook.js'
 import { claimEpoch, releaseEpoch } from './epoch-claim.js'
+import { budgetScopeFor } from './experiment-modes.js'
 import { checkDailyBudget, describeBudget, epochSpend, withSpendContext } from './spend.js'
 import { pickContributionCandidate, sanitizeDecisions, sanitizeMutations } from './model-output.js'
 import { answeredModel } from './openrouter.js'
@@ -126,7 +127,7 @@ export async function runEpochFollowUp(experimentId: string): Promise<FollowUpRu
   const pending = await pendingFollowUp(experimentId)
   if (!pending) return { ran: false, reason: 'nothing pending' }
 
-  const budget = await checkDailyBudget()
+  const budget = await checkDailyBudget(new Date(), await budgetScopeFor(experimentId))
   if (!budget.allowed) {
     console.warn(`[Follow-up] Not running epoch ${pending.epochNumber}'s follow-up: ${describeBudget(budget)}`)
     return { ran: false, reason: budget.reason ?? 'daily budget reached', epoch_number: pending.epochNumber }
