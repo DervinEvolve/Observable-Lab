@@ -63,6 +63,11 @@ const TOOL_LABEL: Record<string, string> = {
   subagent_explore: 'sent an explorer subagent',
   subagent_test: 'sent a test subagent', exhibit: 'proposed an exhibit', lab_proposal: 'proposed a change to the lab',
   tinker_train: 'fine-tuned a model on Tinker (scores measured by the lab)',
+  tinker_name: 'asked for a display name for its adapter',
+  keep_adapter: 'asked the lab to keep a trained adapter',
+  owner_keep_adapter: 'kept a trained adapter',
+  owner_unkeep_adapter: 'stopped keeping a trained adapter',
+  owner_clear_adapter_name: 'took a display name off an adapter',
 }
 
 function esc(text: unknown): string {

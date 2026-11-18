@@ -113,7 +113,8 @@ export function sources(v: unknown, max = 20): SourceLink[] {
 
 const num = (v: unknown): number => (Number.isFinite(Number(v)) ? Number(v) : 0)
 const iso = (v: unknown): string | null => (v ? new Date(v as string).toISOString() : null)
-const nameOf = (id: string) => modelDisplayName(id) || id
+// 'owner' is who a keep or an unkeep made through the operator route is stored under (tinker-keep.ts).
+const nameOf = (id: string) => modelDisplayName(id) || (id === 'owner' ? 'The owner' : id)
 
 /** Claimed-vs-recorded observations for one search-capable step. */
 export function searchFlags(hadWeb: boolean, claimed: string[], recorded: SourceLink[]): string[] {

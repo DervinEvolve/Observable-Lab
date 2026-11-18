@@ -10,9 +10,11 @@ import {
 import { liveModelNote } from './live-model.js'
 import {
   TINKER_BATCH_SIZE, TINKER_EPOCHS, TINKER_LEARNING_RATE, TINKER_MAX_EXAMPLES, TINKER_MAX_MESSAGES, TINKER_MIN_EXAMPLES, TINKER_RANKS,
-  estimateTinkerRun, tinkerBaseModels, tinkerNote, tinkerRunUsd, usdText,
+  estimateTinkerRun, tinkerBaseModels, tinkerNamesFlag, tinkerNote, tinkerRunUsd, usdText,
   type TinkerRequest,
 } from './tinker.js'
+import { KEEP_REASON_MAX, keepNote } from './tinker-keep-request.js'
+import { ADAPTER_NAME_MAX, ADAPTER_NAME_MIN } from './tinker-names.js'
 import { weightsLimits } from './weights.js'
 import { MAX_PARTS, MAX_TRIANGLES, FIXED_TRIANGLES, TUBE_RADIAL_SEGMENTS, MATERIALS, PLACEMENTS, SHAPES } from './exhibits.js'
 
@@ -73,7 +75,12 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
   }
   if (on('tinker_train')) {
     // What it does and where its limits are, nothing about what to train.
-    lines.push(`- ${tinkerNote({ perDay: config.tinker_train.per_day, liveTrained: liveTrainedToolStatus(config).enabled })}`)
+    // The sentence about naming the adapter is there only while names are on.
+    lines.push(`- ${tinkerNote({ perDay: config.tinker_train.per_day, liveTrained: liveTrainedToolStatus(config).enabled, ...(tinkerNamesFlag() ? { names: true } : {}) })}`)
+  }
+  if (on('keep_adapter')) {
+    // What keeping does and where its limits are, nothing about which adapter to keep.
+    lines.push(`- ${keepNote({ perDay: config.keep_adapter.per_day })}`)
   }
   if (on('lab_proposal')) {
     lines.push(`- Proposals to the lab itself: as Executor you may propose one change to the Observable-Lab repository (this room and its server). If the Reviewer approves, it is opened as a pull request labelled model-proposal. The lab never merges these: the owner reads them and decides.`)
@@ -95,8 +102,9 @@ export function executorToolsSection(config: ToolConfig = toolConfig()): string 
   if (on('exhibit')) fields.push(`    "exhibit": { "slug": "a-z 0-9 and -, 3 to 40 characters", "exhibit": { ...the exhibit, see below } }`)
   if (on('lab_proposal')) fields.push(`    "lab_proposal": { "title": "short", "summary": "what and why, for the owner", "files": [ { "path": "src/... api/... docs/... tests/... or modal/...", "content": "the whole new file" } ] }`)
   if (on('tinker_train')) {
-    fields.push(`    "tinker_train": { "purpose": "one line", "base_model": "${tinkerBaseModels().models.join('" | "')}" (optional), "examples": [ { "messages": [ { "role": "system" | "user" | "assistant", "content": "text" } ] }, ... ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} of them ], "settings": { "rank": ${TINKER_RANKS.join(' | ')}, "learning_rate": ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, "epochs": ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, "batch_size": ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max} } (optional) }`)
+    fields.push(`    "tinker_train": { "purpose": "one line", "base_model": "${tinkerBaseModels().models.join('" | "')}" (optional), "examples": [ { "messages": [ { "role": "system" | "user" | "assistant", "content": "text" } ] }, ... ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} of them ], "settings": { "rank": ${TINKER_RANKS.join(' | ')}, "learning_rate": ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, "epochs": ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, "batch_size": ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max} } (optional)${tinkerNamesFlag() ? `, "name": "a display name, ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters (optional)"` : ''} }`)
   }
+  if (on('keep_adapter')) fields.push(`    "keep_adapter": { "adapter": "the lab id of a trained adapter that is alive, like lab/e41-0a1b2c3d", "reason": "one line, at most ${KEEP_REASON_MAX} characters" }`)
   if (!fields.length) return ''
   let text = `
 
@@ -132,6 +140,12 @@ At most ${MAX_TRIANGLES} triangles in all, counted per copy as: ${tri}, tube ${T
   }
   if (on('tinker_train')) {
     text += `\nA Tinker training request takes exactly the fields shown: any other field, a value out of range or a malformed example refuses the whole request. Each example is 2 to ${TINKER_MAX_MESSAGES} messages: an optional system message, then user and assistant in turn, ending with the assistant. Settings left out get rank 16, learning_rate ${TINKER_LEARNING_RATE.fallback}, epochs ${TINKER_EPOCHS.fallback} and batch_size ${TINKER_BATCH_SIZE.fallback}. Nothing runs without the Reviewer's approval.`
+    if (tinkerNamesFlag()) {
+      text += ` The name is the one field that cannot refuse the request: a name the lab does not accept is left off, with the reason stored, and the run stands.`
+    }
+  }
+  if (on('keep_adapter')) {
+    text += `\nA request to keep an adapter takes exactly "adapter" and "reason". Nothing is kept without the Reviewer's approval.`
   }
   if (on('lab_proposal')) {
     text += `\nA lab proposal may hold 1 to 3 files under src/, api/, docs/, tests/ or modal/ (no workflows, configuration, dependency manifests or hidden paths). Each file you give replaces the whole file, so prefer new files or documents.`
@@ -149,30 +163,33 @@ export function tinkerReviewFacts(request: TinkerRequest): { line: string } {
 }
 
 /**
- * Asks the Reviewer to rule on an exhibit, a lab proposal or a Tinker
- * training run the Executor asked for. The lines say what the lab already
- * checked.
+ * Asks the Reviewer to rule on an exhibit, a lab proposal, a Tinker
+ * training run or a request to keep a trained adapter the Executor asked
+ * for. The lines say what the lab already checked.
  */
 export function reviewerToolSection(requests: {
   exhibit?: { slug: string; check: string }
   lab_proposal?: { title: string; files: string[] }
   tinker_train?: { line: string }
+  keep_adapter?: { line: string }
 }): string {
   const parts: string[] = []
   if (requests.exhibit) parts.push(`- An exhibit for the room, "${requests.exhibit.slug}" (it is in the Executor's "tools"). The lab's contract check: ${requests.exhibit.check}.`)
   if (requests.lab_proposal) parts.push(`- A proposal to the lab's own repository: "${requests.lab_proposal.title}" changing ${requests.lab_proposal.files.join(', ')}. The owner reviews it before anything merges.`)
   if (requests.tinker_train) parts.push(`- A Tinker training run: ${requests.tinker_train.line}.`)
+  if (requests.keep_adapter) parts.push(`- Keeping a trained adapter: ${requests.keep_adapter.line}.`)
   if (!parts.length) return ''
   const keys = [
     requests.exhibit ? '"exhibit": "approve" | "reject"' : '',
     requests.lab_proposal ? '"lab_proposal": "approve" | "reject"' : '',
     requests.tinker_train ? '"tinker_train": "approve" | "reject"' : '',
+    requests.keep_adapter ? '"keep_adapter": "approve" | "reject"' : '',
   ].filter(Boolean).join(', ')
   return `
 
 THE EXECUTOR ALSO ASKED FOR:
 ${parts.join('\n')}
-Rule on each with a "tool_verdicts" object in your JSON: { ${keys} }. Nothing is opened${requests.tinker_train ? ' or started' : ''} without "approve".`
+Rule on each with a "tool_verdicts" object in your JSON: { ${keys} }. Nothing is opened${requests.tinker_train ? ' or started' : ''}${requests.keep_adapter ? ' or kept' : ''} without "approve".`
 }
 
 // Create a compressed version of the spec for context (removes pruned items, summarizes older content)

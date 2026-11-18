@@ -32,7 +32,7 @@ import {
 } from './tinker.js'
 import { findTinkerCall, pollTinkerJob, startTinkerJob, tinkerJobBody, waitForTinkerJob, type TinkerPoll } from './tinker-client.js'
 import {
-  claimAdapterName, finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend, settleTinkerSpend,
+  claimAdapterName, shownName, finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend, settleTinkerSpend,
   type TinkerRunRow,
 } from './tinker-store.js'
 
@@ -121,7 +121,7 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
 
   const status: ToolRunStatus = result.status === 'ok' ? 'ok' : result.status === 'refused' ? 'failed' : 'error'
   // The display name, when the run was given one (names are on and it was free). A label; the lab id is the identity.
-  const displayName = row.display_name
+  const displayName = shownName(row)
   const line = describeTinkerRun(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName)
   await recordToolRun({
     experimentId: row.experiment_id, epoch: row.epoch, model: row.model, tool: TINKER_TOOL,
@@ -131,6 +131,7 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
       ...(result.status === 'ok' ? { adapter: `lab/${row.slug}`, sampler_path: result.sampler_path, expires_at: expiresAt } : {}),
       ...(displayName ? { name: displayName } : {}),
       ...(result.status === 'ok' && result.external_path ? { external_path: result.external_path } : {}),
+      ...(result.status === 'ok' && result.export_error ? { export_error: result.export_error } : {}),
       base_model: row.base_model,
       dataset: { sha256: row.dataset_sha256, examples: row.dataset_examples, bytes: row.dataset_bytes },
       settings: row.settings,

@@ -560,6 +560,8 @@ export interface TinkerRunResult {
   wall_seconds: number | null
   /** The weights saved for download, when the lab asked the runner for them (adapters can be kept) and the save worked. */
   external_path?: string
+  /** Why they were not saved, when the lab asked and the save failed. The run stands; the adapter can have no copy. */
+  export_error?: string
 }
 
 const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
@@ -597,7 +599,11 @@ export function normalizeTinkerResult(raw: unknown): TinkerRunResult {
     const completion = short(s.completion, 600)
     if (prompt) samples.push({ prompt, completion })
   }
-  return { ...base, status: 'ok', sampler_path: r.sampler_path, samples, ...(isExternalPath(r.external_path) ? { external_path: r.external_path } : {}) }
+  return {
+    ...base, status: 'ok', sampler_path: r.sampler_path, samples,
+    ...(isExternalPath(r.external_path) ? { external_path: r.external_path } : {}),
+    ...(!isExternalPath(r.external_path) && short(r.export_error, 200) ? { export_error: short(r.export_error, 200) } : {}),
+  }
 }
 
 /** One line for the stored record and the next epoch's context. Says what was measured, by whom, and that the cost is an estimate. */

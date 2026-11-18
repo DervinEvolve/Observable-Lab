@@ -87,10 +87,14 @@ export function tinkerKeepBody(opts: {
 }
 
 /** The body for unkeeping: the checkpoint's time to live goes back to the usual one, and the copy is removed only when asked. */
-export function tinkerUnkeepBody(opts: { jobId: string; slug: string; samplerPath: string; ttlSeconds: number; removeCopy: boolean }): Record<string, unknown> {
+export function tinkerUnkeepBody(opts: {
+  jobId: string; slug: string; samplerPath: string; externalPath: string | null; ttlSeconds: number; removeCopy: boolean
+}): Record<string, unknown> {
   return {
     run_id: opts.jobId,
-    unkeep: { slug: opts.slug, sampler_path: opts.samplerPath, ttl_seconds: opts.ttlSeconds, remove_copy: opts.removeCopy },
+    unkeep: {
+      slug: opts.slug, sampler_path: opts.samplerPath, external_path: opts.externalPath, ttl_seconds: opts.ttlSeconds, remove_copy: opts.removeCopy,
+    },
   }
 }
 

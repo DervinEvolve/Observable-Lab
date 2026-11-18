@@ -38,14 +38,14 @@ import {
   TINKER_KEEP_WAIT_MS, isSamplerPath, tinkerJobsConfigured, tinkerKeepDays, tinkerKeepFlag, tinkerKeepMax, tinkerKeepMaxMb, tinkerKeepStatus,
   tinkerTtlDays,
 } from './tinker.js'
-import { KEEP_TOOL, OWNER_KEEP_TOOL, OWNER_UNKEEP_TOOL, type KeepRequest } from './tinker-keep-request.js'
+import { KEEP_TOOL, OWNER_KEEP_TOOL, OWNER_NAME_TOOL, OWNER_UNKEEP_TOOL, type KeepRequest } from './tinker-keep-request.js'
 import {
   findTinkerCall, keepJobId, pollTinkerJob, startTinkerJob, tinkerKeepBody, tinkerUnkeepBody, waitForTinkerJob, type TinkerPoll,
 } from './tinker-client.js'
 import { adapterExpiry } from './tinker-run.js'
 import {
-  KEPT_BY_OWNER, claimKeepSlot, externalPathOf, finishKeep, getKeep, getRun, keptByName, listAdapters, listKeeps, markKeepStarted, openKeeps,
-  publicAdapter, releaseKeep, setAdapterExpiry,
+  KEPT_BY_OWNER, claimKeepSlot, clearAdapterName, externalPathOf, finishKeep, getKeep, getRun, keptByName, listAdapters, listKeeps, markKeepStarted, openKeeps,
+  publicAdapter, releaseKeep, setAdapterExpiry, shownName,
   type KeepRow, type TinkerRunRow, type TrainedAdapter,
 } from './tinker-store.js'
 
@@ -67,7 +67,8 @@ const modelName = (id: string) => modelDisplayName(id) || id.split('/').pop() ||
 
 /** An adapter as the record names it: its lab id, and its display name when it has one. */
 export function adapterLabel(run: Pick<TinkerRunRow, 'slug' | 'display_name'>): string {
-  return `lab/${run.slug}${run.display_name ? ` ("${run.display_name}")` : ''}`
+  const name = shownName(run)
+  return `lab/${run.slug}${name ? ` ("${name}")` : ''}`
 }
 
 function isAlive(run: TinkerRunRow | null, now: Date): run is TinkerRunRow & { sampler_path: string; expires_at: string } {
@@ -92,7 +93,7 @@ export function keepManifest(run: TinkerRunRow, keep: Pick<KeepRow, 'kept_by' | 
   return {
     schema: 'observable-lab/kept-adapter/1',
     lab_id: `lab/${run.slug}`,
-    name: run.display_name,
+    name: shownName(run),
     base_model: run.base_model,
     tinker_run_id: tinkerRunId(run.sampler_path),
     sampler_path: run.sampler_path,
@@ -225,7 +226,7 @@ async function completeKeep(keep: KeepRow, run: TinkerRunRow, poll: Extract<Tink
     await recordToolRun({
       ...place, tool, requestSummary, status: 'error', durationMs,
       outputTail: `not kept: ${reason}; its place was given back and it still expires on ${(run.expires_at ?? '').slice(0, 10)}`,
-      detail: { adapter: `lab/${run.slug}`, ...(run.display_name ? { name: run.display_name } : {}), kept_by: who(keep.kept_by), reason },
+      detail: { adapter: `lab/${run.slug}`, ...(shownName(run) ? { name: shownName(run) } : {}), kept_by: who(keep.kept_by), reason },
     })
     return { tool, status: 'error', summary: `${label} was not kept: ${reason}` }
   }
@@ -236,7 +237,7 @@ async function completeKeep(keep: KeepRow, run: TinkerRunRow, poll: Extract<Tink
   const expiresAt = adapterExpiry(keep.requested_at, result.ttl_seconds)
   const detail = {
     adapter: `lab/${run.slug}`,
-    ...(run.display_name ? { name: run.display_name } : {}),
+    ...(shownName(run) ? { name: shownName(run) } : {}),
     kept_by: who(keep.kept_by),
     reason: keep.reason,
     kept_until: expiresAt,
@@ -406,7 +407,8 @@ export async function unkeepAdapter(slug: string, opts: { removeCopy?: boolean; 
   let keep: KeepRow | null
   let run: TinkerRunRow | null
   try {
-    keep = await getKeep(slug)
+    // With keeping switched off the table is only looked at, never created: a lab that never kept anything has none.
+    keep = tinkerKeepFlag() ? await getKeep(slug) : await getKeep(slug, { createTables: false }).catch(() => null)
     run = keep ? await getRun(slug) : null
   } catch (e) {
     console.warn('[tinker-keep] could not read the keep:', e instanceof Error ? e.message : e)
@@ -421,7 +423,9 @@ export async function unkeepAdapter(slug: string, opts: { removeCopy?: boolean; 
   let copyNote = 'The copy on the Volume was left where it is.'
   if (tinkerJobsConfigured() && run && isSamplerPath(run.sampler_path)) {
     const jobId = keepJobId('u', slug, randomBytes(4).toString('hex'))
-    const started = await startTinkerJob(tinkerUnkeepBody({ jobId, slug, samplerPath: run.sampler_path, ttlSeconds, removeCopy: opts.removeCopy === true }))
+    const started = await startTinkerJob(tinkerUnkeepBody({
+      jobId, slug, samplerPath: run.sampler_path, externalPath: externalPathOf(run), ttlSeconds, removeCopy: opts.removeCopy === true,
+    }))
     if (!started.ok) return { ok: false, status: 'failed', message: `The runner did not start (${started.error}). Nothing was changed; call again.` }
     const poll = await waitForTinkerJob(started.callId, opts.maxWaitMs ?? TINKER_KEEP_WAIT_MS, opts.pollMs ?? 5_000)
     if (poll.state !== 'done') {
@@ -451,6 +455,25 @@ export async function unkeepAdapter(slug: string, opts: { removeCopy?: boolean; 
   return { ok: true, status: 'unkept', message: `lab/${slug} is no longer kept and expires on ${expiresAt.slice(0, 10)}. ${told} ${copyNote}`, expires_at: expiresAt }
 }
 
+/**
+ * Takes an adapter's display name away (the owner's route), and stores that
+ * it was done. The adapter, its id and its record of training are not
+ * touched. With names switched off and never used there is nothing to take.
+ */
+export async function removeAdapterName(slug: string): Promise<{ ok: boolean; message: string }> {
+  const run = await getRun(slug)
+  if (!run || !run.display_name) return { ok: false, message: `lab/${slug} has no display name.` }
+  const cleared = await clearAdapterName(slug)
+  if (!cleared) return { ok: false, message: `lab/${slug} has no display name.` }
+  await recordToolRun({
+    experimentId: run.experiment_id, epoch: run.epoch, model: KEPT_BY_OWNER, tool: OWNER_NAME_TOOL,
+    requestSummary: `take the display name off lab/${slug}`, status: 'ok',
+    outputTail: 'the display name was removed by the owner; the adapter is still addressed by its lab id',
+    detail: { adapter: `lab/${slug}` },
+  })
+  return { ok: true, message: `lab/${slug} has no display name any more.` }
+}
+
 // ---------------------------------------------------------------------------
 // What the owner's route shows
 // ---------------------------------------------------------------------------
@@ -468,7 +491,8 @@ export interface KeepOverview {
 /** Every adapter that is alive, and every place that is taken, for the owner. */
 export async function keepOverview(now: Date = new Date()): Promise<KeepOverview> {
   const status = tinkerKeepStatus()
-  const keeps = await listKeeps()
+  // With keeping switched off the table is only looked at, never created.
+  const keeps = tinkerKeepFlag() ? await listKeeps() : await listKeeps({ createTables: false }).catch(() => [])
   const bySlug = new Map(keeps.map(k => [k.slug, k]))
   const adapters = (await listAdapters(now, 50)).map(t => t.adapter)
   // With the switch off the list above carries no keep marks; add them here so the owner still sees what is kept.
@@ -492,15 +516,6 @@ export async function keepOverview(now: Date = new Date()): Promise<KeepOverview
 // ---------------------------------------------------------------------------
 // What the models are told
 // ---------------------------------------------------------------------------
-
-/**
- * One paragraph about keeping, only while it is on (the callers check). What
- * it does and where its limits are, nothing about which adapter to keep.
- */
-export function keepNote(opts: { perDay: number }): string {
-  const max = tinkerKeepMax()
-  return `Keeping a trained adapter: as Executor you may ask the lab to mark one trained adapter that is still alive as kept, by its lab id, with a one-line reason. It needs the Reviewer's approval and is done after the epoch by the lab's own code. At most one request an epoch and ${opts.perDay} a day, and at most ${max} adapter${max === 1 ? ' is' : 's are'} kept at one time: when that many are kept a request is refused, and only the owner can unkeep one. A kept adapter stays on Tinker for ${tinkerKeepDays()} days from the day it is kept instead of expiring ${tinkerTtlDays()} days after training, so it goes on answering wherever the lab offers its adapters. The lab also stores a copy of its LoRA weights on its own storage, with a manifest of the run (base model, run id, name, dataset hash, held-out losses, who kept it and when); a copy may be at most ${tinkerKeepMaxMb()} MB and can only be made of an adapter that was trained while keeping was switched on. For any other adapter only its life is extended, and the record says there is no copy. The request, its reason and what was done are public. The adapters alive now are listed under TRAINED ADAPTERS in your context.`
-}
 
 function adapterFacts(a: TrainedAdapter): string {
   const loss = a.holdout_loss_before !== null && a.holdout_loss_after !== null

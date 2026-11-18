@@ -33,6 +33,18 @@
 # scrubbed of it before it is returned. The two HTTP endpoints do not have
 # that secret at all; they hold only the token the lab server calls them with.
 #
+# Keeping an adapter (docs/TOOLS.md, "Keeping a trained adapter"). When the
+# lab server asks, `keeper` sets a long time to live on an adapter's sampler
+# checkpoint, so it goes on answering, and writes a copy of its LoRA weights
+# to the lab's own Modal Volume "oblab-kept-models", in PEFT format when the
+# cookbook's conversion works, with the lab's manifest of the run beside it.
+# Tinker only lets weights be downloaded that were saved for download by the
+# training run itself (save_weights_external), so `train` saves them that way
+# when the lab asks for it ("export": true), and an adapter trained without
+# that has no copy: its life is extended and the answer says so. `keeper`
+# also undoes a keep (the usual time to live again; the copy is removed only
+# when asked). It has the Tinker key, like `train`, and runs lab code only.
+#
 # Deploy (from a Mac, see docs/OPERATIONS.md):
 #   uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py
 # Secrets:
@@ -42,7 +54,10 @@
 #
 # HTTP API (for the Vercel backend), Authorization: Bearer <JOBS_TOKEN> on both:
 #   POST /start   {run_id, train: {base_model, examples, settings, split_salt, budget_usd,
-#                          prices, ttl_seconds, samples, sample_max_tokens, label}}  -> {call_id}
+#                          prices, ttl_seconds, samples, sample_max_tokens, label, export?}}  -> {call_id}
+#   POST /start   {run_id, keep: {slug, base_model, sampler_path, external_path, ttl_seconds,
+#                          max_bytes, manifest}}                                    -> {call_id}
+#   POST /start   {run_id, unkeep: {slug, sampler_path, external_path, ttl_seconds, remove_copy}} -> {call_id}
 #   GET  /status  ?call_id=...  -> {status: running} | {status: done, result} | {status: failed, error}
 #   GET  /status  ?run_id=...   -> the same for the call started under that name, with its call_id,
 #                                  or {status: unknown} when no call is known for it
@@ -58,9 +73,16 @@
 # result: {status: ok, n_train, n_holdout, steps_planned, steps_done, stopped_early,
 #          holdout_loss_before, holdout_loss_after, train_loss_first, train_loss_last,
 #          tokens: {train, eval, sample_prompt, sample_completion},
-#          sampler_path, ttl_seconds, samples: [{prompt, completion}], wall_seconds}
+#          sampler_path, ttl_seconds, samples: [{prompt, completion}], wall_seconds,
+#          external_path? (the weights saved for download, when asked) | export_error?}
 #       | {status: refused, stage, reason, tokens, wall_seconds}
 #       | {status: error, stage, error, tokens, ..., wall_seconds}
+#
+# result of a keep or an unkeep:
+#         {status: ok, ttl_seconds, checkpoints, wall_seconds,
+#          copy: {status: ok, format: peft | tinker, dir, bytes, files: [{path, bytes, sha256}], reason?}
+#              | {status: none | error, reason}}
+#       | {status: refused | error, stage, reason | error, wall_seconds}
 #
 # Every import at the top of this file must be installed in every image below,
 # and must import on Python 3.9 (the deploying Mac's Modal may run on it). The
@@ -68,10 +90,14 @@
 
 import hashlib
 import hmac
+import json
 import math
 import os
 import re
+import shutil
+import tempfile
 import time
+import urllib.request
 from typing import Optional  # the deploying Mac may run Python 3.9, which has no "X | None"
 
 import modal
@@ -125,6 +151,24 @@ RUN_ID_PATTERN = r"e[0-9]{1,6}-[0-9a-f]{8}"
 CALL_ID_PATTERN = r"[A-Za-z0-9_-]{1,100}"
 RUNS_DICT = "oblab-tinker-runs"
 ROLES = ("system", "user", "assistant")
+
+# Keeping an adapter. The lab server sends the same limits; these hold whatever it sends.
+KEPT_VOLUME = "oblab-kept-models"
+KEPT_DIR = "/kept"
+# The lab's name for one attempt to keep ("k") or unkeep ("u") an adapter.
+KEEP_ID_PATTERN = r"[ku]-e[0-9]{1,6}-[0-9a-f]{8}-[0-9a-f]{8}"
+SAMPLER_PATH_PATTERN = r"tinker://([A-Za-z0-9][A-Za-z0-9._:-]{0,200})/sampler_weights/[A-Za-z0-9][A-Za-z0-9._-]{0,100}"
+EXTERNAL_PATH_PATTERN = r"tinker://([A-Za-z0-9][A-Za-z0-9._:-]{0,200})/external_weights/[A-Za-z0-9][A-Za-z0-9._-]{0,100}"
+# Tinker takes a time to live from one hour to ten years.
+MAX_KEEP_TTL_S = 10 * 365 * 24 * 3600
+# The most one copy may weigh, whatever the lab server sends, and how many files it may hold.
+HARD_KEEP_BYTES = 4096 * 1024 * 1024
+MAX_KEEP_FILES = 16
+MANIFEST_MAX_BYTES = 20000
+MANIFEST_NAME = "lab_manifest.json"
+KEEP_FILE_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99}){0,3}"
+KEEP_TIMEOUT_S = 900
+DOWNLOAD_TIMEOUT_S = 300
 
 app = modal.App(APP_NAME)
 
@@ -245,6 +289,8 @@ def check_job(job) -> Optional[str]:
     steps = int(math.ceil((len(examples) - holdout_count(len(examples))) / float(settings["batch_size"]))) * settings["epochs"]
     if steps > MAX_STEPS:
         return "these settings need %d optimizer steps and a run may take %d" % (steps, MAX_STEPS)
+    if "export" in job and not isinstance(job["export"], bool):
+        return "export must be true or false"
     return None
 
 
@@ -315,8 +361,8 @@ def mean_loss(losses: list) -> Optional[float]:
 
 
 def valid_run_id(value) -> bool:
-    """Is this a name the lab gives a run?"""
-    return isinstance(value, str) and re.fullmatch(RUN_ID_PATTERN, value) is not None
+    """Is this a name the lab gives a run, or an attempt to keep or unkeep an adapter?"""
+    return isinstance(value, str) and (re.fullmatch(RUN_ID_PATTERN, value) is not None or re.fullmatch(KEEP_ID_PATTERN, value) is not None)
 
 
 def known_call(names, run_id) -> Optional[str]:
@@ -369,7 +415,9 @@ def run_core(job, make_deps, clock=time.time, log=print) -> dict:
     prompt(conversation) -> (prompt, tokens); forward(datums) -> logprobs per
     datum; forward_backward(datums, learning_rate) -> logprobs per datum;
     save(ttl_seconds) -> sampler path; sample(path, prompt, max_tokens) ->
-    (text, completion tokens); secrets() -> values to scrub from error text.
+    (text, completion tokens); secrets() -> values to scrub from error text;
+    and, used only when the job says "export": true, save_external(ttl_seconds)
+    -> the path of the weights saved for download.
     Never raises: a failure is returned as {"status": "error"}.
     """
     started = clock()
@@ -492,6 +540,21 @@ def run_core(job, make_deps, clock=time.time, log=print) -> dict:
         progress["sampler_path"] = path
         progress["ttl_seconds"] = job["ttl_seconds"]
 
+        # The same weights in the form Tinker lets be downloaded, only when the
+        # lab asked for them (adapters can be kept). Extra, like the samples: a
+        # failure here does not undo a run that trained, was measured and was saved.
+        if job.get("export") is True:
+            state["stage"] = "export"
+            try:
+                external = deps.save_external(job["ttl_seconds"])
+                if isinstance(external, str) and re.fullmatch(EXTERNAL_PATH_PATTERN, external) is not None:
+                    progress["external_path"] = external
+                else:
+                    progress["export_error"] = "the weights were not saved for download"
+            except Exception as exc:  # noqa: BLE001
+                progress["export_error"] = scrub(exc, secrets)
+                log("saving the weights for download failed: %s" % progress["export_error"])
+
         # Samples are extra: a failure here does not undo a run that trained, was measured and was saved.
         state["stage"] = "sample"
         samples = []
@@ -567,6 +630,10 @@ class TinkerDeps:
     def save(self, ttl_seconds: int) -> str:
         return self._client.save_weights_for_sampler("final", ttl_seconds=ttl_seconds).result(timeout=CALL_TIMEOUT_S).path
 
+    def save_external(self, ttl_seconds: int) -> str:
+        # Not encrypted: the copy goes to the lab's own Volume, read with the lab's own Tinker key.
+        return self._client.save_weights_external("final", ttl_seconds=ttl_seconds).result(timeout=CALL_TIMEOUT_S).path
+
     def sample(self, path: str, prompt, max_tokens: int):
         if self._sampler is None:
             self._sampler = self._client.create_sampling_client(path).result(timeout=CALL_TIMEOUT_S)
@@ -587,6 +654,366 @@ def train(job: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Keeping an adapter: a long time to live on Tinker, and a copy on the lab's Volume
+# ---------------------------------------------------------------------------
+
+def _tinker_run(path, pattern) -> Optional[str]:
+    """The training run a checkpoint path belongs to, or None when the path is not of that kind."""
+    found = re.fullmatch(pattern, path) if isinstance(path, str) and len(path) <= 320 else None
+    return found.group(1) if found else None
+
+
+def check_keep(job) -> Optional[str]:
+    """None when this is a keep the runner accepts, else a short reason. Runs nothing."""
+    if not isinstance(job, dict):
+        return "the keep is not an object"
+    if not isinstance(job.get("slug"), str) or re.fullmatch(RUN_ID_PATTERN, job["slug"]) is None:
+        return "slug is not an adapter's lab id"
+    if job.get("base_model") not in RENDERERS:
+        return "base_model is not one this runner trains"
+    run = _tinker_run(job.get("sampler_path"), SAMPLER_PATH_PATTERN)
+    if run is None:
+        return "sampler_path is not a sampler checkpoint"
+    external = job.get("external_path")
+    if external is not None and _tinker_run(external, EXTERNAL_PATH_PATTERN) != run:
+        return "external_path is not the downloadable weights of the same training run"
+    ttl = job.get("ttl_seconds")
+    if not _is_int(ttl) or ttl < MIN_TTL_S or ttl > MAX_KEEP_TTL_S:
+        return "ttl_seconds must be from %d to %d" % (MIN_TTL_S, MAX_KEEP_TTL_S)
+    if not _is_int(job.get("max_bytes")) or not (1 <= job["max_bytes"] <= HARD_KEEP_BYTES):
+        return "max_bytes must be from 1 to %d" % HARD_KEEP_BYTES
+    manifest = job.get("manifest")
+    if not isinstance(manifest, dict):
+        return "manifest must be an object"
+    try:
+        size = len(json.dumps(manifest).encode("utf-8"))
+    except (TypeError, ValueError):
+        return "manifest is not plain data"
+    if size > MANIFEST_MAX_BYTES:
+        return "manifest holds more than %d bytes" % MANIFEST_MAX_BYTES
+    return None
+
+
+def check_unkeep(job) -> Optional[str]:
+    """None when this is an unkeep the runner accepts, else a short reason."""
+    if not isinstance(job, dict):
+        return "the unkeep is not an object"
+    if not isinstance(job.get("slug"), str) or re.fullmatch(RUN_ID_PATTERN, job["slug"]) is None:
+        return "slug is not an adapter's lab id"
+    run = _tinker_run(job.get("sampler_path"), SAMPLER_PATH_PATTERN)
+    if run is None:
+        return "sampler_path is not a sampler checkpoint"
+    external = job.get("external_path")
+    if external is not None and _tinker_run(external, EXTERNAL_PATH_PATTERN) != run:
+        return "external_path is not the downloadable weights of the same training run"
+    ttl = job.get("ttl_seconds")
+    if not _is_int(ttl) or ttl < MIN_TTL_S or ttl > MAX_KEEP_TTL_S:
+        return "ttl_seconds must be from %d to %d" % (MIN_TTL_S, MAX_KEEP_TTL_S)
+    if not isinstance(job.get("remove_copy"), bool):
+        return "remove_copy must be true or false"
+    return None
+
+
+def safe_file_name(name) -> bool:
+    """Is this a file path the runner will write under an adapter's folder? No "..", no hidden parts, no encrypted exports."""
+    if not isinstance(name, str) or re.fullmatch(KEEP_FILE_PATTERN, name) is None:
+        return False
+    return ".." not in name and name != MANIFEST_NAME and not name.endswith(".age")
+
+
+def _sha256_file(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def list_files(folder: str) -> list:
+    """Every file under a folder but the manifest, as {path, bytes, sha256}, sorted by path. Links are not followed."""
+    out = []
+    for base, dirs, names in os.walk(folder):
+        dirs[:] = [d for d in dirs if not os.path.islink(os.path.join(base, d))]
+        for name in names:
+            full = os.path.join(base, name)
+            relative = os.path.relpath(full, folder).replace(os.sep, "/")
+            if relative == MANIFEST_NAME or os.path.islink(full) or not os.path.isfile(full):
+                continue
+            out.append({"path": relative, "bytes": os.path.getsize(full), "sha256": _sha256_file(full)})
+    return sorted(out, key=lambda item: item["path"])
+
+
+def write_manifest(folder: str, manifest: dict, files: list, fmt: str, source, note, clock=time.time) -> None:
+    """The lab's manifest of the run, with what the copy holds, beside the weights."""
+    body = dict(manifest)
+    body.update({
+        "copy": {
+            "format": fmt, "files": files, "bytes": sum(f["bytes"] for f in files), "source": source,
+            "copied_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(clock())), "note": note,
+        },
+    })
+    with open(os.path.join(folder, MANIFEST_NAME), "w", encoding="utf-8") as handle:
+        json.dump(body, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+
+
+def copy_weights(job: dict, deps, root: str, scratch: str, clock=time.time, log=print, secrets=()) -> dict:
+    """Puts a copy of the adapter's weights under <root>/<slug>/ and says what it did. Never raises.
+
+    A copy already there (the adapter was kept before) is left as it is and
+    only its manifest is written again. Otherwise the files Tinker exported
+    are downloaded into `scratch`, converted to PEFT when that works, and
+    moved into place in one step, so a half-written copy is never left under
+    the adapter's name.
+    """
+    slug = job["slug"]
+    final = os.path.join(root, slug)
+    try:
+        if os.path.isdir(final):
+            files = list_files(final)
+            if files:
+                fmt = "tinker"
+                try:
+                    with open(os.path.join(final, MANIFEST_NAME), encoding="utf-8") as handle:
+                        old = json.load(handle)
+                    if isinstance(old, dict) and isinstance(old.get("copy"), dict) and old["copy"].get("format") == "peft":
+                        fmt = "peft"
+                except Exception:  # noqa: BLE001
+                    pass
+                note = "the copy made when it was kept before"
+                write_manifest(final, job["manifest"], files, fmt, job.get("external_path"), note, clock)
+                deps.commit()
+                return {"status": "ok", "format": fmt, "dir": slug, "bytes": sum(f["bytes"] for f in files), "files": files, "reason": note}
+        external = job.get("external_path")
+        if not external:
+            return {"status": "none", "reason": "this adapter was trained before keeping was switched on, so Tinker has no downloadable weights for it"}
+
+        urls = deps.external_urls(external)
+        if not isinstance(urls, dict) or not urls:
+            return {"status": "error", "reason": "Tinker listed no files for the weights"}
+        if len(urls) > MAX_KEEP_FILES:
+            return {"status": "error", "reason": "Tinker listed %d files and a copy may hold %d" % (len(urls), MAX_KEEP_FILES)}
+        for name, url in urls.items():
+            if not safe_file_name(name):
+                return {"status": "error", "reason": "Tinker listed a file the lab will not write"}
+            if not isinstance(url, str) or not url.startswith("https://"):
+                return {"status": "error", "reason": "Tinker gave a download address that is not https"}
+
+        raw = os.path.join(scratch, "raw")
+        left = int(job["max_bytes"])
+        for name in sorted(urls):
+            target = os.path.join(raw, name)
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            got = deps.fetch(urls[name], target, left)
+            if got is None:
+                return {"status": "error", "reason": "the weights are larger than the %d bytes a copy may weigh" % job["max_bytes"]}
+            left -= got
+
+        fmt, note, source = "tinker", None, raw
+        converted = os.path.join(scratch, "peft")
+        try:
+            deps.to_peft(job["base_model"], raw, converted)
+            if list_files(converted):
+                fmt, source = "peft", converted
+            else:
+                note = "not converted to PEFT: the conversion wrote no files"
+        except Exception as exc:  # noqa: BLE001
+            note = "not converted to PEFT: %s" % scrub(exc, secrets)
+            log(note)
+        files = list_files(source)
+        if not files or any(not safe_file_name(f["path"]) for f in files) or len(files) > MAX_KEEP_FILES:
+            return {"status": "error", "reason": "the copy held no usable files"}
+        size = sum(f["bytes"] for f in files)
+        if size > job["max_bytes"]:
+            return {"status": "error", "reason": "the copy is %d bytes and may weigh %d" % (size, job["max_bytes"])}
+
+        incoming = os.path.join(root, ".incoming-%s-%d" % (slug, int(clock() * 1000)))
+        shutil.copytree(source, incoming, symlinks=False)
+        write_manifest(incoming, job["manifest"], files, fmt, external, note, clock)
+        if os.path.isdir(final):
+            shutil.rmtree(final)
+        os.replace(incoming, final)
+        deps.commit()
+        return {"status": "ok", "format": fmt, "dir": slug, "bytes": size, "files": files, "reason": note}
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "error", "reason": scrub(exc, secrets)}
+
+
+def keep_core(job, make_deps, root=KEPT_DIR, clock=time.time, log=print) -> dict:
+    """Keeps one adapter, with Tinker and the Volume behind `make_deps`.
+
+    `make_deps()` is called only after the job has been checked. It returns an
+    object with: set_ttl(path, ttl_seconds); checkpoint_count() -> how many
+    checkpoints the account holds, or None; external_urls(path) -> {file:
+    signed url}; fetch(url, target, max_bytes) -> bytes written, or None when
+    the file is larger; to_peft(base_model, source, target); commit(); and
+    secrets() -> values to scrub from error text.
+
+    The adapter is kept when its time to live was set: that is what keeps it
+    answering. The copy is reported beside it and never undoes the keep.
+    Never raises.
+    """
+    started = clock()
+    state = {"stage": "input"}
+    secrets = []
+
+    def done(result: dict) -> dict:
+        result["wall_seconds"] = round(clock() - started, 1)
+        return result
+
+    try:
+        problem = check_keep(job)
+        if problem:
+            return done({"status": "refused", "stage": state["stage"], "reason": problem})
+        state["stage"] = "client"
+        deps = make_deps()
+        secrets = list(deps.secrets())
+
+        state["stage"] = "ttl"
+        deps.set_ttl(job["sampler_path"], job["ttl_seconds"])
+        log("time to live of %s set to %d s" % (job["slug"], job["ttl_seconds"]))
+
+        state["stage"] = "copy"
+        scratch = tempfile.mkdtemp(prefix="oblab-keep-")
+        try:
+            copy = copy_weights(job, deps, root, scratch, clock, log, secrets)
+        finally:
+            shutil.rmtree(scratch, ignore_errors=True)
+        # The downloadable weights on Tinker are one more stored checkpoint.
+        # Once the copy is on the Volume they are left to expire on their own.
+        # If the copy failed, they are given the adapter's long life as well,
+        # so that the copy can be made later.
+        if copy["status"] == "error" and job.get("external_path"):
+            try:
+                deps.set_ttl(job["external_path"], job["ttl_seconds"])
+                copy["reason"] = "%s; the downloadable weights stay on Tinker as long as the adapter, so the copy can be made later" % copy["reason"]
+            except Exception as exc:  # noqa: BLE001
+                log("could not extend the downloadable weights: %s" % scrub(exc, secrets))
+
+        count = None
+        try:
+            count = deps.checkpoint_count()
+        except Exception as exc:  # noqa: BLE001
+            log("could not count checkpoints: %s" % scrub(exc, secrets))
+        return done({
+            "status": "ok", "ttl_seconds": job["ttl_seconds"], "copy": copy,
+            "checkpoints": count if _is_int(count) and count >= 0 else None,
+        })
+    except Exception as exc:  # noqa: BLE001
+        return done({"status": "error", "stage": state["stage"], "error": scrub(exc, secrets)})
+
+
+def unkeep_core(job, make_deps, root=KEPT_DIR, clock=time.time, log=print) -> dict:
+    """Undoes a keep: the usual time to live again, and the copy removed only when asked. Never raises."""
+    started = clock()
+    state = {"stage": "input"}
+    secrets = []
+
+    def done(result: dict) -> dict:
+        result["wall_seconds"] = round(clock() - started, 1)
+        return result
+
+    try:
+        problem = check_unkeep(job)
+        if problem:
+            return done({"status": "refused", "stage": state["stage"], "reason": problem})
+        state["stage"] = "client"
+        deps = make_deps()
+        secrets = list(deps.secrets())
+        state["stage"] = "ttl"
+        deps.set_ttl(job["sampler_path"], job["ttl_seconds"])
+        if job.get("external_path"):
+            # Gone already, or never extended: either way there is nothing to undo.
+            try:
+                deps.set_ttl(job["external_path"], job["ttl_seconds"])
+            except Exception as exc:  # noqa: BLE001
+                log("the downloadable weights were not changed: %s" % scrub(exc, secrets))
+        state["stage"] = "copy"
+        final = os.path.join(root, job["slug"])
+        if not job["remove_copy"]:
+            reason = "The copy on the Volume was left where it is." if os.path.isdir(final) else "There is no copy on the Volume."
+        elif os.path.isdir(final):
+            shutil.rmtree(final)
+            deps.commit()
+            reason = "The copy on the Volume was removed."
+        else:
+            reason = "There was no copy on the Volume to remove."
+        return done({"status": "ok", "ttl_seconds": job["ttl_seconds"], "copy": {"status": "none", "reason": reason}, "checkpoints": None})
+    except Exception as exc:  # noqa: BLE001
+        return done({"status": "error", "stage": state["stage"], "error": scrub(exc, secrets)})
+
+
+def download_capped(url: str, target: str, max_bytes: int, opener=None) -> Optional[int]:
+    """Downloads one https file to `target`. Returns the bytes written, or None (and no file) when it is larger than max_bytes."""
+    if not url.startswith("https://"):
+        raise ValueError("not an https address")
+    written = 0
+    request = urllib.request.Request(url, headers={"User-Agent": "observable-lab-runner"})
+    with (opener or urllib.request.urlopen)(request, timeout=DOWNLOAD_TIMEOUT_S) as response, open(target, "wb") as out:
+        while True:
+            chunk = response.read(1024 * 1024)
+            if not chunk:
+                break
+            written += len(chunk)
+            if written > max_bytes:
+                out.close()
+                os.remove(target)
+                return None
+            out.write(chunk)
+    return written
+
+
+class KeepDeps:
+    """Tinker's checkpoint calls and the Volume, as keep_core and unkeep_core use them. The SDK reads TINKER_API_KEY itself."""
+
+    def __init__(self):
+        import tinker
+
+        # A RestClient opens no training session, so keeping costs no tokens.
+        self._rest = tinker.RestClient()
+
+    def secrets(self) -> list:
+        return [os.environ.get("TINKER_API_KEY", "")]
+
+    def set_ttl(self, path: str, ttl_seconds: int) -> None:
+        self._rest.set_checkpoint_ttl_from_tinker_path(path, ttl_seconds).result(timeout=CALL_TIMEOUT_S)
+
+    def checkpoint_count(self) -> Optional[int]:
+        response = self._rest.list_user_checkpoints(limit=1).result(timeout=CALL_TIMEOUT_S)
+        cursor = getattr(response, "cursor", None)
+        total = getattr(cursor, "total_count", None)
+        return int(total) if total is not None else None
+
+    def external_urls(self, path: str) -> dict:
+        return dict(self._rest.get_external_weights_urls(path).result(timeout=CALL_TIMEOUT_S).urls)
+
+    def fetch(self, url: str, target: str, max_bytes: int) -> Optional[int]:
+        return download_capped(url, target, max_bytes)
+
+    def to_peft(self, base_model: str, source: str, target: str) -> None:
+        from tinker_cookbook import weights
+
+        # Reads the base model's configuration from Hugging Face (no weights). No code from the repository is run.
+        weights.build_lora_adapter(base_model=base_model, adapter_path=source, output_path=target, trust_remote_code=False)
+
+    def commit(self) -> None:
+        kept_volume.commit()
+
+
+kept_volume = modal.Volume.from_name(KEPT_VOLUME, create_if_missing=True)
+
+
+@app.function(image=train_image, secrets=[modal.Secret.from_name("oblab-tinker-auth")], volumes={KEPT_DIR: kept_volume},
+              timeout=KEEP_TIMEOUT_S, retries=0, max_containers=1, cpu=(1, 2), memory=(2048, 8192))
+def keeper(job: dict) -> dict:
+    """Keeps or unkeeps one adapter. Lab code only; the job is data. One at a time, so two never write the Volume together."""
+    kept_volume.reload()
+    if isinstance(job, dict) and job.get("action") == "unkeep":
+        return unkeep_core(job.get("unkeep"), KeepDeps)
+    return keep_core(job.get("keep") if isinstance(job, dict) else None, KeepDeps)
+
+
+# ---------------------------------------------------------------------------
 # HTTP endpoints for the lab server
 # ---------------------------------------------------------------------------
 
@@ -596,6 +1023,33 @@ def _run_names():
         return modal.Dict.from_name(RUNS_DICT, create_if_missing=True)
     except Exception:  # noqa: BLE001
         return None
+
+
+def read_start(body) -> dict:
+    """What a start asks for: {"kind", "job", "run_id"}, or {"problem"} when it is not something this runner starts.
+
+    Exactly one of "train", "keep" and "unkeep". A training run's name is the
+    adapter's lab id; a keep's or an unkeep's is "k-" or "u-", that id, and a
+    few hex characters, and it is required, so the lab can always find it again.
+    """
+    if not isinstance(body, dict):
+        return {"problem": "the body is not an object"}
+    kinds = [k for k in ("train", "keep", "unkeep") if k in body]
+    if len(kinds) != 1:
+        return {"problem": "the job is not an object" if not kinds else "a start holds one of train, keep and unkeep"}
+    kind = kinds[0]
+    job = body[kind]
+    problem = check_job(job) if kind == "train" else check_keep(job) if kind == "keep" else check_unkeep(job)
+    if problem:
+        return {"problem": problem}
+    run_id = body.get("run_id")
+    if kind == "train":
+        if run_id is not None and (not isinstance(run_id, str) or re.fullmatch(RUN_ID_PATTERN, run_id) is None):
+            return {"problem": "run_id is not a run name"}
+    elif not isinstance(run_id, str) or re.fullmatch(KEEP_ID_PATTERN, run_id) is None \
+            or not run_id.startswith("%s-%s-" % (kind[0], job["slug"])):
+        return {"problem": "run_id is not the name of a keep of that adapter"}
+    return {"kind": kind, "job": job, "run_id": run_id}
 
 
 def _authed(token: str) -> bool:
@@ -608,14 +1062,14 @@ def _authed(token: str) -> bool:
 def start(body: dict, request: Request) -> dict:
     if not _authed(request.headers.get("authorization", "")):
         raise HTTPException(status_code=401, detail="Unauthorized")
-    job = body.get("train") if isinstance(body, dict) else None
-    problem = check_job(job)
-    if problem:
-        raise HTTPException(status_code=400, detail=problem)
-    run_id = body.get("run_id")
-    if run_id is not None and not valid_run_id(run_id):
-        raise HTTPException(status_code=400, detail="run_id is not a run name")
-    return {"call_id": start_once(run_id, _run_names(), lambda: train.spawn(job).object_id)}
+    work = read_start(body)
+    if "problem" in work:
+        raise HTTPException(status_code=400, detail=work["problem"])
+    run_id = work["run_id"]
+    if work["kind"] == "train":
+        return {"call_id": start_once(run_id, _run_names(), lambda: train.spawn(work["job"]).object_id)}
+    # A keep or an unkeep: the same remembered start, on the function that holds the Volume.
+    return {"call_id": start_once(run_id, _run_names(), lambda: keeper.spawn({"action": work["kind"], work["kind"]: work["job"]}).object_id)}
 
 
 @app.function(image=web_image, secrets=[modal.Secret.from_name("oblab-tinker-jobs-auth")])

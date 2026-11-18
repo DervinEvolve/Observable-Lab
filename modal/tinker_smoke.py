@@ -21,6 +21,16 @@
 # its name (how the lab finds a run whose start answer was lost), and then
 # waits for the result. The token is sent in the Authorization header and is
 # never printed.
+#
+# A third check, of keeping an adapter (docs/TOOLS.md, "Keeping a trained
+# adapter"), before LAB_ENABLE_TINKER_KEEP is switched on:
+#   uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py keep
+# It trains the same tiny adapter with its weights also saved for download,
+# asks the deployed `keeper` to keep it (a time to live of two hours and a
+# copy on the Volume oblab-kept-models under a made-up id), prints what the
+# keeper answered, and then unkeeps it and removes the copy again. It costs
+# about the same as the first check; the two checkpoints it leaves on Tinker
+# expire within the hour.
 import json
 import os
 import secrets
@@ -123,7 +133,53 @@ def endpoints() -> int:
     return 1 if problems else 0
 
 
+def keep() -> int:
+    """Trains with the weights saved for download, keeps the adapter, then unkeeps it and removes the copy. 0 when all was as expected."""
+    problems = []
+
+    def expect(what: str, ok: bool, got) -> None:
+        print("%s %s: %s" % ("ok  " if ok else "FAIL", what, got))
+        if not ok:
+            problems.append(what)
+
+    trained = modal.Function.from_name("oblab-tinker", "train").remote(dict(job, export=True))
+    report(trained)
+    expect("the run trained and was saved", trained.get("status") == "ok", trained.get("status"))
+    expect("its weights were also saved for download", isinstance(trained.get("external_path"), str),
+           trained.get("external_path") or trained.get("export_error"))
+    if trained.get("status") != "ok":
+        return 1
+    slug = "e0-%s" % secrets.token_hex(4)
+    keeper = modal.Function.from_name("oblab-tinker", "keeper")
+    kept = keeper.remote({"action": "keep", "keep": {
+        "slug": slug, "base_model": job["base_model"], "sampler_path": trained["sampler_path"],
+        "external_path": trained.get("external_path"), "ttl_seconds": 7200, "max_bytes": 1024 * 1024 * 1024,
+        "manifest": {"schema": "observable-lab/kept-adapter/1", "lab_id": "lab/%s" % slug, "name": None,
+                     "base_model": job["base_model"], "kept_by": "the owner", "kept_reason": "smoke test"},
+    }})
+    print(json.dumps(kept, indent=2))
+    copy = kept.get("copy") or {}
+    expect("the time to live was set", kept.get("status") == "ok" and kept.get("ttl_seconds") == 7200, kept.get("status"))
+    expect("a copy was written to the Volume", copy.get("status") == "ok", copy.get("reason") or copy.get("status"))
+    expect("the copy is in PEFT format", copy.get("format") == "peft", copy.get("format"))
+    print("checkpoints the account holds now: %s (the free plan allows 100)" % kept.get("checkpoints"))
+    if copy.get("status") == "ok":
+        print("look at it with: modal volume ls oblab-kept-models %s" % slug)
+    undone = keeper.remote({"action": "unkeep", "unkeep": {
+        "slug": slug, "sampler_path": trained["sampler_path"], "external_path": trained.get("external_path"),
+        "ttl_seconds": 3600, "remove_copy": True,
+    }})
+    print(json.dumps(undone, indent=2))
+    expect("the unkeep put the short time to live back", undone.get("status") == "ok" and undone.get("ttl_seconds") == 3600, undone.get("status"))
+    expect("the copy was removed again", (undone.get("copy") or {}).get("reason") in (
+        "The copy on the Volume was removed.", "There was no copy on the Volume to remove."), (undone.get("copy") or {}).get("reason"))
+    print("keep: %s" % ("all as expected" if not problems else "%d problem(s): %s" % (len(problems), "; ".join(problems))))
+    return 1 if problems else 0
+
+
 if __name__ == "__main__":
     if sys.argv[1:] == ["endpoints"]:
         sys.exit(endpoints())
+    if sys.argv[1:] == ["keep"]:
+        sys.exit(keep())
     report(modal.Function.from_name("oblab-tinker", "train").remote(job))

@@ -45,6 +45,7 @@ import { MODEL_DISPLAY_NAMES, modelDisplayName } from './types.js'
 import { toolConfig } from './tools-config.js'
 import { planTools, type ToolPlan } from './tool-requests.js'
 import { prepareExhibit } from './exhibits.js'
+import { adaptersContext, keepReviewFacts } from './tinker-keep.js'
 import {
   alreadyRan, recentToolContext, recordIgnored, runSideTools,
   type EpochToolContext, type ToolOutcome,
@@ -343,6 +344,15 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     sharedContext += `\n\nRECENT TOOL RUNS (what really ran, from the lab's records):\n${toolHistory}`
   }
 
+  // The trained adapters that are alive, only while they can be kept
+  // (LAB_ENABLE_TINKER_KEEP): a request to keep one names it by its lab id,
+  // so the ids have to be in front of the models. From the lab's stored runs
+  // only. With keeping off this adds nothing and reads nothing.
+  const adapters = await adaptersContext()
+  if (adapters) {
+    sharedContext += `\n\nTRAINED ADAPTERS (alive now, from the lab's records; scores were measured by the lab):\n${adapters}`
+  }
+
   // The lab's knowledge graph (knowledge-graph.ts): a few lines of memory for
   // every role, and answers to the recall questions each role may ask, added
   // to the context of the roles that speak after it. Built from stored rows
@@ -525,6 +535,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
           } : undefined,
           lab_proposal: toolPlan?.lab_proposal ? { title: toolPlan.lab_proposal.title, files: toolPlan.lab_proposal.files.map(f => f.path) } : undefined,
           tinker_train: toolPlan?.tinker_train ? tinkerReviewFacts(toolPlan.tinker_train) : undefined,
+          keep_adapter: toolPlan?.keep_adapter ? await keepReviewFacts(toolPlan.keep_adapter, { modelId: executorModel }) : undefined,
         })),
         'Make final decisions on each proposed mutation.'
       )
@@ -553,7 +564,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     // so doing both in one request overran it. It is queued on the epoch row
     // and runs in its own request on the next tick (epoch-followup.ts).
     const candidate = pickContributionCandidate(mutations, decisions, challengerOutput.challenges)
-    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal || toolPlan.tinker_train))
+    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal || toolPlan.tinker_train || toolPlan.keep_adapter))
     const followup: EpochFollowUp = {
       status: candidate || hasDeliverables ? 'pending' : 'none',
       contribution_mutation_index: candidate ? candidate.decision.mutation_index : null,
@@ -577,9 +588,10 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
     if (hasDeliverables) {
       toolOutcomes.push({
         tool: 'deliverables', status: 'queued',
-        summary: toolPlan?.tinker_train
+        summary: (toolPlan?.tinker_train
           ? 'any exhibit or lab proposal the Reviewer approved is opened after this epoch, and an approved Tinker training run is started then'
-          : 'any exhibit or lab proposal the Reviewer approved is opened after this epoch',
+          : 'any exhibit or lab proposal the Reviewer approved is opened after this epoch')
+          + (toolPlan?.keep_adapter ? '; an approved request to keep a trained adapter is carried out then too' : ''),
       })
     }
 

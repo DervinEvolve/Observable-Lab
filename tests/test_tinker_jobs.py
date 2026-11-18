@@ -11,7 +11,10 @@ import json
 import math
 import os
 import re
+import shutil
+import tempfile
 import time
+import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
@@ -35,8 +38,8 @@ def _uses(node, names):
 def load(extra=None):
     """The file's constants and functions, without its Modal objects or its Tinker class."""
     namespace = {
-        "hashlib": hashlib, "hmac": hmac, "math": math, "os": os, "re": re, "time": time, "Optional": Optional,
-        "HTTPException": HTTPException, "Request": Request,
+        "hashlib": hashlib, "hmac": hmac, "json": json, "math": math, "os": os, "re": re, "shutil": shutil, "tempfile": tempfile,
+        "time": time, "urllib": urllib, "Optional": Optional, "HTTPException": HTTPException, "Request": Request,
     }
     selected = []
     for node in ast.parse(SOURCE).body:  # a fresh tree: the decorators are taken off below
@@ -503,15 +506,17 @@ class DeployShapeTests(unittest.TestCase):
                 top.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 top.add((node.module or "").split(".")[0])
-        self.assertEqual(top, {"hashlib", "hmac", "math", "os", "re", "time", "typing", "modal", "fastapi"})
-        # The Tinker SDK needs Python 3.11, so it is imported only inside the class that talks to Tinker.
+        self.assertEqual(top, {"hashlib", "hmac", "json", "math", "os", "re", "shutil", "tempfile", "time", "typing", "urllib", "modal", "fastapi"})
+        # The Tinker SDK needs Python 3.11, so it is imported only inside the two classes that talk to Tinker.
         inside = [n for n in ast.walk(TREE) if isinstance(n, (ast.Import, ast.ImportFrom)) and n not in TREE.body]
         names = set()
         for node in inside:
             names.update([(node.module or "").split(".")[0]] if isinstance(node, ast.ImportFrom) else [a.name.split(".")[0] for a in node.names])
         self.assertEqual(names, {"tinker", "tinker_cookbook"})
-        deps = next(n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name == "TinkerDeps")
-        self.assertTrue(all(any(node in ast.walk(deps) for _ in [0]) for node in inside))
+        classes = [n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name in ("TinkerDeps", "KeepDeps")]
+        self.assertEqual(len(classes), 2)
+        within = [n for c in classes for n in ast.walk(c)]
+        self.assertTrue(all(any(node is n for n in within) for node in inside))
 
     def test_every_image_installs_fastapi_and_the_sdk_is_pinned(self):
         train_image = SOURCE[SOURCE.index("train_image = ("):SOURCE.index("web_image = ")]
@@ -522,16 +527,20 @@ class DeployShapeTests(unittest.TestCase):
             self.assertIn(pin, train_image)
         self.assertNotIn("tinker", web_image)
 
-    def test_only_the_training_function_is_given_the_tinker_key(self):
+    def test_only_the_two_functions_that_talk_to_tinker_are_given_the_tinker_key(self):
         functions = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.decorator_list]
         secrets = {}
         for node in functions:
             text = " ".join(ast.unparse(d) for d in node.decorator_list)
             secrets[node.name] = sorted(set(re.findall(r"from_name\('([^']+)'\)", text)))
-        self.assertEqual(secrets, {"train": ["oblab-tinker-auth"], "start": ["oblab-tinker-jobs-auth"], "status": ["oblab-tinker-jobs-auth"]})
+        # `train` trains; `keeper` sets a checkpoint's time to live and copies its weights. The two web endpoints never have the key.
+        self.assertEqual(secrets, {
+            "train": ["oblab-tinker-auth"], "keeper": ["oblab-tinker-auth"],
+            "start": ["oblab-tinker-jobs-auth"], "status": ["oblab-tinker-jobs-auth"],
+        })
         # The key is named only where error text is scrubbed of it; it is never put in a result or printed.
         reads = [line.strip() for line in SOURCE.splitlines() if "TINKER_API_KEY" in line and "os.environ" in line]
-        self.assertEqual(reads, ['return [os.environ.get("TINKER_API_KEY", "")]'])
+        self.assertEqual(reads, ['return [os.environ.get("TINKER_API_KEY", "")]'] * 2)
         # No "X | None" in a signature: the deploying Mac's Python 3.9 cannot evaluate it.
         annotations = [a for n in ast.walk(TREE) if isinstance(n, (ast.FunctionDef, ast.arg)) for a in [getattr(n, "returns", None), getattr(n, "annotation", None)] if a is not None]
         self.assertFalse(any(isinstance(n, ast.BinOp) for a in annotations for n in ast.walk(a)))

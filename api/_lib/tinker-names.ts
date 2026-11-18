@@ -62,9 +62,13 @@ function lookalike(text: string): string {
 /**
  * What two names are compared by to decide whether they are the same name:
  * case, separators and look-alike characters do not make a name different.
+ * Wider than `lookalike`: here an i and an l are one letter whatever their
+ * case, so "QUIET LAMP", "Quiet Lamp" and "Qulet Lamp" are one name. (For
+ * telling a real product name that would refuse ordinary names like
+ * "William", so there only a capital I passes for an l.)
  */
 export function adapterNameKey(name: string): string {
-  return lookalike(name)
+  return lookalike(name.toLowerCase()).replace(/i/g, 'l')
 }
 
 /** The whole names of the models this lab runs: display names and the last part of each id. */
@@ -113,6 +117,8 @@ export function readAdapterName(raw: unknown): AdapterNameReading {
   if (/[A-Za-z0-9-]\.[A-Za-z]/.test(name) || /^(www|https?)\b/i.test(name) || plain(name).startsWith('http') || plain(name).startsWith('www')) {
     return { error: 'a name may not look like a web address (a dot must be followed by a digit, a space or the end)' }
   }
+  // "e41-0a1b2c3d" is how the lab names an adapter. A display name that reads like one could be taken for another adapter.
+  if (/^(lab)?e[0-9]{1,6}[0-9a-f]{8}$/.test(plain(name))) return { error: 'a name may not look like a lab id' }
   const real = readsLike(name)
   if (real) return { error: `"${name}" reads like the real model or product name "${real}"` }
   return { name }

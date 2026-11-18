@@ -8,9 +8,9 @@
  *    A GPU job that names the weights asked for in the same answer waits for
  *    that fetch, and the two share the one wait a job always had; any other
  *    job starts at once.
- *  - deliverables (an exhibit, a lab proposal, a Tinker training run) run
- *    after the Reviewer, and only when the Reviewer approved them in
- *    "tool_verdicts".
+ *  - deliverables (an exhibit, a lab proposal, a Tinker training run, a
+ *    request to keep a trained adapter) run after the Reviewer, and only
+ *    when the Reviewer approved them in "tool_verdicts".
  *
  * Every use is checked against its per-day limit and today's budget first,
  * stored in tool_runs (refusals as "skipped"), and its estimated cost is
@@ -31,7 +31,9 @@ import { contributeExhibit } from './exhibit-contribution.js'
 import { openLabProposal } from './lab-proposals.js'
 import { TINKER_TOOL } from './tinker.js'
 import { runTinkerTrain, tinkerRequestSummary, tinkerWorstCaseUsd } from './tinker-run.js'
-import { tinkerRunsToday } from './tinker-store.js'
+import { pendingModelKeepsToday, tinkerRunsToday } from './tinker-store.js'
+import { KEEP_TOOL } from './tinker-keep-request.js'
+import { keepAdapter } from './tinker-keep.js'
 
 export interface EpochToolContext {
   experimentId: string
@@ -261,14 +263,14 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
   return out
 }
 
-export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal' | 'tinker_train', 'approve' | 'reject'>>
+export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal' | 'tinker_train' | 'keep_adapter', 'approve' | 'reject'>>
 
 /** The Reviewer's verdicts on tool deliverables; anything but an explicit "approve" is a no. */
 export function readToolVerdicts(reviewerOutput: unknown): ToolVerdicts {
   const raw = reviewerOutput && typeof reviewerOutput === 'object' ? (reviewerOutput as Record<string, unknown>).tool_verdicts : undefined
   const out: ToolVerdicts = {}
   if (!raw || typeof raw !== 'object') return out
-  for (const key of ['exhibit', 'lab_proposal', 'tinker_train'] as const) {
+  for (const key of ['exhibit', 'lab_proposal', 'tinker_train', 'keep_adapter'] as const) {
     const v = String((raw as Record<string, unknown>)[key] ?? '').toLowerCase()
     if (v === 'approve' || v === 'reject') out[key] = v
   }
@@ -342,6 +344,27 @@ export async function runDeliverables(
       if (!ok.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, ok.reason))
       const outcome = await runTinkerTrain(ctx, request)
       if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_TOOL, summary, outcome.summary))
+      out.push(outcome)
+    })())
+  }
+
+  // Keeping a trained adapter (tinker-keep.ts). The plan holds a request
+  // only while keeping is on. The Reviewer must have approved it; then the
+  // requests-per-day limit is checked here, and the number of adapters that
+  // may be kept, and the one keep an epoch may ask for, are held by the
+  // database when the place is taken. Keeping uses no Tinker tokens, so its
+  // worst case is nothing. A keep still going when the wait ends writes its
+  // record when a later tick collects it (collectTinkerKeeps), so the limit
+  // counts those as well.
+  if (plan.keep_adapter && !done(KEEP_TOOL)) {
+    const request = plan.keep_adapter
+    const summary = `keep adapter lab/${request.slug}: ${request.reason}`
+    tasks.push((async () => {
+      if (verdicts.keep_adapter !== 'approve') return void out.push(await skip(ctx, KEEP_TOOL, summary, 'the Reviewer did not approve it'))
+      const ok = await allowed(KEEP_TOOL, config, 0, async () => (await toolRunsToday(KEEP_TOOL)) + (await pendingModelKeepsToday()))
+      if (!ok.ok) return void out.push(await skip(ctx, KEEP_TOOL, summary, ok.reason))
+      const outcome = await keepAdapter(request, { by: 'model', modelId: ctx.executorModelId, experimentId: ctx.experimentId, epoch: ctx.epochNumber })
+      if (outcome.status === 'skipped') return void out.push(await skip(ctx, KEEP_TOOL, summary, outcome.summary))
       out.push(outcome)
     })())
   }

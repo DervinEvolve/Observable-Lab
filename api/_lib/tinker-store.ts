@@ -38,7 +38,9 @@ import { isIPv4, isIPv6 } from 'node:net'
 import { sql } from '@vercel/postgres'
 import { sanitizeOutput } from './sprites.js'
 import { modelDisplayName } from './types.js'
-import { isAdapterSlug, isExternalPath, isSamplerPath, tinkerKeepFlag, type TinkerRequest, type TinkerRunResult } from './tinker.js'
+import {
+  isAdapterSlug, isExternalPath, isSamplerPath, tinkerKeepFlag, tinkerNamesFlag, type TinkerRequest, type TinkerRunResult,
+} from './tinker.js'
 import { adapterNameKey } from './tinker-names.js'
 
 export type TinkerScope = 'all' | 'chat'
@@ -478,7 +480,7 @@ const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : n
 
 export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): TrainedAdapter {
   const result = row.result ?? {}
-  const name = row.display_name ? sanitizeOutput(row.display_name).slice(0, 40) : ''
+  const name = shownName(row)
   const kept = keep && keep.status === 'kept' ? keep : null
   return {
     slug: row.slug,
@@ -504,6 +506,28 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
       ...(kept.reason ? { kept_reason: sanitizeOutput(kept.reason).slice(0, 200) } : {}),
     } : {}),
   }
+}
+
+/**
+ * An adapter's display name as it may be shown and recorded, or null. Only
+ * while names are switched on: with LAB_ENABLE_TINKER_NAMES off, a name
+ * given earlier stays in the database and goes nowhere.
+ */
+export function shownName(row: Pick<TinkerRunRow, 'display_name'>): string | null {
+  if (!tinkerNamesFlag() || !row.display_name) return null
+  return sanitizeOutput(row.display_name).slice(0, 40) || null
+}
+
+/**
+ * What the lab model endpoint says about an adapter beside its id: its
+ * display name, and that it is kept. Empty when it has neither.
+ */
+export function adapterDescription(adapter: TrainedAdapter): string {
+  const parts: string[] = []
+  if (adapter.name) parts.push(`"${adapter.name}"`)
+  if (adapter.kept) parts.push(`kept${adapter.kept_by ? ` by ${adapter.kept_by}` : ''}`)
+  if (!parts.length) return ''
+  return `${parts.join(', ')}. A LoRA adapter trained in this lab on ${adapter.base_model}; the id is its identity, the name is a label.`
 }
 
 /** Who marked an adapter to keep, in words. */
@@ -617,16 +641,20 @@ function keepRow(row: Record<string, unknown>): KeepRow {
   }
 }
 
-/** Every adapter that is kept or being kept, by slot. */
-export async function listKeeps(): Promise<KeepRow[]> {
-  await ensureTinkerExtras()
+/**
+ * Every adapter that is kept or being kept, by slot. `createTables: false`
+ * only looks, for a server where keeping is switched off; the caller treats
+ * a failure (no such table) as none.
+ */
+export async function listKeeps(opts: { createTables?: boolean } = {}): Promise<KeepRow[]> {
+  if (opts.createTables !== false) await ensureTinkerExtras()
   const r = await sql`SELECT * FROM tinker_keeps ORDER BY slot ASC`
   return r.rows.map(row => keepRow(row as Record<string, unknown>))
 }
 
-export async function getKeep(slug: string): Promise<KeepRow | null> {
+export async function getKeep(slug: string, opts: { createTables?: boolean } = {}): Promise<KeepRow | null> {
   if (!isAdapterSlug(slug)) return null
-  await ensureTinkerExtras()
+  if (opts.createTables !== false) await ensureTinkerExtras()
   const r = await sql`SELECT * FROM tinker_keeps WHERE slug = ${slug} LIMIT 1`
   return r.rows[0] ? keepRow(r.rows[0] as Record<string, unknown>) : null
 }
@@ -677,6 +705,20 @@ export async function claimKeepSlot(params: {
   return n >= params.max
     ? { ok: false, reason: `${n} adapters are kept and at most ${params.max} may be; the owner has to unkeep one first` }
     : { ok: false, reason: 'another request took the place at the same moment; nothing was changed' }
+}
+
+/**
+ * Keeps models asked for today (UTC) that the runner has not answered yet. A
+ * keep is written to tool_runs only when it is closed, so the requests-per-day
+ * limit adds these to the stored ones.
+ */
+export async function pendingModelKeepsToday(now: Date = new Date()): Promise<number> {
+  await ensureTinkerExtras()
+  const r = await sql`
+    SELECT COUNT(*) AS n FROM tinker_keeps
+    WHERE status = ${'pending'} AND kept_by <> ${KEPT_BY_OWNER} AND requested_at >= ${`${utcDay(now)}T00:00:00.000Z`}
+  `
+  return Number(r.rows[0]?.n) || 0
 }
 
 /** Stores the runner's call for a keep that was started. */

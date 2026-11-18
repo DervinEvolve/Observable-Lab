@@ -30,7 +30,7 @@ import {
   type LiveCallRecord, type LiveKeyGrant,
 } from './live-model-keys.js'
 import { liveTrainedStatus } from './tinker.js'
-import { getAdapter, listAdapters, type AdapterTarget } from './tinker-store.js'
+import { adapterDescription, getAdapter, listAdapters, type AdapterTarget } from './tinker-store.js'
 import { adapterSlugOf, asksForAdapter, buildTrainedRequest, runTrainedCall, type TrainedRequest } from './live-trained.js'
 
 const CHAT_URL = 'https://openrouter.ai/api/v1/chat/completions'
@@ -109,7 +109,16 @@ export async function handleLiveModel(req: VercelRequest, res: VercelResponse) {
     // The lab's own adapters, while LAB_ENABLE_LIVE_TRAINED is on and some are kept.
     if (liveTrainedStatus().enabled) {
       try {
-        for (const { adapter } of await listAdapters()) list.data.push({ id: adapter.model_id, object: 'model', owned_by: 'lab' })
+        // The id stays "lab/<id>": that is the adapter's identity. A display
+        // name its author gave it, or the fact that it is marked to keep,
+        // goes in a "description", which is there only when there is
+        // something to say (so with names and keeping off the list is as it
+        // always was).
+        const data: Array<{ id: string; object: 'model'; owned_by: string; description?: string }> = list.data
+        for (const { adapter } of await listAdapters()) {
+          const description = adapterDescription(adapter)
+          data.push({ id: adapter.model_id, object: 'model', owned_by: 'lab', ...(description ? { description } : {}) })
+        }
       } catch (e) {
         console.warn('[live-model] could not list trained adapters:', e instanceof Error ? e.message : e)
       }
