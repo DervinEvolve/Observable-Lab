@@ -26,7 +26,7 @@ An epoch that is already running finishes; the check is at the start. If the led
 
 **Follow-up step.** With reasoning on, an epoch's five roles already use most of Vercel's 800 s function limit, and the contribution (explorer, code, test, CI, Sprite) can take as long again, so one request could not do both. The epoch now finishes with the Commentator and records what is left on its row (`epochs.followup`: the contribution's mutation, and whether an exhibit or lab proposal waits on the Reviewer's approval). The next cron tick runs that follow-up in its own request before any new epoch; with a 180-minute interval there are two idle ticks between epochs, so the cadence does not change. It takes the same claim as an epoch, checks the daily budget first, and its model calls count toward the epoch's cost. On a preview (no cron), run it by hand with `POST /api/epoch/run?step=followup`. The follow-up runs in two stages on separate ticks: stage 1 writes the code against a deadline inside its own request (the code-writing call gets up to 7 minutes; the test subagent is skipped if time is short) and opens the PR; stage 2 reads CI for that exact commit, runs the author's Sprite tests, and merges or closes, then opens any exhibit or proposal the Reviewer approved. CI runs on GitHub in between, so no request waits for it; stage 2 keeps waiting for CI that is still running for up to 3 hours. A model call that times out goes straight to the fallback instead of retrying the same model. A follow-up that ends without a PR, or dies part way and stays `running`, is not retried by itself; retry it once with `POST /api/epoch/run?step=followup&retry=<epoch>`.
 
-**The tool menu.** The Executor may also choose a Sprite session, a GPU job on Modal, an exhibit for the room or a proposal to this repository. Each is off unless its flag and credentials are set (`LAB_ENABLE_SPRITE_SESSIONS`, `LAB_ENABLE_GPU_JOBS`, `LAB_ENABLE_EXHIBITS`, `LAB_ENABLE_LAB_PROPOSALS`, all default false), has per-epoch and per-day limits, and is described to the models only while it is on. Sprite and GPU time is estimated from measured duration and written to `model_calls` as `tool/sprite_session` or `tool/gpu_job` with `cost_source = 'estimate'`, so the daily budget counts it; a tool whose worst case would pass today's budget does not start. Details, rates and setup: [TOOLS.md](TOOLS.md) and [EXHIBITS.md](EXHIBITS.md).
+**The tool menu.** The Executor may also choose a Sprite session, a GPU job on Modal, an exhibit for the room or a proposal to this repository. Each is off unless its flag and credentials are set (`LAB_ENABLE_SPRITE_SESSIONS`, `LAB_ENABLE_GPU_JOBS`, `LAB_ENABLE_EXHIBITS`, `LAB_ENABLE_LAB_PROPOSALS`, all default false), has per-epoch and per-day limits, and is described to the models only while it is on. Sprite and GPU time is estimated from measured duration and written to `model_calls` as `tool/sprite_session` or `tool/gpu_job` with `cost_source = 'estimate'`, so the daily budget counts it; a tool whose worst case would pass today's budget does not start. Details, rates and setup: [TOOLS.md](TOOLS.md) and [EXHIBITS.md](EXHIBITS.md). Public weights for GPU jobs (`LAB_ENABLE_WEIGHTS`, default false) are one more tool on this menu; how to turn them on is under [Public weights for GPU jobs](#public-weights-for-gpu-jobs).
 
 **Timing.** Sprite sessions (at most 240 s of commands) and GPU jobs (polled for at most `LAB_GPU_JOB_POLL_MAX_MS`, default 300 s) run while the Challenger, rebuttal and Reviewer are answering; the exhibit pull request waits on AI-Agent's CI alongside the code contribution. Keep these limits in mind against the 800 s function limit: an epoch that runs out of time resumes on the next tick from its stored outputs and does not run a tool twice.
 
@@ -131,7 +131,73 @@ The research controller runs only the reviewed preparation harness. It uses a ne
 
 The reviewed preparation source is bundled at `modal/harness/prepare.py`, originating from Research-Lab blob `c33f69057b59a9a9785a2ec77715cb47f2ea1412`. Its image copy is built from this checkout and the controller records its SHA-256 in each result. It prepares TinyStories data; smoke preparation uses synthetic data. Review harness and dataset changes separately from generated training code. Install the deployment client with `python -m pip install -r requirements-runner.txt` (Modal SDK 1.6.3). The runner uses the supported Sandbox filesystem API; the old `Sandbox.open()` API is retired. Verify network denial, cache write denial, no injected credentials, and process termination in a test deployment before rolling out the runner.
 
-For `modal/gpu_jobs.py` (the GPU job tool), create the Modal secret `oblab-gpu-jobs-auth` containing `JOBS_TOKEN` (at least 32 characters), put the same value in Vercel's `GPU_JOBS_TOKEN`, deploy with `modal deploy modal/gpu_jobs.py`, and set `GPU_JOBS_START_URL` and `GPU_JOBS_STATUS_URL` to the endpoints Modal prints. It uses the research runner's pinned base image and packages. Verify in a test deployment that a job cannot reach the network and sees no credentials, and that a job is stopped at 120 s, before turning on `LAB_ENABLE_GPU_JOBS`.
+For `modal/gpu_jobs.py` (the GPU job tool), create the Modal secret `oblab-gpu-jobs-auth` containing `JOBS_TOKEN` (at least 32 characters), put the same value in Vercel's `GPU_JOBS_TOKEN`, deploy with `modal deploy modal/gpu_jobs.py`, and set `GPU_JOBS_START_URL` and `GPU_JOBS_STATUS_URL` to the endpoints Modal prints. It uses the research runner's pinned base image and packages. Verify in a test deployment that a job cannot reach the network and sees no credentials, and that a job is stopped at 120 s, before turning on `LAB_ENABLE_GPU_JOBS`. The same file holds the fetcher for public weights; see [Public weights for GPU jobs](#public-weights-for-gpu-jobs).
+
+## Public weights for GPU jobs
+
+`LAB_ENABLE_WEIGHTS` (default false) lets the Executor ask for one public Hugging Face model repository per epoch. My own fetcher on Modal checks it and downloads it; a GPU job that names it reads it read-only at `/weights`, with the network still blocked. What it checks and why is in [TOOLS.md](TOOLS.md#public-weights). With the flag off nothing changes: no prompt text, no request to Modal, and a GPU job is sent exactly as before.
+
+The fetcher is part of `modal/gpu_jobs.py`, so it uses the GPU jobs endpoints and token that are already set (`GPU_JOBS_START_URL`, `GPU_JOBS_STATUS_URL`, `GPU_JOBS_TOKEN`). There is no new URL, token or Modal secret, and no Hugging Face token anywhere. `modal/research_runner.py` is not changed and does not need a deploy.
+
+**1. Deploy the Modal app from my Mac.** The version deployed on 18 November has no fetcher, so this step comes first. From this repository:
+
+```
+python -m pip install -r requirements-runner.txt
+modal deploy modal/gpu_jobs.py
+```
+
+The first deploy creates the Volume `oblab-weights` (the shelf) and the Dict `oblab-weights-use` (when each entry was last used). The two endpoint URLs stay the same, because the app and function names have not changed. If Modal prints different ones, put them in Vercel.
+
+**2. Check it by hand before any model can use it.** These calls go straight to the Modal endpoints. The token is read into a shell variable without being shown or saved in the shell history.
+
+```
+read -s JOBS_TOKEN
+START=https://dervinevolve--oblab-gpu-jobs-start.us-east.modal.run
+STATUS=https://dervinevolve--oblab-gpu-jobs-status.us-east.modal.run
+
+# a) Fetch a small public model (about 18 MB, apache-2.0, safetensors).
+curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fetch_weights":{"repo":"google/bert_uncased_L-2_H-128_A-2"}}'
+# prints {"call_id":"fc-..."}; poll it until status is "done":
+curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
+
+# b) A gated repository must be refused.
+curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fetch_weights":{"repo":"meta-llama/Llama-2-7b-hf"}}'
+
+# c) A job that names the weights: it must see them, fail to write, and have no network.
+curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"weights":{"repo":"google/bert_uncased_L-2_H-128_A-2"},"script":"import os, urllib.request\nprint(sorted(os.listdir(\"/weights\")))\ntry:\n    open(\"/weights/x\", \"w\")\n    print(\"WRITABLE\")\nexcept OSError as e:\n    print(\"read-only:\", e)\ntry:\n    urllib.request.urlopen(\"https://huggingface.co\", timeout=5)\n    print(\"NETWORK OPEN\")\nexcept Exception as e:\n    print(\"network blocked:\", type(e).__name__)\n"}'
+
+# d) The same script without "weights": there must be no /weights at all.
+unset JOBS_TOKEN
+modal volume ls oblab-weights google/bert_uncased_L-2_H-128_A-2
+```
+
+What I expect: (a) ends with `"status":"ok","cached":false` and a 40 character `sha`, and asking again gives `"cached":true`; (b) ends with `"status":"refused","rule":"gated"`; (c) prints `['_lab_manifest.json', 'config.json', 'model.safetensors', 'vocab.txt']`, a `read-only:` line and a `network blocked:` line, and its result has `"weights":{"repo":"google/bert_uncased_L-2_H-128_A-2",...}`; (d) fails with `FileNotFoundError` and its result has `"weights":null`. If (c) prints `WRITABLE` or `NETWORK OPEN`, or the job in (c) fails at stage `sandbox`, leave the flag off.
+
+I ran the fetcher's rules and its download and hash checks against the live Hugging Face API from a development machine, and that model passed while a gated one, one with custom code and one with only pickle weights were refused. I have not run any of this on Modal: the fetch function itself, the Volume, and above all the read-only mount of one shelf entry into a sandbox (`with_mount_options(read_only=True, sub_path=...)`, which the Modal SDK 1.6.3 has) are untested there. Step 2 is that test.
+
+**3. Turn it on in Vercel.** Set `LAB_ENABLE_WEIGHTS=true` for Production and redeploy. `LAB_ENABLE_GPU_JOBS` must be `true` as well, which it is. The other settings are optional:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LAB_ENABLE_WEIGHTS` | false | The switch. Only the exact value `true` turns it on. |
+| `LAB_WEIGHTS_PER_DAY` | 2 | Requests per UTC day, 0 to 20. A shelf hit and a refusal count; a skipped request does not. |
+| `LAB_WEIGHTS_LICENSES` | apache-2.0, mit, bsd-3-clause, bsd-2-clause, cc-by-4.0 | Comma separated license ids as Hugging Face writes them. |
+| `LAB_WEIGHTS_MAX_GB` | 3 | Largest download, in GB of 10^9 bytes. The Modal side never allows more than 20. |
+| `LAB_WEIGHTS_SHELF_GB` | 30 | Size of the shelf before the least recently used entries are removed. Never more than 500. |
+| `LAB_WEIGHTS_POLL_MAX_MS` | 180000 | How long an epoch waits for a fetch, at most 300000. |
+
+These limits are read by the server and sent to the fetcher with each request, so changing one needs a Vercel redeploy and no Modal deploy. The next epoch's prompts show the new numbers.
+
+**Timing.** A fetch and the GPU job that waits for it run one after the other, so together they can take up to 180 s plus 300 s of the 800 s an epoch has. If that is too tight, lower `LAB_WEIGHTS_POLL_MAX_MS`: a fetch that is not ready in time carries on at Modal and is on the shelf for the next epoch.
+
+**Spend.** A fetch is written to `model_calls` as `tool/weights`, an estimate from its measured time at `LAB_MODAL_GPU_USD_PER_SECOND` (about ten times Modal's CPU price, so it errs high), and counts against `LAB_DAILY_BUDGET_USD`. Its worst case, 960 s or about $0.29, is checked against the budget before it starts. Volume storage is billed by Modal and is not in the ledger. Modal's pricing page listed Volumes at $0.09 per GiB per month with 1 TiB per month free when I read it on 18 November 2026; I have not checked what my account is actually billed.
+
+**The shelf by hand.** `modal volume ls oblab-weights` lists it. `modal volume rm -r oblab-weights <org>/<name>` removes one repository, and `modal volume delete oblab-weights` removes everything (the next deploy creates an empty one). Narrowing `LAB_WEIGHTS_LICENSES` does not delete what is already there, but a job that names weights whose license is no longer on the list is not started.
+
+**Turning it off.** Set `LAB_ENABLE_WEIGHTS` to anything but `true` and redeploy Vercel. The models are no longer told about it, requests for weights are ignored, and GPU jobs get no volume and no label. The shelf stays where it is until I delete it.
 
 ## The lab model endpoint
 

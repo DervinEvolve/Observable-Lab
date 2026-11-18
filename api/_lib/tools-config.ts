@@ -13,7 +13,7 @@
 import { spritesConfigured } from './sprites.js'
 import { liveModelStatus, type LiveModelStatus } from './live-model.js'
 
-export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'exhibit', 'lab_proposal'] as const
+export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal'] as const
 export type ToolName = (typeof TOOL_NAMES)[number]
 
 /** Per-epoch limits. Not tunable: one of each kind per epoch at most. */
@@ -22,6 +22,7 @@ export const PER_EPOCH = {
   sprite_sessions: 1,
   sprite_commands: 4,     // commands in that one session
   gpu_jobs: 1,
+  weights: 1,             // public weights fetched for GPU jobs
   exhibits: 1,
   lab_proposals: 1,
 } as const
@@ -93,6 +94,7 @@ export function codeWritesEnabled(): boolean {
 export function toolConfig(): ToolConfig {
   const code = codeWritesEnabled()
   const ci = has('LAB_REQUIRED_CI_WORKFLOW_IDS') && has('AI_AGENT_GITHUB_TOKEN') && has('AI_AGENT_GITHUB_OWNER')
+  const gpuJobs = flag('LAB_ENABLE_GPU_JOBS') && has('GPU_JOBS_START_URL') && has('GPU_JOBS_STATUS_URL') && has('GPU_JOBS_TOKEN')
   return {
     subagents: status(code, 'LAB_ENABLE_CODE_WRITES is not true', intEnv('LAB_SUBAGENTS_PER_DAY', 24, 0, 200)),
     sprite_session: status(
@@ -101,9 +103,15 @@ export function toolConfig(): ToolConfig {
       intEnv('LAB_SPRITE_SESSIONS_PER_DAY', 8, 0, 100),
     ),
     gpu_job: status(
-      flag('LAB_ENABLE_GPU_JOBS') && has('GPU_JOBS_START_URL') && has('GPU_JOBS_STATUS_URL') && has('GPU_JOBS_TOKEN'),
+      gpuJobs,
       !flag('LAB_ENABLE_GPU_JOBS') ? 'LAB_ENABLE_GPU_JOBS is not true' : 'GPU_JOBS_START_URL, GPU_JOBS_STATUS_URL or GPU_JOBS_TOKEN is not set',
       intEnv('LAB_GPU_JOBS_PER_DAY', 4, 0, 50),
+    ),
+    // Public weights are only for GPU jobs, and are fetched by the same Modal app.
+    weights: status(
+      flag('LAB_ENABLE_WEIGHTS') && gpuJobs,
+      !flag('LAB_ENABLE_WEIGHTS') ? 'LAB_ENABLE_WEIGHTS is not true' : 'GPU jobs are off',
+      intEnv('LAB_WEIGHTS_PER_DAY', 2, 0, 20),
     ),
     exhibit: status(
       flag('LAB_ENABLE_EXHIBITS') && code && ci,

@@ -7,6 +7,7 @@ import {
   type ToolConfig,
 } from './tools-config.js'
 import { liveModelNote } from './live-model.js'
+import { weightsLimits } from './weights.js'
 import { MAX_PARTS, MAX_TRIANGLES, FIXED_TRIANGLES, TUBE_RADIAL_SEGMENTS, MATERIALS, PLACEMENTS, SHAPES } from './exhibits.js'
 
 const PROVIDERS: Record<string, string> = {
@@ -56,6 +57,11 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
   if (on('gpu_job')) {
     lines.push(`- GPU jobs on Modal: as Executor you may send one short Python script (Python 3.11 with torch 2.6 and numpy) to run on an A10G GPU. It has no network and no credentials, it is compiled first (a syntax error never starts the GPU), and it is stopped after ${GPU_JOB_MAX_S} s. Its output is stored and shown to visitors.`)
   }
+  if (on('weights')) {
+    // What it is and where its limits are, nothing about what to do with it.
+    const limits = weightsLimits()
+    lines.push(`- Public weights for GPU jobs: as Executor you may ask the lab for one public Hugging Face model repository by its id (and a revision if you want one). The lab's own code downloads it, not your script, and only when all of this holds: it is public and not gated (the lab uses no Hugging Face account), every license it states is one of ${limits.licenses.join(', ')}, it has safetensors weights, it has no code of its own (no .py file and no auto_map), and the files to download total at most ${limits.max_gb} GB. Only safetensors, JSON, text and tokenizer files are kept. A GPU job that names fetched weights reads them, read-only, at /weights; its network stays off and it is still stopped after ${GPU_JOB_MAX_S} s. The shelf holds ${limits.shelf_gb} GB, and the least recently used weights are removed to make room. Each GPU job's stored result is labelled "fine-tuned from <repo>@<commit>" or "from scratch" by what the lab mounted, and what a job prints is still self-reported.`)
+  }
   if (on('exhibit')) {
     lines.push(`- Exhibits for the room: as Executor you may design one object for the room as data (the exhibit format is in the Executor's instructions). If the Reviewer approves it, it becomes a pull request to AI-Agent that adds exhibits/<slug>/exhibit.json, and merges only if AI-Agent's CI passes. Merged exhibits are displayed in the room with the author model's name on them.`)
   }
@@ -74,7 +80,8 @@ export function executorToolsSection(config: ToolConfig = toolConfig()): string 
   const fields: string[] = []
   if (on('subagents')) fields.push(`    "subagents": { "explore": 0-${PER_EPOCH.explorers}, "test": true | false }`)
   if (on('sprite_session')) fields.push(`    "sprite_session": { "purpose": "one line", "commands": [ { "run": "shell command", "timeout_s": 5-${SPRITE_COMMAND_MAX_S} } ] }`)
-  if (on('gpu_job')) fields.push(`    "gpu_job": { "purpose": "one line", "script": "Python source, at most ${GPU_JOB_SCRIPT_MAX_CHARS} characters" }`)
+  if (on('gpu_job')) fields.push(`    "gpu_job": { "purpose": "one line", "script": "Python source, at most ${GPU_JOB_SCRIPT_MAX_CHARS} characters"${on('weights') ? ', "weights": "org/name of fetched weights (optional)"' : ''} }`)
+  if (on('weights')) fields.push(`    "weights": { "repo": "org/name on Hugging Face", "revision": "a branch, tag or commit (optional)" }`)
   if (on('exhibit')) fields.push(`    "exhibit": { "slug": "a-z 0-9 and -, 3 to 40 characters", "exhibit": { ...the exhibit, see below } }`)
   if (on('lab_proposal')) fields.push(`    "lab_proposal": { "title": "short", "summary": "what and why, for the owner", "files": [ { "path": "src/... api/... docs/... tests/... or modal/...", "content": "the whole new file" } ] }`)
   if (!fields.length) return ''
@@ -93,6 +100,9 @@ Leave out what you don't need. Use a tool only when it would really help this ep
   }
   if (on('gpu_job')) {
     text += `\nThe GPU script runs as job.py with no network and no files from the lab. Print what you want to see; the last part of the output is kept.`
+  }
+  if (on('weights')) {
+    text += `\nWeights asked for in the same answer are fetched before the GPU job starts. A job that names weights finds that one repository's files at /weights (the same path is in LAB_WEIGHTS_DIR), with the lab's record of them in /weights/_lab_manifest.json; a job that names none has no /weights. If the weights it names are not on the shelf, the job is not started and the reason is stored.`
   }
   if (on('exhibit')) {
     const tri = Object.entries(FIXED_TRIANGLES).map(([k, v]) => `${k} ${v}`).join(', ')

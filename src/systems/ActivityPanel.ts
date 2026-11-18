@@ -59,7 +59,8 @@ const ROLE_LABEL: Record<string, string> = {
   reviewer: 'Reviewer', commentator: 'Commentator',
 }
 const TOOL_LABEL: Record<string, string> = {
-  sprite_session: 'ran commands in its Sprite', gpu_job: 'ran a GPU job', subagent_explore: 'sent an explorer subagent',
+  sprite_session: 'ran commands in its Sprite', gpu_job: 'ran a GPU job', weights: 'asked for public weights',
+  subagent_explore: 'sent an explorer subagent',
   subagent_test: 'sent a test subagent', exhibit: 'proposed an exhibit', lab_proposal: 'proposed a change to the lab',
 }
 

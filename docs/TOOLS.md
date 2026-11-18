@@ -9,6 +9,7 @@ In a classic epoch the Executor may return an optional `tools` object next to it
 | `subagents` | `LAB_ENABLE_CODE_WRITES=true` | the contribution setup | 0 to 2 explorers and 0 or 1 test subagent | `LAB_SUBAGENTS_PER_DAY` (24) |
 | `sprite_session` | `LAB_ENABLE_SPRITE_SESSIONS=true` | `SPRITES_TOKEN` | 1 session, up to 4 commands | `LAB_SPRITE_SESSIONS_PER_DAY` (8) |
 | `gpu_job` | `LAB_ENABLE_GPU_JOBS=true` | `GPU_JOBS_START_URL`, `GPU_JOBS_STATUS_URL`, `GPU_JOBS_TOKEN` | 1 | `LAB_GPU_JOBS_PER_DAY` (4) |
+| `weights` | `LAB_ENABLE_WEIGHTS=true` | GPU jobs switched on, and `modal/gpu_jobs.py` deployed from a version that has the fetcher | 1 | `LAB_WEIGHTS_PER_DAY` (2) |
 | `exhibit` | `LAB_ENABLE_EXHIBITS=true` | `LAB_ENABLE_CODE_WRITES=true`, `AI_AGENT_GITHUB_TOKEN`, `AI_AGENT_GITHUB_OWNER`, `LAB_REQUIRED_CI_WORKFLOW_IDS` | 1 | `LAB_EXHIBITS_PER_DAY` (2) |
 | `lab_proposal` | `LAB_ENABLE_LAB_PROPOSALS=true` | `LAB_PROPOSALS_GITHUB_TOKEN`, `LAB_PROPOSALS_GITHUB_OWNER` | 1 | `LAB_LAB_PROPOSALS_PER_DAY` (1) |
 
@@ -18,7 +19,7 @@ Web search is not on this menu: the Planner and Executor calls, and the explorer
 
 ## When each runs
 
-- **Side tools** (`sprite_session`, `gpu_job`) start as soon as the Executor has answered and run while the Challenger, the rebuttal and the Reviewer talk. The runner waits for them before the Commentator, who is given a one-line summary of each, built from the stored records.
+- **Side tools** (`sprite_session`, `gpu_job`, `weights`) start as soon as the Executor has answered and run while the Challenger, the rebuttal and the Reviewer talk. The runner waits for them before the Commentator, who is given a one-line summary of each, built from the stored records. Weights asked for are fetched before that epoch's GPU job starts.
 - **Subagents** are part of the epoch's one code contribution, after the Reviewer.
 - **Deliverables** (`exhibit`, `lab_proposal`) run after the Reviewer, alongside the code contribution, and only when the Reviewer answered `"tool_verdicts": { "exhibit": "approve" }` or `{ "lab_proposal": "approve" }`. Anything else is a no.
 - The recent runs (not the skipped ones) go into the next epoch's shared context as `RECENT TOOL RUNS`, so the models see what really happened.
@@ -81,13 +82,45 @@ Revoking a key stops new calls. It does not stop a call that is already with the
 `"gpu_job": { "purpose": "...", "script": "..." }`, one Python script of at most 20,000 characters, run by `modal/gpu_jobs.py` under the research runner's sandbox rules:
 
 - the script must compile under the runner's Python first; a syntax error comes back at stage `syntax` and no GPU is started;
-- it runs in a fresh Modal Sandbox on an A10G with the network blocked, no secrets, no volumes, CPU and memory limits, and a hard limit of 120 s; the sandbox is always terminated;
+- it runs in a fresh Modal Sandbox on an A10G with the network blocked, no secrets, no volumes (unless it names [public weights](#public-weights), see below), CPU and memory limits, and a hard limit of 120 s; the sandbox is always terminated;
 - its output goes to a size-limited file and only the last 64 KiB is read back, from one verified regular file;
 - whatever it prints is self-reported and stored as output, nothing more.
 
 Deploy it with `modal deploy modal/gpu_jobs.py`, create the Modal secret `oblab-gpu-jobs-auth` with `JOBS_TOKEN` (at least 32 characters), and put the same value in the server's `GPU_JOBS_TOKEN`. Set `GPU_JOBS_START_URL` and `GPU_JOBS_STATUS_URL` to the `https://` endpoints Modal prints. The token travels in the Authorization header only. The server spawns the job and polls for up to `LAB_GPU_JOB_POLL_MAX_MS` (default 300000).
 
 **Cost** is the job's measured wall time at `LAB_MODAL_GPU_USD_PER_SECOND`, default **0.000306** (Modal's published A10G rate when this was written; check modal.com/pricing and set it if it has changed). The whole job time is billed at the GPU rate, which slightly overestimates. A job that never started costs nothing; one whose result was lost is charged 210 s.
+
+## Public weights
+
+A GPU job's script has no network, and it must stay that way. With a connection it could download a trained model and print a great score as if it had trained one, and the experiment would mean nothing. So a model cannot download anything. What it can do, while `LAB_ENABLE_WEIGHTS=true`, is ask: `"weights": { "repo": "org/name", "revision": "..." }` names one public Hugging Face model repository (the revision is optional and defaults to `main`). My own code fetches it, checks it, and puts it on a shelf. A GPU job that names it, `"gpu_job": { ..., "weights": "org/name" }`, then reads it. Weights asked for in the same answer are fetched before the job starts.
+
+**Who does what.** The request is read strictly by the server (`api/_lib/weights.ts`): the id must be `org/name` in Hugging Face's own spelling, with no slashes, dots or anything else that could be a path. The server sends it to `fetch_weights` in `modal/gpu_jobs.py`, through the same endpoint and token as GPU jobs, with the token in the Authorization header only. `fetch_weights` is lab code. It is the only code in that app that downloads anything, it holds no credentials of any kind, and it never runs, imports or unpickles what it downloads. The model's script still runs in the sandbox with the network blocked.
+
+**What the fetcher checks, in this order, before it downloads any weights.** It asks the public Hugging Face API for that revision, without a token, and gets back a commit sha and the file list. Then:
+
+1. The repository must be public and not gated. No Hugging Face token is used anywhere, so a gated or private repository could not be read anyway; it looks the same as one that does not exist.
+2. Every license the model card states must be on my list: `LAB_WEIGHTS_LICENSES`, default apache-2.0, mit, bsd-3-clause, bsd-2-clause, cc-by-4.0. No license stated is a refusal.
+3. No custom code. A `.py` file anywhere in the repository, or an `auto_map` entry in its config, is a refusal. I never use `trust_remote_code`.
+4. It must have safetensors weights. Only safetensors, JSON, `.txt` and the tokenizer model files (`tokenizer.model`, `spiece.model`, `sentencepiece.bpe.model`) are downloaded. `.bin`, `.pt`, `.pkl` and every other kind of file stay on the hub. A repository with only pickle weights is refused.
+5. The files to download must total at most `LAB_WEIGHTS_MAX_GB` (default 3, where 1 GB is 10^9 bytes), in at most 64 files with plain paths.
+
+Then it downloads that exact commit, small files first. Every file must be the size the hub said and hash to what the hub published for it (the sha256 for a large file, the git blob id for a small one). Each downloaded config is read again for `auto_map` before the weights are fetched. Anything that does not match removes the whole download.
+
+**The shelf.** The files go to the Modal Volume `oblab-weights` at `<org>/<name>/<commit sha>/`, with a manifest, `_lab_manifest.json`: the repository, the commit, the license, the total size, each file with its size and sha256, when it was fetched, and that no token was used. Weights already on the shelf are not downloaded again, but the rules are checked again each time they are asked for. The shelf holds `LAB_WEIGHTS_SHELF_GB` (default 30). When a new download needs room, the least recently used entries are removed, where use means being asked for or being named by a job.
+
+**What a job sees.** A job that names weights gets that one shelf entry, and nothing else from the shelf, mounted read-only at `/weights` (the same path is in `LAB_WEIGHTS_DIR`). The network stays blocked, there are still no secrets, and the 120 s limit still applies. If the weights are not on the shelf, or their license has since been taken off my list, the job is not started and no GPU time is spent. A job that names no weights has no volume at all, exactly as before.
+
+**The label.** While this is on, every GPU job result is stored with a label: `fine-tuned from <repo>@<commit>` or `from scratch`. It is at the front of the job's `request_summary`, so it shows on the ticket by the gauge and in the activity record, and in full in `detail.label`. The label is built from what the Modal controller reports it mounted, never from what the model asked for or printed. A sandbox with nothing mounted has no network and no files from outside, so `from scratch` holds. What the job prints is still self-reported and unverified, as before.
+
+**Limits to keep in mind.** `fine-tuned from` says which weights the job could read. It does not show that the job used them, or how. The license check reads what the model card says; it does not judge whether the card is right. A refusal comes back with its rule (`gated`, `license`, `custom_code`, `format`, `size`, `not_public`, `repo`, `revision`, `paths`, `files`, `shelf`) and is stored as a `failed` tool run with the reason.
+
+**Waiting.** The server polls a fetch for `LAB_WEIGHTS_POLL_MAX_MS` (default 180000, at most 300000). If it is still running then, it carries on at Modal for up to 900 s, the run is stored as `timeout`, and the job that named those weights is skipped for this epoch. Asking again in a later epoch finds them on the shelf.
+
+**Cost.** The fetcher runs on CPU. I charge its measured time at `LAB_MODAL_GPU_USD_PER_SECOND`, the same rate as a GPU job, which is about ten times Modal's listed CPU price, so the estimate errs high. A fetch whose time never came back is charged 960 s. It is written to `model_calls` as `tool/weights`. Storage is separate and not in the ledger: Modal's pricing page listed Volumes at $0.09 per GiB per month with 1 TiB per month free when I read it on 18 November 2026, so a 30 GB shelf costs nothing inside that allowance and about $2.50 a month outside it. Check modal.com/pricing before relying on that.
+
+**What the models are told.** One line in the shared context and a few in the Executor's instructions, only while it is on: what can be asked for, the rules above with my current numbers, that a job reads the weights read-only at `/weights` with the network still off and the 120 s limit, the shelf size, and how results are labelled. It says nothing about which weights to ask for or what to do with them.
+
+The research loop (`modal/research_runner.py`) does not get the shelf. Its kept scores compare runs that all start from nothing, and I did not want to change what those numbers mean.
 
 ## Exhibits
 
@@ -101,7 +134,7 @@ The token is `LAB_PROPOSALS_GITHUB_TOKEN`, a fine-grained token for that one rep
 
 ## Spend
 
-Before a tool runs, the server checks its daily limit and today's spend. A Sprite session or GPU job is refused when today's spend plus its worst case (240 s of Sprite time, or 210 s of GPU time) would pass `LAB_DAILY_BUDGET_USD`. Afterwards its estimated cost is written to the `model_calls` ledger as model `tool/sprite_session` or `tool/gpu_job` with `cost_source` `estimate`, so the daily cap, the cron's pause and the epoch's `cost_usd` all include it.
+Before a tool runs, the server checks its daily limit and today's spend. A Sprite session, GPU job or weights fetch is refused when today's spend plus its worst case (240 s of Sprite time, 210 s of GPU time, or 960 s of fetch time) would pass `LAB_DAILY_BUDGET_USD`. Afterwards its estimated cost is written to the `model_calls` ledger as model `tool/sprite_session`, `tool/gpu_job` or `tool/weights` with `cost_source` `estimate`, so the daily cap, the cron's pause and the epoch's `cost_usd` all include it.
 
 ## The record
 

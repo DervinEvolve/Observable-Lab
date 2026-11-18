@@ -8,6 +8,7 @@
 import { PER_EPOCH, TOOL_NAMES, type ToolConfig } from './tools-config.js'
 import { normalizeSessionCommands, type SessionCommand } from './sprite-session.js'
 import { normalizeGpuScript } from './gpu-jobs.js'
+import { normalizeWeightsRef, normalizeWeightsRequest, type WeightsRef, type WeightsRequest } from './weights.js'
 import { isValidSlug } from './exhibits.js'
 import { normalizeProposal, type ProposalRequest } from './lab-proposals.js'
 
@@ -17,7 +18,8 @@ export const DEFAULT_SUBAGENTS = { explore: 1, test: true } as const
 export interface ToolPlan {
   subagents: { explore: number; test: boolean; chosen: boolean }
   sprite_session?: { purpose: string; commands: SessionCommand[] }
-  gpu_job?: { purpose: string; script: string }
+  gpu_job?: { purpose: string; script: string; weights?: WeightsRef }
+  weights?: WeightsRequest
   exhibit?: { slug: string; exhibit: unknown }
   lab_proposal?: ProposalRequest
   ignored: Array<{ tool: string; reason: string }>
@@ -72,8 +74,20 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
   if (!off('gpu_job')) {
     const g = req.gpu_job as Record<string, unknown>
     const checked = normalizeGpuScript(g && typeof g === 'object' ? g.script : undefined)
+    // "weights" on a job is read only while public weights are on; otherwise
+    // the field is left alone, as any extra field always was.
+    const named = config.weights.enabled && config.weights.per_day > 0 && g && typeof g === 'object' && g.weights !== undefined && g.weights !== null && g.weights !== false
+      ? normalizeWeightsRef(g.weights) : null
     if ('error' in checked) plan.ignored.push({ tool: 'gpu_job', reason: checked.error })
-    else plan.gpu_job = { purpose: text(g.purpose, 200), script: checked.script }
+    // A script written for weights it cannot have would only burn GPU time.
+    else if (named && 'error' in named) plan.ignored.push({ tool: 'gpu_job', reason: named.error })
+    else plan.gpu_job = { purpose: text(g.purpose, 200), script: checked.script, ...(named ? { weights: named.ref } : {}) }
+  }
+
+  if (!off('weights')) {
+    const checked = normalizeWeightsRequest(req.weights)
+    if ('error' in checked) plan.ignored.push({ tool: 'weights', reason: checked.error })
+    else plan.weights = checked.request
   }
 
   if (!off('exhibit')) {

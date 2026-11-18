@@ -7,10 +7,19 @@
  * Cost is estimated from the job's measured time at the A10G rate
  * (tools-config.ts) and recorded; when the job's time is unknown the full
  * limit plus startup is charged, so the estimate errs high.
+ *
+ * The same Modal app holds the lab's weights fetcher (weights.ts). It is
+ * reached through the same two endpoints with the same token:
+ * runWeightsFetch asks for a public repository, and runGpuJob can name
+ * fetched weights for the job's sandbox to read.
  */
 import { requireEnv, requireHttpsUrl } from './config.js'
 import { GPU_JOB_MAX_S, GPU_JOB_SCRIPT_MAX_CHARS, modalGpuUsdPerSecond } from './tools-config.js'
 import { assertNoSecrets } from './sprites.js'
+import {
+  estimateWeightsFetchCost, normalizeFetchResult, normalizeMounted, weightsLimits, weightsWaitMs,
+  type MountedWeights, type WeightsFetchResult, type WeightsRef, type WeightsRequest,
+} from './weights.js'
 
 const REQUEST_TIMEOUT_MS = 30_000
 /** Seconds charged when the job's real time never came back. */
@@ -26,6 +35,8 @@ export interface GpuJobResult {
   gpu: string | null
   error?: string
   cost_usd: number
+  /** The public weights the sandbox had mounted, as the controller reported them; null when it had none. */
+  weights: MountedWeights | null
 }
 
 function authHeaders(): Record<string, string> {
@@ -53,7 +64,9 @@ export function normalizeJobResult(raw: unknown): GpuJobResult {
   const status = ['ok', 'error', 'timeout', 'crash'].includes(String(r.status)) ? String(r.status) as GpuJobResult['status'] : 'failed'
   const wall = num(r.wall_seconds)
   // A syntax failure never started a GPU: only the tiny controller ran.
-  const cost = r.stage === 'syntax' || r.stage === 'input' ? estimateGpuCost(Math.min(wall ?? 1, 5)) : estimateGpuCost(wall)
+  // The same when the weights it named were not on the shelf (stage "weights").
+  const noGpu = r.stage === 'syntax' || r.stage === 'input' || r.stage === 'weights'
+  const cost = noGpu ? estimateGpuCost(Math.min(wall ?? 1, 5)) : estimateGpuCost(wall)
   return {
     status,
     stage: typeof r.stage === 'string' ? r.stage.slice(0, 20) : undefined,
@@ -64,54 +77,103 @@ export function normalizeJobResult(raw: unknown): GpuJobResult {
     gpu: typeof r.gpu === 'string' ? r.gpu.slice(0, 20) : null,
     error: typeof r.error === 'string' ? r.error.slice(0, 1500) : undefined,
     cost_usd: cost,
+    weights: normalizeMounted(r.weights),
   }
 }
 
-/**
- * Starts the job and waits for it. Never throws: a start failure costs
- * nothing, a lost poll is charged at the worst case.
- */
-export async function runGpuJob(script: string, opts: { pollMs?: number; maxWaitMs?: number } = {}): Promise<GpuJobResult> {
-  const pollMs = opts.pollMs ?? 5000
-  const envWait = Number(process.env.LAB_GPU_JOB_POLL_MAX_MS)
-  const maxWaitMs = opts.maxWaitMs ?? (Number.isFinite(envWait) && envWait > 0 ? Math.min(envWait, 600_000) : 300_000)
-  const failed = (error: string, cost: number): GpuJobResult => ({
-    status: 'failed', exit_code: null, log_tail: '', run_seconds: null, wall_seconds: null, gpu: null, error, cost_usd: cost,
-  })
-  try { assertNoSecrets([script]) } catch { return failed('refusing to send a server credential into a GPU job', 0) }
+type JobsCall =
+  | { state: 'not_started'; error: string }   // nothing ran: nothing to charge
+  | { state: 'done'; result: unknown }
+  | { state: 'failed'; error: string }        // started, then lost
+  | { state: 'no_result'; waitedMs: number }  // started, still running when the wait ended
+
+/** One call to the Modal app: POST the body to /start, then poll /status. Never throws. */
+async function callJobsApp(body: Record<string, unknown>, pollMs: number, maxWaitMs: number): Promise<JobsCall> {
   let callId: string
   try {
     const startUrl = requireHttpsUrl('GPU_JOBS_START_URL', 'GPU jobs')
     const res = await fetch(startUrl, {
       method: 'POST',
       headers: { ...authHeaders(), 'Content-Type': 'application/json' },
-      body: JSON.stringify({ script }),
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     })
-    if (!res.ok) return failed(`start failed: HTTP ${res.status}`, 0)
+    if (!res.ok) return { state: 'not_started', error: `start failed: HTTP ${res.status}` }
     const data = await res.json() as { call_id?: unknown }
-    if (typeof data.call_id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(data.call_id)) return failed('start: no call id', 0)
+    if (typeof data.call_id !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(data.call_id)) return { state: 'not_started', error: 'start: no call id' }
     callId = data.call_id
   } catch (e) {
-    // Not known to have started: nothing charged.
-    return failed(`start failed: ${e instanceof Error ? e.message : 'request error'}`, 0)
+    return { state: 'not_started', error: `start failed: ${e instanceof Error ? e.message : 'request error'}` }
   }
 
-  const statusUrl = new URL(requireHttpsUrl('GPU_JOBS_STATUS_URL', 'GPU jobs'))
+  let statusUrl: URL
+  try {
+    statusUrl = new URL(requireHttpsUrl('GPU_JOBS_STATUS_URL', 'GPU jobs'))
+  } catch (e) {
+    return { state: 'failed', error: e instanceof Error ? e.message : 'no status URL' }
+  }
   statusUrl.searchParams.set('call_id', callId)
   const deadline = Date.now() + maxWaitMs
   for (let first = true; Date.now() < deadline; first = false) {
-    if (!first) await new Promise(r => setTimeout(r, pollMs))
+    if (!first) await new Promise(r => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))))
     try {
       const res = await fetch(statusUrl, { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
       if (!res.ok) continue
       const data = await res.json() as { status?: unknown; result?: unknown; error?: unknown }
       if (data.status === 'running') continue
-      if (data.status === 'done') return normalizeJobResult(data.result)
-      return failed(`job failed: ${typeof data.error === 'string' ? data.error.slice(0, 300) : 'unknown status'}`, estimateGpuCost(null))
+      if (data.status === 'done') return { state: 'done', result: data.result }
+      return { state: 'failed', error: typeof data.error === 'string' ? data.error.slice(0, 300) : 'unknown status' }
     } catch {
       // keep polling until the deadline
     }
   }
-  return failed(`no result after ${Math.round(maxWaitMs / 1000)} s of waiting`, estimateGpuCost(null))
+  return { state: 'no_result', waitedMs: maxWaitMs }
+}
+
+/**
+ * Starts the job and waits for it. Never throws: a start failure costs
+ * nothing, a lost poll is charged at the worst case.
+ *
+ * `weights` names public weights from the lab's shelf for the sandbox to
+ * read at /weights. It is sent only when given, so a job without it is the
+ * same request as before.
+ */
+export async function runGpuJob(script: string, opts: { pollMs?: number; maxWaitMs?: number; weights?: WeightsRef } = {}): Promise<GpuJobResult> {
+  const pollMs = opts.pollMs ?? 5000
+  const envWait = Number(process.env.LAB_GPU_JOB_POLL_MAX_MS)
+  const maxWaitMs = opts.maxWaitMs ?? (Number.isFinite(envWait) && envWait > 0 ? Math.min(envWait, 600_000) : 300_000)
+  const failed = (error: string, cost: number): GpuJobResult => ({
+    status: 'failed', exit_code: null, log_tail: '', run_seconds: null, wall_seconds: null, gpu: null, error, cost_usd: cost, weights: null,
+  })
+  try { assertNoSecrets([script]) } catch { return failed('refusing to send a server credential into a GPU job', 0) }
+  const body: Record<string, unknown> = { script }
+  if (opts.weights) body.weights = { ...opts.weights, licenses: weightsLimits().licenses }
+  const call = await callJobsApp(body, pollMs, maxWaitMs)
+  // Not known to have started: nothing charged.
+  if (call.state === 'not_started') return failed(call.error, 0)
+  if (call.state === 'done') return normalizeJobResult(call.result)
+  if (call.state === 'failed') return failed(`job failed: ${call.error}`, estimateGpuCost(null))
+  return failed(`no result after ${Math.round(call.waitedMs / 1000)} s of waiting`, estimateGpuCost(null))
+}
+
+/**
+ * Asks the lab's fetcher on Modal for one public repository and waits for
+ * its answer. Never throws. The limits (licenses, sizes) are the owner's,
+ * read from the environment here and sent with the request; a model cannot
+ * set them. If the fetch is still running when the wait ends it carries on
+ * on Modal, and the result here is "pending", charged at the worst case.
+ */
+export async function runWeightsFetch(request: WeightsRequest, opts: { pollMs?: number; maxWaitMs?: number } = {}): Promise<WeightsFetchResult> {
+  const none = (status: 'failed' | 'pending', error: string, cost: number): WeightsFetchResult => ({
+    status, repo: request.repo, sha: null, cached: false, license: null, size_bytes: null, files: null, evicted: [],
+    error, wall_seconds: null, cost_usd: cost,
+  })
+  const call = await callJobsApp(
+    { fetch_weights: { repo: request.repo, revision: request.revision, limits: weightsLimits() } },
+    opts.pollMs ?? 5000, opts.maxWaitMs ?? weightsWaitMs(),
+  )
+  if (call.state === 'not_started') return none('failed', call.error, 0)
+  if (call.state === 'done') return normalizeFetchResult(call.result, request)
+  if (call.state === 'failed') return none('failed', `fetch failed: ${call.error}`, estimateWeightsFetchCost(null))
+  return none('pending', `still fetching after ${Math.round(call.waitedMs / 1000)} s; it carries on, and asking again later finds it on the shelf`, estimateWeightsFetchCost(null))
 }
