@@ -32,7 +32,6 @@ import { assertManagedBranchName } from './branch-names.js'
 
 const SPRITES_API_BASE = 'https://api.sprites.dev/v1'
 const SPRITE_HOME = '/home/sprite'
-const REPO_DIR = `${SPRITE_HOME}/AI-Agent`
 
 export const SPRITE_KEYS = ['gemini', 'deepseek', 'claude', 'gpt', 'grok', 'north', 'glm'] as const
 export type SpriteKey = (typeof SPRITE_KEYS)[number]
