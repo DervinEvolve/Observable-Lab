@@ -9,6 +9,7 @@ import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 import unittest
 from unittest.mock import patch
 
@@ -28,6 +29,7 @@ def functions(names, namespace):
             node.decorator_list = []
             selected.append(node)
     assert len(selected) == len(names)
+    namespace.setdefault("Optional", Optional)  # the runner's signatures name it, for the deploying Mac's Python 3.9
     exec(compile(ast.Module(body=selected, type_ignores=[]), "modal/gpu_jobs.py", "exec"), namespace)
     return namespace
 

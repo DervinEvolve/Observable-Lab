@@ -21,6 +21,7 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Optional
 from unittest.mock import patch
 
 from fastapi import FastAPI, HTTPException, Request
@@ -56,6 +57,7 @@ def load(names, extra=None):
                 pass  # not a plain constant (a Modal object, an image)
     assert {n.name for n in selected} == set(names), set(names) - {n.name for n in selected}
     namespace.update(extra or {})
+    namespace.setdefault("Optional", Optional)  # the runner's signatures name it, for the deploying Mac's Python 3.9
     exec(compile(ast.Module(body=selected, type_ignores=[]), "modal/gpu_jobs.py", "exec"), namespace)
     return namespace
 
