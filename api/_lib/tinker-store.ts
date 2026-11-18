@@ -7,8 +7,9 @@
  *   tinker_spend_days    what Tinker use has been set aside and spent per
  *                        UTC day, per scope. This is where the daily caps
  *                        are enforced.
- *   trained_chat_rate    how many messages a visitor has sent, by a hash of
- *                        the visitor. No address is stored.
+ *   trained_chat_rate    how many messages an address, and an address with
+ *                        a browser string, has sent, by keyed hashes. No
+ *                        address is stored.
  *   trained_chat_calls   one row of counts per visitor chat call. No text.
  *
  * The caps are held by the database, not by this code's own arithmetic. A
@@ -26,6 +27,7 @@
  * All four tables are created at runtime, like the other run 2 tables.
  */
 import { createHash, createHmac } from 'node:crypto'
+import { isIPv4, isIPv6 } from 'node:net'
 import { sql } from '@vercel/postgres'
 import { sanitizeOutput } from './sprites.js'
 import { modelDisplayName } from './types.js'
@@ -314,16 +316,39 @@ export async function finishTinkerRun(id: string, params: {
   return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
 }
 
-/** Runs of one experiment that were started and not collected yet, oldest first. */
-export async function openTinkerRuns(experimentId: string): Promise<TinkerRunRow[]> {
-  await ensureTinkerTables()
+/**
+ * Runs that were opened and not closed yet, oldest first, whichever
+ * experiment they belong to: a run still owes its record and its cost after
+ * its experiment was archived or replaced. `createTables: false` is for a
+ * server where the tool is switched off: it only looks, and the caller
+ * treats a failure (no such table) as no runs.
+ */
+export async function openTinkerRuns(opts: { createTables?: boolean } = {}): Promise<TinkerRunRow[]> {
+  if (opts.createTables !== false) await ensureTinkerTables()
   const r = await sql`
     SELECT * FROM tinker_runs
-    WHERE experiment_id = ${experimentId} AND status IN ('reserved', 'running')
+    WHERE status IN ('reserved', 'running')
     ORDER BY created_at ASC
     LIMIT 5
   `
   return r.rows.map(row => runRow(row as Record<string, unknown>))
+}
+
+/**
+ * Runs that count toward today's limit (LAB_TINKER_PER_DAY): every run that
+ * was opened on this UTC day, except one that was closed at no cost (it never
+ * started, or the runner refused it before training). A run that is still
+ * training counts from the moment it is opened, which is why this is read
+ * from tinker_runs and not from tool_runs, where a run appears only once its
+ * result has been collected.
+ */
+export async function tinkerRunsToday(now: Date = new Date()): Promise<number> {
+  await ensureTinkerTables()
+  const r = await sql`
+    SELECT COUNT(*) AS n FROM tinker_runs
+    WHERE spend_day = ${utcDay(now)} AND (status IN ('reserved', 'running', 'ok') OR COALESCE(cost_usd, 0) > 0)
+  `
+  return Number(r.rows[0]?.n) || 0
 }
 
 // ---------------------------------------------------------------------------
@@ -402,16 +427,62 @@ export async function getAdapter(slug: string, now: Date = new Date()): Promise<
 // Visitor chat: rate limits by a hash, and counts
 // ---------------------------------------------------------------------------
 
+function visitorKey(): Buffer {
+  const secret = (process.env.LAB_OPERATOR_SECRET || process.env.CRON_SECRET || process.env.POSTGRES_URL || '').trim()
+  return createHash('sha256').update(`trained-chat-visitor|${secret}`, 'utf8').digest()
+}
+
+/**
+ * The network an address belongs to, for counting. An IPv4 address is itself.
+ * An IPv6 address is its first 64 bits: a home or a phone is usually given a
+ * whole /64 and can pick any address in it, so counting each address apart
+ * would count one sender as many. An IPv4 address written the IPv6 way
+ * (::ffff:1.2.3.4) is the IPv4 address. Anything else is kept as it came.
+ */
+export function addressNetwork(ip: string): string {
+  const raw = ip.trim().toLowerCase().replace(/^\[|\]$/g, '').replace(/%.*$/, '')
+  if (isIPv4(raw)) return raw
+  if (!isIPv6(raw)) return raw.slice(0, 80)
+  // A dotted IPv4 tail is two groups of the address.
+  let text = raw
+  const tail = /^(.*:)(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(raw)
+  if (tail) {
+    const [a, b, c, d] = tail.slice(2).map(Number)
+    text = `${tail[1]}${((a << 8) | b).toString(16)}:${((c << 8) | d).toString(16)}`
+  }
+  const [head, rest] = text.split('::') as [string, string | undefined]
+  const left = head ? head.split(':') : []
+  const right = rest ? rest.split(':') : []
+  const groups = (rest === undefined ? left : [...left, ...Array(Math.max(0, 8 - left.length - right.length)).fill('0'), ...right])
+    .map(g => parseInt(g, 16) || 0)
+  if (groups.length !== 8) return raw
+  if (groups.slice(0, 5).every(g => g === 0) && groups[5] === 0xffff) {
+    return `${groups[6] >> 8}.${groups[6] & 255}.${groups[7] >> 8}.${groups[7] & 255}`
+  }
+  return `${groups.slice(0, 4).map(g => g.toString(16)).join(':')}::/64`
+}
+
 /**
  * A visitor, as the lab remembers one: a keyed hash of the address and the
  * browser string, new every UTC day. The address itself is never stored or
  * logged. The key is taken from a secret this server already has, so the
  * hash cannot be turned back into an address by trying every address.
+ *
+ * The browser string is whatever the sender writes, so this hash only splits
+ * the people behind one address from each other. It is never the only thing
+ * a limit is counted by: addressHash below is counted too.
  */
 export function visitorHash(ip: string, userAgent: string, now: Date = new Date()): string {
-  const secret = (process.env.LAB_OPERATOR_SECRET || process.env.CRON_SECRET || process.env.POSTGRES_URL || '').trim()
-  const key = createHash('sha256').update(`trained-chat-visitor|${secret}`, 'utf8').digest()
-  return createHmac('sha256', key).update(`${utcDay(now)}|${ip}|${userAgent.slice(0, 300)}`, 'utf8').digest('hex').slice(0, 40)
+  return createHmac('sha256', visitorKey()).update(`${utcDay(now)}|${addressNetwork(ip)}|${userAgent.slice(0, 300)}`, 'utf8').digest('hex').slice(0, 40)
+}
+
+/**
+ * An address alone, as the lab remembers one: a keyed hash of its network
+ * (addressNetwork), new every UTC day. Nothing the sender can choose besides
+ * the network it sends from goes into it.
+ */
+export function addressHash(ip: string, now: Date = new Date()): string {
+  return createHmac('sha256', visitorKey()).update(`address|${utcDay(now)}|${addressNetwork(ip)}`, 'utf8').digest('hex').slice(0, 40)
 }
 
 /**

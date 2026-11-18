@@ -31,6 +31,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     return res.status(405).json({ error: 'Method not allowed' })
   }
 
+  // Tinker training runs that were still going when their follow-up ended:
+  // their results are collected here, once per tick and before anything
+  // else, whichever experiment they belong to and whatever this tick goes on
+  // to do (an epoch in progress, nothing due, no active experiment). With
+  // LAB_ENABLE_TINKER off and no runner configured this does nothing, not
+  // even a query. It never throws.
+  const collected = await collectTinkerRuns()
+  if (collected.length) console.log(`[CRON] Collected ${collected.length} Tinker training run(s)`)
+
   if (!researchAlongside()) {
     try {
       // The classic experiment, or the only active one. Active means anything
@@ -109,12 +118,6 @@ async function advance(experiment: Record<string, any>, slot: TickSlot): Promise
       console.warn(`${tag} Cleared stale epoch flag after ${Math.round(minutesInProgress)} minutes for experiment ${experiment.id}`)
     }
   }
-
-  // Tinker training runs that were still going when their follow-up ended:
-  // their results are collected here, whatever else this tick does. With
-  // LAB_ENABLE_TINKER off this does nothing, not even a query.
-  const collected = await collectTinkerRuns(experiment.id)
-  if (collected.length) console.log(`${tag} Collected ${collected.length} Tinker training run(s)`)
 
   // A finished epoch's queued work (its code contribution, approved
   // exhibits and proposals) gets a tick of its own before the next epoch,

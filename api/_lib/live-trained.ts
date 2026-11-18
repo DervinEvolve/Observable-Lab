@@ -20,7 +20,7 @@ import { recordModelCall, withSpendContext } from './spend.js'
 import { LIVE_MAX_MESSAGES, LIVE_UPSTREAM_TIMEOUT_MS, shapeLiveCompletion, type LiveRefusal } from './live-model.js'
 import { LIVE_MODEL_PURPOSE, recordLiveCall, settleLiveCall, type LiveCallRecord, type LiveKeyGrant } from './live-model-keys.js'
 import { LAB_ADAPTER_PREFIX, isAdapterSlug, tinkerChatCostUsd, tinkerChatWorstCaseUsd, tinkerDailyUsd } from './tinker.js'
-import { callTinkerChat, type TinkerChatMessage } from './tinker-chat.js'
+import { callTinkerChat, tinkerChatCharge, type TinkerChatMessage } from './tinker-chat.js'
 import { reserveTinkerSpend, settleTinkerSpend, type AdapterTarget } from './tinker-store.js'
 
 /** The most one call to an adapter may generate. */
@@ -144,12 +144,17 @@ export async function runTrainedCall(res: VercelResponse, key: LiveKeyGrant, tar
     ...(request.temperature !== undefined ? { temperature: request.temperature } : {}), timeoutMs: LIVE_UPSTREAM_TIMEOUT_MS,
   })
   record.httpStatus = answer.httpStatus
+  // Measured tokens at the published prices; or, when the call may have been
+  // served without the lab learning its token counts (a timeout, a broken
+  // connection, an answer with no usage), the whole amount set aside, so the
+  // caps fill from estimates that err high and never from zeros.
+  const charge = tinkerChatCharge(answer, (p, c) => tinkerChatCostUsd(base, p, c), worst)
+  if (charge.basis === 'worst_case') record.detail.cost_basis = 'usage unknown: the most the call could cost is counted'
   if (!answer.ok) {
     record.status = answer.kind === 'timeout' ? 'timeout' : answer.kind === 'no_answer' ? 'no_answer' : 'upstream_error'
     record.detail.error = answer.detail
-    // A call that timed out may still have been served and billed: the amount set aside is counted.
-    if (answer.kind === 'timeout') {
-      costUsd = worst
+    if (charge.usd > 0) {
+      costUsd = charge.usd
       record.costSource = 'estimate'
       await ledger(key, model, costUsd, 0, 0)
     }
@@ -162,7 +167,7 @@ export async function runTrainedCall(res: VercelResponse, key: LiveKeyGrant, tar
       : 'The training service could not be reached or gave no usable answer.')
   }
 
-  costUsd = tinkerChatCostUsd(base, answer.promptTokens, answer.completionTokens)
+  costUsd = charge.usd
   record.costSource = 'estimate'
   record.promptTokens = answer.promptTokens
   record.completionTokens = answer.completionTokens

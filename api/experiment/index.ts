@@ -10,6 +10,7 @@ import { checkDailyBudget, describeRunState, type BudgetStatus } from '../_lib/s
 import { computeGrowth, growthEventsFor, growthFactsFor, repoLinks } from '../_lib/growth.js'
 import { getRecentToolRuns } from '../_lib/tool-runs-store.js'
 import { enabledTools } from '../_lib/tools-config.js'
+import { trainedChatStatus } from '../_lib/tinker.js'
 import { exhibitsHandler } from '../_lib/exhibits-reader.js'
 import { researchAlongside } from '../_lib/experiment-modes.js'
 import { researchRunState, researchSummary } from '../_lib/research-alongside.js'
@@ -173,6 +174,9 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
 
     return res.status(200).json({
       ...response, growth_events: growthEvents, tool_runs: toolRuns, tools_enabled: enabledTools(),
+      // Present only while the visitor chat with trained adapters is switched
+      // on. The room's chat panel calls its own route only after seeing this.
+      ...(trainedChatStatus().enabled ? { trained_chat_enabled: true } : {}),
       ...(research ? { research } : {}),
     })
   } catch (error) {

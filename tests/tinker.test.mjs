@@ -118,8 +118,10 @@ class FakeDb {
     this.rate = new Map()
     this.chatCalls = []
     this.statements = []
+    this.epochCosts = []
     this.failSpend = false
     this.failTinker = false
+    this.noTinkerTables = false
   }
 
   handle(text, v) {
@@ -162,6 +164,14 @@ class FakeDb {
     if (text.startsWith('INSERT INTO model_calls')) {
       const [experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens] = v
       this.modelCalls.push({ experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens, created_at: new Date() })
+      return { rows: [] }
+    }
+    if (text.includes('FROM model_calls WHERE experiment_id = ? AND epoch_number = ?')) {
+      const calls = this.modelCalls.filter(c => c.experiment_id === v[0] && c.epoch_number === v[1])
+      return { rows: [{ cost_usd: calls.reduce((a, c) => a + Number(c.cost_usd), 0), prompt_tokens: 0, completion_tokens: 0 }] }
+    }
+    if (text.startsWith('UPDATE epochs SET cost_usd = ?, prompt_tokens = ?, completion_tokens = ? WHERE experiment_id = ? AND epoch_number = ?')) {
+      this.epochCosts.push({ cost_usd: v[0], experiment_id: v[3], epoch_number: v[4] })
       return { rows: [] }
     }
     if (text.includes('FROM model_calls WHERE purpose = ? AND created_at >= ?')) {
@@ -241,8 +251,14 @@ class FakeDb {
       Object.assign(row, { status, reason, cost_usd, result, sampler_path, expires_at })
       return { rows: [{ ...row }] }
     }
-    if (text.startsWith("SELECT * FROM tinker_runs WHERE experiment_id = ? AND status IN ('reserved', 'running')")) {
-      return { rows: this.tinkerRuns.filter(r => r.experiment_id === v[0] && (r.status === 'reserved' || r.status === 'running')).map(r => ({ ...r })) }
+    if (text.startsWith("SELECT * FROM tinker_runs WHERE status IN ('reserved', 'running') ORDER BY created_at ASC LIMIT 5")) {
+      if (this.noTinkerTables) throw new Error('relation "tinker_runs" does not exist')
+      return { rows: this.tinkerRuns.filter(r => r.status === 'reserved' || r.status === 'running').slice(0, 5).map(r => ({ ...r })) }
+    }
+    // The runs-per-day count: every run opened today except one closed at no cost.
+    if (text.startsWith('SELECT COUNT(*) AS n FROM tinker_runs WHERE spend_day = ?')) {
+      assert.ok(text.includes("AND (status IN ('reserved', 'running', 'ok') OR COALESCE(cost_usd, 0) > 0)"), 'the runs-per-day count lost its condition')
+      return { rows: [{ n: this.tinkerRuns.filter(r => r.spend_day === v[0] && (['reserved', 'running', 'ok'].includes(r.status) || Number(r.cost_usd) > 0)).length }] }
     }
     if (text.startsWith('SELECT * FROM tinker_runs WHERE status = ? AND sampler_path IS NOT NULL AND expires_at > ?')) {
       return { rows: this.tinkerRuns.filter(r => r.status === v[0] && r.sampler_path && at(r.expires_at) > at(v[1])).slice().reverse().map(r => ({ ...r })) }
@@ -328,14 +344,25 @@ const runnerOk = (extra = {}) => ({
   samples: [{ prompt: 'Question number 3?', completion: 'Answer number 3.' }], wall_seconds: 95.5, ...extra,
 })
 
-/** fetch that answers like the runner's two endpoints. `statuses` are served in order; the last repeats. */
-function fakeRunner(sent, statuses = [{ status: 'done', result: runnerOk() }], start = { call_id: 'fc-test-1' }) {
+/**
+ * fetch that answers like the runner's two endpoints. `statuses` are served in order; the last repeats.
+ * `names` is what the runner remembers: the call it started under each run's name. It is filled when a
+ * start is answered, and a test can fill it to stand for a run that started although its answer was lost.
+ */
+function fakeRunner(sent, statuses = [{ status: 'done', result: runnerOk() }], start = { call_id: 'fc-test-1' }, names = new Map()) {
   let polls = 0
   return async (url, options = {}) => {
     const u = String(url)
     if (u === START_URL) {
-      sent.push({ kind: 'start', headers: options.headers, raw: options.body, body: JSON.parse(options.body) })
-      return start instanceof Response ? start : new Response(JSON.stringify(start), { headers: { 'content-type': 'application/json' } })
+      const body = JSON.parse(options.body)
+      sent.push({ kind: 'start', headers: options.headers, raw: options.body, body })
+      if (!(start instanceof Response) && body.run_id) names.set(body.run_id, start.call_id)
+      return start instanceof Response ? start.clone() : new Response(JSON.stringify(start), { headers: { 'content-type': 'application/json' } })
+    }
+    if (u.startsWith(STATUS_URL) && new URL(u).searchParams.has('run_id')) {
+      const callId = names.get(new URL(u).searchParams.get('run_id'))
+      sent.push({ kind: 'lookup', headers: options.headers, url: u })
+      return new Response(JSON.stringify(callId ? { status: 'running', call_id: callId } : { status: 'unknown', error: 'no call is known for that run' }), { headers: { 'content-type': 'application/json' } })
     }
     if (u.startsWith(STATUS_URL)) {
       sent.push({ kind: 'status', headers: options.headers, url: u })
@@ -411,8 +438,12 @@ test('with the switches off nothing changes: no tool, no prompt text, no query, 
   assert.deepEqual(plan.ignored, [{ tool: 'tinker_train', reason: 'not enabled' }])
 
   // The tick's collector does nothing at all.
-  assert.deepEqual(await runs.collectTinkerRuns('exp-1'), [])
+  assert.deepEqual(await runs.collectTinkerRuns(), [])
   assert.equal(lab.statements.length, 0)
+
+  // The room's state does not mention the chat, so the panel never calls its route (see the panel test).
+  const stateRoute = readFileSync(join(root, 'api/experiment/index.ts'), 'utf8')
+  assert.match(stateRoute, /\.\.\.\(trainedChatStatus\(\)\.enabled \? \{ trained_chat_enabled: true \} : \{\}\)/)
 
   // The visitor route says it is off, without a query.
   const get = response()
@@ -543,8 +574,29 @@ test('the estimate counts every epoch, two held-out passes over the largest exam
   // A 20 example run costs well under a cent, and more epochs cost more.
   assert.ok(e.max_cost_usd < 0.01)
   assert.ok(tinker.estimateTinkerRun(ok(ask({ settings: { epochs: 3 } }))).max_cost_usd > e.max_cost_usd)
-  // An example is assumed to take a token for every 3 bytes and some for the chat format.
-  assert.equal(tinker.estimateExampleTokens({ messages: [{ role: 'user', content: 'abcdef' }, { role: 'assistant', content: 'é' }] }), 12 + (2 + 8) + (1 + 8))
+  // An example is assumed to take a token for every byte and some for the chat format. That is a
+  // ceiling: no text makes more tokens than it has bytes, and digits come close to one each.
+  assert.equal(tinker.TINKER_BYTES_PER_TOKEN, 1)
+  assert.equal(tinker.estimateExampleTokens({ messages: [{ role: 'user', content: 'abcdef' }, { role: 'assistant', content: 'é' }] }), 12 + (6 + 8) + (2 + 8))
+  // The run a reviewer saw refused after approval: 200 answers of 400 digits each, which the real
+  // tokenizer counts at about a token a digit. The amount set aside now covers a token for every byte
+  // of it, every epoch, and still sits far under the per-run cap.
+  const digits = ok({ examples: Array.from({ length: 200 }, (_, i) => ({ messages: [{ role: 'user', content: `Digits ${i}?` }, { role: 'assistant', content: String(i).padStart(4, '0').repeat(100) }] })), settings: { epochs: 2, batch_size: 8 } })
+  const d = tinker.estimateTinkerRun(digits)
+  assert.ok(d.dataset_tokens >= digits.dataset_bytes)
+  assert.ok(d.max_cost_usd >= 1.25 * digits.dataset_bytes * 2 * price.train / 1e6)
+  assert.ok(d.max_cost_usd > 0.1234 && d.max_cost_usd < tinker.tinkerRunUsd())
+  // The most any request the limits allow can set aside is still under the 2 dollars a run may cost:
+  // the full 120000 bytes cut into as many messages as there can be (2000 examples of 12 messages, so
+  // the chat-format allowance is as large as it gets), 3 epochs, on the dearest base model to train.
+  const extreme = tinker.normalizeTinkerRequest({
+    base_model: 'Qwen/Qwen3.5-9B', settings: { epochs: 3, batch_size: 16 },
+    examples: Array.from({ length: 2000 }, (_, i) => ({ messages: Array.from({ length: 12 }, (_, j) => ({ role: j % 2 === 0 ? 'user' : 'assistant', content: j === 0 ? String(i).padStart(5, '0') : 'xxxxx' })) })),
+  }, ['Qwen/Qwen3.5-9B'])
+  assert.ok('request' in extreme, extreme.error)
+  assert.equal(extreme.request.dataset_bytes, tinker.TINKER_MAX_DATASET_BYTES)
+  const most = tinker.estimateTinkerRun(extreme.request).max_cost_usd
+  assert.ok(most > 1.9 && most < tinker.DEFAULT_TINKER_RUN_USD, 'the largest amount that can be set aside is ' + most)
   assert.deepEqual([10, 20, 25, 2000].map(tinker.holdoutCount), [2, 2, 3, 200])
   // Measured tokens are priced the same way, and that is what a run is settled at.
   assert.ok(Math.abs(tinker.tinkerCostUsd(BASE, { train: 1_000_000, eval: 0, sample_prompt: 0, sample_completion: 0 }) - 0.737) < 1e-9)
@@ -635,7 +687,7 @@ test('an approved run: the estimate is set aside, the runner is sent data and li
   // What left the server.
   const start = sent.find(s => s.kind === 'start')
   assert.equal(start.headers.Authorization, `Bearer ${JOBS_TOKEN}`)
-  assert.deepEqual(Object.keys(start.body), ['train'])
+  assert.deepEqual(Object.keys(start.body), ['run_id', 'train'])
   const job = start.body.train
   assert.deepEqual(Object.keys(job).sort(), ['base_model', 'budget_usd', 'examples', 'label', 'prices', 'sample_max_tokens', 'samples', 'settings', 'split_salt', 'ttl_seconds'])
   assert.equal(job.base_model, BASE)
@@ -653,6 +705,8 @@ test('an approved run: the estimate is set aside, the runner is sent data and li
   assert.equal(run.status, 'ok')
   assert.equal(run.sampler_path, SAMPLER)
   assert.match(run.slug, /^e41-[0-9a-f]{8}$/)
+  // The runner is told the run's own name, so a start whose answer is lost can be found again.
+  assert.equal(start.body.run_id, run.slug)
   const measured = tinker.tinkerCostUsd(BASE, runnerOk().tokens)
   assert.ok(Math.abs(run.cost_usd - measured) < 2e-6)
   const ttlLeft = at(run.expires_at) - Date.now()
@@ -669,6 +723,9 @@ test('an approved run: the estimate is set aside, the runner is sent data and li
   const ledger = lab.modelCalls[0]
   assert.deepEqual([ledger.experiment_id, ledger.epoch_number, ledger.purpose, ledger.model_id, ledger.cost_source], ['exp-1', 41, 'tinker_train', 'tool/tinker_train', 'estimate'])
   assert.ok(Math.abs(ledger.cost_usd - measured) < 2e-6)
+  // The epoch's own cost is brought up to date from the ledger.
+  assert.deepEqual(lab.epochCosts.map(c => [c.experiment_id, c.epoch_number]), [['exp-1', 41]])
+  assert.ok(Math.abs(lab.epochCosts[0].cost_usd - measured) < 2e-6)
 
   // The public record.
   assert.equal(lab.toolRuns.length, 1)
@@ -718,10 +775,17 @@ test('nothing runs without the Reviewer, over a limit, or over a cap, and every 
   }
   assert.deepEqual(epochTools.readToolVerdicts({ tool_verdicts: { tinker_train: 'APPROVE', exhibit: 'maybe' } }), { tinker_train: 'approve' })
 
-  // The runs-per-day limit counts runs that happened.
-  lab.toolRuns.push({ id: uuid(), experiment_id: 'exp-0', epoch: 1, tool: 'tinker_train', status: 'ok', created_at: new Date() }, { id: uuid(), experiment_id: 'exp-0', epoch: 2, tool: 'tinker_train', status: 'error', created_at: new Date() })
+  // The runs-per-day limit counts the runs opened today, from tinker_runs: a run that is still training
+  // has no tool_runs row yet and counts all the same. One closed at no cost (never started, or refused by
+  // the runner before training) does not count, and neither does a run of another day.
+  const opened = (status, cost_usd, spend_day = store.utcDay()) => ({ id: uuid(), created_at: new Date().toISOString(), experiment_id: 'exp-0', epoch: 100 + lab.tinkerRuns.length, slug: `e${100 + lab.tinkerRuns.length}-00000000`, status, cost_usd, spend_day, reserved_usd: 0.01, call_id: 'fc-other' })
+  lab.tinkerRuns.push(opened('running', null), opened('failed', 0), opened('refused', 0), opened('ok', 0.004, '2026-01-01'))
+  assert.equal(await store.tinkerRunsToday(), 1)
+  lab.tinkerRuns.push(opened('error', 0.002))
+  assert.equal(await store.tinkerRunsToday(), 2)
+  assert.equal(lab.toolRuns.filter(r => r.status !== 'skipped').length, 0)
   assert.equal((await skipped({ tinker_train: 'approve' })).output_tail, 'daily limit of 2 reached')
-  lab.toolRuns = []
+  lab.tinkerRuns = []
 
   // The lab's own daily budget.
   lab.modelCalls.push({ purpose: 'epoch', cost_usd: 14.9999, created_at: new Date() })
@@ -774,11 +838,11 @@ test('a run that could not be started costs nothing; a refusal by the runner cos
   const plan = planFor(ask())
   const estimate = tinker.estimateTinkerRun(plan.tinker_train).max_cost_usd
 
-  // The start call fails: nothing reached Tinker.
-  globalThis.fetch = fakeRunner([], [], new Response('no', { status: 500 }))
+  // The runner itself says no (a 4xx comes before it starts anything): nothing reached Tinker.
+  globalThis.fetch = fakeRunner([], [], new Response('no', { status: 400 }))
   let out = await deliver(plan, undefined, { ...CTX, epochNumber: 50 })
   assert.equal(out[0].status, 'error')
-  assert.match(out[0].summary, /was not started: start failed: HTTP 500/)
+  assert.match(out[0].summary, /was not started: start failed: HTTP 400/)
   assert.deepEqual([lab.tinkerRuns[0].status, lab.tinkerRuns[0].cost_usd], ['failed', 0])
   assert.deepEqual([lab.spend('all').reserved_usd, lab.spend('all').spent_usd], [0, 0])
   assert.equal(lab.modelCalls.length, 0)
@@ -814,10 +878,19 @@ test('a run that could not be started costs nothing; a refusal by the runner cos
   assert.deepEqual([out[0].status, lab.tinkerRuns[4].status, lab.tinkerRuns[4].sampler_path], ['error', 'failed', null])
   assert.equal(lab.spend('all').reserved_usd, 0)
 
-  // The start request left and no answer came back: the run may be training. Nothing is given back,
-  // and after a while the tick closes it as a run whose usage is unknown.
+  // The start request left and nothing settles whether a run was started: no answer, an answer that
+  // is not the runner's, or a 5xx or 408 from the gateway in front of it (which can come after the run
+  // was started). The run may be training. Nothing is given back, and after a while the tick closes
+  // it as a run whose usage is unknown.
   const spentBefore = lab.spend('all').spent_usd
-  for (const answer of [async () => { throw new Error('socket hang up') }, async () => new Response('<html>gateway</html>', { status: 200 })]) {
+  const unsettled = [
+    async () => { throw new Error('socket hang up') },
+    async () => new Response('<html>gateway</html>', { status: 200 }),
+    async () => new Response('bad gateway', { status: 502 }),
+    async () => new Response('gateway timeout', { status: 504 }),
+    async () => new Response('request timeout', { status: 408 }),
+  ]
+  for (const answer of unsettled) {
     globalThis.fetch = answer
     const epochNumber = 55 + lab.tinkerRuns.length
     out = await deliver(plan, undefined, { ...CTX, epochNumber })
@@ -827,14 +900,62 @@ test('a run that could not be started costs nothing; a refusal by the runner cos
     assert.deepEqual([open.status, open.call_id], ['reserved', null])
     assert.ok(Math.abs(lab.spend('all').reserved_usd - estimate) < 2e-6)
     globalThis.fetch = async url => { throw new Error(`Unexpected outbound request to ${url}`) }
-    assert.deepEqual(await runs.collectTinkerRuns('exp-1'), [])
-    const closed = await runs.collectTinkerRuns('exp-1', new Date(Date.now() + runs.TINKER_UNCONFIRMED_AFTER_MS + 1000))
+    assert.deepEqual(await runs.collectTinkerRuns(), [])
+    const closed = await runs.collectTinkerRuns(new Date(Date.now() + runs.TINKER_UNCONFIRMED_AFTER_MS + 1000))
     assert.deepEqual(closed.map(o => o.status), ['error'])
     assert.deepEqual([open.status, open.cost_usd], ['failed', estimate])
     assert.equal(lab.spend('all').reserved_usd, 0)
   }
-  assert.ok(Math.abs(lab.spend('all').spent_usd - spentBefore - 2 * estimate) < 4e-6)
+  assert.ok(Math.abs(lab.spend('all').spent_usd - spentBefore - unsettled.length * estimate) < 1e-5)
   assert.match(lab.toolRuns[lab.toolRuns.length - 1].output_tail, /its start was never confirmed/)
+})
+
+test('a run whose start answer was lost is found again by its name, and costs what it measured', async () => {
+  enableTinker({ LAB_TINKER_PER_DAY: '10', LAB_TINKER_POLL_MAX_MS: '1' })
+  const plan = planFor(ask())
+  const estimate = tinker.estimateTinkerRun(plan.tinker_train).max_cost_usd
+  const measured = tinker.tinkerCostUsd(BASE, runnerOk().tokens)
+
+  // The gateway answers 502, but the runner had already started the run and remembers it by name.
+  // The lab asks once by name, gets the call id, and carries on as if the start had answered.
+  let sent = []
+  const names = new Map()
+  const lostAnswer = (statuses) => {
+    const runner = fakeRunner(sent, statuses, new Response('bad gateway', { status: 502 }), names)
+    return async (url, options = {}) => {
+      if (String(url) === START_URL) names.set(JSON.parse(options.body).run_id, 'fc-started-anyway')
+      return runner(url, options)
+    }
+  }
+  globalThis.fetch = lostAnswer([{ status: 'done', result: runnerOk() }])
+  let out = await deliver(plan, undefined, { ...CTX, epochNumber: 70 })
+  assert.deepEqual(out.map(o => o.status), ['ok'])
+  assert.deepEqual([lab.tinkerRuns[0].status, lab.tinkerRuns[0].call_id, lab.tinkerRuns[0].sampler_path], ['ok', 'fc-started-anyway', SAMPLER])
+  assert.ok(Math.abs(lab.tinkerRuns[0].cost_usd - measured) < 2e-6)
+  const lookup = sent.find(x => x.kind === 'lookup')
+  assert.equal(new URL(lookup.url).searchParams.get('run_id'), lab.tinkerRuns[0].slug)
+  assert.equal(lookup.headers.Authorization, `Bearer ${JOBS_TOKEN}`)
+  assert.equal(sent.filter(x => x.kind === 'status').every(x => new URL(x.url).searchParams.get('call_id') === 'fc-started-anyway'), true)
+
+  // The runner does not know the name yet when the lab asks (or cannot say): the run stays open. A
+  // later tick asks again by name, finds the call, and collects the result at its measured cost,
+  // not at the whole amount set aside.
+  sent = []
+  globalThis.fetch = fakeRunner(sent, [{ status: 'done', result: runnerOk() }], new Response('bad gateway', { status: 502 }), names)
+  out = await deliver(plan, undefined, { ...CTX, epochNumber: 71 })
+  assert.equal(out[0].status, 'error')
+  assert.match(out[0].summary, /start not confirmed: HTTP 502; the \$0\.\d+ set aside stays counted/)
+  const open = lab.tinkerRuns[1]
+  assert.deepEqual([open.status, open.call_id], ['reserved', null])
+  assert.equal(lab.spend('all').reserved_usd, estimate)
+  assert.equal(await store.tinkerRunsToday(), 2)
+  names.set(open.slug, 'fc-found-later')
+  const collected = await runs.collectTinkerRuns()
+  assert.deepEqual(collected.map(o => o.status), ['ok'])
+  assert.deepEqual([open.status, open.call_id], ['ok', 'fc-found-later'])
+  assert.ok(Math.abs(open.cost_usd - measured) < 2e-6)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+  assert.equal(JSON.stringify(sent).includes(TINKER_KEY), false)
 })
 
 test('a run still training when the wait ends is collected by a later tick, once', async () => {
@@ -850,13 +971,18 @@ test('a run still training when the wait ends is collected by a later tick, once
   assert.equal(lab.spend('all').reserved_usd, estimate)
   assert.equal(lab.toolRuns.length, 0)
 
-  // Still running at the next tick: nothing changes.
-  assert.deepEqual(await runs.collectTinkerRuns('exp-1'), [])
+  // Still running at the next tick: nothing changes. It already counts toward today's runs,
+  // although it has no tool_runs row yet.
+  assert.deepEqual(await runs.collectTinkerRuns(), [])
   assert.equal(lab.spend('all').reserved_usd, estimate)
+  assert.equal(await store.tinkerRunsToday(), 1)
 
-  // Finished at the one after. Two ticks collecting at once close it only once.
+  // Finished at the one after, which comes three hours after the run was opened (a status call that
+  // did not answer, say). Two ticks collecting at once close it only once.
+  const openedAt = Date.now() - 3 * 3600_000
+  lab.tinkerRuns[0].created_at = new Date(openedAt).toISOString()
   globalThis.fetch = fakeRunner(sent)
-  const [a, b] = await Promise.all([runs.collectTinkerRuns('exp-1'), runs.collectTinkerRuns('exp-1')])
+  const [a, b] = await Promise.all([runs.collectTinkerRuns(), runs.collectTinkerRuns()])
   assert.equal(a.length + b.length, 1)
   assert.equal(lab.tinkerRuns[0].status, 'ok')
   assert.equal(lab.toolRuns.length, 1)
@@ -865,17 +991,81 @@ test('a run still training when the wait ends is collected by a later tick, once
   const measured = tinker.tinkerCostUsd(BASE, runnerOk().tokens)
   assert.equal(lab.spend('all').reserved_usd, 0)
   assert.ok(Math.abs(lab.spend('all').spent_usd - measured) < 2e-6)
-  assert.deepEqual(await runs.collectTinkerRuns('exp-1'), [])
+  assert.deepEqual(await runs.collectTinkerRuns(), [])
+  // The adapter's expiry is counted from when the run was opened, which is never after the save on
+  // Tinker, not from when the result happened to be collected: the lab never offers an adapter that
+  // Tinker has already removed.
+  assert.equal(at(lab.tinkerRuns[0].expires_at), openedAt + (14 * 86400 - 3600) * 1000)
+  assert.equal(runs.adapterExpiry('2026-11-18T10:00:00.000Z', 14 * 86400, new Date('2026-11-18T13:00:00Z')), '2026-12-02T09:00:00.000Z')
+  // The epoch's stored cost is brought up to date with the run that was collected after it was saved.
+  assert.deepEqual(lab.epochCosts.map(c => [c.experiment_id, c.epoch_number]), [['exp-1', 41]])
+  assert.ok(Math.abs(lab.epochCosts[0].cost_usd - measured) < 2e-6)
 
   // A run with no answer long after its time limit is given up, and charged all that was set aside.
   globalThis.fetch = fakeRunner(sent, [{ status: 'running' }])
   await deliver(plan, undefined, { ...CTX, epochNumber: 60 })
   const late = new Date(Date.now() + runs.TINKER_LOST_AFTER_MS + 60_000)
-  const lost = await runs.collectTinkerRuns('exp-1', late)
+  const lost = await runs.collectTinkerRuns(late)
   assert.deepEqual(lost.map(o => o.status), ['error'])
   assert.deepEqual([lab.tinkerRuns[1].status, lab.tinkerRuns[1].cost_usd], ['failed', estimate])
-  // Another experiment's runs are not touched.
-  assert.deepEqual(await runs.collectTinkerRuns('exp-2'), [])
+})
+
+test('an open run is always closed: with the tool switched off, and for an experiment the tick is no longer advancing', async () => {
+  enableTinker({ LAB_TINKER_POLL_MAX_MS: '1', LAB_TINKER_PER_DAY: '10' })
+  const sent = []
+  globalThis.fetch = fakeRunner(sent, [{ status: 'running' }])
+  const plan = planFor(ask())
+  const estimate = tinker.estimateTinkerRun(plan.tinker_train).max_cost_usd
+  const measured = tinker.tinkerCostUsd(BASE, runnerOk().tokens)
+  // Two runs are left training: one of an experiment that is then replaced, one of the current one.
+  await deliver(plan, undefined, { ...CTX, experimentId: 'exp-old', epochNumber: 9 })
+  await deliver(plan, undefined, { ...CTX, experimentId: 'exp-1', epochNumber: 44 })
+  assert.deepEqual(lab.tinkerRuns.map(r => r.status), ['running', 'running'])
+
+  // The owner switches the tool off, the documented way. The runner's address and token are still set.
+  process.env.LAB_ENABLE_TINKER = 'false'
+  assert.equal(toolsConfig.toolConfig().tinker_train.enabled, false)
+  assert.equal(planFor(ask()).tinker_train, undefined)
+  lab.statements = []
+  globalThis.fetch = fakeRunner(sent)
+  const collected = await runs.collectTinkerRuns()
+  // Both are closed, with their records and their estimated cost on the ledger, each under its own experiment.
+  assert.deepEqual(collected.map(o => o.status), ['ok', 'ok'])
+  assert.deepEqual(lab.tinkerRuns.map(r => r.status), ['ok', 'ok'])
+  assert.deepEqual(lab.modelCalls.map(c => [c.experiment_id, c.epoch_number, c.purpose]), [['exp-old', 9, 'tinker_train'], ['exp-1', 44, 'tinker_train']])
+  assert.deepEqual(lab.toolRuns.map(r => [r.experiment_id, r.status]), [['exp-old', 'ok'], ['exp-1', 'ok']])
+  assert.equal(lab.spend('all').reserved_usd, 0)
+  assert.ok(Math.abs(lab.spend('all').spent_usd - 2 * measured) < 4e-6)
+  // Collecting started nothing, and with the switch off it did not create the tables either.
+  assert.equal(sent.filter(x => x.kind === 'start').length, 2)
+  assert.equal(lab.statements.some(x => /^CREATE TABLE IF NOT EXISTS tinker_/.test(x.text)), false)
+
+  // Switched off on a server that never used the tool: the table is not there, and that is not an error.
+  lab.noTinkerTables = true
+  lab.statements = []
+  logs = []
+  assert.deepEqual(await runs.collectTinkerRuns(), [])
+  assert.equal(lab.statements.some(x => /^CREATE/.test(x.text)), false)
+  assert.deepEqual(logs, [])
+  lab.noTinkerTables = false
+
+  // The runner's address is taken away too while a run is open (a hard stop). With the switch still
+  // on, the run cannot be asked about, and it is closed at the whole amount set aside once it is long
+  // past its time limit.
+  process.env.LAB_ENABLE_TINKER = 'true'
+  globalThis.fetch = fakeRunner(sent, [{ status: 'running' }])
+  await deliver(plan, undefined, { ...CTX, epochNumber: 45 })
+  for (const name of ['TINKER_JOBS_START_URL', 'TINKER_JOBS_STATUS_URL', 'TINKER_JOBS_TOKEN']) delete process.env[name]
+  globalThis.fetch = async url => { throw new Error(`Unexpected outbound request to ${url}`) }
+  assert.deepEqual(await runs.collectTinkerRuns(), [])
+  const closed = await runs.collectTinkerRuns(new Date(Date.now() + runs.TINKER_LOST_AFTER_MS + 60_000))
+  assert.deepEqual(closed.map(o => o.status), ['error'])
+  assert.deepEqual([lab.tinkerRuns[2].status, lab.tinkerRuns[2].cost_usd], ['failed', estimate])
+  // With the switch off and no runner configured, nothing at all happens.
+  process.env.LAB_ENABLE_TINKER = 'false'
+  lab.statements = []
+  assert.deepEqual(await runs.collectTinkerRuns(), [])
+  assert.equal(lab.statements.length, 0)
 })
 
 // ===========================================================================
@@ -1142,6 +1332,35 @@ test('a visitor is remembered as a keyed hash that changes with the address, the
   assert.notEqual(store.visitorHash(IP, 'A', now), h)
 })
 
+test('an address is remembered by its network alone: the browser string does not change it, and an IPv6 address is its /64', () => {
+  process.env.CRON_SECRET = 'test-only-scheduler-secret-0000000000'
+  const now = new Date('2026-11-18T12:00:00Z')
+  const a = store.addressHash(IP, now)
+  assert.match(a, /^[0-9a-f]{40}$/)
+  assert.equal(a.includes(IP), false)
+  assert.notEqual(a, store.visitorHash(IP, '', now))
+  assert.notEqual(store.addressHash('203.0.113.78', now), a)
+  assert.notEqual(store.addressHash(IP, new Date('2026-11-19T12:00:00Z')), a)
+  // IPv4 is itself, however it is written.
+  assert.equal(store.addressNetwork(' 203.0.113.77 '), '203.0.113.77')
+  assert.equal(store.addressNetwork('::ffff:203.0.113.77'), '203.0.113.77')
+  assert.equal(store.addressNetwork('::FFFF:cb00:714d'), '203.0.113.77')
+  assert.equal(store.addressHash('::ffff:203.0.113.77', now), a)
+  // IPv6 is its first 64 bits: every address a sender can pick inside its own /64 is the same sender.
+  const net = '2001:db8:12:3400::/64'
+  for (const ip of ['2001:db8:12:3400::1', '2001:0db8:0012:3400:ffff:ffff:ffff:ffff', '2001:DB8:12:3400:a:b:c:d', '[2001:db8:12:3400::9]', '2001:db8:12:3400::1.2.3.4']) {
+    assert.equal(store.addressNetwork(ip), net, ip)
+  }
+  assert.equal(store.addressHash('2001:db8:12:3400::1', now), store.addressHash('2001:db8:12:3400:dead:beef:0:1', now))
+  assert.equal(store.visitorHash('2001:db8:12:3400::1', 'A', now), store.visitorHash('2001:db8:12:3400:dead:beef:0:1', 'A', now))
+  assert.equal(store.addressNetwork('2001:db8:12:3401::1'), '2001:db8:12:3401::/64')
+  assert.equal(store.addressNetwork('::1'), '0:0:0:0::/64')
+  assert.equal(store.addressNetwork('fe80::1%eth0'), 'fe80:0:0:0::/64')
+  // Anything that is not an address is kept as it came, cut short.
+  assert.equal(store.addressNetwork('unknown'), 'unknown')
+  assert.equal(store.addressNetwork('x'.repeat(200)).length, 80)
+})
+
 test('the chat refuses what is out of bounds before anything is counted or sent', async () => {
   enableChat()
   const slug = keepAdapter()
@@ -1201,6 +1420,47 @@ test('a visitor is held to a number of messages in ten minutes and in a day, and
   assert.equal([...lab.rate.keys()].some(k => k.includes(IP) || k.includes('198.51.100.4')), false)
 })
 
+test('changing the browser string does not get past the limit of the address, and neither does changing address inside an IPv6 /64', async () => {
+  enableChat()
+  const slug = keepAdapter()
+  const sent = []
+  globalThis.fetch = fakeTinker(sent)
+  const perWindow = trainedChat.TRAINED_CHAT_ADDRESS_PER_WINDOW
+  assert.ok(perWindow > trainedChat.TRAINED_CHAT_PER_WINDOW && trainedChat.TRAINED_CHAT_ADDRESS_PER_DAY > trainedChat.TRAINED_CHAT_PER_DAY)
+
+  // One address, a new browser string with every message: each looks like a new visitor, so the
+  // visitor limit never trips. The address limit does.
+  for (let i = 0; i < perWindow; i++) assert.equal((await visit(say(slug, `message ${i}`), { agent: `x-${i}` })).code, 200)
+  const rowsBefore = lab.rate.size
+  for (let i = 0; i < 5; i++) {
+    const limited = await visit(say(slug, 'one more'), { agent: `x-${perWindow + i}` })
+    assert.deepEqual([limited.code, limited.body.error, limited.headers['Retry-After']], [429, 'rate', '600'])
+  }
+  assert.equal(sent.length, perWindow)
+  // A refused message writes no new row: the address is counted first, and it said no.
+  assert.equal(lab.rate.size, rowsBefore)
+  // Another address is not held up by it.
+  assert.equal((await visit(say(slug), { ip: '198.51.100.4', agent: 'x-0' })).code, 200)
+
+  // The day limit of the address, with the ten minute windows empty again.
+  for (const key of [...lab.rate.keys()]) if (key.includes('|w:')) lab.rate.delete(key)
+  const address = store.addressHash(IP)
+  lab.rate.set(`${address}|d:${store.utcDay()}`, trainedChat.TRAINED_CHAT_ADDRESS_PER_DAY)
+  const day = await visit(say(slug, 'tomorrow then'), { agent: 'a-browser-never-seen' })
+  assert.deepEqual([day.code, day.body.error], [429, 'rate'])
+  assert.match(day.body.message, /today's message limit/)
+
+  // IPv6: a sender that picks a new address inside its own /64 for every message, and a new browser
+  // string too, is one address.
+  sent.length = 0
+  for (let i = 0; i < perWindow; i++) assert.equal((await visit(say(slug, `v6 ${i}`), { ip: `2001:db8:77:1:${(i + 1).toString(16)}::${i + 1}`, agent: `v6-${i}` })).code, 200)
+  assert.equal((await visit(say(slug, 'v6 one more'), { ip: '2001:db8:77:1:ffff::1', agent: 'v6-new' })).code, 429)
+  assert.equal(sent.length, perWindow)
+  // The neighbouring /64 is somebody else.
+  assert.equal((await visit(say(slug, 'v6 neighbour'), { ip: '2001:db8:77:2::1', agent: 'v6-new' })).code, 200)
+  assert.equal([...lab.rate.keys()].some(k => k.includes('2001') || k.includes(IP)), false)
+})
+
 test('the chat has its own small daily cap, sits inside the Tinker cap and the lab budget, and says so kindly', async () => {
   enableChat({ LAB_TINKER_CHAT_DAILY_USD: '0.00025' })
   const slug = keepAdapter()
@@ -1245,6 +1505,7 @@ test('the chat has its own small daily cap, sits inside the Tinker cap and the l
   assert.deepEqual([failed.code, failed.body.error], [502, 'busy'])
   assert.deepEqual(logs, ['[trained-chat] no reply (upstream, 400)'])
   assert.equal(lab.spend('chat').reserved_usd, 0)
+  assert.deepEqual([lab.chatCalls[lab.chatCalls.length - 1].status, lab.chatCalls[lab.chatCalls.length - 1].cost_usd], ['upstream', 0])
   // A reply is cut to its limit and cleaned before it is returned.
   globalThis.fetch = fakeTinker(sent, () => tinkerCompletion({ content: `ok ${TINKER_KEY} ${'z'.repeat(3000)}`, finish_reason: 'length' }))
   const long = await visit(say(slug, 'six'), { ip: '198.51.100.9' })
@@ -1253,9 +1514,188 @@ test('the chat has its own small daily cap, sits inside the Tinker cap and the l
   assert.equal(long.body.cut_short, true)
 })
 
+test('a call that may have been served without usable token counts is counted at the most it could cost, never at nothing', async () => {
+  enableChat()
+  const slug = keepAdapter()
+  const sent = []
+  const messages = [{ role: 'user', content: VISITOR_TEXT }]
+  const worst = tinker.tinkerChatWorstCaseUsd(BASE, messages, trainedChat.TRAINED_CHAT_MAX_TOKENS)
+  const measured = tinker.tinkerChatCostUsd(BASE, 20, 8)
+  assert.ok(worst > measured * 2)
+  const spent = () => [lab.spend('chat').spent_usd, lab.spend('all').spent_usd]
+  let before = spent()
+  let n = 0
+  const call = async () => {
+    before = spent()
+    logs = []
+    return visit(say(slug), { ip: `198.51.100.${++n}` })
+  }
+  const charged = (amount) => {
+    const [chat, all] = spent()
+    assert.ok(Math.abs(chat - before[0] - amount) < 2e-6 && Math.abs(all - before[1] - amount) < 2e-6, `expected ${amount} more, got ${chat - before[0]}`)
+    assert.deepEqual([lab.spend('chat').reserved_usd, lab.spend('all').reserved_usd], [0, 0])
+    assert.ok(Math.abs(lab.chatCalls[lab.chatCalls.length - 1].cost_usd - amount) < 2e-6)
+  }
+
+  // Usage reported: the measured tokens at the published prices.
+  globalThis.fetch = fakeTinker(sent)
+  assert.equal((await call()).code, 200)
+  charged(measured)
+
+  // Tinker's endpoint is a beta. If an answer comes without usage, with usage null, with a count
+  // missing or renamed, or with a prompt of no tokens, the reply is still given, and the call is
+  // counted at what was set aside for it, with a warning in the log. It is never counted at $0.
+  const without = [
+    c => { delete c.usage },
+    c => { c.usage = null },
+    c => { c.usage = { input_tokens: 20, output_tokens: 8 } },
+    c => { c.usage = { prompt_tokens: 20 } },
+    c => { c.usage = { prompt_tokens: '20', completion_tokens: '8' } },
+    c => { c.usage = { prompt_tokens: 0, completion_tokens: 0 } },
+  ]
+  for (const strip of without) {
+    globalThis.fetch = fakeTinker(sent, () => { const c = tinkerCompletion(); strip(c); return c })
+    const res = await call()
+    assert.deepEqual([res.code, res.body.reply], [200, 'Answer number 3.'])
+    charged(worst)
+    assert.deepEqual(logs, ['[tinker] an answer carried no usable token counts; the most the call could cost is counted'])
+    const ledger = lab.modelCalls[lab.modelCalls.length - 1]
+    assert.deepEqual([ledger.purpose, ledger.cost_source, ledger.prompt_tokens, ledger.completion_tokens], ['trained_chat', 'estimate', 0, 0])
+    assert.ok(Math.abs(ledger.cost_usd - worst) < 2e-6)
+  }
+
+  // The request failed on the way in a manner that does not rule out that it arrived (a reset, a
+  // socket closed part way), timed out, or was answered 200 with nothing usable: counted in full.
+  const reset = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('read ECONNRESET'), { code: 'ECONNRESET' }) })
+  const closed = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('other side closed'), { code: 'UND_ERR_SOCKET' }) })
+  const timeout = Object.assign(new Error('timed out'), { name: 'TimeoutError' })
+  for (const [answer, status, code] of [
+    [async () => { throw reset }, 'unreachable', 502], [async () => { throw closed }, 'unreachable', 502], [async () => { throw new TypeError('fetch failed') }, 'unreachable', 502],
+    [async () => { throw timeout }, 'timeout', 504],
+    [async () => new Response('<html>ok</html>', { status: 200 }), 'no_answer', 502], [async () => new Response(JSON.stringify({ choices: [] }), { status: 200 }), 'no_answer', 502],
+  ]) {
+    globalThis.fetch = answer
+    const res = await call()
+    assert.deepEqual([res.code, res.body.error, lab.chatCalls[lab.chatCalls.length - 1].status], [code, 'busy', status])
+    charged(worst)
+  }
+
+  // It is certain the call was not served: no connection was ever made, or Tinker answered with an error.
+  const refused = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('connect ECONNREFUSED'), { code: 'ECONNREFUSED' }) })
+  const noDns = Object.assign(new TypeError('fetch failed'), { cause: Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }) })
+  const ledgerRows = lab.modelCalls.length
+  for (const answer of [async () => { throw refused }, async () => { throw noDns }, async () => new Response('{"error":{"message":"overloaded"}}', { status: 503 }), async () => new Response('{}', { status: 429 })]) {
+    globalThis.fetch = answer
+    const res = await call()
+    assert.equal(res.body.error, 'busy')
+    charged(0)
+  }
+  assert.equal(lab.modelCalls.length, ledgerRows)
+  // Nothing a visitor wrote, and no key, in any of it.
+  assert.equal(everything().includes(VISITOR_TEXT), false)
+  assert.equal(everything().includes(TINKER_KEY), false)
+
+  // The same rule on the lab model endpoint: an adapter call answered without usage costs the key,
+  // the Tinker cap and the ledger the most it could have cost.
+  enableLive()
+  const key = await mint()
+  const liveBody = { model: `lab/${slug}`, messages: [{ role: 'user', content: 'Question number 3?' }], max_tokens: 64 }
+  const liveWorst = tinker.tinkerChatWorstCaseUsd(BASE, liveBody.messages, 64)
+  const allBefore = lab.spend('all').spent_usd
+  globalThis.fetch = fakeTinker(sent, () => { const c = tinkerCompletion(); delete c.usage; return c })
+  const live = await liveCall(key.token, liveBody)
+  assert.equal(live.code, 200)
+  assert.equal(live.body.choices[0].message.content, 'Answer number 3.')
+  assert.ok(Math.abs(Number(lab.keys[lab.keys.length - 1].usd_used) - liveWorst) < 2e-6)
+  assert.ok(Math.abs(lab.spend('all').spent_usd - allBefore - liveWorst) < 2e-6)
+  const liveLedger = lab.modelCalls[lab.modelCalls.length - 1]
+  assert.deepEqual([liveLedger.purpose, liveLedger.cost_source], ['live_model', 'estimate'])
+  assert.ok(Math.abs(liveLedger.cost_usd - liveWorst) < 2e-6)
+  assert.equal(lab.liveCalls[lab.liveCalls.length - 1].detail.cost_basis, 'usage unknown: the most the call could cost is counted')
+  // And a connection broken part way is counted too, where it used to cost nothing.
+  globalThis.fetch = async () => { throw reset }
+  const broken = await liveCall(key.token, liveBody)
+  assert.equal(broken.code, 502)
+  assert.ok(Math.abs(lab.spend('all').spent_usd - allBefore - 2 * liveWorst) < 4e-6)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+})
+
 // ===========================================================================
 // The panel in the room
 // ===========================================================================
+test('the panel asks for nothing until the room says the chat is on, and stops asking when it is off', async () => {
+  // A page with just enough of a document for the panel to build itself.
+  const element = () => {
+    const el = { style: {}, classList: { add() {}, remove() {} } }
+    return new Proxy(el, {
+      get: (t, k) => (k in t ? t[k] : k === 'querySelector' ? () => element() : () => undefined),
+      set: (t, k, v) => { t[k] = v; return true },
+    })
+  }
+  const timers = new Map()
+  let nextTimer = 1
+  const page = { document: globalThis.document, window: globalThis.window }
+  globalThis.document = { createElement: element, body: element() }
+  globalThis.window = { setInterval: (fn, ms) => { timers.set(nextTimer, { fn, ms }); return nextTimer++ }, clearInterval: id => { timers.delete(id) } }
+  const asked = []
+  let answer = { enabled: true, adapters: [], limits: { max_message_chars: 500, max_turns: 8 } }
+  globalThis.fetch = async (url, options = {}) => {
+    asked.push([options.method ?? 'GET', String(url)])
+    return new Response(JSON.stringify(answer), { headers: { 'content-type': 'application/json' } })
+  }
+  const settle = () => new Promise(r => setTimeout(r, 5))
+  try {
+    // Built with the page, as main.ts does. With the chat off (the default) the state never says it
+    // is on: no request, no timer, however long the page stays open.
+    const chat = new panel.TrainedChatPanel()
+    chat.setAvailable(false)
+    chat.setAvailable(false)
+    await settle()
+    assert.deepEqual([asked.length, timers.size], [0, 0])
+
+    // The state says the chat is on: the adapters are read once, and again every two minutes.
+    chat.setAvailable(true)
+    chat.setAvailable(true)
+    await settle()
+    assert.deepEqual(asked, [['GET', '/api/experiment/trained-chat']])
+    assert.deepEqual([...timers.values()].map(t => t.ms), [120_000])
+    ;[...timers.values()][0].fn()
+    await settle()
+    assert.equal(asked.length, 2)
+
+    // The state says it is off again: the timer is gone and nothing more is asked.
+    chat.setAvailable(false)
+    await settle()
+    assert.deepEqual([asked.length, timers.size], [2, 0])
+
+    // On again, but the route itself answers that the chat is off: the panel stops asking, and a
+    // state that keeps saying on does not start it again.
+    answer = { enabled: false, adapters: [] }
+    chat.setAvailable(true)
+    await settle()
+    assert.deepEqual([asked.length, timers.size], [3, 0])
+    chat.setAvailable(true)
+    await settle()
+    assert.deepEqual([asked.length, timers.size], [3, 0])
+  } finally {
+    globalThis.document = page.document
+    globalThis.window = page.window
+  }
+
+  // main.ts passes on what the state says, and nothing else switches the panel on.
+  const main = readFileSync(join(root, 'src/main.ts'), 'utf8')
+  assert.match(main, /this\.trainedChat\?\.setAvailable\(\(state as unknown as \{ trained_chat_enabled\?: unknown \}\)\.trained_chat_enabled === true\)/)
+  const source = readFileSync(join(root, 'src/systems/TrainedChatPanel.ts'), 'utf8')
+  assert.equal((source.match(/setInterval\(/g) ?? []).length, 1)
+  // The message box is 16px, so a phone does not zoom the page when it is tapped. `inherit` cannot
+  // be mixed into the font shorthand: a browser drops such a rule whole and falls back to about 13px.
+  const shorthands = [...source.matchAll(/[\s{;]font:\s*([^;}]*)/g)].map(m => m[1].trim())
+  assert.ok(shorthands.length >= 2)
+  assert.deepEqual(shorthands.filter(v => /\binherit\b/.test(v) && v !== 'inherit'), [], 'a font shorthand mixes inherit with other values, which is invalid CSS')
+  assert.match(source, /#trained-chat-panel textarea \{[^}]*font-family: inherit; font-size: 16px; line-height: 1\.3;/)
+  assert.match(source, /\.tc-send, #trained-chat-panel \.tc-new \{[^}]*font-family: inherit; font-size: 12px; font-weight: 600;/)
+})
+
 test('the panel reads adapters strictly and says who measured the score', () => {
   const adapters = panel.parseAdapters({
     adapters: [

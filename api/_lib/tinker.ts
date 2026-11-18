@@ -92,8 +92,15 @@ export const TINKER_SAMPLE_MAX_TOKENS = 120
 export const TINKER_TRAIN_WALL_S = 1800
 export const TINKER_RUN_TIMEOUT_S = 2700
 
-/** The estimate: one token for every 3 bytes of text, some for the chat format, and a margin on top. */
-export const TINKER_BYTES_PER_TOKEN = 3
+/**
+ * The estimate: one token for every byte of text, some for the chat format,
+ * and a margin on top. One token per byte is a ceiling, not a guess: the
+ * tokenizer never makes more tokens than there are bytes, and text such as
+ * digits really does come close to one each. An estimate that assumed 3 bytes
+ * a token set aside too little for data like that, and the runner, which
+ * counts real tokens, then refused a run the Reviewer had approved.
+ */
+export const TINKER_BYTES_PER_TOKEN = 1
 export const TINKER_TOKENS_PER_MESSAGE = 8
 export const TINKER_TOKENS_PER_EXAMPLE = 12
 export const TINKER_ESTIMATE_MARGIN = 1.25
@@ -386,12 +393,14 @@ export interface TinkerEstimate {
 }
 
 /**
- * The most a run could cost, from the text alone. Training is counted over
- * the whole dataset for every epoch (the held-out slice is not trained on,
- * so this is a little high), the two measurements over the largest examples
- * the slice could hold, and the samples at their longest. The runner then
- * counts real tokens and refuses to start a run whose real plan costs more
- * than this, so the estimate is a ceiling on what is spent either way.
+ * The most a run could cost, from the text alone: a token for every byte,
+ * which no text can exceed. Training is counted over the whole dataset for
+ * every epoch (the held-out slice is not trained on, so this is a little
+ * high), the two measurements over the largest examples the slice could
+ * hold, and the samples at their longest. Prose takes a fifth to a third
+ * of this, so a run usually settles well under what was set aside. The
+ * runner counts real tokens and would still refuse a plan that cost more
+ * than this, so the amount set aside is a ceiling on what is spent either way.
  */
 export function estimateTinkerRun(request: Pick<TinkerRequest, 'base_model' | 'examples' | 'settings'>): TinkerEstimate {
   const price = TINKER_PRICES[request.base_model]

@@ -143,6 +143,21 @@ export async function epochSpend(experimentId: string, epochNumber: number): Pro
   }
 }
 
+/**
+ * Writes an epoch's cost and token totals onto its row from the ledger, so
+ * the public per-epoch cost includes what was recorded after the epoch was
+ * saved (its follow-up work, and a training run collected by a later tick).
+ * Never throws.
+ */
+export async function refreshEpochCost(experimentId: string, epochNumber: number): Promise<void> {
+  const ledger = await epochSpend(experimentId, epochNumber)
+  if (!ledger) return
+  await sql`
+    UPDATE epochs SET cost_usd = ${ledger.cost_usd}, prompt_tokens = ${ledger.prompt_tokens}, completion_tokens = ${ledger.completion_tokens}
+    WHERE experiment_id = ${experimentId} AND epoch_number = ${epochNumber}
+  `.catch(() => {})
+}
+
 // ---------------------------------------------------------------------------
 // Daily budget
 // ---------------------------------------------------------------------------

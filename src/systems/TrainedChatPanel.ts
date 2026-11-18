@@ -1,8 +1,12 @@
 // "Talk to what they trained": a small chat with the adapters the lab's
 // models fine-tuned on Tinker (docs/TOOLS.md, "Talking to a trained adapter").
 //
-// It reads GET /api/experiment/trained-chat and shows nothing at all, not
-// even its button, unless the server says the chat is on. Every number shown
+// It asks for nothing until the room's own state (GET /api/experiment, which
+// the page reads anyway) says the chat is switched on: main.ts passes that on
+// through setAvailable. With the chat off, which is the default, the panel
+// makes no request at all and shows nothing, not even its button. Once it is
+// on, the panel reads GET /api/experiment/trained-chat for the adapters, and
+// again every two minutes while the chat stays on. Every number shown
 // comes from the lab's record of the run: the base model, the epoch, the
 // model that wrote the data, and the held-out loss the lab measured before
 // and after training. A message goes to POST /api/experiment/trained-chat,
@@ -115,6 +119,9 @@ export class TrainedChatPanel {
   private turns: Turn[] = []
   private busy = false
   private isOpen = false
+  /** What the room's state last said about the chat being switched on. */
+  private available = false
+  private refreshTimer: number | null = null
 
   constructor() {
     this.container = document.createElement('div')
@@ -146,8 +153,8 @@ export class TrainedChatPanel {
       #trained-chat-panel .tc-msg.assistant { align-self: flex-start; background: rgba(255,255,255,0.07); }
       #trained-chat-panel .tc-status { color: #ffcc80; font-size: 11px; min-height: 16px; }
       #trained-chat-panel .tc-form { display: flex; gap: 8px; align-items: flex-end; padding: 10px 14px 12px; border-top: 1px solid rgba(255,255,255,0.08); }
-      #trained-chat-panel textarea { flex: 1; min-height: 44px; max-height: 120px; resize: none; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: #f5f2eb; padding: 10px; font: 16px/1.3 inherit; font-family: inherit; }
-      #trained-chat-panel .tc-send, #trained-chat-panel .tc-new { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid rgba(181,166,66,0.5); background: rgba(181,166,66,0.2); color: #f5f2eb; cursor: pointer; font: 600 12px inherit; font-family: inherit; }
+      #trained-chat-panel textarea { flex: 1; min-height: 44px; max-height: 120px; resize: none; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: #f5f2eb; padding: 10px; font-family: inherit; font-size: 16px; line-height: 1.3; }
+      #trained-chat-panel .tc-send, #trained-chat-panel .tc-new { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid rgba(181,166,66,0.5); background: rgba(181,166,66,0.2); color: #f5f2eb; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600; }
       #trained-chat-panel .tc-new { background: none; border-color: rgba(255,255,255,0.15); font-weight: 400; align-self: flex-start; }
       #trained-chat-panel button:disabled { opacity: 0.4; cursor: default; }
       @media (max-width: 760px) {
@@ -206,9 +213,30 @@ export class TrainedChatPanel {
       }
       if (e.key === 'Escape') this.close()
     })
+  }
 
-    void this.load()
-    window.setInterval(() => void this.load(), REFRESH_MS)
+  /**
+   * Told by the page what the room's state says: is the visitor chat switched
+   * on? Only a change does anything. Turning on reads the adapters and starts
+   * the two minute refresh; turning off stops it and hides the panel. Until
+   * this is called with true, the panel never calls its route.
+   */
+  setAvailable(on: boolean): void {
+    if (on === this.available) return
+    this.available = on
+    if (on) {
+      void this.load()
+      this.refreshTimer = window.setInterval(() => void this.load(), REFRESH_MS)
+    } else {
+      this.stopRefresh()
+      this.close()
+      this.container.style.display = 'none'
+    }
+  }
+
+  private stopRefresh(): void {
+    if (this.refreshTimer !== null) window.clearInterval(this.refreshTimer)
+    this.refreshTimer = null
   }
 
   private open(): void {
@@ -234,11 +262,16 @@ export class TrainedChatPanel {
 
   /** Reads what can be talked to. With the chat off, or no backend, the button stays hidden. */
   private async load(): Promise<void> {
+    if (!this.available) return
     try {
       const res = await fetch(API, { headers: { Accept: 'application/json' } })
       if (!res.ok) throw new Error(String(res.status))
       const data = await res.json() as { enabled?: unknown; notice?: unknown }
       if (data.enabled !== true) {
+        // The route itself says the chat is off: stop asking. It is asked
+        // again only after the room's state has said off and then on again.
+        this.stopRefresh()
+        this.close()
         this.container.style.display = 'none'
         return
       }

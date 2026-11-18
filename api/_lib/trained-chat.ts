@@ -17,8 +17,12 @@
  * lab's own daily budget). The cost is an estimate from Tinker's published
  * prices, set aside before the call and settled after it.
  *
- * A visitor is remembered only as a keyed hash that changes every day
- * (tinker-store.ts). What a visitor writes is sent to Tinker to be answered
+ * A visitor is remembered only as keyed hashes that change every day
+ * (tinker-store.ts): one of the address alone, and one of the address with
+ * the browser string. Both have limits and both must pass. The browser
+ * string is whatever the sender says it is, so on its own it would let one
+ * sender pose as any number of visitors; the address limit is the one that
+ * holds. What a visitor writes is sent to Tinker to be answered
  * and is not stored or logged by the lab: a call leaves a row of counts.
  * The replies come from a small model fine-tuned on data the lab's models
  * wrote, and nobody reviews them; the room says so beside the chat.
@@ -29,10 +33,10 @@ import { sanitizeOutput } from './sprites.js'
 import {
   isAdapterSlug, tinkerChatCostUsd, tinkerChatDailyUsd, tinkerChatWorstCaseUsd, tinkerDailyUsd, trainedChatFlag, trainedChatStatus,
 } from './tinker.js'
-import { callTinkerChat, type TinkerChatMessage } from './tinker-chat.js'
+import { callTinkerChat, tinkerChatCharge, type TinkerChatMessage } from './tinker-chat.js'
 import {
-  countVisitorMessage, getAdapter, listAdapters, pruneVisitorCounts, recordTrainedChatCall, reserveTinkerSpend, settleTinkerSpend, utcDay,
-  visitorHash, type Reservation,
+  addressHash, countVisitorMessage, getAdapter, listAdapters, pruneVisitorCounts, recordTrainedChatCall, reserveTinkerSpend, settleTinkerSpend,
+  utcDay, visitorHash, type Reservation,
 } from './tinker-store.js'
 
 export const TRAINED_CHAT_PURPOSE = 'trained_chat'
@@ -44,10 +48,18 @@ export const TRAINED_CHAT_MAX_TURNS = 8
 export const TRAINED_CHAT_MAX_TOKENS = 200
 export const TRAINED_CHAT_MAX_REPLY_CHARS = 1200
 export const TRAINED_CHAT_TEMPERATURE = 0.7
-/** Messages one visitor may send: in a ten minute window, and in a UTC day. */
+/** Messages one visitor (an address and a browser string) may send: in a ten minute window, and in a UTC day. */
 export const TRAINED_CHAT_PER_WINDOW = 10
 export const TRAINED_CHAT_WINDOW_S = 600
 export const TRAINED_CHAT_PER_DAY = 40
+/**
+ * Messages one address may send, whatever browser string comes with them.
+ * Twice the visitor limits, so a few people behind one address can each
+ * talk, and changing the browser string buys nothing past it. An IPv6
+ * address counts as its /64 network.
+ */
+export const TRAINED_CHAT_ADDRESS_PER_WINDOW = 20
+export const TRAINED_CHAT_ADDRESS_PER_DAY = 80
 export const TRAINED_CHAT_MAX_BODY_BYTES = 16 * 1024
 export const TRAINED_CHAT_TIMEOUT_MS = 45_000
 
@@ -169,15 +181,26 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
   const chat = readChatRequest(raw)
   if (!chat.ok) return say(res, chat.status, chat.error, chat.message)
 
-  // ---- one visitor's share: counted by the database, by a hash only ----
+  // ---- one visitor's share: counted by the database, by hashes only ----
+  // The address alone is counted first. It is the limit a sender cannot get
+  // around by changing the browser string, and a message it refuses writes
+  // nothing more. Then the address with the browser string, at half as many.
   const now = new Date()
-  const visitor = visitorHash(visitorAddress(req), header(req, 'user-agent'), now)
+  const ip = visitorAddress(req)
+  const address = addressHash(ip, now)
+  const visitor = visitorHash(ip, header(req, 'user-agent'), now)
+  const windowBucket = `w:${Math.floor(now.getTime() / 1000 / TRAINED_CHAT_WINDOW_S)}`
+  const dayBucket = `d:${utcDay(now)}`
   try {
-    if (!(await countVisitorMessage(visitor, `w:${Math.floor(now.getTime() / 1000 / TRAINED_CHAT_WINDOW_S)}`, TRAINED_CHAT_PER_WINDOW))) {
-      res.setHeader('Retry-After', String(TRAINED_CHAT_WINDOW_S))
-      return say(res, 429, 'rate', MESSAGES.rate)
+    for (const [who, perWindow] of [[address, TRAINED_CHAT_ADDRESS_PER_WINDOW], [visitor, TRAINED_CHAT_PER_WINDOW]] as const) {
+      if (!(await countVisitorMessage(who, windowBucket, perWindow))) {
+        res.setHeader('Retry-After', String(TRAINED_CHAT_WINDOW_S))
+        return say(res, 429, 'rate', MESSAGES.rate)
+      }
     }
-    if (!(await countVisitorMessage(visitor, `d:${utcDay(now)}`, TRAINED_CHAT_PER_DAY))) return say(res, 429, 'rate', MESSAGES.day)
+    for (const [who, perDay] of [[address, TRAINED_CHAT_ADDRESS_PER_DAY], [visitor, TRAINED_CHAT_PER_DAY]] as const) {
+      if (!(await countVisitorMessage(who, dayBucket, perDay))) return say(res, 429, 'rate', MESSAGES.day)
+    }
   } catch (e) {
     console.warn('[trained-chat] could not count a message:', e instanceof Error ? e.message : e)
     return say(res, 503, 'unavailable', MESSAGES.unavailable)
@@ -221,8 +244,12 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
     samplerPath: target.sampler_path, messages: chat.messages, maxTokens: TRAINED_CHAT_MAX_TOKENS,
     temperature: TRAINED_CHAT_TEMPERATURE, timeoutMs: TRAINED_CHAT_TIMEOUT_MS,
   })
-  // A call that timed out may still have been served: what was set aside is counted.
-  const costUsd = answer.ok ? tinkerChatCostUsd(base, answer.promptTokens, answer.completionTokens) : answer.kind === 'timeout' ? worst : 0
+  // Measured tokens at the published prices. A call that may have been
+  // served without the lab learning its token counts (a timeout, a broken
+  // connection, an answer with no usage) is counted at what was set aside,
+  // so the caps fill from estimates that err high, never from zeros.
+  const charge = tinkerChatCharge(answer, (p, c) => tinkerChatCostUsd(base, p, c), worst)
+  const costUsd = charge.usd
   await settleTinkerSpend(chatHold, costUsd)
   await settleTinkerSpend(allHold, costUsd)
   if (costUsd > 0) {

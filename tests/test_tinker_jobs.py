@@ -399,9 +399,100 @@ class EndpointTests(unittest.TestCase):
             ok = client.post("/start", headers=auth, json={"train": job()})
             self.assertEqual(ok.json(), {"call_id": "test-call"})
             self.assertEqual(calls, [job()])
-            self.assertEqual(client.get("/status", headers=auth, params={"call_id": "test-call"}).json(), {"status": "running"})
+            self.assertEqual(client.get("/status", headers=auth, params={"call_id": "test-call"}).json(), {"status": "running", "call_id": "test-call"})
+            # With no store of run names at all (this stand-in for Modal has none), a named start still starts.
+            self.assertEqual(client.post("/start", headers=auth, json={"run_id": "e41-0a1b2c3d", "train": job()}).json(), {"call_id": "test-call"})
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(client.get("/status", headers=auth, params={"run_id": "e41-0a1b2c3d"}).json()["status"], "unknown")
         with TestClient(app) as client, patch.dict(os.environ, {"JOBS_TOKEN": "short"}):
             self.assertEqual(client.post("/start", headers={"Authorization": "Bearer short"}, json={"train": job()}).status_code, 401)
+
+    def test_a_run_is_remembered_by_its_name_so_a_lost_answer_can_be_found_and_a_repeat_starts_nothing(self):
+        spawned = []
+        names = {}
+
+        class Names:
+            def get(self, key, default=None):
+                return names.get(key, default)
+
+            def put(self, key, value):
+                names[key] = value
+
+        def spawn(checked):
+            spawned.append(checked)
+            return SimpleNamespace(object_id="fc-%d" % len(spawned))
+
+        asked = []
+
+        def from_id(call_id):
+            asked.append(call_id)
+            return SimpleNamespace(get=lambda timeout: {"status": "ok"} if call_id == "fc-1" else (_ for _ in ()).throw(TimeoutError()))
+
+        m = load({
+            "train": SimpleNamespace(spawn=spawn),
+            "OutputExpiredError": type("Expired", (Exception,), {}),
+            "modal": SimpleNamespace(
+                FunctionCall=SimpleNamespace(from_id=from_id),
+                Dict=SimpleNamespace(from_name=lambda name, create_if_missing=False: Names() if (name, create_if_missing) == ("oblab-tinker-runs", True) else None)),
+        })
+        app = FastAPI()
+        app.add_api_route("/start", m.start, methods=["POST"])
+        app.add_api_route("/status", m.status, methods=["GET"])
+        auth = {"Authorization": "Bearer " + TOKEN}
+        with TestClient(app) as client, patch.dict(os.environ, {"JOBS_TOKEN": TOKEN}):
+            # A name that is not a run name is refused before anything is started.
+            for bad in ["", "e41", "../x", 7, ["e41-0a1b2c3d"], "e41-0A1B2C3D", "e41-0a1b2c3d\n"]:
+                self.assertEqual(client.post("/start", headers=auth, json={"run_id": bad, "train": job()}).status_code, 400, bad)
+            self.assertEqual(spawned, [])
+            # Before the run exists, the runner does not know the name, and a lookup needs the token.
+            self.assertEqual(client.get("/status", headers=auth, params={"run_id": "e41-0a1b2c3d"}).json(), {"status": "unknown", "error": "no call is known for that run"})
+            self.assertEqual(client.get("/status", params={"run_id": "e41-0a1b2c3d"}).status_code, 401)
+            # Started once, remembered under its name.
+            self.assertEqual(client.post("/start", headers=auth, json={"run_id": "e41-0a1b2c3d", "train": job()}).json(), {"call_id": "fc-1"})
+            self.assertEqual(names, {"e41-0a1b2c3d": "fc-1"})
+            # The lab never got that answer: it asks by name and is given the call, with its state.
+            self.assertEqual(client.get("/status", headers=auth, params={"run_id": "e41-0a1b2c3d"}).json(), {"status": "done", "call_id": "fc-1", "result": {"status": "ok"}})
+            # Sent again for the same name: the same call, and nothing new is started.
+            self.assertEqual(client.post("/start", headers=auth, json={"run_id": "e41-0a1b2c3d", "train": job()}).json(), {"call_id": "fc-1"})
+            self.assertEqual(len(spawned), 1)
+            # Another name is another run.
+            self.assertEqual(client.post("/start", headers=auth, json={"run_id": "e42-0a1b2c3d", "train": job()}).json(), {"call_id": "fc-2"})
+            self.assertEqual(client.get("/status", headers=auth, params={"run_id": "e42-0a1b2c3d"}).json(), {"status": "running", "call_id": "fc-2"})
+            # A call id that is not one is not passed to Modal.
+            asked.clear()
+            self.assertEqual(client.get("/status", headers=auth, params={"call_id": "not a call id!"}).json()["status"], "failed")
+            self.assertEqual(asked, [])
+            # A name that is not a run name knows nothing, whatever the store holds.
+            names["../x"] = "fc-1"
+            self.assertEqual(client.get("/status", headers=auth, params={"run_id": "../x"}).json()["status"], "unknown")
+
+    def test_the_store_of_run_names_is_never_a_gate(self):
+        log = []
+
+        class Broken:
+            def get(self, key, default=None):
+                raise RuntimeError("store down")
+
+            def put(self, key, value):
+                raise RuntimeError("store down " + KEY)
+
+        # A store that cannot be read or written does not stop a run, and the log line says only what kind of error it was.
+        self.assertEqual(M.start_once("e41-0a1b2c3d", Broken(), lambda: "fc-9", log=log.append), "fc-9")
+        self.assertEqual(log, ["could not remember the call for run e41-0a1b2c3d: RuntimeError"])
+        self.assertIsNone(M.known_call(Broken(), "e41-0a1b2c3d"))
+        # No store, or no name: the run starts and nothing is remembered.
+        self.assertEqual(M.start_once("e41-0a1b2c3d", None, lambda: "fc-9"), "fc-9")
+        store = {}
+        names = SimpleNamespace(get=store.get, put=store.__setitem__)
+        self.assertEqual(M.start_once(None, names, lambda: "fc-9"), "fc-9")
+        self.assertEqual(store, {})
+        # A stored value that is not a call id is not handed back as one.
+        store["e41-0a1b2c3d"] = {"call": "fc-1"}
+        self.assertIsNone(M.known_call(names, "e41-0a1b2c3d"))
+        store["e41-0a1b2c3d"] = "fc 1; rm"
+        self.assertIsNone(M.known_call(names, "e41-0a1b2c3d"))
+        self.assertTrue(M.valid_run_id("e41-0a1b2c3d"))
+        self.assertFalse(any(M.valid_run_id(v) for v in ["e-0a1b2c3d", "e41-0a1b2c3", "E41-0a1b2c3d", None, 41]))
 
 
 class DeployShapeTests(unittest.TestCase):

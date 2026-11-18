@@ -41,9 +41,19 @@
 #          (the same value goes in the lab server's TINKER_JOBS_TOKEN)
 #
 # HTTP API (for the Vercel backend), Authorization: Bearer <JOBS_TOKEN> on both:
-#   POST /start   {train: {base_model, examples, settings, split_salt, budget_usd,
+#   POST /start   {run_id, train: {base_model, examples, settings, split_salt, budget_usd,
 #                          prices, ttl_seconds, samples, sample_max_tokens, label}}  -> {call_id}
 #   GET  /status  ?call_id=...  -> {status: running} | {status: done, result} | {status: failed, error}
+#   GET  /status  ?run_id=...   -> the same for the call started under that name, with its call_id,
+#                                  or {status: unknown} when no call is known for it
+#
+# run_id is the lab's own name for a run (optional). The call started for a
+# name is remembered in the Modal Dict "oblab-tinker-runs", so the lab can
+# find a run whose start answer never reached it, and a start repeated for a
+# name that already has a call returns that call and starts nothing. The Dict
+# is a convenience and never a gate: if it cannot be read or written the run
+# starts all the same, and the lab then treats a lost answer as a run that may
+# be training.
 #
 # result: {status: ok, n_train, n_holdout, steps_planned, steps_done, stopped_early,
 #          holdout_loss_before, holdout_loss_after, train_loss_first, train_loss_last,
@@ -110,6 +120,10 @@ TRAIN_WALL_S = 1800
 RUN_TIMEOUT_S = 2700
 CALL_TIMEOUT_S = 600
 SALT_PATTERN = r"[0-9a-f]{16,64}"
+# The lab's name for a run (its adapter name), and a Modal call id as stored under it.
+RUN_ID_PATTERN = r"e[0-9]{1,6}-[0-9a-f]{8}"
+CALL_ID_PATTERN = r"[A-Za-z0-9_-]{1,100}"
+RUNS_DICT = "oblab-tinker-runs"
 ROLES = ("system", "user", "assistant")
 
 app = modal.App(APP_NAME)
@@ -298,6 +312,40 @@ def mean_loss(losses: list) -> Optional[float]:
     """The mean over examples, each counted once."""
     kept = [x for x in losses if x is not None and math.isfinite(x)]
     return sum(kept) / len(kept) if kept else None
+
+
+def valid_run_id(value) -> bool:
+    """Is this a name the lab gives a run?"""
+    return isinstance(value, str) and re.fullmatch(RUN_ID_PATTERN, value) is not None
+
+
+def known_call(names, run_id) -> Optional[str]:
+    """The call already started under a run's name, or None. A store that fails knows nothing."""
+    if names is None or not valid_run_id(run_id):
+        return None
+    try:
+        value = names.get(run_id)
+    except Exception:  # noqa: BLE001
+        return None
+    return value if isinstance(value, str) and re.fullmatch(CALL_ID_PATTERN, value) is not None else None
+
+
+def start_once(run_id, names, spawn, log=print) -> str:
+    """Starts a run and returns its call id; for a name that already has a call, returns that call and starts nothing.
+
+    `names` maps a run's name to its call id (a Modal Dict, or None). It is
+    never a gate: a store that cannot be read or written does not stop the run.
+    """
+    known = known_call(names, run_id)
+    if known:
+        return known
+    call_id = spawn()
+    if names is not None and valid_run_id(run_id):
+        try:
+            names.put(run_id, call_id)
+        except Exception as exc:  # noqa: BLE001
+            log("could not remember the call for run %s: %s" % (run_id, type(exc).__name__))
+    return call_id
 
 
 def scrub(text, secrets=()) -> str:
@@ -542,6 +590,14 @@ def train(job: dict) -> dict:
 # HTTP endpoints for the lab server
 # ---------------------------------------------------------------------------
 
+def _run_names():
+    """The Modal Dict of run name -> call id. None if it cannot even be named; reads and writes are guarded where it is used."""
+    try:
+        return modal.Dict.from_name(RUNS_DICT, create_if_missing=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def _authed(token: str) -> bool:
     expected = os.environ.get("JOBS_TOKEN", "")
     return len(expected.encode()) >= 32 and hmac.compare_digest(token.encode(), ("Bearer %s" % expected).encode())
@@ -556,23 +612,32 @@ def start(body: dict, request: Request) -> dict:
     problem = check_job(job)
     if problem:
         raise HTTPException(status_code=400, detail=problem)
-    call = train.spawn(job)
-    return {"call_id": call.object_id}
+    run_id = body.get("run_id")
+    if run_id is not None and not valid_run_id(run_id):
+        raise HTTPException(status_code=400, detail="run_id is not a run name")
+    return {"call_id": start_once(run_id, _run_names(), lambda: train.spawn(job).object_id)}
 
 
 @app.function(image=web_image, secrets=[modal.Secret.from_name("oblab-tinker-jobs-auth")])
 @modal.fastapi_endpoint(method="GET")
-def status(request: Request, call_id: str = "") -> dict:
+def status(request: Request, call_id: str = "", run_id: str = "") -> dict:
     if not _authed(request.headers.get("authorization", "")):
         raise HTTPException(status_code=401, detail="Unauthorized")
+    if not call_id and run_id:
+        # Asked by the run's name: the lab never got the call id.
+        call_id = known_call(_run_names(), run_id) or ""
+        if not call_id:
+            return {"status": "unknown", "error": "no call is known for that run"}
     if not call_id:
         return {"error": "call_id required"}
-    fc = modal.FunctionCall.from_id(call_id)
+    if re.fullmatch(CALL_ID_PATTERN, call_id) is None:
+        return {"status": "failed", "error": "that is not a call id"}
     try:
-        return {"status": "done", "result": fc.get(timeout=0)}
+        fc = modal.FunctionCall.from_id(call_id)
+        return {"status": "done", "call_id": call_id, "result": fc.get(timeout=0)}
     except OutputExpiredError:
-        return {"status": "failed", "error": "the run's result expired before it was collected"}
+        return {"status": "failed", "call_id": call_id, "error": "the run's result expired before it was collected"}
     except TimeoutError:
-        return {"status": "running"}
+        return {"status": "running", "call_id": call_id}
     except Exception as e:  # noqa: BLE001
-        return {"status": "failed", "error": str(e)[-300:]}
+        return {"status": "failed", "call_id": call_id, "error": str(e)[-300:]}

@@ -31,6 +31,7 @@ import { contributeExhibit } from './exhibit-contribution.js'
 import { openLabProposal } from './lab-proposals.js'
 import { TINKER_TOOL } from './tinker.js'
 import { runTinkerTrain, tinkerRequestSummary, tinkerWorstCaseUsd } from './tinker-run.js'
+import { tinkerRunsToday } from './tinker-store.js'
 
 export interface EpochToolContext {
   experimentId: string
@@ -50,10 +51,15 @@ export interface ToolOutcome {
 
 const name = (id: string) => modelDisplayName(id) || id.split('/').pop() || id
 
-async function allowed(tool: ToolName, config: ToolConfig, worstCaseUsd: number):
+/**
+ * `countToday` replaces the count of stored tool runs for a tool whose runs
+ * are stored late: a Tinker run still training has no tool_runs row yet, so
+ * its limit is counted from the runs that were opened.
+ */
+async function allowed(tool: ToolName, config: ToolConfig, worstCaseUsd: number, countToday: () => Promise<number> = () => toolRunsToday(tool)):
   Promise<{ ok: true } | { ok: false; reason: string }> {
   try {
-    const used = await toolRunsToday(tool)
+    const used = await countToday()
     if (used >= config[tool].per_day) return { ok: false, reason: `daily limit of ${config[tool].per_day} reached` }
   } catch {
     return { ok: false, reason: 'could not read today\'s tool runs' }
@@ -325,13 +331,14 @@ export async function runDeliverables(
   // against the most the run could cost, and the Tinker caps in tinker-run.
   // A run still training when the wait ends writes its record when a later
   // tick collects it (collectTinkerRuns), so it is not in tool_runs yet; the
-  // epoch's one row in tinker_runs is what stops a second run.
+  // epoch's one row in tinker_runs is what stops a second run, and the
+  // runs-per-day limit is counted from tinker_runs for the same reason.
   if (plan.tinker_train && !done(TINKER_TOOL)) {
     const request = plan.tinker_train
     const summary = tinkerRequestSummary(request.base_model, request.examples.length, request.purpose)
     tasks.push((async () => {
       if (verdicts.tinker_train !== 'approve') return void out.push(await skip(ctx, TINKER_TOOL, summary, 'the Reviewer did not approve it'))
-      const ok = await allowed(TINKER_TOOL, config, tinkerWorstCaseUsd(request))
+      const ok = await allowed(TINKER_TOOL, config, tinkerWorstCaseUsd(request), () => tinkerRunsToday())
       if (!ok.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, ok.reason))
       const outcome = await runTinkerTrain(ctx, request)
       if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_TOOL, summary, outcome.summary))

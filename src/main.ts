@@ -61,6 +61,7 @@ class ObservableLab {
   private overgrowth: Overgrowth
   private exhibitHall: ExhibitHall | null = null
   private toolRuns: ToolRunsService | null = null
+  private trainedChat: TrainedChatPanel | null = null
   private growthSeen = false // a growth record (or the dev preview) has arrived
   private growthShattered = false // the record says the glass is broken
   private growthTarget = 0
@@ -536,8 +537,8 @@ class ObservableLab {
     // What each model did, beside what it said (the research record); it keeps itself up to date
     new ActivityPanel()
     new KnowledgeGraphPanel()
-    // "Talk to what they trained": shows itself only when the server says the visitor chat is on
-    new TrainedChatPanel()
+    // "Talk to what they trained": asks for nothing and shows nothing until the room's state says the visitor chat is on
+    this.trainedChat = new TrainedChatPanel()
 
     // Initialize PatinaSystem
     this.patinaSystem = new PatinaSystem()
@@ -598,6 +599,8 @@ class ObservableLab {
       exhibits: () => this.exhibitHall,
       // feed stored tool_runs rows through the same path as the state (development only)
       acceptToolRuns: (raw: unknown) => this.toolRuns?.accept(parseToolRuns(raw)),
+      // what the state would say about the visitor chat being switched on (development only)
+      trainedChat: (on: boolean) => this.trainedChat?.setAvailable(on === true),
       renderInfo: () => ({ ...this.renderer.info.render, geometries: this.renderer.info.memory.geometries, textures: this.renderer.info.memory.textures }),
       // Replay live per-role activity from a real in-progress/completed epoch object
       liveReplay: (epoch: ExperimentState['recent_epochs'][0]) => { this.liveAnnouncedKeys.clear(); this.streamedBrowsingKeys.clear(); this.driveLiveEpochActivity(epoch) },
@@ -1158,6 +1161,9 @@ class ObservableLab {
     // tool runs may also come on the state itself
     const runsOnState = (state as unknown as { tool_runs?: unknown }).tool_runs
     if (runsOnState !== undefined) this.toolRuns?.accept(parseToolRuns(runsOnState))
+    // The visitor chat with trained adapters: the state says whether it is switched on,
+    // and only then does its panel call its own route.
+    this.trainedChat?.setAvailable((state as unknown as { trained_chat_enabled?: unknown }).trained_chat_enabled === true)
 
     if (extra.repos !== undefined) {
       const links = repoLinksFrom(extra.repos)
