@@ -20,8 +20,7 @@ export class JSpaceReadout {
       #jspace-readout .js-title { font: 700 14px/1.2 "SF Mono", ui-monospace, Menlo, monospace; color: #78C8FF; letter-spacing: 0.5px; }
       #jspace-readout .js-model { font-size: 17px; font-weight: 650; margin-top: 4px; }
       #jspace-readout .js-note { font-size: 12.5px; color: rgba(232,238,245,0.72); margin-top: 6px; line-height: 1.45; }
-      #jspace-readout .js-x { order: 2; flex: 0 0 auto; background: none; border: none; color: rgba(232,238,245,0.8); font-size: 22px; cursor: pointer; line-height: 1; padding: 0 2px; }
-      #jspace-readout .js-back { margin-top: 10px; background: rgba(120,200,255,0.12); border: 1px solid rgba(120,200,255,0.45); color: #78C8FF; border-radius: 8px; padding: 6px 10px; font-size: 13px; cursor: pointer; }
+      #jspace-readout button { flex: 0 0 auto; background: none; border: none; color: rgba(232,238,245,0.8); font-size: 22px; cursor: pointer; line-height: 1; padding: 0 2px; }
       #jspace-readout button:focus-visible { outline: 2px solid #78C8FF; outline-offset: 2px; }
       #jspace-readout .js-body { overflow: auto; overscroll-behavior: contain; padding: 4px 16px 16px; }
       #jspace-readout .js-section { margin: 12px 0 6px; font: 600 11.5px/1.2 "SF Mono", ui-monospace, monospace; letter-spacing: 0.6px; text-transform: uppercase; color: rgba(120,200,255,0.85); }
@@ -30,37 +29,31 @@ export class JSpaceReadout {
       #jspace-readout .js-said { font-size: 18px; line-height: 1.45; color: #FFFFFF; }
       #jspace-readout .js-reasoning { font-size: 14px; line-height: 1.6; color: rgba(232,238,245,0.85); white-space: pre-wrap; }
       /* A finger needs 44 px to land on. */
-      @media (pointer: coarse) {
-        #jspace-readout .js-x { min-width: 44px; min-height: 44px; margin: -8px -10px -8px 0; }
-        #jspace-readout .js-back { min-height: 44px; }
-      }
-      @media (max-width: 640px) { #jspace-readout { left: max(8px, env(safe-area-inset-left)); right: max(8px, env(safe-area-inset-right)); width: auto; bottom: max(8px, env(safe-area-inset-bottom)); } }`
+      @media (pointer: coarse) { #jspace-readout button { min-width: 44px; min-height: 44px; margin: -8px -10px -8px 0; } }
+      /* On a phone it is a sheet along the bottom that stops short of the round buttons on the right (the knowledge graph's among them), so they stay in reach while it is open. */
+      @media (max-width: 640px) { #jspace-readout { left: max(8px, env(safe-area-inset-left)); right: max(72px, env(safe-area-inset-right)); width: auto; bottom: max(8px, env(safe-area-inset-bottom)); } }`
     document.head.appendChild(style)
     this.el = document.createElement('div')
     this.el.id = 'jspace-readout'
     this.el.setAttribute('role', 'dialog')
     this.el.setAttribute('aria-label', 'J-space readout')
     document.body.appendChild(this.el)
-    document.addEventListener('keydown', e => { if (e.key === 'Escape' && this.el.classList.contains('open')) this.onClose() })
+    // Escape closes the readout, unless the knowledge graph is open over it (the graph takes that Escape).
+    document.addEventListener('keydown', e => { if (e.key === 'Escape' && this.el.classList.contains('open') && !this.el.inert) this.onClose() })
   }
 
-  /**
-   * `fromGraph`: the readout was opened from the knowledge graph. On a phone it covers the graph's button,
-   * so it carries its own way back (main.ts and KnowledgeGraphPanel listen for lab:open-graph).
-   */
-  show(model: string, reasoning: string, remark: string, fromGraph = false): void {
+  show(model: string, reasoning: string, remark: string): void {
     const seen = new Set<string>()
     const ideas = (reasoning || '').replace(/[^a-zA-Z0-9' -]/g, ' ').split(/\s+/)
       .filter(w => w.length > 3 && w.length < 16 && !FILLER.has(w.toLowerCase()))
       .filter(w => { const k = w.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true })
       .slice(0, 24)
     this.el.innerHTML = `
-      <div class="js-head"><button class="js-x" aria-label="Close the J-space readout">×</button><div>
+      <div class="js-head"><div>
         <div class="js-title">◉ J-SPACE</div>
         <div class="js-model">${esc(model)}</div>
         <div class="js-note">The ideas in this model's own reasoning text, and what it then said. Drawn from its text, not from its internal activations, which a cloud model does not share.</div>
-        ${fromGraph ? '<button class="js-back">‹ Knowledge graph</button>' : ''}
-      </div></div>
+      </div><button aria-label="Close the J-space readout">×</button></div>
       <div class="js-body">
         <div class="js-section">Workspace: ideas in its reasoning</div>
         ${ideas.length ? `<div class="js-chips">${ideas.map(w => `<span>${esc(w)}</span>`).join('')}</div>` : '<div class="js-reasoning">No reasoning text yet.</div>'}
@@ -68,11 +61,7 @@ export class JSpaceReadout {
         <div class="js-said">${esc(remark || '…')}</div>
         ${reasoning ? `<div class="js-section">Its reasoning, in full</div><div class="js-reasoning">${esc(reasoning)}</div>` : ''}
       </div>`
-    ;(this.el.querySelector('.js-x') as HTMLButtonElement).addEventListener('click', () => this.onClose())
-    this.el.querySelector('.js-back')?.addEventListener('click', () => {
-      this.onClose()
-      window.dispatchEvent(new CustomEvent('lab:open-graph'))
-    })
+    ;(this.el.querySelector('button') as HTMLButtonElement).addEventListener('click', () => this.onClose())
     this.el.classList.add('open')
   }
 

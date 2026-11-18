@@ -302,8 +302,6 @@ export class KnowledgeGraphPanel {
       if (e.key === 'Enter') { const first = this.results.querySelector('button') as HTMLButtonElement | null; first?.click() }
     })
     this.bindCanvas()
-    // The J-space readout's way back (its "Knowledge graph" button sends this).
-    window.addEventListener('lab:open-graph', () => this.open())
   }
 
   /** Add a listener for as long as the panel is open; close() removes it. */
@@ -1317,7 +1315,7 @@ export class KnowledgeGraphPanel {
     }
     const [said, reasoning] = turn.detail.split('\nReasoning: ')
     this.close()
-    window.dispatchEvent(new CustomEvent('lab:open-jspace', { detail: { model: String(turn.meta.model ?? ''), title: turn.label, remark: said ?? '', reasoning: reasoning ?? '', from: 'graph' } }))
+    window.dispatchEvent(new CustomEvent('lab:open-jspace', { detail: { model: String(turn.meta.model ?? ''), title: turn.label, remark: said ?? '', reasoning: reasoning ?? '' } }))
   }
 
   private linkButton(id: string, note: string): string {

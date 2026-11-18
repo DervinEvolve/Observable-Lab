@@ -287,11 +287,11 @@ class ObservableLab {
     })
     // "Open in J-space" from the knowledge graph: one turn's words, on that model's scientist if it has one.
     window.addEventListener('lab:open-jspace', (e) => {
-      const d = (e as CustomEvent<{ model: string; title: string; remark: string; reasoning: string; from?: string }>).detail
+      const d = (e as CustomEvent<{ model: string; title: string; remark: string; reasoning: string }>).detail
       const frontend = (BACKEND_TO_FRONTEND_MODEL as Record<string, string>)[d.model]
       const scientist = this.scientists.find(s => s.getModelId() === frontend)
       if (scientist) this.jspaceLens?.attach(scientist.group, d.title, d.reasoning, d.remark)
-      this.jspaceReadout?.show(d.title, d.reasoning, d.remark || '…', d.from === 'graph')
+      this.jspaceReadout?.show(d.title, d.reasoning, d.remark || '…')
     })
     this.wireJSpaceToggle = (scientist) => {
       const lens = this.jspaceLens!
