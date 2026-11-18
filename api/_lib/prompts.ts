@@ -3,9 +3,10 @@ import { MODELS, MODEL_DISPLAY_NAMES } from './types.js'
 import { spritesConfigured } from './sprites.js'
 import { envEpochIntervalMinutes } from './epoch-claim.js'
 import {
-  GPU_JOB_MAX_S, GPU_JOB_SCRIPT_MAX_CHARS, PER_EPOCH, SPRITE_COMMAND_MAX_S, SPRITE_SESSION_TOTAL_MAX_S, toolConfig,
+  GPU_JOB_MAX_S, GPU_JOB_SCRIPT_MAX_CHARS, PER_EPOCH, SPRITE_COMMAND_MAX_S, SPRITE_SESSION_TOTAL_MAX_S, liveModelToolStatus, toolConfig,
   type ToolConfig,
 } from './tools-config.js'
+import { liveModelNote } from './live-model.js'
 import { MAX_PARTS, MAX_TRIANGLES, FIXED_TRIANGLES, TUBE_RADIAL_SEGMENTS, MATERIALS, PLACEMENTS, SHAPES } from './exhibits.js'
 
 const PROVIDERS: Record<string, string> = {
@@ -47,7 +48,10 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
     lines.push(`- Subagents, chosen by the Executor: up to ${PER_EPOCH.explorers} explorer subagents that research the contribution with real web search before any code is written (their task, searches and findings are published in the pull request description), and a test subagent that adds a test after. They appear in the room as drones. If the Executor does not choose, one explorer and the test subagent are deployed.`)
   }
   if (on('sprite_session')) {
-    lines.push(`- Your own Sprite: a persistent Linux computer in the cloud, one per lab, shown as the screen above your desk. As Executor you may run up to ${PER_EPOCH.sprite_commands} shell commands in it for prototyping or a quick benchmark, each with its own time limit (at most ${SPRITE_COMMAND_MAX_S} s, ${SPRITE_SESSION_TOTAL_MAX_S} s in all). It can reach GitHub and the usual package registries and nothing else, it holds no credentials, and its output is stored and shown to visitors.`)
+    // The lab model endpoint is mentioned only while a session really comes with it, and only what it is and where its limits are.
+    const live = liveModelToolStatus(config).enabled
+    lines.push(`- Your own Sprite: a persistent Linux computer in the cloud, one per lab, shown as the screen above your desk. As Executor you may run up to ${PER_EPOCH.sprite_commands} shell commands in it for prototyping or a quick benchmark, each with its own time limit (at most ${SPRITE_COMMAND_MAX_S} s, ${SPRITE_SESSION_TOTAL_MAX_S} s in all). It can reach GitHub and the usual package registries${live ? ' (and, during a session, the lab model endpoint in the next line)' : ''} and nothing else, it holds no credentials${live ? ' apart from that endpoint\'s short-lived key' : ''}, and its output is stored and shown to visitors.`)
+    if (live) lines.push(`- ${liveModelNote()}`)
   }
   if (on('gpu_job')) {
     lines.push(`- GPU jobs on Modal: as Executor you may send one short Python script (Python 3.11 with torch 2.6 and numpy) to run on an A10G GPU. It has no network and no credentials, it is compiled first (a syntax error never starts the GPU), and it is stopped after ${GPU_JOB_MAX_S} s. Its output is stored and shown to visitors.`)
@@ -83,6 +87,9 @@ ${fields.join(',\n')}
 Leave out what you don't need. Use a tool only when it would really help this epoch.`
   if (on('sprite_session')) {
     text += `\nSprite commands run one after another in ~/lab-session with bash. Nothing secret is in the Sprite, and it only reaches GitHub and the usual package registries.`
+    if (liveModelToolStatus(config).enabled) {
+      text += ` During a session it also reaches the lab model endpoint at LAB_MODEL_BASE_URL, with that session's key in LAB_MODEL_API_KEY.`
+    }
   }
   if (on('gpu_job')) {
     text += `\nThe GPU script runs as job.py with no network and no files from the lab. Print what you want to see; the last part of the output is kept.`

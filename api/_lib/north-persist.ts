@@ -1,6 +1,5 @@
 import { sql } from '@vercel/postgres'
 import { runNorthExperiment, type NorthResult } from './north-runner.js'
-import { generatePlantFromSpec } from './plant-generator.js'
 import { contributeCode } from './code-contribution.js'
 import { persistContribution } from './code-contributions-store.js'
 import { addNotebookNote } from './notebook.js'
@@ -39,8 +38,6 @@ async function runNorthAndPersist(
   const newSpec: AgentSpecification = JSON.parse(JSON.stringify(currentSpec))
   newSpec.behaviors.push(result.contribution)
   newSpec.meta.total_mutations++
-
-  const plantGeometry = generatePlantFromSpec(newSpec)
 
   await sql`
     UPDATE experiments SET current_spec = ${JSON.stringify(newSpec)} WHERE id = ${experimentId}

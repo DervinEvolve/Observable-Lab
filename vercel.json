@@ -16,8 +16,17 @@
     },
     "api/sprites/exec.ts": {
       "maxDuration": 60
+    },
+    "api/live-model/v1/chat/completions.ts": {
+      "maxDuration": 120
     }
   },
+  "rewrites": [
+    {
+      "source": "/api/live-model/v1/models",
+      "destination": "/api/live-model/v1/chat/completions"
+    }
+  ],
   "crons": [
     {
       "path": "/api/epoch/tick",

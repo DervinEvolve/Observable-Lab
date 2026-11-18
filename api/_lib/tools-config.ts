@@ -6,8 +6,12 @@
  * Every tool is off unless its flag is "true" AND what it needs is
  * configured. Limits are per epoch (hard constants) and per UTC day (env,
  * clamped). All spending also counts against LAB_DAILY_BUDGET_USD.
+ *
+ * The lab model endpoint (LAB_ENABLE_LIVE_MODEL) is reported here too, as
+ * liveModelToolStatus: it is part of a Sprite session, not a tool of its own.
  */
 import { spritesConfigured } from './sprites.js'
+import { liveModelStatus, type LiveModelStatus } from './live-model.js'
 
 export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'exhibit', 'lab_proposal'] as const
 export type ToolName = (typeof TOOL_NAMES)[number]
@@ -115,7 +119,23 @@ export function toolConfig(): ToolConfig {
   }
 }
 
-/** The enabled tool names, for the public state and logs. */
-export function enabledTools(config: ToolConfig = toolConfig()): ToolName[] {
-  return TOOL_NAMES.filter(name => config[name].enabled && config[name].per_day > 0)
+/**
+ * The lab model endpoint (live-model.ts). It is not a tool the Executor asks
+ * for: it is something a Sprite session comes with when it is on, so it
+ * needs LAB_ENABLE_LIVE_MODEL and its own settings AND Sprite sessions.
+ */
+export function liveModelToolStatus(config: ToolConfig = toolConfig()): LiveModelStatus {
+  const own = liveModelStatus()
+  if (!own.enabled) return own
+  if (!config.sprite_session.enabled || config.sprite_session.per_day <= 0) {
+    return { enabled: false, off_reason: `Sprite sessions are off (${config.sprite_session.off_reason ?? 'daily limit is 0'})` }
+  }
+  return { enabled: true }
+}
+
+/** The enabled tool names, for the public state and logs. "live_model" is added when Sprite sessions offer the lab model endpoint. */
+export function enabledTools(config: ToolConfig = toolConfig()): Array<ToolName | 'live_model'> {
+  const tools: Array<ToolName | 'live_model'> = TOOL_NAMES.filter(name => config[name].enabled && config[name].per_day > 0)
+  if (liveModelToolStatus(config).enabled) tools.push('live_model')
+  return tools
 }

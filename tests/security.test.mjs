@@ -75,6 +75,12 @@ const PUBLIC_ROUTES = {
   'experiment/activity': ['GET'],
   'experiment/graph': ['GET'],
 }
+// Routes authorised by a scoped key the lab itself issues (the lab model
+// endpoint, api/_lib/live-model.ts). They are neither public nor operator
+// routes: switched off (the default) they answer 503 to everyone, switched on
+// they answer 401 to anything that is not a live scoped key, the operator
+// secret included. Either way nothing is read or sent first.
+const SCOPED_KEY_ROUTES = ['live-model/v1/chat/completions']
 function discoverRoutes(directory = 'api') {
   const found = []
   for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
@@ -95,22 +101,61 @@ test('anonymous operator requests stop before database, model, or compute work',
     assert.ok(routes.includes(known), `route discovery missed ${known}`)
   }
   for (const route of Object.keys(PUBLIC_ROUTES)) assert.ok(routes.includes(route), `public allowlist names a missing route: ${route}`)
+  for (const route of SCOPED_KEY_ROUTES) {
+    assert.ok(routes.includes(route), `scoped-key list names a missing route: ${route}`)
+    assert.equal(route in PUBLIC_ROUTES, false, `${route} cannot be both public and scoped`)
+  }
+  delete process.env.LAB_ENABLE_LIVE_MODEL
   const cases = []
   for (const route of routes) {
     for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
       const isPublic = (PUBLIC_ROUTES[route] || []).includes(method)
-      if (!isPublic) cases.push({ route, method, query: {}, allowed: route in PUBLIC_ROUTES ? [401, 405] : [401] })
+      // A scoped-key route is switched off here, so it must say so (503) and do nothing else.
+      if (SCOPED_KEY_ROUTES.includes(route)) cases.push({ route, method, query: {}, allowed: [503], noStore: true })
+      else if (!isPublic) cases.push({ route, method, query: {}, allowed: route in PUBLIC_ROUTES ? [401, 405] : [401] })
     }
   }
   cases.push({ route: 'experiment/index', method: 'GET', query: { debug: 'true' }, allowed: [401] })
-  for (const { route, method, query, allowed } of cases) {
+  for (const { route, method, query, allowed, noStore } of cases) {
     const { default: handler } = await load(`api/${route}.js`)
     for (const authorization of [undefined, 'Bearer wrong', [`Bearer ${operator}`]]) {
       const res = response()
       await handler({ method, headers: { authorization }, query, body: {} }, res)
       assert.ok(allowed.includes(res.code), `${route} ${method} ${JSON.stringify(query)}: anonymous request got ${res.code}`)
-      if (res.code === 401) assert.equal(res.headers['Cache-Control'], 'no-store')
+      if (res.code === 401 || noStore) assert.equal(res.headers['Cache-Control'], 'no-store')
     }
+  }
+})
+
+test('a scoped-key route that is switched on refuses everything but a live scoped key, the operator secret included', async () => {
+  let outbound = 0
+  globalThis.fetch = async () => { outbound++; throw new Error('Unexpected outbound request') }
+  const saved = { ...process.env }
+  Object.assign(process.env, {
+    LAB_ENABLE_LIVE_MODEL: 'true',
+    OPENROUTER_API_KEY: 'test-only-openrouter-placeholder',
+    LAB_PUBLIC_ORIGIN: 'https://lab.example',
+  })
+  try {
+    for (const route of SCOPED_KEY_ROUTES) {
+      const { default: handler } = await load(`api/${route}.js`)
+      for (const method of ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS']) {
+        for (const authorization of [undefined, '', 'Bearer wrong', `Bearer ${operator}`, [`Bearer ${operator}`], `Bearer ${cron}`, 'Bearer labk_short', `Basic labk_${'a'.repeat(64)}`]) {
+          const res = response()
+          await handler({ method, headers: { authorization }, query: {}, body: { model: 'google/gemini-3.8-flash', messages: [{ role: 'user', content: 'hi' }] } }, res)
+          assert.equal(res.code, 401, `${route} ${method} with ${JSON.stringify(authorization)} got ${res.code}`)
+          assert.equal(res.headers['Cache-Control'], 'no-store')
+        }
+        // A key of the right shape that the lab never issued is not let through either. There is no
+        // database here, so the key cannot be checked and the route fails closed.
+        const res = response()
+        await handler({ method, headers: { authorization: `Bearer labk_${'0'.repeat(64)}` }, query: {}, body: {} }, res)
+        assert.ok([401, 503].includes(res.code), `${route} ${method} with an unissued key got ${res.code}`)
+      }
+    }
+    assert.equal(outbound, 0)
+  } finally {
+    process.env = saved
   }
 })
 

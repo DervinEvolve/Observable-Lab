@@ -122,7 +122,7 @@ async function callModalEndpoint<T>(
  */
 export function generatePracticeTasks(
   spec: AgentSpecification,
-  epochWork: {
+  _epochWork: {
     plannerDirection?: string
     executorMutations?: unknown[]
     challengerConcerns?: string[]
