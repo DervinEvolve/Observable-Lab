@@ -848,7 +848,11 @@ export class KnowledgeGraphPanel {
       if (box) label(t, box, (box.x0 + box.x1) / 2, size, 500, w.on ? '#F5F2EB' : 'rgba(245,242,235,0.45)', 'rgba(18,18,20,0.82)')
     }
     const inFocus = wanted.find(w => w.b.id === focus && !w.b.isCluster)
-    if (inFocus) nodeLabel(inFocus, true)
+    if (inFocus) {
+      nodeLabel(inFocus, true)
+      taken.push({ x0: inFocus.x - inFocus.r, y0: inFocus.y - inFocus.r, x1: inFocus.x + inFocus.r, y1: inFocus.y + inFocus.r }) // no name over the node itself
+    }
+    const offLogos = (b: Box) => !logos.some(d => touches(b, d))
 
     for (const n of names) {
       if (n.bottom < 0 || n.top > H || n.x + (n.bottom - n.top) / 2 < 0 || n.x - (n.bottom - n.top) / 2 > W) continue // out of view
@@ -864,7 +868,7 @@ export class KnowledgeGraphPanel {
         const at = (cy: number): Box => ({ x0: x - half, y0: cy - tall / 2, x1: x + half, y1: cy + tall / 2 })
         const spots = [at(n.top + dpr - tall / 2), at(n.bottom - dpr + tall / 2)]
         if (half <= hullR) spots.push(at(n.top + tall / 2 + 3 * dpr), at(n.y))
-        return { text, x, pill: spots.find(b => clear(b, n.type)) }
+        return { text, x, pill: spots.find(b => clear(b, n.type) && offLogos(b)) }
       }
       const short = n.text.replace(/^.*?(\d+  ×)$/, '$1')
       let name = place(n.text)
@@ -875,7 +879,7 @@ export class KnowledgeGraphPanel {
         const x = within(n.x, half)
         for (let cy = Math.max(tall / 2, n.top + tall / 2); cy <= Math.min(H - tall / 2, n.bottom - tall / 2) && !name.pill; cy += tall) {
           const at: Box = { x0: x - half, y0: cy - tall / 2, x1: x + half, y1: cy + tall / 2 }
-          if (clear(at, n.type)) name = { text: short, x, pill: at }
+          if (clear(at, n.type) && offLogos(at)) name = { text: short, x, pill: at }
         }
       }
       if (!name.pill) continue
