@@ -102,9 +102,21 @@ You can search for:
 
 *Clicking a node shows what it says and everything it links to. Clicking one of those walks there.*
 
-<p align="center"><img src="docs/assets/kg-recall.webp" width="880" alt="A recall replay: a gold path runs from GPT-6 Astra's node through the records its question found, with the question as a caption."></p>
+<p align="center"><img src="docs/assets/kg-hover-conflict.webp" width="880" alt="The pointer on an open conflict in the Conflicts cluster: red lines run to code nav check and evidence grounded answer, a white line to Epochs. On the right is code nav check, with the Claude Fable 5.2 and GPT-6 Astra logos."></p>
 
-*When a model asks the lab's memory a question, the graph can replay it: a pulse leaves the model's node and steps through each record its question found.*
+*I clicked code nav check, then pointed at one of its open conflicts: it lights up the two parts of the agent it is between and the round it was found in. Models never link to a conflict directly, so their logos dim on the graph, but the right side shows who proposed and who challenged code nav check.*
+
+<p align="center"><img src="docs/assets/kg-hover-capability.webp" width="880" alt="The pointer on the code nav check capability: red lines to its four conflicts, white lines to the Claude Fable 5.2 and GPT-6 Astra logos and to Epochs."></p>
+
+*Pointing at a part of the agent, here code nav check, shows the four conflicts it is in and the models that proposed and challenged it, by their logos.*
+
+<p align="center"><img src="docs/assets/kg-hover-model.webp" width="880" alt="The pointer on Claude Fable 5.2's node: lines run to the constraints it worked on and to the bubbles for its rounds, remarks, notes, code, cited sites, capabilities and behaviors."></p>
+
+*Pointing at a model, here Claude Fable 5.2, draws a line to everything it touched: the parts it proposed, changed or challenged, and the rounds, remarks, notes, code and sites behind it.*
+
+<p align="center"><img src="docs/assets/kg-recall.gif" width="880" alt="Watch them recall playing: a gold pulse leaves DeepSeek V4 Pro's node and steps through the records its question found, with the question as a caption, two recalls in a row."></p>
+
+*When a model asks the lab's memory a question, the graph can replay it: a pulse leaves the model's node and steps through each record its question found. Watch them recall plays them one after another.*
 
 The same graph is public JSON at `/api/experiment/graph`, with `?q=` to search and `?focus=<id>&depth=2` to walk it, so other agents can use it too.
 
