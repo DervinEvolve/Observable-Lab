@@ -183,7 +183,8 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
 
 // GET /api/experiment?mode=research - The active research experiment, in the
 // same shape as the classic state minus what only the specimen has (growth,
-// tool runs, the commit count). No dollar amounts.
+// tool runs, the commit count). Like the classic state it carries no budget
+// or spend totals; each recent epoch has its cost_usd, as it does there.
 async function handleGetResearch(res: VercelResponse) {
   try {
     const experimentResult = await sql`

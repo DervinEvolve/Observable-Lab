@@ -90,6 +90,8 @@ const { default: tick } = await load('api/epoch/tick.js')
 const { default: experimentRoute } = await load('api/experiment/index.js')
 const { default: graphRoute } = await load('api/experiment/graph.js')
 const { default: runRoute } = await load('api/epoch/run.js')
+const { default: resetRoute } = await load('api/experiment/reset.js')
+const { default: patchResearchRoute } = await load('api/experiment/patch-research.js')
 
 // ---------------------------------------------------------------------------
 // In-memory database
@@ -127,7 +129,12 @@ class FakeLab {
   }
 
   spend(exp, cost, extra = {}) {
-    this.modelCalls.push({ experiment_id: exp ? exp.id : null, epoch_number: null, purpose: 'epoch', model_id: 'm', cost_usd: cost, prompt_tokens: 0, completion_tokens: 0, created_at: new Date(), ...extra })
+    this.modelCalls.push({ experiment_id: exp ? exp.id : null, epoch_number: null, purpose: 'epoch', model_id: 'm', cost_usd: cost, prompt_tokens: 0, completion_tokens: 0, budget_scope: null, created_at: new Date(), ...extra })
+  }
+
+  /** A row spent under the research cap (the mark the research epoch writes while the flag is on). */
+  spendResearch(exp, cost, extra = {}) {
+    this.spend(exp, cost, { budget_scope: 'research', ...extra })
   }
 
   // Any SELECT on experiments: the archive filter, the mode filter and the
@@ -177,10 +184,17 @@ class FakeLab {
       return set(byId(v[0]).filter(e => e.epoch_in_progress === true && (!e.epoch_started_at || new Date(e.epoch_started_at) < cutoff)), { epoch_in_progress: false, epoch_started_at: null })
     }
     // ensureResearchExperiment: reactivate
-    if (text === "UPDATE experiments SET status = 'growing', epoch_in_progress = FALSE, epoch_started_at = NULL, current_epoch = GREATEST(current_epoch, ?::int) WHERE id = ? AND status = 'archived' AND NOT EXISTS ( SELECT 1 FROM experiments x WHERE x.status <> 'archived' AND jsonb_typeof(x.current_spec->'meta'->'research') = 'object' ) RETURNING id, current_epoch") {
-      const rows = this.noActiveResearch() ? byId(v[1]).filter(e => e.status === 'archived') : []
-      for (const e of rows) Object.assign(e, { status: 'growing', epoch_in_progress: false, epoch_started_at: null, current_epoch: Math.max(e.current_epoch, v[0]) })
+    if (text === "UPDATE experiments SET status = 'growing', epoch_in_progress = FALSE, epoch_started_at = NULL, current_epoch = GREATEST(current_epoch, ?::int, ?::int), current_spec = COALESCE(?::jsonb, current_spec) WHERE id = ? AND status = 'archived' AND NOT EXISTS ( SELECT 1 FROM experiments x WHERE x.status <> 'archived' AND jsonb_typeof(x.current_spec->'meta'->'research') = 'object' ) RETURNING id, current_epoch") {
+      const rows = this.noActiveResearch() ? byId(v[3]).filter(e => e.status === 'archived') : []
+      for (const e of rows) {
+        Object.assign(e, { status: 'growing', epoch_in_progress: false, epoch_started_at: null, current_epoch: Math.max(e.current_epoch, v[0], v[1]) })
+        if (v[2] !== null) e.current_spec = JSON.parse(v[2])
+      }
       return { rows: rows.map(e => ({ id: e.id, current_epoch: e.current_epoch })) }
+    }
+    // patch-research?archive=true: the research experiment only
+    if (text === "UPDATE experiments SET status = 'archived', epoch_in_progress = FALSE, epoch_started_at = NULL WHERE status <> 'archived' AND jsonb_typeof(current_spec->'meta'->'research') = 'object' RETURNING id, current_epoch") {
+      return set(this.experiments.filter(e => e.status !== 'archived' && isResearch(e)), { status: 'archived', epoch_in_progress: false, epoch_started_at: null })
     }
     // the end of a research epoch, and a finished epoch whose experiment row was never advanced
     if (text === "UPDATE experiments SET current_spec = ?, current_epoch = ?, epoch_in_progress = FALSE, epoch_started_at = NULL, status = 'growing' WHERE id = ? AND status <> 'archived'") {
@@ -221,18 +235,18 @@ class FakeLab {
 
     // Spend ledger
     if (text.startsWith('INSERT INTO model_calls')) {
-      const [experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens] = v
-      this.modelCalls.push({ experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens, created_at: new Date() })
+      const [experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens, reasoning_tokens, budget_scope] = v
+      assert.equal(v.length, 11, 'a ledger row has eleven values, the cap it was spent under last')
+      this.modelCalls.push({ experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens, reasoning_tokens, budget_scope, created_at: new Date() })
       return { rows: [] }
     }
-    const modeOf = c => (this.experiments.find(e => e.id === c.experiment_id && isResearch(e)) ? 'research' : 'classic')
-    if (text.includes("FROM model_calls m JOIN experiments e ON e.id = m.experiment_id WHERE m.created_at >= ? AND jsonb_typeof(e.current_spec->'meta'->'research') = 'object'")) {
-      return this.spentSince(new Date(v[0]), c => modeOf(c) === 'research')
+    // Today's spend under one cap: the rows marked research, or every other row.
+    if (text.endsWith("FROM model_calls WHERE created_at >= ? AND budget_scope = 'research'")) {
+      return this.spentSince(new Date(v[0]), c => c.budget_scope === 'research')
     }
-    if (text.includes("FROM model_calls m LEFT JOIN experiments e ON e.id = m.experiment_id WHERE m.created_at >= ? AND jsonb_typeof(e.current_spec->'meta'->'research') IS DISTINCT FROM 'object'")) {
-      return this.spentSince(new Date(v[0]), c => modeOf(c) === 'classic')
+    if (text.endsWith("FROM model_calls WHERE created_at >= ? AND budget_scope IS DISTINCT FROM 'research'")) {
+      return this.spentSince(new Date(v[0]), c => c.budget_scope !== 'research')
     }
-    if (text.includes('FROM model_calls WHERE created_at >= ?')) return this.spentSince(new Date(v[0]), () => true)
     if (text.includes('FROM model_calls WHERE experiment_id = ? AND epoch_number = ?')) {
       const rows = this.modelCalls.filter(c => c.experiment_id === v[0] && c.epoch_number === v[1])
       const sum = k => rows.reduce((s, c) => s + (c[k] || 0), 0)
@@ -259,10 +273,15 @@ class FakeLab {
     if (text.startsWith('SELECT * FROM epochs WHERE experiment_id = ? AND epoch_number = ? LIMIT 1')) {
       return { rows: this.epochs.filter(e => e.experiment_id === v[0] && e.epoch_number === v[1]) }
     }
-    if (text.startsWith('SELECT epoch_number FROM epochs WHERE experiment_id = ? AND completed_at IS NULL AND started_at > ? ORDER BY epoch_number DESC LIMIT 1')) {
+    if (text.startsWith('SELECT epoch_number FROM epochs WHERE experiment_id = ? AND completed_at IS NULL AND (started_at > ? OR resumed_at > ?) ORDER BY epoch_number DESC LIMIT 1')) {
       const since = new Date(v[1])
-      return { rows: this.epochs.filter(e => e.experiment_id === v[0] && !e.completed_at && new Date(e.started_at) > since).sort((a, b) => b.epoch_number - a.epoch_number).slice(0, 1) }
+      assert.equal(v[2], v[1])
+      return { rows: this.epochs.filter(e => e.experiment_id === v[0] && !e.completed_at && (new Date(e.started_at) > since || (e.resumed_at && new Date(e.resumed_at) > since))).sort((a, b) => b.epoch_number - a.epoch_number).slice(0, 1) }
     }
+    if (text.startsWith('SELECT epoch_number, spec_after FROM epochs WHERE experiment_id = ? AND epoch_number > ? AND completed_at IS NOT NULL AND spec_after IS NOT NULL AND commentator_output IS NOT NULL ORDER BY epoch_number DESC LIMIT 1')) {
+      return { rows: this.epochs.filter(e => e.experiment_id === v[0] && e.epoch_number > v[1] && e.completed_at && e.spec_after && e.commentator_output).sort((a, b) => b.epoch_number - a.epoch_number).slice(0, 1) }
+    }
+    if (text.startsWith('SELECT epoch_number, spec_after FROM epochs')) throw new Error(`fake db: unsupported epochs read: ${text}`)
     if (text.includes('FROM epochs WHERE experiment_id = ? AND completed_at IS NULL') && !text.startsWith('SELECT * FROM epochs WHERE experiment_id = ? AND completed_at IS NULL ORDER BY epoch_number DESC LIMIT 1')) {
       throw new Error(`fake db: unsupported epochs read: ${text}`)
     }
@@ -294,7 +313,7 @@ beforeEach(() => {
   logs = []
   openrouter.resetModelCatalog()
   alongside.resetResearchStateCache()
-  for (const name of ['LAB_RESEARCH_ALONGSIDE', 'LAB_RESEARCH_DAILY_BUDGET_USD', 'LAB_DAILY_BUDGET_USD', 'EPOCH_INTERVAL_MINUTES', 'EPOCH_STALE_MINUTES']) delete process.env[name]
+  for (const name of ['LAB_RESEARCH_ALONGSIDE', 'LAB_RESEARCH_DAILY_BUDGET_USD', 'LAB_DAILY_BUDGET_USD', 'EPOCH_INTERVAL_MINUTES', 'EPOCH_STALE_MINUTES', 'RESEARCH_RUN_POLL_MAX_MS']) delete process.env[name]
 })
 
 function classicSpec() {
@@ -375,8 +394,8 @@ const ledgerTo = last => [LEDGER_HEADER, ...Array.from({ length: last }, (_, i) 
  * to content), written to by PUTs; `model(body)` may answer a chat
  * completion itself (return a Response) before the research answers apply.
  */
-function fakeWorld({ files = {}, model, github, wallSeconds = 400 } = {}) {
-  const world = { files: { 'train.py': TRAIN_PY, 'wiki/index.md': '# Wiki\n', ...files }, puts: [], chats: [], runnerStarts: 0 }
+function fakeWorld({ files = {}, model, github, wallSeconds = 400, metrics, runner } = {}) {
+  const world = { files: { 'train.py': TRAIN_PY, 'wiki/index.md': '# Wiki\n', ...files }, puts: [], chats: [], runnerStarts: 0, runnerPolls: 0 }
   const answer = (body) => {
     const user = body.messages.at(-1).content
     const content = user.startsWith('Propose this epoch') ? { hypothesis: 'a warmup schedule lowers val_bpb', notebook: '' }
@@ -402,8 +421,11 @@ function fakeWorld({ files = {}, model, github, wallSeconds = 400 } = {}) {
       return new Response(JSON.stringify({ call_id: 'call-1' }))
     }
     if (target.startsWith('https://runner.example/status')) {
+      world.runnerPolls++
+      const early = runner && runner()
+      if (early) return new Response(JSON.stringify(early))
       return new Response(JSON.stringify({ status: 'done', result: {
-        status: 'ok', metrics: { val_bpb: 0.74, train_steps: 100, train_seconds: 299, peak_vram_mb: 9000, params_m: 10, tokens_seen: 1 },
+        status: 'ok', metrics: metrics ?? { val_bpb: 0.74, train_steps: 100, train_seconds: 299, peak_vram_mb: 9000, params_m: 10, tokens_seen: 1 },
         metrics_source: 'experiment_stdout_unverified', dataset: 'tinystories', wall_seconds: wallSeconds, train_wall_seconds: 310,
       } }))
     }
@@ -508,6 +530,42 @@ test('with the flag off and one experiment, the tick picks it whatever its mode,
   assert.equal((await getState()).body.id, only.id)
 })
 
+test('turning the flag off does not charge what research spent under its own cap to the classic experiment', async () => {
+  // Earlier today, with the flag on, research spent $22 of its $40. Now the flag is off.
+  const researchExp = researchAt77()
+  const classic = runTwo()
+  lab.spendResearch(researchExp, 21.88)
+  lab.spendResearch(researchExp, 0.12, { model_id: 'tool/research_gpu_run' })
+  lab.spend(classic, 3)
+  noNetwork()
+
+  const budget = await spend.checkDailyBudget()
+  assert.deepEqual(Object.keys(budget).sort(), ['allowed', 'budget_usd', 'resumes_at', 'spent_usd'])
+  assert.equal(budget.allowed, true)
+  assert.equal(budget.spent_usd, 3)
+  assert.equal(budget.budget_usd, 15)
+  // The classic experiment's own scope is that same cap, with no mode lookup.
+  assert.equal(await modes.budgetScopeFor(classic.id), 'classic')
+  assert.equal(lab.queries.some(q => q.text.includes('AS research FROM experiments WHERE id = ?')), false)
+  // Its public state is not paused, and neither is the tick.
+  assert.equal((await getState()).body.run_state, 'waiting for next epoch')
+  const res = await cronTick()
+  assert.equal(res.code, 200)
+  assert.match(res.body.message, /^Waiting\./)
+  assert.equal('state' in res.body, false)
+
+  // Past its own $15 the classic experiment still pauses, on its own spend.
+  lab.spend(classic, 12.5)
+  const over = await spend.checkDailyBudget()
+  assert.equal(over.allowed, false)
+  assert.equal(over.spent_usd, 15.5)
+  assert.equal(over.reason, 'daily budget reached')
+
+  // Back on, the same rows are the research cap's again.
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  assert.equal((await spend.checkDailyBudget(new Date(), 'research')).spent_usd, 22)
+})
+
 // ===========================================================================
 // 3. Budgets
 // ===========================================================================
@@ -516,17 +574,18 @@ test('with the flag on each mode has its own cap and counts only its own spend',
   const researchExp = researchAt77()
   const classic = runTwo()
   const oldClassic = lab.addExperiment({ status: 'archived' })
-  lab.spend(researchExp, 20)
-  lab.spend(researchExp, 0.12, { model_id: 'tool/research_gpu_run' })
+  // Rows written under the research cap carry its mark; every other row does not.
+  lab.spendResearch(researchExp, 20)
+  lab.spendResearch(researchExp, 0.12, { model_id: 'tool/research_gpu_run' })
   lab.spend(classic, 6)
   lab.spend(oldClassic, 1)
   lab.spend(null, 0.5) // a row with no experiment counts as classic
-  lab.spend(researchExp, 99, { created_at: new Date(Date.now() - 3 * 86_400_000) }) // an earlier day
+  lab.spendResearch(researchExp, 99, { created_at: new Date(Date.now() - 3 * 86_400_000) }) // an earlier day
 
   const now = new Date()
   assert.equal(await spend.spentTodayUsd(now, 'research'), 20.12)
   assert.equal(await spend.spentTodayUsd(now, 'classic'), 7.5)
-  assert.equal(await spend.spentTodayUsd(now), 27.62)
+  assert.equal(await spend.spentTodayUsd(now), 7.5)
 
   let c = await spend.checkDailyBudget()
   assert.deepEqual({ allowed: c.allowed, spent: c.spent_usd, budget: c.budget_usd, scope: c.scope }, { allowed: true, spent: 7.5, budget: 15, scope: 'classic' })
@@ -610,7 +669,7 @@ test('numbering never goes back behind the ledger, and an unreadable ledger star
 
   // An epoch that started minutes ago may still be running on the archived row (a reset just now): wait for it.
   const justStarted = lab.addEpoch(archived, 79, { completed_at: null, started_at: new Date(Date.now() - 5 * 60_000) })
-  fakeWorld({ files: { 'results.tsv': ledgerTo(80) } })
+  fakeWorld({ files: { 'results.tsv': ledgerTo(79) } })
   result = await alongside.ensureResearchExperiment()
   assert.equal(result.activated, false)
   assert.match(result.reason, /epoch 79 may still be running/)
@@ -618,21 +677,183 @@ test('numbering never goes back behind the ledger, and an unreadable ledger star
   justStarted.started_at = new Date(Date.now() - 2 * 86_400_000)
   justStarted.research_run = { call_id: 'recent enough to collect' }
 
-  // The ledger is ahead of the experiment (rows 78 to 80 exist): continue after it.
-  fakeWorld({ files: { 'results.tsv': ledgerTo(80) } })
+  // The same epoch picked up again by a later request (its started_at is days
+  // old, its resumed_at is minutes old) is still running: wait for that too.
+  justStarted.resumed_at = new Date(Date.now() - 5 * 60_000)
+  result = await alongside.ensureResearchExperiment()
+  assert.equal(result.activated, false)
+  assert.match(result.reason, /epoch 79 may still be running/)
+  assert.equal(archived.status, 'archived')
+  justStarted.resumed_at = new Date(Date.now() - 3 * 60 * 60_000)
+
+  // The ledger is a little ahead of the experiment (rows 78 and 79 exist): continue after it.
   result = await alongside.ensureResearchExperiment()
   assert.equal(result.activated, true)
-  assert.equal(result.next_epoch, 81)
-  assert.equal(archived.current_epoch, 80)
+  assert.equal(result.next_epoch, 80)
+  assert.equal(archived.current_epoch, 79)
+  assert.equal(archived.current_spec.meta.research.best_bpb, 0.7) // rows 78 and 79 kept nothing: the spec is untouched
   assert.equal(oldOpen.research_run, null)
   assert.deepEqual(justStarted.research_run, { call_id: 'recent enough to collect' })
-  assert.ok(logs.some(l => /results\.tsv is at epoch 80, past the experiment's 77/.test(l)))
+  assert.ok(logs.some(l => /results\.tsv is at epoch 79, past the experiment's 77/.test(l)))
 
   assert.deepEqual(alongside.summarizeLedger(ledgerTo(77)), { last_epoch: 77, best_kept: { epoch: 40, val_bpb: 0.7 } })
   assert.deepEqual(alongside.summarizeLedger(''), { last_epoch: 0, best_kept: null })
   // 2,326 repeated rows for one epoch (run 1's ledger) do not move the last epoch.
   assert.equal(alongside.summarizeLedger(ledgerTo(20) + (ledgerRow(20, 'discard', '0.7400') + '\n').repeat(50)).last_epoch, 20)
   assert.equal(alongside.summarizeLedger(`${LEDGER_HEADER}\n5\treverted\t-\t-\t-\t-\t-\tcrash\tx\n`).best_kept, null)
+  // Kept scores can be read from a later epoch on only, and with a floor.
+  assert.equal(alongside.summarizeLedger(ledgerTo(77), { keptAfter: 40 }).best_kept, null)
+  assert.deepEqual(alongside.summarizeLedger(ledgerTo(77), { keptAfter: 39 }).best_kept, { epoch: 40, val_bpb: 0.7 })
+  assert.equal(alongside.summarizeLedger(ledgerTo(77), { minBpb: 0.71 }).best_kept, null)
+})
+
+test('a ledger far ahead of the experiment, or lines not shaped like the lab\'s rows, start nothing and count for nothing', async () => {
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  const archived = researchAt77({ status: 'archived' })
+  runTwo()
+  const before = JSON.stringify(archived)
+
+  // Three epochs past the experiment is more than one request can have written.
+  fakeWorld({ files: { 'results.tsv': ledgerTo(80) } })
+  let result = await alongside.ensureResearchExperiment()
+  assert.equal(result.activated, false)
+  assert.equal(result.experiment_id, archived.id)
+  assert.match(result.reason, /results\.tsv is at epoch 80, more than 2 past the research experiment's epoch 77/)
+  assert.equal(JSON.stringify(archived), before)
+  assert.ok(logs.some(l => /not starting research: results\.tsv is at epoch 80, more than 2 past the experiment's 77/.test(l)))
+
+  // A row in the lab's own shape with a number nobody reached: the same answer, and the tick says so.
+  fakeWorld({ files: { 'results.tsv': ledgerTo(77) + ledgerRow(999999, 'keep', '0.0001') + '\n' } })
+  const res = await cronTick()
+  assert.equal(res.code, 200)
+  assert.equal(res.body.research.message, 'No active research experiment')
+  assert.match(res.body.research.activation.reason, /more than 2 past/)
+  assert.equal(JSON.stringify(archived), before)
+
+  // Lines that are not rows as appendResultsRow writes them are not read at all.
+  const good = ledgerTo(77)
+  const notRows = [
+    '999999999\tmerged\t0.0001\t1\t1.0\t1\t1.000\tkeep\tx\t-\t-\t-\t-',                 // an epoch number with more than six digits
+    '500\tmerged\t0.0001\t1\t1.0\t1\t1.000\tkeep\tx\t-\t-\t-\t-\t300.0\t9000\t10.000\tdiscard\th', // too many columns (a row split in two)
+    '500\tmerged\t0.0001\t1\t1.0\t1\t1.000\tkeep',                                       // too few
+    '500\tmerged\t-\t1\t1.0\t1\t1.000\tkeep\tx',                                          // kept with no score
+    '500\treverted\t0.0001\t1\t1.0\t1\t1.000\tkeep\tx',                                   // kept but not merged
+    '500\tmerged\t1e-4\t1\t1.0\t1\t1.000\tkeep\tx',                                       // a score not written the lab's way
+    '500\tmerged\t0.0001\t1\t1.0\t1\t1.000\tbest\tx',                                     // an unknown status
+    '500\tpushed\t0.0001\t1\t1.0\t1\t1.000\tkeep\tx',                                     // an unknown commit word
+  ]
+  for (const line of notRows) {
+    assert.deepEqual(alongside.summarizeLedger(`${good}${line}\n`), { last_epoch: 77, best_kept: { epoch: 40, val_bpb: 0.7 } }, line)
+  }
+  // Both real shapes are read: nine columns (before the provenance columns) and thirteen.
+  assert.deepEqual(alongside.summarizeLedger(`${good}78\tmerged\t0.6900\t1\t1.0\t1\t1.000\tkeep\tx\n`), { last_epoch: 78, best_kept: { epoch: 78, val_bpb: 0.69 } })
+})
+
+test('what the generated train.py prints cannot add a row to results.tsv', async () => {
+  // The runner passes the printed metrics on after checking only val_bpb.
+  const forged = '5\n999999999\tmerged\t0.0001\t1\t1.0\t1\t1.000\tkeep\tx\t-\t-\t-\t-'
+  assert.deepEqual(research.sanitizeRunResult({ status: 'ok', metrics: { val_bpb: 1.2, train_steps: forged, train_seconds: '9\n9', peak_vram_mb: null, params_m: Infinity, extra: 'x' }, wall_seconds: '400', log_tail: 7, dataset: 'tinystories' }),
+    { status: 'ok', metrics: { val_bpb: 1.2 }, dataset: 'tinystories' })
+  // A real result comes through unchanged.
+  const real = { status: 'ok', metrics: { val_bpb: 0.74, train_steps: 100, train_seconds: 299.5, peak_vram_mb: 9000, params_m: 10.72, tokens_seen: 1 }, metrics_source: 'experiment_stdout_unverified', dataset: 'tinystories', harness_sha256: 'a'.repeat(64), budget_s: 300, train_wall_seconds: 310.2, gpu: 'A10G', log_tail: 'done', wall_seconds: 400.5 }
+  assert.deepEqual(research.sanitizeRunResult(real), real)
+  // No usable score: not a result. A status the runner never sends: an infrastructure error.
+  assert.deepEqual(research.sanitizeRunResult({ status: 'ok', metrics: { val_bpb: '1.2' } }), { status: 'crash', error: 'the run reported no usable val_bpb' })
+  assert.deepEqual(research.sanitizeRunResult({ status: 'ok' }), { status: 'crash', error: 'the run reported no usable val_bpb' })
+  assert.deepEqual(research.sanitizeRunResult({ status: 'crash', error: 'boom', stage: 'train' }), { status: 'crash', error: 'boom', stage: 'train' })
+  assert.deepEqual(research.sanitizeRunResult({ status: 'keep\n1' }), { status: 'infra_error' })
+  assert.deepEqual(research.sanitizeRunResult(null), { status: 'infra_error' })
+
+  // The row writer itself writes "-" for anything that is not a number, whatever it is handed.
+  const world = fakeWorld({ files: { 'results.tsv': ledgerTo(77) } })
+  await research.appendResultsRow({
+    epoch: 78, commit: 'reverted', val_bpb: 1.2, train_steps: forged, train_seconds: '300\t1', peak_vram_mb: NaN, params_m: null,
+    status: 'discard', hypothesis: 'a\tb\nc', provenance: { metrics_source: 'experiment_stdout_unverified', dataset: 'tinystories', harness_sha256: null, train_wall_seconds: 310 },
+  })
+  let lines = world.files['results.tsv'].trim().split('\n')
+  assert.equal(lines.length, 79)
+  assert.equal(lines.at(-1), '78\treverted\t1.2000\t-\t-\t-\t-\tdiscard\ta b c\texperiment_stdout_unverified\ttinystories\t-\t310.0')
+  assert.deepEqual(alongside.summarizeLedger(world.files['results.tsv']), { last_epoch: 78, best_kept: { epoch: 40, val_bpb: 0.7 } })
+
+  // The whole way: an epoch whose run printed the forged value writes one row, numbered 78.
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  const researchExp = researchAt77()
+  runTwo()
+  const run = fakeWorld({ files: { 'results.tsv': ledgerTo(77) }, metrics: { val_bpb: 0.74, train_steps: forged, train_seconds: 299, peak_vram_mb: 9000, params_m: 10 } })
+  const res = await cronTick()
+  assert.equal(res.body.research.epoch_number, 78, JSON.stringify(res.body))
+  lines = run.files['results.tsv'].trim().split('\n')
+  assert.equal(lines.length, 79)
+  assert.equal(lines.at(-1).split('\t').length, 13)
+  assert.match(lines.at(-1), /^78\treverted\t0\.7400\t-\t299\.0\t9000\t10\.000\tdiscard\t/)
+  assert.equal(alongside.summarizeLedger(run.files['results.tsv']).last_epoch, 78)
+  // What was stored for the epoch is the cleaned result.
+  const stored = lab.epochs.find(e => e.experiment_id === researchExp.id && e.epoch_number === 78).research_run.result
+  assert.deepEqual(stored.metrics, { val_bpb: 0.74, train_seconds: 299, peak_vram_mb: 9000, params_m: 10 })
+})
+
+test('an epoch that finished on the archived experiment is taken over, and a score the ledger kept after that is the one to beat', async () => {
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+
+  // 1. Epoch 78 was running when the experiment was archived. It finished into
+  //    the archived row (train.py, ledger row, wiki page, its epochs row), but
+  //    the experiment row stayed at 77 with the spec from before.
+  let archived = researchAt77({ status: 'archived' })
+  const after78 = researchSpec({ best_bpb: 0.69, best_epoch: 78, last_run: { epoch: 78, val_bpb: 0.69, verdict: 'keep', status: 'ok', hypothesis: 'h' } })
+  after78.meta.total_epochs = 78
+  lab.addEpoch(archived, 78, { started_at: new Date(Date.now() - 3 * 86_400_000), completed_at: new Date(Date.now() - 3 * 86_400_000), spec_after: after78, commentator_output: { summary: 's', mood: 'm' } })
+  runTwo()
+  fakeWorld({ files: { 'results.tsv': ledgerTo(77) + ledgerRow(78, 'keep', '0.6900') + '\n' } })
+  let result = await alongside.ensureResearchExperiment()
+  assert.deepEqual(result, { activated: true, how: 'reactivated', experiment_id: archived.id, next_epoch: 79, ledger_last_epoch: 78 })
+  assert.equal(archived.current_epoch, 78)
+  assert.deepEqual(archived.current_spec, after78)
+  assert.ok(logs.some(l => /epoch 78 had finished on the archived experiment \(it stopped at 77\); took its result over/.test(l)))
+
+  // 2. Epoch 78 wrote train.py and its ledger row (kept, 0.6800) and then the
+  //    request died: its epochs row never finished. The spec still says 0.70.
+  lab = new FakeLab()
+  archived = researchAt77({ status: 'archived' })
+  lab.addEpoch(archived, 78, { completed_at: null, started_at: new Date(Date.now() - 3 * 86_400_000) })
+  const classic = runTwo()
+  const world = fakeWorld({
+    files: { 'results.tsv': ledgerTo(77) + ledgerRow(78, 'keep', '0.6800') + '\n' },
+    // The next run scores 0.69: better than the stale 0.70, worse than what train.py now holds.
+    metrics: { val_bpb: 0.69, train_steps: 100, train_seconds: 299, peak_vram_mb: 9000, params_m: 10 },
+    model: (body) => {
+      if (body.messages.at(-1).content.startsWith('Rule: keep or revert')) {
+        return new Response(JSON.stringify({ model: body.model, choices: [{ message: { content: JSON.stringify({ verdict: 'keep', reason: 'beats the best' }) } }], usage: { prompt_tokens: 1, completion_tokens: 1, cost: 0.5 } }))
+      }
+    },
+  })
+  const res = await cronTick()
+  assert.equal(res.code, 200, JSON.stringify(res.body))
+  assert.equal(res.body.research.activation.next_epoch, 79)
+  assert.equal(res.body.research.epoch_number, 79)
+  assert.equal(res.body.experiment_id, classic.id)
+  assert.ok(logs.some(l => /results\.tsv kept 0\.6800 at epoch 78/.test(l)))
+  // The keep was overturned against 0.68: train.py is not overwritten with a worse one.
+  assert.equal(world.puts.some(p => p.path === 'train.py'), false)
+  assert.match(world.files['results.tsv'].trim().split('\n').at(-1), /^79\treverted\t0\.6900\t/)
+  const epoch79 = lab.epochs.find(e => e.experiment_id === archived.id && e.epoch_number === 79)
+  assert.equal(epoch79.reviewer_output.verdict, 'revert')
+  assert.equal(archived.current_epoch, 79)
+  assert.equal(archived.current_spec.meta.research.best_bpb, 0.68)
+  assert.equal(archived.current_spec.meta.research.best_epoch, 78)
+
+  // 3. Kept rows at or before the experiment's own epoch are its history, already in
+  //    its spec (or set aside by a re-baseline): they do not change the best score.
+  //    Nor does a kept score below the target.
+  lab = new FakeLab()
+  archived = researchAt77({ status: 'archived', current_spec: researchSpec({ best_bpb: 0.72, best_epoch: 60 }) })
+  lab.addEpoch(archived, 78, { completed_at: null, started_at: new Date(Date.now() - 3 * 86_400_000) })
+  runTwo()
+  fakeWorld({ files: { 'results.tsv': ledgerTo(77) + ledgerRow(78, 'keep', '0.0001') + '\n' } })
+  result = await alongside.ensureResearchExperiment()
+  assert.equal(result.activated, true)
+  assert.equal(archived.current_epoch, 78)
+  assert.equal(archived.current_spec.meta.research.best_bpb, 0.72)
+  assert.equal(archived.current_spec.meta.research.best_epoch, 60)
 })
 
 test('with no research experiment in the database a new one is seeded after the ledger\'s last epoch', async () => {
@@ -661,6 +882,16 @@ test('with no research experiment in the database a new one is seeded after the 
   seeded.status = 'archived'
   assert.equal((await alongside.ensureResearchExperiment()).activated, false)
   assert.equal(seeded.status, 'archived')
+
+  // A kept score below the target is not taken as the best: the seed keeps its own baseline.
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  lab = new FakeLab()
+  runTwo()
+  fakeWorld({ files: { 'results.tsv': `${LEDGER_HEADER}\n${ledgerRow(1, 'discard', '0.7400')}\n${ledgerRow(2, 'keep', '0.0001')}\n` } })
+  const second = await alongside.ensureResearchExperiment()
+  assert.equal(second.how, 'seeded')
+  assert.equal(second.next_epoch, 3)
+  assert.deepEqual(lab.experiments.find(e => e.id === second.experiment_id).current_spec.meta.research, { baseline_bpb: 0.7236, best_bpb: 0.7236, best_epoch: 0, target_bpb: 0.35 })
 })
 
 // ===========================================================================
@@ -700,6 +931,7 @@ test('one tick reactivates research and runs epoch 78 while the classic experime
   const mine = lab.modelCalls.filter(c => c.experiment_id === researchExp.id)
   assert.equal(mine.length, lab.modelCalls.length)
   assert.equal(mine.every(c => c.epoch_number === 78), true)
+  assert.equal(mine.every(c => c.budget_scope === 'research'), true) // spent under the research cap, and marked so
   const gpu = mine.filter(c => c.model_id === 'tool/research_gpu_run')
   assert.equal(gpu.length, 1)
   assert.equal(gpu[0].cost_source, 'estimate')
@@ -723,6 +955,10 @@ test('the GPU estimate is not written while the flag is off', async () => {
   assert.equal(only.current_epoch, 78)
   assert.equal(lab.modelCalls.some(c => c.model_id === 'tool/research_gpu_run'), false)
   assert.equal(lab.modelCalls.length, 5)
+  // Nothing is marked, the resumed-at stamp is not written, and the one cap counts every row.
+  assert.equal(lab.modelCalls.every(c => c.budget_scope === null), true)
+  assert.equal(lab.queries.some(q => q.text.includes('resumed_at')), false)
+  assert.equal((await spend.checkDailyBudget()).spent_usd, 2.5)
 })
 
 test('classic over its cap waits while research runs; research over its cap waits while classic is unaffected', async () => {
@@ -735,7 +971,7 @@ test('classic over its cap waits while research runs; research over its cap wait
 
   // Classic has spent its $15; research has spent $30 of its $40.
   lab.spend(classic, 15.5)
-  lab.spend(researchExp, 30)
+  lab.spendResearch(researchExp, 30)
   let res = await cronTick()
   assert.equal(res.code, 200, JSON.stringify(res.body))
   assert.equal(res.body.state, 'paused: daily budget reached')
@@ -748,7 +984,7 @@ test('classic over its cap waits while research runs; research over its cap wait
 
   // Now research passes its own cap. Its next epoch is due (pretend 78 ended long ago).
   lab.epochs.find(e => e.experiment_id === researchExp.id && e.epoch_number === 78).completed_at = new Date(Date.now() - 300 * 60_000)
-  lab.spend(researchExp, 10)
+  lab.spendResearch(researchExp, 10)
   const chatsBefore = world.chats.length
   res = await cronTick()
   assert.equal(res.code, 200)
@@ -969,6 +1205,119 @@ test('POST /api/epoch/run?mode=research runs the research experiment; without it
   assert.equal(researchExp.current_epoch, 78)
 })
 
+test('a GPU run still training when the request stops waiting is not a failed tick, and the next tick collects it', async () => {
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  process.env.RESEARCH_RUN_POLL_MAX_MS = '0' // stop waiting at once
+  const researchExp = researchAt77()
+  const classic = runTwo()
+  const world = fakeWorld({ files: { 'results.tsv': ledgerTo(77) } })
+
+  let res = await cronTick()
+  assert.equal(res.code, 200, JSON.stringify(res.body))
+  assert.deepEqual(res.body.research, { message: 'GPU run still in progress; resumes next tick', experiment_id: researchExp.id, epoch_number: 78 })
+  assert.equal(res.body.experiment_id, classic.id)
+  assert.equal(researchExp.epoch_in_progress, false) // the claim was released
+  assert.equal(researchExp.current_epoch, 77)
+  const epoch78 = lab.epochs.find(e => e.experiment_id === researchExp.id && e.epoch_number === 78)
+  assert.equal(epoch78.research_run.call_id, 'call-1')
+  assert.equal(epoch78.resumed_at, undefined) // made by this request, not picked up again
+  assert.equal(world.runnerStarts, 1)
+  assert.equal(logs.some(l => /\[CRON research\] Error in epoch tick/.test(l)), false)
+  assert.ok(logs.some(l => l.includes('[CRON research] Epoch 78: GPU run still in progress; resumes next tick')))
+  // The room's state shows the run as open only while a request holds the epoch.
+  assert.equal((await getState()).body.research.epoch_in_progress, false)
+
+  // The operator's trigger answers the same way: 202, not 500.
+  const auth = { authorization: `Bearer ${OPERATOR}` }
+  let manual = response()
+  await runRoute({ method: 'POST', headers: auth, query: { mode: 'research' } }, manual)
+  assert.equal(manual.code, 202)
+  assert.deepEqual(manual.body, { message: 'GPU run still in progress; resumes next tick', experiment_id: researchExp.id, epoch_number: 78 })
+  assert.ok(epoch78.resumed_at instanceof Date) // that request picked the epoch up again, and said so
+
+  // Next tick, with time to wait: the same call is collected, no second run starts.
+  delete process.env.RESEARCH_RUN_POLL_MAX_MS
+  epoch78.resumed_at = undefined
+  res = await cronTick()
+  assert.equal(res.code, 200, JSON.stringify(res.body))
+  assert.equal(res.body.research.epoch_number, 78)
+  assert.equal(world.runnerStarts, 1)
+  assert.equal(researchExp.current_epoch, 78)
+  assert.ok(epoch78.resumed_at instanceof Date)
+
+  // A real failure is still a 500 (covered above); and with the flag off the
+  // tick answers as it always did for a run that outlasts the wait.
+  delete process.env.LAB_RESEARCH_ALONGSIDE
+  process.env.RESEARCH_RUN_POLL_MAX_MS = '0'
+  lab = new FakeLab()
+  const only = researchAt77()
+  fakeWorld({ files: { 'results.tsv': ledgerTo(77) } })
+  res = await cronTick()
+  assert.equal(res.code, 500)
+  assert.deepEqual(res.body, { error: 'Epoch processing failed' })
+  assert.equal(only.epoch_in_progress, false)
+})
+
+test('reset?mode=research is refused while the flag is on, and nothing is archived', async () => {
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  const researchExp = researchAt77()
+  const classic = runTwo()
+  noNetwork()
+  const before = JSON.stringify([researchExp, classic])
+  const queriesBefore = lab.queries.length
+  const res = response()
+  await resetRoute({ method: 'POST', headers: { authorization: `Bearer ${OPERATOR}` }, query: { confirm: 'true', mode: 'research' } }, res)
+  assert.equal(res.code, 409)
+  assert.match(res.body.error, /refused while LAB_RESEARCH_ALONGSIDE is on/)
+  assert.equal(JSON.stringify([researchExp, classic]), before)
+  assert.equal(lab.queries.length, queriesBefore) // the database was not touched
+  assert.equal(lab.experiments.length, 2)
+})
+
+test('patch-research?archive=true archives the research experiment only, and only while the flag is off', async () => {
+  const auth = { authorization: `Bearer ${OPERATOR}` }
+  const call = async (query) => {
+    const res = response()
+    await patchResearchRoute({ method: 'POST', headers: auth, query, body: {} }, res)
+    return res
+  }
+  const researchExp = researchAt77({ epoch_in_progress: true, epoch_started_at: new Date() })
+  const classic = runTwo()
+  const classicBefore = JSON.stringify(classic)
+  noNetwork()
+
+  // With the flag on the tick would bring it straight back: refused.
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  let res = await call({ confirm: 'true', archive: 'true' })
+  assert.equal(res.code, 409)
+  assert.equal(researchExp.status, 'growing')
+
+  delete process.env.LAB_RESEARCH_ALONGSIDE
+  assert.equal((await call({ archive: 'true' })).code, 400) // no confirm
+  assert.equal((await call({ confirm: 'true', archive: 'yes' })).code, 400)
+  assert.equal(researchExp.status, 'growing')
+
+  res = await call({ confirm: 'true', archive: 'true' })
+  assert.equal(res.code, 200, JSON.stringify(res.body))
+  assert.deepEqual(res.body, { success: true, archived: [{ id: researchExp.id, current_epoch: 77 }] })
+  assert.equal(researchExp.status, 'archived')
+  assert.equal(researchExp.epoch_in_progress, false)
+  assert.equal(JSON.stringify(classic), classicBefore) // run 2 is not touched
+  assert.equal((await getState()).body.id, classic.id)
+
+  // Nothing left to archive.
+  assert.equal((await call({ confirm: 'true', archive: 'true' })).code, 404)
+  assert.equal(JSON.stringify(classic), classicBefore)
+
+  // Turned on again, the tick brings that same experiment back at 78.
+  process.env.LAB_RESEARCH_ALONGSIDE = 'true'
+  fakeWorld({ files: { 'results.tsv': ledgerTo(77) } })
+  const back = await alongside.ensureResearchExperiment()
+  assert.equal(back.how, 'reactivated')
+  assert.equal(back.experiment_id, researchExp.id)
+  assert.equal(back.next_epoch, 78)
+})
+
 // ===========================================================================
 // 7. Documentation
 // ===========================================================================
@@ -977,9 +1326,14 @@ test('the flag and the cap are documented with their defaults', () => {
   assert.match(env, /^LAB_RESEARCH_ALONGSIDE=false$/m)
   assert.match(env, /^LAB_RESEARCH_DAILY_BUDGET_USD=40$/m)
   const ops = readFileSync(join(root, 'docs/OPERATIONS.md'), 'utf8')
-  for (const needle of ['LAB_RESEARCH_ALONGSIDE', 'LAB_RESEARCH_DAILY_BUDGET_USD', '/api/experiment?mode=research', 'paused: research daily budget reached']) {
+  for (const needle of ['LAB_RESEARCH_ALONGSIDE', 'LAB_RESEARCH_DAILY_BUDGET_USD', '/api/experiment?mode=research', 'paused: research daily budget reached',
+    'budget_scope', 'resumed_at', 'patch-research?confirm=true&archive=true', 'more than 2 past', 'SEPARATE RESEARCH', 'GPU run still in progress; resumes next tick']) {
     assert.ok(ops.includes(needle), needle)
   }
+  // The way to archive research alone is not the reset, and the docs say what the reset does.
+  assert.doesNotMatch(ops, /To archive it as well, use the reset/)
+  assert.match(ops, /the reset ends run 2 too/)
+  assert.match(readFileSync(join(root, 'api/_lib/schema.sql'), 'utf8'), /budget_scope TEXT/)
   // Visitor-facing and owner-facing text here uses no em dashes.
   const section = ops.slice(ops.indexOf('## Research beside run 2'))
   assert.ok(section.length > 500)

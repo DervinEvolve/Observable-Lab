@@ -225,14 +225,16 @@ export interface EpochRunResult {
  * experiment and epoch. The claim is released however the epoch ends.
  */
 export async function runEpoch(experimentId: string): Promise<EpochRunResult> {
-  // One cap for everything, or research's own cap when it runs alongside (spend.ts).
-  const budget = await checkDailyBudget(new Date(), await budgetScopeFor(experimentId))
+  // One cap for everything, or research's own cap when it runs alongside
+  // (spend.ts). The rows this epoch writes carry the cap it started under.
+  const budgetScope = await budgetScopeFor(experimentId)
+  const budget = await checkDailyBudget(new Date(), budgetScope)
   if (!budget.allowed) {
     console.warn(`[Epoch] Not starting an epoch for ${experimentId}: ${describeBudget(budget)}`)
     throw new BudgetPausedError(budget)
   }
   if (!(await claimEpoch(experimentId))) throw new EpochBusyError(experimentId)
-  return withSpendContext({ experimentId, purpose: 'epoch' }, async () => {
+  return withSpendContext({ experimentId, purpose: 'epoch', budgetScope }, async () => {
     try {
       return await runClaimedEpoch(experimentId)
     } catch (error) {

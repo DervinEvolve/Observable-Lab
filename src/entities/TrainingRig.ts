@@ -10,6 +10,11 @@ import { COLORS } from '../scene/colors'
 //
 // Idle state is quiet-science calm: lamps breathe slow green, fan barely
 // turns, no pulses, needle at rest.
+//
+// When the run belongs to a separate research experiment (one running beside
+// the experiment in this room), the rack still works and the gauge says whose
+// score it shows, but no pulses travel to the terrarium: that run is not
+// training this plant.
 
 const AMBER = new THREE.Color(0xffb454)
 const IDLE_GREEN = new THREE.Color(0x7cb342)
@@ -36,6 +41,9 @@ export class TrainingRig {
   private gaugeTexture: THREE.CanvasTexture
   private active = false
   private activeAmount = 0 // eased 0..1
+  private feedsPlant = true // false: the run in flight is a separate experiment's
+  private pulseAmount = 0 // eased 0..1
+  private separate = false // the gauge shows a separate research experiment's score
   private bestBpb: number | null = null
   private baselineBpb: number | null = null
   private time = 0
@@ -173,7 +181,12 @@ export class TrainingRig {
     ctx.fillStyle = '#3a3128'
     ctx.font = '600 20px Georgia, serif'
     ctx.textAlign = 'center'
-    ctx.fillText('TRAINING', c, 190)
+    if (this.separate) {
+      ctx.font = '600 15px Georgia, serif'
+      ctx.fillText('SEPARATE RESEARCH', c, 188)
+    } else {
+      ctx.fillText('TRAINING', c, 190)
+    }
     ctx.font = '600 26px "Courier New", monospace'
     ctx.fillStyle = this.bestBpb !== null && this.baselineBpb !== null && this.bestBpb < this.baselineBpb ? '#4a7a34' : '#3a3128'
     ctx.fillText(this.bestBpb !== null ? this.bestBpb.toFixed(4) : 'none yet', c, 224)
@@ -196,8 +209,14 @@ export class TrainingRig {
     this.gaugeTexture.needsUpdate = true
   }
 
-  public setActive(active: boolean): void {
+  /**
+   * A GPU training run is in flight. `feedsPlant` is false when the run
+   * belongs to a separate research experiment: the rack works, but nothing
+   * flows to this room's plant.
+   */
+  public setActive(active: boolean, feedsPlant = true): void {
     this.active = active
+    this.feedsPlant = feedsPlant
   }
 
   /**
@@ -238,10 +257,12 @@ export class TrainingRig {
     this.jobUntil = this.time + holdS
   }
 
-  public setResearch(best: number | null, baseline: number | null): void {
-    if (best !== this.bestBpb || baseline !== this.baselineBpb) {
+  /** The score on the gauge. `separate` labels it as a separate research experiment's. */
+  public setResearch(best: number | null, baseline: number | null, separate = false): void {
+    if (best !== this.bestBpb || baseline !== this.baselineBpb || separate !== this.separate) {
       this.bestBpb = best
       this.baselineBpb = baseline
+      this.separate = separate
       this.lastGaugeDraw = -1 // force redraw
     }
   }
@@ -252,6 +273,8 @@ export class TrainingRig {
     const jobLive = this.time < this.jobUntil
     this.activeAmount += ((this.active || jobLive ? 1 : 0) - this.activeAmount) * Math.min(1, fdt * 2)
     const k = this.activeAmount
+    this.pulseAmount += (((this.active && this.feedsPlant) || jobLive ? 1 : 0) - this.pulseAmount) * Math.min(1, fdt * 2)
+    const p = this.pulseAmount
 
     // lamps: slow green breathing idle → frantic amber chase while training
     const c = IDLE_GREEN.clone().lerp(AMBER, k)
@@ -269,9 +292,9 @@ export class TrainingRig {
     this.fanMat.uniforms.uT.value = this.fanAngle
     this.fanMat.uniforms.uA.value = 0.1 + k * 0.35
 
-    // data pulses flow only while training
-    ;(this.pulses.material as THREE.PointsMaterial).opacity = k * 0.85
-    if (k > 0.02) {
+    // data pulses flow only while a run that trains this room's plant is in flight
+    ;(this.pulses.material as THREE.PointsMaterial).opacity = p * 0.85
+    if (p > 0.02) {
       const pos = (this.pulses.geometry.getAttribute('position') as THREE.BufferAttribute).array as Float32Array
       const v = new THREE.Vector3()
       for (let i = 0; i < this.pulseT.length; i++) {

@@ -24,7 +24,8 @@ import { researchAlongside } from './experiment-modes.js'
 import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
-  provenanceOf, provenanceTrailers, putResearchFile, researchGpuCostUsd, startResearchRun, writeFindingPage,
+  provenanceOf, provenanceTrailers, putResearchFile, researchGpuCostUsd, ResearchRunPendingError,
+  sanitizeRunResult, startResearchRun, writeFindingPage,
   type ResearchRunResult,
 } from './research.js'
 import {
@@ -38,7 +39,7 @@ const RESEARCH_BUDGET_S = Number(process.env.RESEARCH_BUDGET_S || 300)
 // Leave headroom inside the 800 s function budget for the LLM stages and the
 // repo writes after the run; a run still going at the deadline is picked up
 // again from its persisted call_id on the next tick.
-const RUN_POLL_MAX_MS = Number(process.env.RESEARCH_RUN_POLL_MAX_MS || 400_000)
+const runPollMaxMs = () => Number(process.env.RESEARCH_RUN_POLL_MAX_MS || 400_000)
 
 function getGrowthStage(spec: AgentSpecification): AgentSpecification['meta']['growth_stage'] {
   const caps = spec.capabilities.filter(c => c.status === 'active').length
@@ -109,6 +110,16 @@ export async function runResearchEpoch(experimentId: string): Promise<{
   }
 
   try {
+    // Beside run 2, a request that picks an unfinished epoch up again says so
+    // on its row. A reset can archive the experiment while this request is
+    // still working, and the tick must not bring the experiment back (and
+    // start this same epoch a second time) until it is done. epochs.started_at
+    // is set once, when the row is made, so it cannot tell.
+    if (existingEpoch && researchAlongside()) {
+      await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS resumed_at TIMESTAMP WITH TIME ZONE`
+      await sql`UPDATE epochs SET resumed_at = NOW() WHERE id = ${existingEpoch.id as string}`
+    }
+
     // --- Assemble research context from the repo (the org's real memory) ---
     const [trainPyFile, resultsFile, wikiIndexFile] = await Promise.all([
       getResearchFile('train.py'),
@@ -189,7 +200,10 @@ export async function runResearchEpoch(experimentId: string): Promise<{
 
     // 3. THE RUN — real GPU, fixed budget. call_id persists immediately so a
     // function timeout resumes polling instead of re-running.
-    let runResult = existingEpoch?.research_run?.result as ResearchRunResult | undefined
+    // A stored result is cleaned again when it is read back: it may have been
+    // saved before results were cleaned on arrival (sanitizeRunResult).
+    let runResult: ResearchRunResult | undefined = existingEpoch?.research_run?.result
+      ? sanitizeRunResult(existingEpoch.research_run.result) : undefined
     if (!runResult) {
       let callId = existingEpoch?.research_run?.call_id
       if (!callId) {
@@ -200,11 +214,11 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         `
         console.log(`[Research e${epochNumber}] run started: ${callId}`)
       }
-      const awaited = await awaitResearchRun(callId, RUN_POLL_MAX_MS)
+      const awaited = await awaitResearchRun(callId, runPollMaxMs())
       if (awaited === null) {
         // Still training at our polling deadline — bail out cleanly; the next
         // tick reuses the persisted call_id and picks up the result.
-        throw new Error(`GPU run still in progress at poll deadline (call ${callId}) — epoch will resume next tick`)
+        throw new ResearchRunPendingError(callId)
       }
       runResult = awaited
       // Beside run 2, research has its own daily cap and the GPU time counts
@@ -396,7 +410,8 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     return { success: true, epochNumber, newSpec, commentatorOutput }
   } catch (error) {
     await releaseEpoch(experimentId)
-    console.error(`[Research e${epochNumber}] failed:`, error instanceof Error ? error.message : error)
+    if (error instanceof ResearchRunPendingError && researchAlongside()) console.log(`[Research e${epochNumber}] ${error.message}`)
+    else console.error(`[Research e${epochNumber}] failed:`, error instanceof Error ? error.message : error)
     throw error
   }
 }

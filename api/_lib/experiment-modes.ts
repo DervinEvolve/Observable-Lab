@@ -41,8 +41,9 @@ export async function experimentMode(experimentId: string): Promise<ExperimentMo
 }
 
 /**
- * Which daily cap an experiment's work counts against. With the flag off
- * there is one cap for everything and no lookup is made.
+ * Which daily cap an experiment's work counts against, and so which mark its
+ * ledger rows get (spend.ts). With the flag off there is one cap, nothing is
+ * marked and no lookup is made.
  */
 export async function budgetScopeFor(experimentId: string): Promise<ExperimentMode> {
   return researchAlongside() ? experimentMode(experimentId) : 'classic'

@@ -7,6 +7,7 @@ import { BudgetPausedError, budgetPausedState } from '../_lib/spend.js'
 import { persistGlassIfBrokenOut } from '../_lib/growth.js'
 import { requeueFollowUp, runEpochFollowUp } from '../_lib/epoch-followup.js'
 import { researchAlongside } from '../_lib/experiment-modes.js'
+import { ResearchRunPendingError } from '../_lib/research.js'
 
 // POST /api/epoch/run - Force trigger an epoch (operator). Shares the atomic
 // claim with the cron, so the two can never run an epoch at the same time,
@@ -82,6 +83,15 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
           error: budgetPausedState(e.status),
           reason: e.status.reason,
           resumes_at: e.status.resumes_at,
+        })
+      }
+      // mode=research: the GPU run is still training. Nothing failed; the
+      // next tick (or this call again) collects the result.
+      if (wantResearch && e instanceof ResearchRunPendingError) {
+        return res.status(202).json({
+          message: 'GPU run still in progress; resumes next tick',
+          experiment_id: experiment.id,
+          epoch_number: experiment.current_epoch + 1,
         })
       }
       throw e

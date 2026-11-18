@@ -10,6 +10,7 @@ import { persistGlassIfBrokenOut } from '../_lib/growth.js'
 import { runEpochFollowUp } from '../_lib/epoch-followup.js'
 import { loadTickExperiment, researchAlongside, type TickSlot } from '../_lib/experiment-modes.js'
 import { ensureResearchExperiment, type ResearchActivation } from '../_lib/research-alongside.js'
+import { ResearchRunPendingError } from '../_lib/research.js'
 
 type TickBody = Record<string, unknown>
 
@@ -152,6 +153,13 @@ async function advance(experiment: Record<string, any>, slot: TickSlot): Promise
     if (e instanceof EpochBusyError) {
       console.log(`${tag} Epoch already claimed by another request for ${experiment.id}`)
       return { message: 'Epoch already in progress', experiment_id: experiment.id }
+    }
+    // Beside run 2, a GPU run that is still training when the request stops
+    // waiting is not a failure: the claim is released, the call id is stored
+    // and the next tick collects the result.
+    if (slot === 'research' && e instanceof ResearchRunPendingError) {
+      console.log(`${tag} Epoch ${experiment.current_epoch + 1}: GPU run still in progress; resumes next tick`)
+      return { message: 'GPU run still in progress; resumes next tick', experiment_id: experiment.id, epoch_number: experiment.current_epoch + 1 }
     }
     throw e
   }

@@ -90,7 +90,8 @@ CREATE TABLE IF NOT EXISTS model_calls (
   cost_source TEXT,
   prompt_tokens INTEGER NOT NULL DEFAULT 0,
   completion_tokens INTEGER NOT NULL DEFAULT 0,
-  reasoning_tokens INTEGER NOT NULL DEFAULT 0
+  reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+  budget_scope TEXT -- 'research' when spent under the research cap, else empty
 );
 CREATE INDEX IF NOT EXISTS idx_model_calls_created ON model_calls(created_at);
 CREATE INDEX IF NOT EXISTS idx_model_calls_epoch ON model_calls(experiment_id, epoch_number);

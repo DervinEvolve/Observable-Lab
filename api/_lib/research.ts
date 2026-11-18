@@ -184,12 +184,17 @@ export async function appendResultsRow(fields: {
   const header = (newline === -1 ? base : base.slice(0, newline)).replace(/\r$/, '')
   if (header === RESULTS_HEADER_V1) base = RESULTS_HEADER + (newline === -1 ? '' : base.slice(newline))
   else if (header !== RESULTS_HEADER) throw new Error('results.tsv does not start with a known header; not rewriting it')
-  const fmt = (v: number | null, digits = 4) => (v === null || v === undefined ? '-' : v.toFixed(digits))
+  // The metrics are whatever the generated train.py printed. Only a real
+  // number is written; anything else becomes "-", and no cell can carry a tab
+  // or a line break, so one epoch can never write a second row.
+  const fmt = (v: unknown, digits = 4) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '-')
+  const count = (v: unknown) => (typeof v === 'number' && Number.isSafeInteger(v) && v >= 0 ? String(v) : '-')
+  if (!Number.isSafeInteger(fields.epoch) || fields.epoch < 0) throw new Error('appendResultsRow: epoch is not a whole number')
   const row = [
     fields.epoch,
     fields.commit,
     fmt(fields.val_bpb),
-    fields.train_steps ?? '-',
+    count(fields.train_steps),
     fmt(fields.train_seconds, 1),
     fmt(fields.peak_vram_mb, 0),
     fmt(fields.params_m, 3),
@@ -199,7 +204,7 @@ export async function appendResultsRow(fields: {
     fields.provenance.dataset ?? '-',
     fields.provenance.harness_sha256 ?? '-',
     fmt(fields.provenance.train_wall_seconds, 1),
-  ].join('\t')
+  ].map(cell => String(cell).replace(/[\t\n\r]/g, ' ')).join('\t')
   if (base.split('\n').some(line => line.replace(/\r$/, '') === row)) return false
   const unverified = fields.provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
   await putResearchFile('results.tsv', base + '\n' + row + '\n',
@@ -288,11 +293,11 @@ ${experimentId ? `\n<!-- oblab-experiment: ${experimentId} -->\n` : ''}`
 
 export interface ResearchRunMetrics {
   val_bpb: number
-  train_steps: number
-  train_seconds: number
-  peak_vram_mb: number
-  params_m: number
-  tokens_seen: number
+  train_steps?: number
+  train_seconds?: number
+  peak_vram_mb?: number
+  params_m?: number
+  tokens_seen?: number
 }
 
 export interface ResearchRunResult {
@@ -308,6 +313,61 @@ export interface ResearchRunResult {
   harness_sha256?: string
   budget_s?: number
   train_wall_seconds?: number // measured by the runner around train.py
+}
+
+/**
+ * A run result as the lab will use it. The runner passes on the metrics
+ * object the generated train.py printed after checking only val_bpb, so
+ * every other value in it can be anything, a string with tabs and line
+ * breaks included. Here each metric is kept only when it is a real number
+ * (train_steps a whole one) and every other field only when it has the type
+ * it should; a run marked ok with no usable val_bpb becomes a crash. Applied
+ * to every result that arrives and to every stored result that is read back.
+ */
+export function sanitizeRunResult(raw: unknown): ResearchRunResult {
+  const r = (raw && typeof raw === 'object' ? raw : {}) as Record<string, unknown>
+  const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) ? v : undefined)
+  const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
+  let status: ResearchRunResult['status'] = r.status === 'ok' || r.status === 'crash' || r.status === 'infra_error' ? r.status : 'infra_error'
+  let error = str(r.error)
+  let metrics: ResearchRunMetrics | undefined
+  const m = r.metrics && typeof r.metrics === 'object' ? r.metrics as Record<string, unknown> : null
+  const bpb = num(m?.val_bpb)
+  if (m && bpb !== undefined && bpb >= 0) {
+    const steps = num(m.train_steps)
+    metrics = { val_bpb: bpb }
+    if (steps !== undefined && Number.isSafeInteger(steps) && steps >= 0) metrics.train_steps = steps
+    for (const key of ['train_seconds', 'peak_vram_mb', 'params_m', 'tokens_seen'] as const) {
+      const v = num(m[key])
+      if (v !== undefined) metrics[key] = v
+    }
+  } else if (status === 'ok') {
+    status = 'crash'
+    error = error ?? 'the run reported no usable val_bpb'
+  }
+  const out: ResearchRunResult = { status }
+  if (metrics) out.metrics = metrics
+  if (error !== undefined) out.error = error
+  for (const key of ['log_tail', 'gpu', 'stage', 'metrics_source', 'dataset', 'harness_sha256'] as const) {
+    const v = str(r[key])
+    if (v !== undefined) out[key] = v
+  }
+  for (const key of ['wall_seconds', 'budget_s', 'train_wall_seconds'] as const) {
+    const v = num(r[key])
+    if (v !== undefined) out[key] = v
+  }
+  return out
+}
+
+/**
+ * The GPU run was still training when this request stopped waiting for it.
+ * Nothing failed: the call id is stored and the next tick collects the result.
+ */
+export class ResearchRunPendingError extends Error {
+  constructor(public readonly callId: string) {
+    super(`GPU run still in progress at poll deadline (call ${callId}) — epoch will resume next tick`)
+    this.name = 'ResearchRunPendingError'
+  }
 }
 
 // Seconds charged for a run whose own time never came back: the training
@@ -348,7 +408,7 @@ export async function pollResearchRun(callId: string): Promise<
   const res = await fetch(url, { headers: { Authorization: `Bearer ${runnerToken()}` }, signal: AbortSignal.timeout(RUNNER_TIMEOUT_MS) })
   if (!res.ok) return { status: 'failed', error: `status endpoint HTTP ${res.status}` }
   const data = await res.json()
-  if (data.status === 'done') return { status: 'done', result: data.result as ResearchRunResult }
+  if (data.status === 'done') return { status: 'done', result: sanitizeRunResult(data.result) }
   if (data.status === 'failed') return { status: 'failed', error: String(data.error || 'unknown') }
   if (data.status === 'running') return { status: 'running' }
   return { status: 'failed', error: 'Runner returned an invalid status' }

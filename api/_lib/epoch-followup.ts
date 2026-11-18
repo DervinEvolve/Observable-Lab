@@ -127,14 +127,15 @@ export async function runEpochFollowUp(experimentId: string): Promise<FollowUpRu
   const pending = await pendingFollowUp(experimentId)
   if (!pending) return { ran: false, reason: 'nothing pending' }
 
-  const budget = await checkDailyBudget(new Date(), await budgetScopeFor(experimentId))
+  const budgetScope = await budgetScopeFor(experimentId)
+  const budget = await checkDailyBudget(new Date(), budgetScope)
   if (!budget.allowed) {
     console.warn(`[Follow-up] Not running epoch ${pending.epochNumber}'s follow-up: ${describeBudget(budget)}`)
     return { ran: false, reason: budget.reason ?? 'daily budget reached', epoch_number: pending.epochNumber }
   }
   if (!(await claimEpoch(experimentId))) return { ran: false, reason: 'an epoch is in progress', epoch_number: pending.epochNumber }
 
-  return withSpendContext({ experimentId, epochNumber: pending.epochNumber, purpose: 'followup' }, async () => {
+  return withSpendContext({ experimentId, epochNumber: pending.epochNumber, purpose: 'followup', budgetScope }, async () => {
     try {
       return await runClaimed(experimentId, pending.epochNumber)
     } finally {

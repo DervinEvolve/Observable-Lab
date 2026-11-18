@@ -11,12 +11,14 @@
  * starts the work (runEpoch, runAndPersistNorth), so callModel's callers do
  * not have to pass it through.
  *
- * With LAB_RESEARCH_ALONGSIDE on there are two caps. Every row already
- * carries its experiment, and an experiment's mode never changes, so the
- * split is a join at read time: LAB_RESEARCH_DAILY_BUDGET_USD counts the
- * rows of research experiments (the GPU run estimate included), and
- * LAB_DAILY_BUDGET_USD counts every other row. With the flag off there is
- * one cap over all rows, as before.
+ * With LAB_RESEARCH_ALONGSIDE on there are two caps, and each row says which
+ * one it was spent under: work started under the research cap writes
+ * `budget_scope = 'research'` on its rows (model calls and the GPU run
+ * estimate), every other row leaves it empty. LAB_RESEARCH_DAILY_BUDGET_USD
+ * counts the marked rows and LAB_DAILY_BUDGET_USD counts the rest. The mark
+ * stays on the row, so turning the flag off never moves what research spent
+ * onto the classic cap. A database where the flag was never on has no marked
+ * rows, and its one cap counts every row, as before.
  */
 import { AsyncLocalStorage } from 'node:async_hooks'
 import { sql } from '@vercel/postgres'
@@ -26,6 +28,8 @@ export interface SpendContext {
   experimentId?: string
   epochNumber?: number
   purpose?: string
+  /** The cap this work was started under. Only `research` is written to the rows. */
+  budgetScope?: ExperimentMode
 }
 
 const contextStore = new AsyncLocalStorage<SpendContext>()
@@ -72,9 +76,13 @@ export function ensureSpendTable(): Promise<void> {
           cost_source TEXT,
           prompt_tokens INTEGER NOT NULL DEFAULT 0,
           completion_tokens INTEGER NOT NULL DEFAULT 0,
-          reasoning_tokens INTEGER NOT NULL DEFAULT 0
+          reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+          budget_scope TEXT
         )
       `
+      // Which cap a row was spent under: 'research', or empty for the classic
+      // (or only) cap. Added to an existing ledger the way its other columns were.
+      await sql`ALTER TABLE model_calls ADD COLUMN IF NOT EXISTS budget_scope TEXT`
       await sql`CREATE INDEX IF NOT EXISTS idx_model_calls_created ON model_calls(created_at)`
       await sql`CREATE INDEX IF NOT EXISTS idx_model_calls_epoch ON model_calls(experiment_id, epoch_number)`
     })().catch(e => {
@@ -95,11 +103,12 @@ export async function recordModelCall(rec: ModelCallRecord): Promise<void> {
     await sql`
       INSERT INTO model_calls (
         experiment_id, epoch_number, purpose, model_id, assigned_model_id,
-        cost_usd, cost_source, prompt_tokens, completion_tokens, reasoning_tokens
+        cost_usd, cost_source, prompt_tokens, completion_tokens, reasoning_tokens, budget_scope
       ) VALUES (
         ${ctx.experimentId ?? null}, ${ctx.epochNumber ?? null}, ${ctx.purpose ?? null},
         ${rec.model}, ${rec.assigned}, ${rec.cost_usd}, ${rec.cost_source},
-        ${rec.prompt_tokens}, ${rec.completion_tokens}, ${rec.reasoning_tokens}
+        ${rec.prompt_tokens}, ${rec.completion_tokens}, ${rec.reasoning_tokens},
+        ${ctx.budgetScope === 'research' ? 'research' : null}
       )
     `
   } catch (e) {
@@ -166,29 +175,23 @@ export function researchDailyBudgetUsd(): number {
 }
 
 /**
- * Today's spend (UTC). With no scope, every row. With a scope, only the rows
- * of that kind of experiment: `research` is rows whose experiment is in
- * research mode, `classic` is every other row (rows with no experiment too).
+ * Today's spend (UTC) under one cap. `research` is the rows written under
+ * the research cap (`budget_scope = 'research'`); `classic` is every other
+ * row, which is also the whole ledger wherever the flag was never on.
  */
-export async function spentTodayUsd(now: Date = new Date(), scope?: ExperimentMode): Promise<number> {
+export async function spentTodayUsd(now: Date = new Date(), scope: ExperimentMode = 'classic'): Promise<number> {
   await ensureSpendTable()
   const since = utcDayStart(now).toISOString()
   const r = scope === 'research'
     ? await sql`
-      SELECT COALESCE(SUM(m.cost_usd), 0) AS total
-      FROM model_calls m JOIN experiments e ON e.id = m.experiment_id
-      WHERE m.created_at >= ${since} AND jsonb_typeof(e.current_spec->'meta'->'research') = 'object'
-    `
-    : scope === 'classic'
-    ? await sql`
-      SELECT COALESCE(SUM(m.cost_usd), 0) AS total
-      FROM model_calls m LEFT JOIN experiments e ON e.id = m.experiment_id
-      WHERE m.created_at >= ${since} AND jsonb_typeof(e.current_spec->'meta'->'research') IS DISTINCT FROM 'object'
+      SELECT COALESCE(SUM(cost_usd), 0) AS total
+      FROM model_calls
+      WHERE created_at >= ${since} AND budget_scope = 'research'
     `
     : await sql`
     SELECT COALESCE(SUM(cost_usd), 0) AS total
     FROM model_calls
-    WHERE created_at >= ${since}
+    WHERE created_at >= ${since} AND budget_scope IS DISTINCT FROM 'research'
   `
   return Number(r.rows[0]?.total) || 0
 }
@@ -215,11 +218,10 @@ export function budgetPausedState(status: BudgetStatus): string {
  * May the lab spend more today? Fails closed: if the ledger can't be read,
  * nothing new starts, because the cap could not be checked.
  *
- * `scope` says whose work is asking. It only matters while
- * LAB_RESEARCH_ALONGSIDE is on: then research is held to its own cap and
- * its own spend, and everything else to LAB_DAILY_BUDGET_USD and the spend
- * that is not research. With the flag off both scopes are the one cap over
- * all spend.
+ * `scope` says whose work is asking. Research is held to its own cap and
+ * the rows spent under it only while LAB_RESEARCH_ALONGSIDE is on. Everything
+ * else, and everything while the flag is off, is held to LAB_DAILY_BUDGET_USD
+ * and the rows that were not spent under the research cap.
  */
 export async function checkDailyBudget(now: Date = new Date(), scope: ExperimentMode = 'classic'): Promise<BudgetStatus> {
   const split = researchAlongside()
@@ -229,7 +231,7 @@ export async function checkDailyBudget(now: Date = new Date(), scope: Experiment
   const which = split ? { scope } : {}
   let spent: number
   try {
-    spent = await spentTodayUsd(now, split ? scope : undefined)
+    spent = await spentTodayUsd(now, research ? 'research' : 'classic')
   } catch (e) {
     console.warn('[spend] could not read today\'s spend:', e instanceof Error ? e.message : e)
     return { allowed: false, spent_usd: null, budget_usd: budget, resumes_at, reason: 'spend ledger unavailable', ...which }

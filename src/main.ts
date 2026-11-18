@@ -1200,11 +1200,14 @@ class ObservableLab {
       const inProg = state.recent_epochs.find(e => !e.completed_at)
       const training = !!(state.epoch_in_progress && inProg?.research_run?.call_id && !inProg?.research_run?.result)
       // Research running beside this experiment reports its GPU run and its
-      // scores in `research`; the rack shows those.
-      const side = state.research
-      this.trainingRig?.setActive(training || side?.gpu_running === true)
-      const research = state.current_spec.meta.research ?? side
-      this.trainingRig?.setResearch(research?.best_bpb ?? null, research?.baseline_bpb ?? null)
+      // scores in `research`. The rack works for that run too, but it is a
+      // separate experiment: no pulses flow to this room's plant, and the
+      // gauge is labelled as separate research.
+      const own = state.current_spec.meta.research
+      const side = own ? undefined : state.research
+      this.trainingRig?.setActive(training || side?.gpu_running === true, training || !side?.gpu_running)
+      const research = own ?? side
+      this.trainingRig?.setResearch(research?.best_bpb ?? null, research?.baseline_bpb ?? null, !own && !!side)
     }
 
     // The archive wall fills up with what the agent has actually earned

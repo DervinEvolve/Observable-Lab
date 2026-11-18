@@ -2,6 +2,7 @@ import { requireBearer } from '../_lib/auth.js'
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { sql } from '@vercel/postgres'
 import type { AgentSpecification } from '../_lib/types.js'
+import { researchAlongside } from '../_lib/experiment-modes.js'
 
 // POST /api/experiment/patch-research?confirm=true
 // Admin: re-baseline the ACTIVE research experiment in place (e.g. after a
@@ -9,12 +10,22 @@ import type { AgentSpecification } from '../_lib/types.js'
 // Sets baseline_bpb AND best_bpb to the given value, best_epoch to the
 // current epoch, clears last_run, and drops a system note in the lab
 // notebook so the models know history before this point isn't comparable.
+//
+// POST /api/experiment/patch-research?confirm=true&archive=true
+// Admin: archive the active research experiment, and only that one. The
+// classic experiment is not touched (the reset archives everything). Refused
+// while LAB_RESEARCH_ALONGSIDE is on, because the next tick would bring the
+// experiment straight back. No body.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
   if (!requireBearer(req, res)) return
 
   if (req.method !== 'POST') return res.status(405).json({ error: 'POST only' })
   if (req.query.confirm !== 'true') {
     return res.status(400).json({ error: 'Pass ?confirm=true to actually patch.' })
+  }
+  if (req.query.archive !== undefined) {
+    if (req.query.archive !== 'true') return res.status(400).json({ error: 'archive must be true' })
+    return archiveResearch(res)
   }
   const baseline = Number((req.body as Record<string, unknown>)?.baseline_bpb)
   const target = Number((req.body as Record<string, unknown>)?.target_bpb)
@@ -64,3 +75,28 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   }
 }
 
+
+// Archives every active research experiment (there is at most one) and
+// clears its claim, as the reset does for all experiments. An epoch still
+// running on it finishes into the archived row.
+async function archiveResearch(res: VercelResponse) {
+  if (researchAlongside()) {
+    return res.status(409).json({
+      error: 'LAB_RESEARCH_ALONGSIDE is on',
+      hint: 'Turn the flag off and redeploy first, or the next tick reactivates the research experiment.',
+    })
+  }
+  try {
+    const r = await sql`
+      UPDATE experiments
+      SET status = 'archived', epoch_in_progress = FALSE, epoch_started_at = NULL
+      WHERE status <> 'archived' AND jsonb_typeof(current_spec->'meta'->'research') = 'object'
+      RETURNING id, current_epoch
+    `
+    if (!r.rows.length) return res.status(404).json({ error: 'no active research experiment' })
+    console.log(`[ADMIN] Archived research experiment(s): ${r.rows.map(x => `${x.id} at epoch ${x.current_epoch}`).join(', ')}`)
+    return res.status(200).json({ success: true, archived: r.rows })
+  } catch (e) {
+    return res.status(500).json({ error: e instanceof Error ? e.message : 'unknown' })
+  }
+}
