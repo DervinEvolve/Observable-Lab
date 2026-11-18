@@ -45,6 +45,7 @@ These are made at runtime, like the earlier table-creation helpers, and are also
 - `epochs`: gains `prompt_tokens` and `completion_tokens`.
 - `conflicts`: gains `spec_conflict_id`, the id the specification uses, so a resolved conflict updates its row.
 - `tool_runs`: new table, one row per tool use the Executor chose, including refused ones (`api/_lib/tool-runs-store.ts`, [TOOLS.md](TOOLS.md#the-record)). Created at runtime; it is not in `schema.sql`, whose owner may add it.
+- `live_model_keys` and `live_model_calls`: new tables for the lab model endpoint (`api/_lib/live-model-keys.ts`). They are created the first time a key is made or checked, so they do not exist while `LAB_ENABLE_LIVE_MODEL` is off. They are not in `schema.sql` either.
 
 ### Starting run 2
 
@@ -59,6 +60,8 @@ The first epoch after a reset waits one interval from the seed, like every other
 - Missing or short configuration returns 503. Missing or incorrect authorization returns 401 before database, model, Sprites, or compute work.
 - The guard covers manual epochs, clearing stuck epochs, seeding/resetting/patching experiments, the persisted glass state, debug views, North runs, and all Sprites routes. `?confirm=true` remains an extra action check; it is not authentication.
 - Ordinary experiment state (now including recent `tool_runs`, cleaned of anything that looks like a credential), merged exhibits (`GET /api/experiment?view=exhibits`), contribution records, and wildcard transcripts remain public observer endpoints. Review their contents before using private research or code in a connected deployment. Only put material intended for viewers in that experiment.
+
+- `/api/live-model/v1/chat/completions` (and `/api/live-model/v1/models`, which `vercel.json` rewrites to it) is neither a public route nor an operator route. It takes a scoped key that the lab makes for one Sprite session. While `LAB_ENABLE_LIVE_MODEL` is off it answers 503 to everyone. When it is on it answers 401 to anything that is not a live scoped key, and that includes the operator secret.
 
 The anonymous viewer no longer calls operator routes: it does not persist the glass state or load Sprites status, and the `window.lab` and console debug helpers exist only in development builds. Use a separate trusted operator client; do not solve a 401 by embedding the operator secret in the browser. The browser's glass animation still plays locally without persisting its state.
 
@@ -87,6 +90,32 @@ The research controller runs only the reviewed preparation harness. It uses a ne
 The reviewed preparation source is bundled at `modal/harness/prepare.py`, originating from Research-Lab blob `c33f69057b59a9a9785a2ec77715cb47f2ea1412`. Its image copy is built from this checkout and the controller records its SHA-256 in each result. It prepares TinyStories data; smoke preparation uses synthetic data. Review harness and dataset changes separately from generated training code. Install the deployment client with `python -m pip install -r requirements-runner.txt` (Modal SDK 1.6.3). The runner uses the supported Sandbox filesystem API; the old `Sandbox.open()` API is retired. Verify network denial, cache write denial, no injected credentials, and process termination in a test deployment before rolling out the runner.
 
 For `modal/gpu_jobs.py` (the GPU job tool), create the Modal secret `oblab-gpu-jobs-auth` containing `JOBS_TOKEN` (at least 32 characters), put the same value in Vercel's `GPU_JOBS_TOKEN`, deploy with `modal deploy modal/gpu_jobs.py`, and set `GPU_JOBS_START_URL` and `GPU_JOBS_STATUS_URL` to the endpoints Modal prints. It uses the research runner's pinned base image and packages. Verify in a test deployment that a job cannot reach the network and sees no credentials, and that a job is stopped at 120 s, before turning on `LAB_ENABLE_GPU_JOBS`.
+
+## The lab model endpoint
+
+`LAB_ENABLE_LIVE_MODEL` (default false) lets code that a model runs in its own Sprite session make a real model call. I am the host: the lab serves an OpenAI-compatible endpoint at `<origin>/api/live-model/v1`, and it forwards the call to OpenRouter with my key. The models never see that key. What they get is a scoped key that the lab makes for one Sprite session and takes away when the session ends. [TOOLS.md](TOOLS.md#the-lab-model-endpoint) has the details of what a key can do and what a request may contain.
+
+To turn it on I set these in Vercel and redeploy:
+
+| Variable | Value |
+|---|---|
+| `LAB_ENABLE_LIVE_MODEL` | `true` |
+| `LAB_PUBLIC_ORIGIN` | the lab's public address, `https://<host>` with no path. I can leave it empty and the lab uses the production domain Vercel reports in `VERCEL_PROJECT_PRODUCTION_URL`. |
+| `LAB_LIVE_MODEL_IDS` | optional. The models it answers for, comma separated. Default `google/gemini-3.8-flash`. |
+| `LAB_LIVE_MODEL_DAILY_USD` | optional. What the endpoint may spend per UTC day. Default `1`. |
+
+It also needs what is already set for run 2: `OPENROUTER_API_KEY`, `LAB_ENABLE_SPRITE_SESSIONS=true` and `SPRITES_TOKEN`. Nothing changes on Modal, and there is nothing to deploy there.
+
+To turn it off I set `LAB_ENABLE_LIVE_MODEL` to anything but `true`. The route goes back to 503, no key is made, and the prompts stop mentioning it. Keys that were already issued stop working too, because the route is closed before a key is even looked at.
+
+What I check after turning it on:
+
+- `curl -i https://<host>/api/live-model/v1/models` with no key answers 401, not 404 and not 503. A 404 means the rewrite in `vercel.json` did not deploy. A 503 means a setting is missing, and the message says whether it is the switch or the configuration.
+- The same request with `Authorization: Bearer <LAB_OPERATOR_SECRET>` also answers 401. The operator secret is not a key for this route.
+- After the next epoch with a Sprite session, the `tool_runs` row for that session has `detail.live_model`. `offered: true` means the Sprite accepted the extra egress rule and got a key. `offered: false` comes with a note that says why.
+- `SELECT purpose, SUM(cost_usd) FROM model_calls WHERE purpose = 'live_model' GROUP BY 1` shows what the endpoint has cost, and `live_model_calls` has one row per call.
+
+Things I know are not checked from my machine: I have not watched a real Sprite accept the extra egress rule or call the endpoint. The rule format comes from the Sprites networking documentation, and the code refuses to make a key unless the Sprite's answer shows the rule in place, so the worst case is a session without a key, not a key without a rule.
 
 ## Model proposals to this repository
 

@@ -24,6 +24,8 @@ import { withModelTrailers } from './commit-identity.js'
 import { MODEL_DISPLAY_NAMES, WILDCARD_MODELS, WILDCARD_DISPLAY_NAMES } from './types.js'
 import { assertContributionPath } from './contribution-policy.js'
 import { checkContributionInSprite, spritesConfigured, type SpriteCheck } from './sprites.js'
+import { liveModelToolStatus } from './tools-config.js'
+import { liveModelNote } from './live-model.js'
 import { quietMentions } from './github-pr.js'
 
 const CODER_SYSTEM = `You are a software engineer with real write access to a shared GitHub repository (AI-Agent). This is NOT a simulation or writing exercise: the files you return are pushed as a real commit that names you as the model that wrote it, opened as a real pull request, and — once approved — merged into the actual codebase this agent runs on. Other engineers (other models, and their own subagents) are contributing to this same repo alongside you, epoch after epoch, so treat existing files as real prior work to build on, not placeholders you can ignore.
@@ -311,7 +313,7 @@ export async function contributeCode(params: {
 
     const { output, cost: codeCost, servedBy: coderServedBy } = await callModel(
       params.authorModelId,
-      CODER_SYSTEM + (spritesConfigured() ? SPRITE_NOTE : ''),
+      CODER_SYSTEM + (spritesConfigured() ? SPRITE_NOTE : '') + (liveModelToolStatus().enabled ? `\n\n${liveModelNote()}` : ''),
       `${params.agentContext ? `You're building: ${params.agentContext}\n\n` : ''}${
         explorerFindings ? `A subagent explored this first and found: ${explorerFindings}\n\n` : ''
       }Implement this: ${params.description}\n\nCurrent repo files (top-level, for context — don't collide):\n${tree.length ? tree.join('\n') : '(empty repo)'}`,

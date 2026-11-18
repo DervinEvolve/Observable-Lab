@@ -12,6 +12,8 @@ In a classic epoch the Executor may return an optional `tools` object next to it
 | `exhibit` | `LAB_ENABLE_EXHIBITS=true` | `LAB_ENABLE_CODE_WRITES=true`, `AI_AGENT_GITHUB_TOKEN`, `AI_AGENT_GITHUB_OWNER`, `LAB_REQUIRED_CI_WORKFLOW_IDS` | 1 | `LAB_EXHIBITS_PER_DAY` (2) |
 | `lab_proposal` | `LAB_ENABLE_LAB_PROPOSALS=true` | `LAB_PROPOSALS_GITHUB_TOKEN`, `LAB_PROPOSALS_GITHUB_OWNER` | 1 | `LAB_LAB_PROPOSALS_PER_DAY` (1) |
 
+A Sprite session can also come with [the lab model endpoint](#the-lab-model-endpoint) (`LAB_ENABLE_LIVE_MODEL=true`). It is not a tool the Executor asks for, so it is not in this table.
+
 Web search is not on this menu: the Planner and Executor calls, and the explorer subagents, already use OpenRouter's web plugin, as before.
 
 ## When each runs
@@ -36,6 +38,31 @@ Web search is not on this menu: the Planner and Executor calls, and the explorer
 - output is cleaned of ANSI codes and anything that looks like a credential, and the last 1.5 KB per command is stored.
 
 The room shows the stored transcript on the screen above the model's desk. **Cost** is estimated from measured command time at `LAB_SPRITE_USD_PER_HOUR` (default 1.30). That default is a placeholder chosen to be on the high side, not a published Sprites price; set it from the current price list.
+
+## The lab model endpoint
+
+This is not a tool on the menu. It is something a Sprite session comes with when `LAB_ENABLE_LIVE_MODEL=true` (default off), so there is nothing for the Executor to ask for. I added it because the models were building a client for a hosted model and had no model to call. I did not want to hand them my OpenRouter key, so the lab is the host: it serves the endpoint and keeps the key.
+
+While a Sprite session runs, its commands have four more variables: `LAB_MODEL_BASE_URL` and `LAB_MODEL_API_KEY`, and the same two values as `OPENAI_BASE_URL` and `OPENAI_API_KEY`. The base URL is `<origin>/api/live-model/v1`, and it answers two requests in the OpenAI shape:
+
+- `POST <base>/chat/completions` returns one chat completion: `choices[0].message` with `content` and native `tool_calls` (`id`, `type: "function"`, `function.name`, and `function.arguments` always as a string), `finish_reason` and `usage`.
+- `GET <base>/models` lists the models it answers for.
+
+**What a request may contain.** The lab builds the request it sends on, field by field, from a short list: `model`, `messages`, `tools`, `tool_choice`, `max_tokens` or `max_completion_tokens` (never more than 4096), and `temperature` and `response_format` when the model's entry in the OpenRouter catalog lists them. Everything else is dropped before the request leaves the server. That is what keeps provider routing, plugins, transforms, fallback model lists and other people's keys out of a call I pay for. The names of dropped fields come back in the `X-Lab-Dropped-Fields` header. Messages are text only, at most 200 of them, and the whole request may be 256 KB. `"stream": true` is refused with a 400, because the endpoint is non-streaming only. The model must be one of `LAB_LIVE_MODEL_IDS` (default `google/gemini-3.8-flash`), spelled exactly. Any other model gets a 400 that names the ones allowed. An id with a `:` suffix such as `:online` is never allowed, because those suffixes change routing.
+
+**The key.** A key is 256 random bits with `labk_` in front. The database holds only its SHA-256 hash, with the experiment, epoch, model and Sprite it was issued to. It ends when the session ends, and after 15 minutes at the latest. It allows 20 calls, one at a time, and $0.25. An expired, revoked or unknown key gets a 401 with a short reason. A key that has used its calls or its money, or that already has a call running, gets a 429.
+
+The limits are held by the database. A call is let through by one conditional `UPDATE` that counts it, checks expiry, revocation and both limits, and takes the key's single in-flight slot, all in one statement. Two calls that arrive together cannot both get past a limit. Because only one call per key runs at a time, and what a call costs is only known once it is billed, the dollar limit can be passed by one call at most.
+
+**Getting the key into the Sprite.** This is the one place where something shaped like a credential goes into a Sprite, so the exception is narrow and written down in `api/_lib/sprites.ts`. `execInSprite` has a separate option for it. That option only accepts a value in the scoped key format and an `https` base URL, and the ordinary environment option still refuses any name that looks like a key, these four included. The check that stops this server's own credentials from being sent still runs on every value. Output from the session has the key removed before it is stored.
+
+**Egress.** Sprites normally get the Sprites `defaults` policy and nothing else. For the length of a session with the endpoint on, the lab adds one rule that allows its own host, `{ "domain": "<host>", "action": "allow" }`, which is the format in the [Sprites networking documentation](https://docs.fly.io/sprites/concepts/networking). The order matters: the rule is applied first, the lab reads back that the Sprite has it, and only then is a key made. If the Sprite does not confirm the rule, no key is made and the session runs as it does with the endpoint off. When the session ends, the key is revoked and the policy goes back to `defaults`. I have not watched this happen on a real Sprite yet.
+
+**Spend.** Before a call the lab checks `LAB_DAILY_BUDGET_USD`, then the endpoint's own cap, `LAB_LIVE_MODEL_DAILY_USD` (default 1, UTC day). After it, what OpenRouter reports as `usage.cost` is written to `model_calls` with purpose `live_model`, under the experiment and epoch the key was issued to, and added to the key. No price table is involved. If a response comes back without `usage.cost`, it is recorded as costing nothing with `cost_source` `none`, and the 20 call limit is what bounds it. A call I gave up waiting for (90 s) is recorded as costing nothing too, although OpenRouter may still bill it. A Sprite session's worst case for the budget check includes the key's $0.25.
+
+**The record.** Every call is a row in `live_model_calls`: the key, experiment, epoch, the model and Sprite it was issued to, the model asked for and the one that served, status, token counts, cost and duration, with a 200 character excerpt of the last user message and of the answer and the names of any tools called. Whole conversations are not kept. The session's `tool_runs` row gets `detail.live_model` with whether a key was offered, how many calls it made and what they cost. A call that failed upstream still counts against the key's 20.
+
+**What the models are told.** One paragraph, and only while a session really comes with the endpoint: the variable names, the models, the limits, that it is non-streaming, that CI and the contribution check get no key and keep their localhost fixture, and that what a model answers through it is untrusted data. It says nothing about what to do with it.
 
 ## GPU jobs
 
@@ -66,4 +93,4 @@ Before a tool runs, the server checks its daily limit and today's spend. A Sprit
 
 ## The record
 
-`tool_runs` is created at runtime: `experiment_id`, `epoch`, `model`, `tool`, `request_summary`, `status` (`ok`, `failed`, `error`, `timeout`, `skipped`, `opened`, `merged`, `closed`), `exit_code`, `duration_ms`, `cost_usd`, `output_tail` (cleaned, at most 4 KB), `detail` (small JSON: commands, slug, pull request URL) and `created_at`. `GET /api/experiment` returns the 12 most recent for the current experiment as `tool_runs`, cleaned again on the way out, and the switched-on tools as `tools_enabled`.
+`tool_runs` is created at runtime: `experiment_id`, `epoch`, `model`, `tool`, `request_summary`, `status` (`ok`, `failed`, `error`, `timeout`, `skipped`, `opened`, `merged`, `closed`), `exit_code`, `duration_ms`, `cost_usd`, `output_tail` (cleaned, at most 4 KB), `detail` (small JSON: commands, slug, pull request URL) and `created_at`. `GET /api/experiment` returns the 12 most recent for the current experiment as `tool_runs`, cleaned again on the way out, and the switched-on tools as `tools_enabled`. `tools_enabled` also lists `live_model` while Sprite sessions come with the lab model endpoint.

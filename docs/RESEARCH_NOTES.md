@@ -139,7 +139,7 @@ python -m pip install -r requirements-dev.txt
 python -m unittest discover -s tests -v
 ```
 
-The security tests use local test credentials and mocked provider responses. They do not call live models or start compute. The route check finds every file under `api/` by itself, so a new route must either require the operator secret or be added to the short public list in the test. The Python tests load only a few functions from the Modal files and do not contact Modal. GitHub Actions runs the same checks on every push to `main` and every pull request (`.github/workflows/ci.yml`), with no secrets.
+The security tests use local test credentials and mocked provider responses. They do not call live models or start compute. The route check finds every file under `api/` by itself, so a new route must either require the operator secret or be added to the short public list in the test. One route is neither: the lab model endpoint takes a scoped key the lab issues to a Sprite session, and the test holds it to its own rule (503 while it is switched off, 401 for anything that is not a live scoped key, the operator secret included). The Python tests load only a few functions from the Modal files and do not contact Modal. GitHub Actions runs the same checks on every push to `main` and every pull request (`.github/workflows/ci.yml`), with no secrets.
 
 ### Connect a backend
 

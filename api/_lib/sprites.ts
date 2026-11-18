@@ -11,10 +11,15 @@
  * Rules kept here:
  * - No secret ever goes into a sprite. Arguments and env values are checked
  *   against this server's own credentials before a request is sent, and the
- *   repository is cloned over plain https (it is public).
+ *   repository is cloned over plain https (it is public). The one thing
+ *   shaped like a credential a sprite may receive is the lab's own scoped
+ *   model key (live-model-keys.ts): short lived, capped, made for one Sprite
+ *   session, and never one of this server's secrets. It has its own option
+ *   on execInSprite and nothing else can set an API key variable.
  * - Egress is limited at creation to the Sprites "defaults" preset (GitHub,
  *   npm and the usual registries), so a sprite can clone and install but not
- *   wander.
+ *   wander. A Sprite session with the lab model endpoint on also allows the
+ *   lab's own host for as long as the session runs.
  * - The HTTP exec response format is not documented, so the body is read
  *   defensively (plain text or JSON) and the exit status comes from a marker
  *   the wrapper script prints, never from an assumed field.
@@ -125,13 +130,46 @@ export async function getSpriteStatus(key: SpriteKey): Promise<SpriteInfo> {
   }
 }
 
-/** Egress allowlist: the Sprites "defaults" preset only (GitHub, npm, PyPI, ...). */
-export async function applyNetworkPolicy(key: SpriteKey): Promise<void> {
-  const res = await spritesFetch(`/sprites/${spriteName(key)}/policy/network`, {
-    method: 'POST',
-    body: JSON.stringify({ rules: [{ include: 'defaults' }] }),
-  })
+const PLAIN_HOST = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/
+
+/**
+ * The egress rules for a sprite: the Sprites "defaults" preset, plus an exact
+ * allow rule for each extra host. Rule format from the Sprites networking
+ * docs (docs.fly.io/sprites/concepts/networking): { include: "defaults" } and
+ * { domain: "example.com", action: "allow" }. Only plain host names are
+ * accepted: no wildcard, port, path or IP address.
+ */
+export function networkPolicyRules(extraHosts: string[] = []): Array<Record<string, string>> {
+  const rules: Array<Record<string, string>> = [{ include: 'defaults' }]
+  for (const host of extraHosts) {
+    if (!PLAIN_HOST.test(host) || /^[0-9.]+$/.test(host)) throw new Error('Refusing a network rule that is not a plain host name')
+    rules.push({ domain: host, action: 'allow' })
+  }
+  return rules
+}
+
+/**
+ * Egress allowlist: the Sprites "defaults" preset only (GitHub, npm, PyPI, ...),
+ * plus `extraHosts` when given. With extra hosts the answer is read back and
+ * the call throws unless every one of them is in the policy the sprite now
+ * has, so a caller can rely on it before handing anything to the sprite.
+ */
+export async function applyNetworkPolicy(key: SpriteKey, extraHosts: string[] = []): Promise<void> {
+  const rules = networkPolicyRules(extraHosts)
+  const path = `/sprites/${spriteName(key)}/policy/network`
+  const res = await spritesFetch(path, { method: 'POST', body: JSON.stringify({ rules }) })
   if (!res.ok) throw await failure(res, 'set network policy')
+  if (!extraHosts.length) return
+  const allows = (data: unknown): boolean => {
+    const got = data && typeof data === 'object' ? (data as { rules?: unknown }).rules : null
+    return Array.isArray(got) && extraHosts.every(host =>
+      got.some(r => r && typeof r === 'object' && (r as Record<string, unknown>).domain === host && (r as Record<string, unknown>).action === 'allow'))
+  }
+  if (allows(await res.json().catch(() => null))) return
+  const check = await spritesFetch(path)
+  if (!check.ok || !allows(await check.json().catch(() => null))) {
+    throw new Error('set network policy failed: the sprite did not confirm the extra host rule')
+  }
 }
 
 /**
@@ -171,6 +209,16 @@ function serverSecretValues(): string[] {
     .map(([, value]) => (value as string).trim())
 }
 
+/**
+ * The lab's scoped model key (live-model-keys.ts): "labk_" and 64 hex
+ * characters. It is random, stored by the server only as a hash, and is not
+ * one of this server's secrets, so it is the single credential-shaped value
+ * execInSprite will pass on, and only through its `scopedModelKey` option.
+ */
+export const SCOPED_MODEL_KEY = /^labk_[0-9a-f]{64}$/
+/** The variables that option sets. No other path may set a name like these. */
+export const SCOPED_MODEL_KEY_ENV = ['LAB_MODEL_BASE_URL', 'LAB_MODEL_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_API_KEY'] as const
+
 /** Throws if any string about to be sent into a sprite carries one of this server's credentials. */
 export function assertNoSecrets(values: string[]): void {
   const secrets = serverSecretValues()
@@ -201,6 +249,7 @@ export function sanitizeOutput(text: string): string {
     .replace(/\bgithub_pat_[A-Za-z0-9_]{20,}/g, '[redacted]')
     .replace(/\bgh[pousr]_[A-Za-z0-9]{20,}/g, '[redacted]')
     .replace(/\bsk-[A-Za-z0-9_-]{16,}/g, '[redacted]')
+    .replace(/\blabk_[0-9a-f]{16,}/g, '[redacted]')
     .replace(/\bxox[abprs]-[A-Za-z0-9-]{10,}/g, '[redacted]')
     .replace(/\bAKIA[0-9A-Z]{16}\b/g, '[redacted]')
     .replace(/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}/g, '[redacted]')
@@ -231,6 +280,13 @@ export interface ExecOptions {
   env?: Record<string, string>
   timeoutS?: number      // in-sprite limit; the HTTP wait adds a short grace
   maxOutputBytes?: number
+  /**
+   * The lab model endpoint for this command: sets LAB_MODEL_BASE_URL and
+   * LAB_MODEL_API_KEY, and the same two as OPENAI_BASE_URL and OPENAI_API_KEY.
+   * The key must be a scoped model key and the URL plain https; the usual
+   * check against this server's own credentials still runs on both.
+   */
+  scopedModelKey?: { baseUrl: string; key: string }
 }
 
 export interface ExecResult {
@@ -302,9 +358,23 @@ function wrapperScript(nonce: string): string {
 export async function execInSprite(key: SpriteKey, script: string, opts: ExecOptions = {}): Promise<ExecResult> {
   const timeoutS = Math.max(5, Math.min(Math.floor(opts.timeoutS ?? 60), 600))
   const maxOutputBytes = opts.maxOutputBytes ?? 64 * 1024
-  const env = { CI: 'true', NO_COLOR: '1', FORCE_COLOR: '0', npm_config_update_notifier: 'false', npm_config_fund: 'false', ...opts.env }
+  const env: Record<string, string> = { CI: 'true', NO_COLOR: '1', FORCE_COLOR: '0', npm_config_update_notifier: 'false', npm_config_fund: 'false', ...opts.env }
   for (const name of Object.keys(env)) {
-    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || SECRET_ENV_NAME.test(name)) throw new Error(`Refusing env name ${name}`)
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || SECRET_ENV_NAME.test(name) || (SCOPED_MODEL_KEY_ENV as readonly string[]).includes(name)) {
+      throw new Error(`Refusing env name ${name}`)
+    }
+  }
+  // The one exception to "no API key variable": the lab's own scoped model
+  // key, and only in its exact format. Added after the name check above, so
+  // `opts.env` can never set these names. assertNoSecrets below still runs.
+  if (opts.scopedModelKey) {
+    const { baseUrl, key: modelKey } = opts.scopedModelKey
+    if (!SCOPED_MODEL_KEY.test(modelKey)) throw new Error('Refusing a model key that is not a scoped lab key')
+    if (!/^https:\/\/[a-z0-9.-]+(\/[A-Za-z0-9._\/-]*)?$/.test(baseUrl)) throw new Error('Refusing a model base URL that is not plain https')
+    env.LAB_MODEL_BASE_URL = baseUrl
+    env.LAB_MODEL_API_KEY = modelKey
+    env.OPENAI_BASE_URL = baseUrl
+    env.OPENAI_API_KEY = modelKey
   }
   const nonce = randomBytes(8).toString('hex')
   const argv = ['/bin/sh', '-c', wrapperScript(nonce), 'lab-exec', String(timeoutS), script]

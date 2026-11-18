@@ -196,7 +196,7 @@ npm run build
 npm run check:api
 npm run test:security
 npm run test:bundle
-node --test tests/run2.test.mjs tests/sprites.test.mjs tests/tools.test.mjs
+node --test tests/run2.test.mjs tests/sprites.test.mjs tests/tools.test.mjs tests/live-model.test.mjs
 python -m unittest discover -s tests -v
 ```
 

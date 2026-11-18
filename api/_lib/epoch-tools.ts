@@ -17,7 +17,8 @@
 import { recordModelCall, checkDailyBudget, describeBudget } from './spend.js'
 import { modelDisplayName } from './types.js'
 import { recordToolRun, toolRunsToday, toolsRunInEpoch, getRecentToolRuns, type ToolRunStatus } from './tool-runs-store.js'
-import { toolConfig, SPRITE_SESSION_TOTAL_MAX_S, type ToolConfig, type ToolName } from './tools-config.js'
+import { liveModelToolStatus, toolConfig, SPRITE_SESSION_TOTAL_MAX_S, type ToolConfig, type ToolName } from './tools-config.js'
+import { LIVE_KEY_MAX_USD } from './live-model.js'
 import type { ToolPlan } from './tool-requests.js'
 import { estimateSpriteCost, runSpriteSession, sessionTranscript } from './sprite-session.js'
 import { GPU_JOB_WORST_CASE_S, estimateGpuCost, runGpuJob } from './gpu-jobs.js'
@@ -96,7 +97,9 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
   const tasks: Promise<void>[] = []
   const done = (tool: string) => ran.has('*') || ran.has(tool)
   // both side tools run at once, so each is checked against their combined worst case
-  const worstCase = (plan.sprite_session && !done('sprite_session') ? estimateSpriteCost(SPRITE_SESSION_TOTAL_MAX_S * 1000) : 0)
+  // a session that comes with a model key can also spend up to that key's limit
+  const liveModel = liveModelToolStatus(config).enabled
+  const worstCase = (plan.sprite_session && !done('sprite_session') ? estimateSpriteCost(SPRITE_SESSION_TOTAL_MAX_S * 1000) + (liveModel ? LIVE_KEY_MAX_USD : 0) : 0)
     + (plan.gpu_job && !done('gpu_job') ? estimateGpuCost(GPU_JOB_WORST_CASE_S) : 0)
 
   if (plan.sprite_session && !done('sprite_session')) {
@@ -105,17 +108,24 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
     tasks.push((async () => {
       const ok = await allowed('sprite_session', config, worstCase)
       if (!ok.ok) return void out.push(await skip(ctx, 'sprite_session', summary, ok.reason))
-      const result = await runSpriteSession(ctx.executorModelId, session.commands)
+      const result = await runSpriteSession(ctx.executorModelId, session.commands,
+        liveModel ? { liveModel: { experimentId: ctx.experimentId, epoch: ctx.epochNumber } } : {})
       await ledger(ctx, 'sprite_session', result.cost_usd)
       const last = result.commands[result.commands.length - 1]
       await recordToolRun({
         experimentId: ctx.experimentId, epoch: ctx.epochNumber, model: ctx.executorModelId, tool: 'sprite_session',
         requestSummary: summary, status: result.status, exitCode: last?.exit_code ?? null, durationMs: result.duration_ms,
         costUsd: result.cost_usd, outputTail: sessionTranscript(result),
-        detail: { sprite: result.sprite_name, commands: result.commands.map(c => ({ run: c.run, exit_code: c.exit_code, duration_ms: c.duration_ms, timed_out: c.timed_out })) },
+        detail: {
+          sprite: result.sprite_name,
+          commands: result.commands.map(c => ({ run: c.run, exit_code: c.exit_code, duration_ms: c.duration_ms, timed_out: c.timed_out })),
+          // the model calls themselves are in live_model_calls and, with their real cost, in the spend ledger
+          ...(result.live_model ? { live_model: result.live_model } : {}),
+        },
       })
       const exits = result.commands.map(c => c.exit_code === null ? '?' : String(c.exit_code)).join(', ')
-      out.push({ tool: 'sprite_session', status: result.status, summary: `${name(ctx.executorModelId)} ran ${result.commands.length} command(s) in its Sprite (exit codes ${exits || 'none'})${result.error ? `; error: ${result.error}` : ''}` })
+      const modelCalls = result.live_model?.calls ? `; ${result.live_model.calls} call(s) to the lab model endpoint` : ''
+      out.push({ tool: 'sprite_session', status: result.status, summary: `${name(ctx.executorModelId)} ran ${result.commands.length} command(s) in its Sprite (exit codes ${exits || 'none'})${modelCalls}${result.error ? `; error: ${result.error}` : ''}` })
     })())
   }
 
