@@ -131,6 +131,12 @@ The research controller runs only the reviewed preparation harness. It uses a ne
 
 The reviewed preparation source is bundled at `modal/harness/prepare.py`, originating from Research-Lab blob `c33f69057b59a9a9785a2ec77715cb47f2ea1412`. Its image copy is built from this checkout and the controller records its SHA-256 in each result. It prepares TinyStories data; smoke preparation uses synthetic data. Review harness and dataset changes separately from generated training code. Install the deployment client with `python -m pip install -r requirements-runner.txt` (Modal SDK 1.6.3). The runner uses the supported Sandbox filesystem API; the old `Sandbox.open()` API is retired. Verify network denial, cache write denial, no injected credentials, and process termination in a test deployment before rolling out the runner.
 
+**Deploy with the pinned Modal.** Modal runs the deploying computer's Modal library inside every container, so deploy with the version in `requirements-runner.txt` (1.6.3, which needs Python 3.10 or newer). On a Mac whose Python is 3.9, an older Modal gets used without warning and the weights mount fails (`'Volume' object has no attribute 'with_mount_options'`). With [uv](https://docs.astral.sh/uv/) installed, deploy any of the apps like this, from the repository folder:
+
+```bash
+uv run --no-project --python 3.12 --with modal==1.6.3 modal deploy modal/gpu_jobs.py
+```
+
 For `modal/gpu_jobs.py` (the GPU job tool), create the Modal secret `oblab-gpu-jobs-auth` containing `JOBS_TOKEN` (at least 32 characters), put the same value in Vercel's `GPU_JOBS_TOKEN`, deploy with `modal deploy modal/gpu_jobs.py`, and set `GPU_JOBS_START_URL` and `GPU_JOBS_STATUS_URL` to the endpoints Modal prints. It uses the research runner's pinned base image and packages. Verify in a test deployment that a job cannot reach the network and sees no credentials, and that a job is stopped at 120 s, before turning on `LAB_ENABLE_GPU_JOBS`. The same file holds the fetcher for public weights; see [Public weights for GPU jobs](#public-weights-for-gpu-jobs).
 
 ## Public weights for GPU jobs
@@ -143,7 +149,7 @@ The fetcher is part of `modal/gpu_jobs.py`, so it uses the GPU jobs endpoints an
 
 ```
 python -m pip install -r requirements-runner.txt
-modal deploy modal/gpu_jobs.py
+uv run --no-project --python 3.12 --with modal==1.6.3 modal deploy modal/gpu_jobs.py
 ```
 
 The first deploy creates the Volume `oblab-weights` (the shelf) and the Dict `oblab-weights-use` (when each entry was last used). The two endpoint URLs stay the same, because the app and function names have not changed. If Modal prints different ones, put them in Vercel.
