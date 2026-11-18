@@ -53,6 +53,18 @@ const colorOf = (n: GNode): string => (n.type === 'model' ? PROVIDER_COLOR[Strin
 const STACKED = '(max-width: 760px), (max-width: 1000px) and (orientation: portrait)' // graph on top, list below
 const SHORT = '(max-height: 500px) and (min-width: 520px)' // a phone on its side: graph and list side by side, full screen
 const COMPACT = `(max-width: 760px), (max-width: 1000px) and (orientation: landscape), ${SHORT}` // a small graph area
+/** The arrangement for a small graph area, as CSS for the overlay selected by `o`. */
+const compactCss = (o: string, captionWidth: string): string => `
+        ${o} .kg-legend, ${o} .kg-sub { display: none; }
+        ${o} .kg-about { display: block; }
+        ${o} .kg-kinds { display: flex; }
+        ${o} .kg-top { padding-top: 12px; padding-bottom: 22px; }
+        ${o} .kg-zoom { right: 10px; bottom: 10px; }
+        ${o} .kg-searchbar { padding: 10px 12px; }
+        /* No room for a title and a caption: while a recall replays, its caption takes the title's place. */
+        ${o}.replaying .kg-top { display: none; }
+        ${o} .kg-caption { align-self: flex-start; margin: 8px 0 0 12px; max-width: ${captionWidth}; padding: 7px 10px; font-size: 0.78125rem; line-height: 1.4; overflow: hidden; }
+        ${o} .kg-caption span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }`
 const MIN_K = 0.1
 const MAX_K = 4
 
@@ -193,18 +205,9 @@ export class KnowledgeGraphPanel {
         #kg-overlay .kg-caption { max-width: calc(100% - 24px); }
       }
       /* A small graph area: the subtitle and the legend move into the list, and the title band stays one line. */
-      @media ${COMPACT} {
-        #kg-overlay .kg-legend, #kg-overlay .kg-sub { display: none; }
-        #kg-overlay .kg-about { display: block; }
-        #kg-overlay .kg-kinds { display: flex; }
-        #kg-overlay .kg-top { padding: 12px 16px 22px; }
-        #kg-overlay .kg-zoom { right: 10px; bottom: 10px; }
-        #kg-overlay .kg-searchbar { padding: 10px 12px; }
-        /* No room for a title and a caption: while a recall replays, its caption takes the title's place. */
-        #kg-overlay.replaying .kg-top { display: none; }
-        #kg-overlay .kg-caption { align-self: flex-start; margin: 8px 0 0 12px; max-width: calc(100% - 24px); padding: 7px 10px; font-size: 0.78125rem; line-height: 1.4; overflow: hidden; }
-        #kg-overlay .kg-caption span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
-      }
+      @media ${COMPACT} { ${compactCss('#kg-overlay', 'calc(100% - 24px)')} }
+      /* The same where the text is so large that the title and legend leave the graph no room (set in measure()). */
+      ${compactCss('#kg-overlay.cramped', 'calc(100% - 72px)')}
       @media (max-width: 760px) {
         #kg-overlay .kg-top { padding-right: 56px; }
         #kg-overlay .kg-caption { max-width: calc(100% - 72px); }
@@ -223,6 +226,10 @@ export class KnowledgeGraphPanel {
       }
       @media (max-height: 260px) and (min-width: 520px) {
         #kg-overlay .kg-top { display: none; }
+        #kg-overlay .kg-searchbar { padding: 4px 10px; }
+        #kg-overlay .kg-scroll { padding-top: 0; }
+        #kg-overlay .kg-results .kg-section { margin-top: 4px; }
+        #kg-overlay .kg-results button { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       }`
     document.head.appendChild(style)
 
@@ -335,7 +342,7 @@ export class KnowledgeGraphPanel {
     this.hovered = null
     if (this.searchTimer) { window.clearTimeout(this.searchTimer); this.searchTimer = 0; this.runSearch() } // keep query and results in step
     for (const undo of this.session.splice(0)) undo()
-    this.overlay.classList.remove('open')
+    this.overlay.classList.remove('open', 'cramped')
     this.overlay.style.removeProperty('--kg-vh')
     this.overlay.style.removeProperty('--kg-vt')
     this.toggle.setAttribute('aria-expanded', 'false')
@@ -654,6 +661,13 @@ export class KnowledgeGraphPanel {
     const head = box('.kg-headtext'), cap = box('.kg-caption'), zoom = box('.kg-zoom'), legend = box('.kg-legend'), x = box('.kg-close')
     this.blocked = [head, cap, zoom, legend, x].filter((b): b is Box => !!b)
     const rest = { top: Math.max(head?.y1 ?? 0, x?.y1 ?? 0), bottom: c.height - Math.min(zoom?.y0 ?? c.height, legend?.y0 ?? c.height) }
+    // Text so large that the title and the legend leave the graph almost no room: use the small arrangement
+    // until the panel closes.
+    if (c.height - Math.max(rest.top, cap?.y1 ?? 0) - rest.bottom < 200 && (legend || this.overlay.querySelector('.kg-sub')?.getClientRects().length) && !this.overlay.classList.contains('cramped')) {
+      this.overlay.classList.add('cramped')
+      this.measure()
+      return
+    }
     this.band = { top: Math.max(rest.top, cap?.y1 ?? 0), bottom: rest.bottom }
     // Judged without the caption, so a replay starting does not rearrange the graph.
     this.tight = Math.min(c.width, c.height - Math.max(110, rest.top + 8) - Math.max(64, rest.bottom + 6)) < 420
@@ -814,7 +828,8 @@ export class KnowledgeGraphPanel {
       const text = w.b.node?.label ?? ''
       const size = 12 * fs * dpr
       ctx.font = `500 ${size}px ${FONT}`
-      const t = text.length > 38 ? `${text.slice(0, 36)}…` : text
+      let t = text.length > 38 ? `${text.slice(0, 36)}…` : text
+      while (t.length > 6 && ctx.measureText(t).width > W - 16 * dpr) t = `${t.slice(0, -4)}…`
       const half = ctx.measureText(t).width / 2 + 4 * dpr, tall = size + 6 * dpr
       const cx = within(w.x, half)
       const below: Box = { x0: cx - half, y0: w.y + w.r + 3 * dpr, x1: cx + half, y1: w.y + w.r + 3 * dpr + tall }
