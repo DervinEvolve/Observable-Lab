@@ -20,7 +20,7 @@ import { recordToolRun, toolRunsToday, toolsRunInEpoch, getRecentToolRuns, type 
 import { liveModelToolStatus, toolConfig, SPRITE_SESSION_TOTAL_MAX_S, type ToolConfig, type ToolName } from './tools-config.js'
 import { LIVE_KEY_MAX_USD } from './live-model.js'
 import type { ToolPlan } from './tool-requests.js'
-import { estimateSpriteCost, runSpriteSession, sessionTranscript } from './sprite-session.js'
+import { estimateSpriteCost, liveModelClause, runSpriteSession, sessionTranscript } from './sprite-session.js'
 import { GPU_JOB_WORST_CASE_S, estimateGpuCost, runGpuJob } from './gpu-jobs.js'
 import { contributeExhibit } from './exhibit-contribution.js'
 import { openLabProposal } from './lab-proposals.js'
@@ -124,7 +124,7 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
         },
       })
       const exits = result.commands.map(c => c.exit_code === null ? '?' : String(c.exit_code)).join(', ')
-      const modelCalls = result.live_model?.calls ? `; ${result.live_model.calls} call(s) to the lab model endpoint` : ''
+      const modelCalls = liveModelClause(result.live_model)
       out.push({ tool: 'sprite_session', status: result.status, summary: `${name(ctx.executorModelId)} ran ${result.commands.length} command(s) in its Sprite (exit codes ${exits || 'none'})${modelCalls}${result.error ? `; error: ${result.error}` : ''}` })
     })())
   }

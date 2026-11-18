@@ -88,7 +88,7 @@ Leave out what you don't need. Use a tool only when it would really help this ep
   if (on('sprite_session')) {
     text += `\nSprite commands run one after another in ~/lab-session with bash. Nothing secret is in the Sprite, and it only reaches GitHub and the usual package registries.`
     if (liveModelToolStatus(config).enabled) {
-      text += ` During a session it also reaches the lab model endpoint at LAB_MODEL_BASE_URL, with that session's key in LAB_MODEL_API_KEY.`
+      text += ` During a session it also reaches the lab model endpoint at LAB_MODEL_BASE_URL, with that session's key in LAB_MODEL_API_KEY, when the lab could open the endpoint for that session; the session's stored output says whether it did.`
     }
   }
   if (on('gpu_job')) {

@@ -18,7 +18,10 @@
  * it as LAB_MODEL_API_KEY with LAB_MODEL_BASE_URL, and when the session ends
  * the key is revoked and the policy goes back to the defaults. The order
  * matters: no key is made unless the sprite confirmed the policy, and a
- * session without a key runs exactly as it does with the endpoint off.
+ * session without a key runs exactly as it does with the endpoint off
+ * (CI=true included; only commands that hold the key run without it). The
+ * stored output ends with one line saying whether the session had the
+ * endpoint and what it used, so the models read the real outcome.
  */
 import {
   applyNetworkPolicy, ensureSprite, execInSprite, sanitizeOutput, spriteKeyForModel, spriteName, tailBytes,
@@ -28,7 +31,7 @@ import {
   liveModelToolStatus, spriteUsdPerHour,
 } from './tools-config.js'
 import { LIVE_KEY_TTL_MS, liveModelBaseUrl, liveModelHost } from './live-model.js'
-import { mintLiveModelKey, revokeLiveKey, type IssuedLiveKey } from './live-model-keys.js'
+import { liveKeyUsage, mintLiveModelKey, revokeLiveKey, type IssuedLiveKey, type LiveKeyUsage } from './live-model-keys.js'
 
 export interface SessionCommand { run: string; timeout_s: number }
 
@@ -47,14 +50,32 @@ export interface SpriteSessionResult {
   duration_ms: number
   cost_usd: number
   error?: string
-  /** Only when the lab model endpoint is on: whether this session got a key, and what the key was used for. */
-  live_model?: { offered: boolean; calls: number; cost_usd: number; note?: string }
+  /**
+   * Only when the lab model endpoint is on: whether this session got a key,
+   * and what the key was used for. `call_in_flight` means a call was still
+   * running at the endpoint when the totals were read, so `cost_usd` is short
+   * by that call; the spend ledger and live_model_calls have it.
+   */
+  live_model?: { offered: boolean; calls: number; cost_usd: number; call_in_flight?: true; note?: string }
 }
 
 /** What a session needs to be given a scoped model key: who the key is issued to. */
 export interface SessionOptions {
-  liveModel?: { experimentId: string | null; epoch: number | null }
+  liveModel?: {
+    experimentId: string | null
+    epoch: number | null
+    /** How long to wait at the end for a call that is still running to be settled. Default LIVE_SETTLE_WAIT_MS. */
+    settleWaitMs?: number
+  }
 }
+
+/**
+ * How long the end of a session waits for a model call that was still
+ * running when its key was revoked, so that the session's totals include
+ * what that call cost. Short on purpose: the epoch is waiting too.
+ */
+export const LIVE_SETTLE_WAIT_MS = 10_000
+const LIVE_SETTLE_POLL_MS = 1_000
 
 const COMMAND_TAIL_BYTES = 1500
 const SESSION_DIR = '/home/sprite/lab-session'
@@ -137,6 +158,17 @@ async function openLiveModel(
   }
 }
 
+/** Reads a revoked key's totals again until its last call has been settled, or the wait is over. */
+async function settledUsage(keyId: string, used: LiveKeyUsage, waitMs: number): Promise<LiveKeyUsage> {
+  const deadline = Date.now() + Math.max(0, waitMs)
+  let latest = used
+  while (latest.in_flight && Date.now() < deadline) {
+    await new Promise(resolve => setTimeout(resolve, Math.min(LIVE_SETTLE_POLL_MS, Math.max(1, deadline - Date.now()))))
+    latest = (await liveKeyUsage(keyId)) ?? latest
+  }
+  return latest
+}
+
 /** Runs the session. Never throws: every failure is a result to store. */
 export async function runSpriteSession(modelId: string, commands: SessionCommand[], options: SessionOptions = {}): Promise<SpriteSessionResult> {
   const key = spriteKeyForModel(modelId)
@@ -184,11 +216,19 @@ export async function runSpriteSession(modelId: string, commands: SessionCommand
   }
   // The session is over: the key stops working now, and the sprite goes back to the default egress policy.
   if (live) {
-    const used = live.issued ? await revokeLiveKey(live.issued.id, 'the Sprite session ended') : null
+    let used = live.issued ? await revokeLiveKey(live.issued.id, 'the Sprite session ended') : null
     if (live.widened) {
       await applyNetworkPolicy(key).catch(e => console.warn(`[sprite-session] could not reset the egress policy of ${name}:`, e instanceof Error ? e.message : e))
     }
-    liveResult = { offered: Boolean(live.issued), calls: used?.calls_used ?? 0, cost_usd: used?.usd_used ?? 0, ...(live.note ? { note: live.note } : {}) }
+    // Revoking stops new calls, not one already with the model: that one is
+    // settled on the key when it ends. Give it a moment, so these totals match
+    // the ledger; if it is still running after that, say the totals are short.
+    if (live.issued && used?.in_flight) used = await settledUsage(live.issued.id, used, options.liveModel?.settleWaitMs ?? LIVE_SETTLE_WAIT_MS)
+    liveResult = {
+      offered: Boolean(live.issued), calls: used?.calls_used ?? 0, cost_usd: used?.usd_used ?? 0,
+      ...(used?.in_flight ? { call_in_flight: true as const } : {}),
+      ...(live.note ? { note: live.note } : {}),
+    }
   }
   return liveResult ? { ...result, live_model: liveResult } : result
 }
@@ -202,5 +242,34 @@ export function sessionTranscript(result: SpriteSessionResult): string {
     lines.push(`[exit ${c.exit_code === null ? 'unknown' : c.exit_code}, ${(c.duration_ms / 1000).toFixed(1)} s]`)
   }
   if (result.error) lines.push(`sprite error: ${result.error}`)
+  const endpoint = liveModelLine(result.live_model)
+  if (endpoint) lines.push(endpoint)
   return lines.join('\n')
+}
+
+/**
+ * The lab model endpoint's part of the one-line summary of a session that the
+ * Commentator is given, or '' when there is nothing to say. A session that
+ * was not given a key is always mentioned, with the reason.
+ */
+export function liveModelClause(live: SpriteSessionResult['live_model']): string {
+  if (!live) return ''
+  if (!live.offered) return `; the lab model endpoint was not available in this session (${live.note || 'no key was set'})`
+  if (!live.calls) return ''
+  return `; ${live.calls} call(s) to the lab model endpoint${live.call_in_flight ? ', one still running when the session ended' : ''}`
+}
+
+/**
+ * One line on the lab model endpoint for a session's stored output, or ''
+ * when the endpoint is off. It is what tells the models (and visitors)
+ * whether this session really had the key, since the prompt can only say
+ * the endpoint is switched on.
+ */
+export function liveModelLine(live: SpriteSessionResult['live_model']): string {
+  if (!live) return ''
+  if (!live.offered) return `lab model endpoint: not available in this session, ${live.note || 'no key was set'}`
+  const used = `${live.calls} call${live.calls === 1 ? '' : 's'}, $${live.cost_usd.toFixed(4)}`
+  return live.call_in_flight
+    ? `lab model endpoint: ${used} when the session ended; one call was still running and its cost is not in this figure`
+    : `lab model endpoint: ${used}`
 }

@@ -18,6 +18,13 @@
  * else is dropped before the request leaves this server, which is what
  * keeps provider routing, plugins, transforms, fallback model lists and user
  * keys out of a call the lab pays for.
+ *
+ * One thing travels inside a message besides its text and tool calls:
+ * reasoning_details, the list OpenRouter returns next to an assistant
+ * message. Some models (Gemini's thought signatures are carried there)
+ * refuse the next request of a tool loop unless the assistant turn comes
+ * back with it, so it is returned in the answer and accepted back on
+ * assistant messages, rebuilt field by field and bounded like the rest.
  */
 import { randomBytes } from 'node:crypto'
 
@@ -35,6 +42,9 @@ export const LIVE_MAX_OUTPUT_TOKENS = 4096
 export const LIVE_MAX_MESSAGES = 200
 export const LIVE_MAX_TOOLS = 32
 export const LIVE_MAX_BODY_BYTES = 256 * 1024
+/** reasoning_details on one message: how many, and how large in all when they come back from the model. */
+export const LIVE_MAX_REASONING_DETAILS = 64
+export const LIVE_MAX_REASONING_BYTES = 128 * 1024
 /** How long this server waits for the model. Well under the route's maxDuration (120 s) in vercel.json. */
 export const LIVE_UPSTREAM_TIMEOUT_MS = 90_000
 
@@ -44,14 +54,19 @@ export function liveModelFlag(): boolean {
   return (process.env.LAB_ENABLE_LIVE_MODEL || '').trim() === 'true'
 }
 
+/** OpenRouter's own router ids ("openrouter/auto" and the rest): OpenRouter picks the model, so the price is not known in advance. */
+const ROUTER_ID = /^openrouter\//
+
 /**
  * The models this endpoint answers for: LAB_LIVE_MODEL_IDS (comma list),
- * else the default. Exact ids only: a routing suffix such as ":online" or
- * ":nitro" is not a plain id and is left out, so it can never be asked for.
+ * else the default. Exact ids of one model only. Two kinds of id are left
+ * out, so they can never be asked for, because they let OpenRouter change
+ * what is called: a routing suffix such as ":online" or ":nitro", and
+ * anything in the "openrouter/" namespace such as "openrouter/auto".
  */
 export function liveModelIds(): string[] {
   const raw = (process.env.LAB_LIVE_MODEL_IDS || '').trim()
-  const ids = raw.split(',').map(id => id.trim()).filter(id => MODEL_ID.test(id))
+  const ids = raw.split(',').map(id => id.trim()).filter(id => MODEL_ID.test(id) && !ROUTER_ID.test(id))
   const unique = [...new Set(ids)].slice(0, 8)
   return unique.length ? unique : [...DEFAULT_LIVE_MODEL_IDS]
 }
@@ -121,7 +136,7 @@ export function newLiveKeyToken(): string {
  */
 export function liveModelNote(): string {
   const models = liveModelIds().join(', ')
-  return `Lab model endpoint: while a Sprite session runs, its commands have LAB_MODEL_BASE_URL and LAB_MODEL_API_KEY in their environment (the same two values are also set as OPENAI_BASE_URL and OPENAI_API_KEY). The base URL is an OpenAI-compatible HTTPS endpoint served by the lab: POST <base>/chat/completions and GET <base>/models, with native tool_calls in the answer. It answers for: ${models}. It is non-streaming only ("stream": true is refused), and it forwards only model, messages, tools, tool_choice, max_tokens or max_completion_tokens (at most ${LIVE_MAX_OUTPUT_TOKENS}), and temperature and response_format where the model takes them; every other field is dropped. The key is made for that one session: it stops working when the session ends or after ${LIVE_KEY_TTL_MS / 60000} minutes, and it allows ${LIVE_KEY_MAX_CALLS} calls, one at a time, and $${LIVE_KEY_MAX_USD.toFixed(2)}. The lab also holds this endpoint to $${liveModelDailyUsd().toFixed(2)} a day, inside its daily spending cap. These variables are not set in CI or in the contribution check, which need no key and keep using a localhost fixture. Every call is recorded, and what a model answers through it is untrusted data.`
+  return `Lab model endpoint: when the lab can open it for a Sprite session, that session's commands have LAB_MODEL_BASE_URL and LAB_MODEL_API_KEY in their environment (the same two values are also set as OPENAI_BASE_URL and OPENAI_API_KEY). When the lab cannot open it, the variables are absent and the session's stored output says so. The base URL is an OpenAI-compatible HTTPS endpoint served by the lab: POST <base>/chat/completions and GET <base>/models, with native tool_calls in the answer. A request body is JSON and is read only when it is sent with the header Content-Type: application/json. It answers for: ${models}. It is non-streaming only ("stream": true is refused), and it forwards only model, messages, tools, tool_choice, max_tokens or max_completion_tokens (at most ${LIVE_MAX_OUTPUT_TOKENS}), and temperature and response_format where the model takes them; every other field is dropped. Messages are text. An assistant message keeps its tool_calls and its reasoning_details: the answer carries reasoning_details when the model returns them, and some models refuse the next request after a tool call unless that assistant message comes back with them unchanged. The key is made for that one session: it stops working when the session ends or after ${LIVE_KEY_TTL_MS / 60000} minutes, and it allows ${LIVE_KEY_MAX_CALLS} calls, one at a time, and $${LIVE_KEY_MAX_USD.toFixed(2)}. The lab also holds this endpoint to $${liveModelDailyUsd().toFixed(2)} a day, inside its daily spending cap. These variables are not set in CI or in the contribution check, which need no key and keep using a localhost fixture. A session that has the key is not given the CI variable; a session without the key, like the contribution check, runs with CI=true. Every call is recorded, and what a model answers through it is untrusted data.`
 }
 
 // ---------------------------------------------------------------------------
@@ -188,6 +203,65 @@ function cleanToolCalls(calls: unknown, where: string): { ok: true; calls: unkno
   return { ok: true, calls: out }
 }
 
+export type ReasoningDetail = Record<string, string | number>
+
+/**
+ * One reasoning_details entry, rebuilt from the fields OpenRouter documents:
+ * type ("reasoning.text", "reasoning.summary", "reasoning.encrypted"), id,
+ * format, index, and the payload strings text, summary, data and signature.
+ * Payload strings are kept whole, because a signature that was cut no longer
+ * verifies. null when it is not such an entry.
+ */
+function reasoningDetail(raw: unknown): ReasoningDetail | null {
+  if (!isPlainObject(raw) || typeof raw.type !== 'string' || !/^reasoning\.[a-z_]{1,40}$/.test(raw.type)) return null
+  const out: ReasoningDetail = { type: raw.type }
+  for (const k of ['id', 'format'] as const) {
+    const v = raw[k]
+    if (v === undefined || v === null) continue
+    if (typeof v !== 'string' || v.length > 200) return null
+    out[k] = v
+  }
+  for (const k of ['text', 'summary', 'data', 'signature'] as const) {
+    const v = raw[k]
+    if (v === undefined || v === null) continue
+    if (typeof v !== 'string') return null
+    out[k] = v
+  }
+  if (typeof raw.index === 'number' && Number.isInteger(raw.index) && raw.index >= 0 && raw.index < 10_000) out.index = raw.index
+  return out
+}
+
+/** reasoning_details a caller sends back on an assistant message. Strict: a list this endpoint could have returned, or a 400. */
+function cleanReasoningDetails(raw: unknown, where: string): { ok: true; details: ReasoningDetail[] } | LiveRefusal {
+  const no = () => refuse(`${where}: "reasoning_details" must be the list the endpoint returned with that message: at most ${LIVE_MAX_REASONING_DETAILS} objects, each with a "type" that starts with "reasoning.".`)
+  if (!Array.isArray(raw) || raw.length > LIVE_MAX_REASONING_DETAILS) return no()
+  const details: ReasoningDetail[] = []
+  for (const item of raw) {
+    const detail = reasoningDetail(item)
+    if (!detail) return no()
+    details.push(detail)
+  }
+  return { ok: true, details }
+}
+
+/**
+ * reasoning_details as the model service returned them, for the answer.
+ * Lenient: an entry that is not one is left out, and the list stops at the
+ * count and size limits (whole entries only, never a cut one).
+ */
+function shapeReasoningDetails(raw: unknown): ReasoningDetail[] {
+  const details: ReasoningDetail[] = []
+  let bytes = 0
+  for (const item of Array.isArray(raw) ? raw : []) {
+    const detail = reasoningDetail(item)
+    if (!detail) continue
+    bytes += Buffer.byteLength(JSON.stringify(detail), 'utf8')
+    if (details.length >= LIVE_MAX_REASONING_DETAILS || bytes > LIVE_MAX_REASONING_BYTES) break
+    details.push(detail)
+  }
+  return details
+}
+
 function cleanMessages(raw: unknown): { ok: true; messages: unknown[] } | LiveRefusal {
   if (!Array.isArray(raw) || raw.length === 0) return refuse('"messages" must be a non-empty list.')
   if (raw.length > LIVE_MAX_MESSAGES) return refuse(`"messages" may hold at most ${LIVE_MAX_MESSAGES} messages.`)
@@ -205,6 +279,11 @@ function cleanMessages(raw: unknown): { ok: true; messages: unknown[] } | LiveRe
       const calls = cleanToolCalls(m.tool_calls, where)
       if (!calls.ok) return calls
       if (calls.calls.length) message.tool_calls = calls.calls
+    }
+    if (m.role === 'assistant' && m.reasoning_details !== undefined && m.reasoning_details !== null) {
+      const details = cleanReasoningDetails(m.reasoning_details, where)
+      if (!details.ok) return details
+      if (details.details.length) message.reasoning_details = details.details
     }
     if (m.role === 'tool') {
       if (typeof m.tool_call_id !== 'string' || !m.tool_call_id || m.tool_call_id.length > 200) return refuse(`${where}: a tool message needs "tool_call_id".`)
@@ -332,6 +411,8 @@ export interface LiveCompletion {
       role: 'assistant'
       content: string | null
       tool_calls?: Array<{ id: string; type: 'function'; function: { name: string; arguments: string } }>
+      /** As the model service returned them; a caller sends them back unchanged on this message in its next request. */
+      reasoning_details?: ReasoningDetail[]
     }
     finish_reason: string
   }>
@@ -345,9 +426,10 @@ function tokenCount(v: unknown): number {
 
 /**
  * One chat completion in the OpenAI shape, rebuilt from the model service's
- * answer field by field: choices[0].message with content and tool_calls
- * (arguments always a string), finish_reason and usage. null when the answer
- * holds no choice. Cost is not part of it; the caller reads that separately.
+ * answer field by field: choices[0].message with content, tool_calls
+ * (arguments always a string) and reasoning_details when there are any,
+ * finish_reason and usage. null when the answer holds no choice. Cost is not
+ * part of it; the caller reads that separately.
  */
 export function shapeLiveCompletion(data: unknown, model: string, now: Date = new Date()): LiveCompletion | null {
   const d = isPlainObject(data) ? data : {}
@@ -366,6 +448,7 @@ export function shapeLiveCompletion(data: unknown, model: string, now: Date = ne
     })
   }
   const content = typeof msg.content === 'string' ? msg.content : null
+  const details = shapeReasoningDetails(msg.reasoning_details)
   const reported = typeof choice.finish_reason === 'string' && FINISH.includes(choice.finish_reason) ? choice.finish_reason : null
   const usage = isPlainObject(d.usage) ? d.usage : {}
   const prompt_tokens = tokenCount(usage.prompt_tokens)
@@ -377,7 +460,11 @@ export function shapeLiveCompletion(data: unknown, model: string, now: Date = ne
     model,
     choices: [{
       index: 0,
-      message: { role: 'assistant', content: calls.length && !content ? null : content ?? '', ...(calls.length ? { tool_calls: calls } : {}) },
+      message: {
+        role: 'assistant', content: calls.length && !content ? null : content ?? '',
+        ...(calls.length ? { tool_calls: calls } : {}),
+        ...(details.length ? { reasoning_details: details } : {}),
+      },
       finish_reason: reported ?? (calls.length ? 'tool_calls' : 'stop'),
     }],
     usage: { prompt_tokens, completion_tokens, total_tokens: prompt_tokens + completion_tokens },

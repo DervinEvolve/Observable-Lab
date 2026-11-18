@@ -38,6 +38,21 @@ function fail(res: VercelResponse, status: number, type: string, message: string
 
 const short = (text: unknown, max = 200): string => sanitizeOutput(typeof text === 'string' ? text : '').replace(/\s+/g, ' ').trim().slice(0, max)
 
+/**
+ * Vercel reads a body by its Content-Type: JSON only when the header says
+ * application/json. With no header the body is not read at all, and a form
+ * type (what Python's urllib adds by itself) turns the JSON text into the
+ * single key of a form object. Both would otherwise be refused with a
+ * message about the wrong thing, so the header is checked first. text/plain
+ * and application/octet-stream arrive as text and are parsed in readBody.
+ */
+function sentAsJson(header: unknown): boolean {
+  const value = Array.isArray(header) ? header[0] : header
+  if (typeof value !== 'string') return false
+  const type = value.split(';')[0].trim().toLowerCase()
+  return type === 'application/json' || type === 'text/plain' || type === 'application/octet-stream'
+}
+
 function readBody(req: VercelRequest): unknown {
   // Vercel parses JSON bodies lazily and throws on a malformed one.
   const body = (req as { body?: unknown }).body
@@ -90,6 +105,9 @@ export async function handleLiveModel(req: VercelRequest, res: VercelResponse) {
   if (req.method !== 'POST') return fail(res, 405, 'method_not_allowed', 'Use POST for chat completions and GET for the model list.')
 
   // ---- the request, through the allowlist ----
+  if (!sentAsJson(req.headers?.['content-type'])) {
+    return fail(res, 415, 'unsupported_media_type', 'Send the request body as JSON with the header "Content-Type: application/json".')
+  }
   let raw: unknown
   try {
     raw = readBody(req)
@@ -240,6 +258,7 @@ async function runCall(res: VercelResponse, key: LiveKeyGrant, model: string, bo
   record.finishReason = completion.choices[0].finish_reason
   record.detail.response_excerpt = message.content ?? ''
   if (message.tool_calls?.length) record.detail.tool_calls = message.tool_calls.map(c => c.function.name)
+  if (message.reasoning_details?.length) record.detail.reasoning_details = message.reasoning_details.length
   await finish()
 
   res.setHeader('X-Lab-Calls-Left', String(Math.max(0, key.max_calls - key.calls_used)))

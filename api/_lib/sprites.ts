@@ -28,7 +28,10 @@
  * Authorization: Bearer SPRITES_TOKEN; POST /sprites {name}; GET and DELETE
  * /sprites/{name} (status cold|warm|running); POST /sprites/{name}/exec with
  * query params cmd (repeated), path, dir, env (repeated KEY=VALUE);
- * POST /sprites/{name}/policy/network {rules}.
+ * POST and GET /sprites/{name}/policy/network, both with {rules} as the
+ * request and the documented answer (docs.fly.io/sprites/api/network-policy).
+ * The policy works through DNS: a host that is not allowed does not resolve,
+ * and an address is reachable only if an allowed host resolved to it.
  */
 import { randomBytes } from 'node:crypto'
 import { WILDCARD_MODELS } from './types.js'
@@ -284,7 +287,8 @@ export interface ExecOptions {
    * The lab model endpoint for this command: sets LAB_MODEL_BASE_URL and
    * LAB_MODEL_API_KEY, and the same two as OPENAI_BASE_URL and OPENAI_API_KEY.
    * The key must be a scoped model key and the URL plain https; the usual
-   * check against this server's own credentials still runs on both.
+   * check against this server's own credentials still runs on both. A
+   * command given the key is not sent the default CI=true.
    */
   scopedModelKey?: { baseUrl: string; key: string }
 }
@@ -358,7 +362,13 @@ function wrapperScript(nonce: string): string {
 export async function execInSprite(key: SpriteKey, script: string, opts: ExecOptions = {}): Promise<ExecResult> {
   const timeoutS = Math.max(5, Math.min(Math.floor(opts.timeoutS ?? 60), 600))
   const maxOutputBytes = opts.maxOutputBytes ?? 64 * 1024
-  const env: Record<string, string> = { CI: 'true', NO_COLOR: '1', FORCE_COLOR: '0', npm_config_update_notifier: 'false', npm_config_fund: 'false', ...opts.env }
+  // CI=true goes to every command but one that is given the lab model key:
+  // the models are told the key is never present in CI, and code that keeps
+  // to its fixture when CI is set would otherwise never call the endpoint.
+  const env: Record<string, string> = {
+    ...(opts.scopedModelKey ? {} : { CI: 'true' }),
+    NO_COLOR: '1', FORCE_COLOR: '0', npm_config_update_notifier: 'false', npm_config_fund: 'false', ...opts.env,
+  }
   for (const name of Object.keys(env)) {
     if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name) || SECRET_ENV_NAME.test(name) || (SCOPED_MODEL_KEY_ENV as readonly string[]).includes(name)) {
       throw new Error(`Refusing env name ${name}`)

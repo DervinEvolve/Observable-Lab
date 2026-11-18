@@ -101,7 +101,7 @@ To turn it on I set these in Vercel and redeploy:
 |---|---|
 | `LAB_ENABLE_LIVE_MODEL` | `true` |
 | `LAB_PUBLIC_ORIGIN` | the lab's public address, `https://<host>` with no path. I can leave it empty and the lab uses the production domain Vercel reports in `VERCEL_PROJECT_PRODUCTION_URL`. |
-| `LAB_LIVE_MODEL_IDS` | optional. The models it answers for, comma separated. Default `google/gemini-3.8-flash`. |
+| `LAB_LIVE_MODEL_IDS` | optional. The models it answers for, comma separated. Default `google/gemini-3.8-flash`. An id with a `:` suffix or under `openrouter/` (such as `openrouter/auto`) is left out, because those let OpenRouter choose what is called. |
 | `LAB_LIVE_MODEL_DAILY_USD` | optional. What the endpoint may spend per UTC day. Default `1`. |
 
 It also needs what is already set for run 2: `OPENROUTER_API_KEY`, `LAB_ENABLE_SPRITE_SESSIONS=true` and `SPRITES_TOKEN`. Nothing changes on Modal, and there is nothing to deploy there.
@@ -112,10 +112,16 @@ What I check after turning it on:
 
 - `curl -i https://<host>/api/live-model/v1/models` with no key answers 401, not 404 and not 503. A 404 means the rewrite in `vercel.json` did not deploy. A 503 means a setting is missing, and the message says whether it is the switch or the configuration.
 - The same request with `Authorization: Bearer <LAB_OPERATOR_SECRET>` also answers 401. The operator secret is not a key for this route.
-- After the next epoch with a Sprite session, the `tool_runs` row for that session has `detail.live_model`. `offered: true` means the Sprite accepted the extra egress rule and got a key. `offered: false` comes with a note that says why.
+- After the next epoch with a Sprite session, the `tool_runs` row for that session has `detail.live_model`. `offered: true` means the Sprite accepted the extra egress rule and got a key. `offered: false` comes with a note that says why, and the session's stored output ends with the same note.
+- If the first session says `offered: false`, I turn the switch off again until I have fixed the cause. While the switch is on the prompts tell the models the endpoint exists. Each session's output does tell them when it got no key, but a setup where no session can get one is just noise for them.
 - `SELECT purpose, SUM(cost_usd) FROM model_calls WHERE purpose = 'live_model' GROUP BY 1` shows what the endpoint has cost, and `live_model_calls` has one row per call.
 
-Things I know are not checked from my machine: I have not watched a real Sprite accept the extra egress rule or call the endpoint. The rule format comes from the Sprites networking documentation, and the code refuses to make a key unless the Sprite's answer shows the rule in place, so the worst case is a session without a key, not a key without a rule.
+Things I know are not checked from my machine: I have not watched a real Sprite accept the extra egress rule or call the endpoint. The rule format comes from the Sprites networking documentation, and the shape of the answer the code reads back comes from the Sprites API reference. The code refuses to make a key unless the Sprite's answer shows the rule in place, so the worst case is a session without a key, not a key without a rule. I have also not run a tool loop of more than one round against the real model through the endpoint.
+
+Two things to keep in mind while it is on:
+
+- I do not run `create`, `create_all` or `setup` on `/api/sprites` while an epoch's Sprite session is running. Setting a Sprite up again puts its egress policy back to `defaults`, which takes the lab's host away from the running session. Its remaining calls then fail, and the record still says `offered: true`.
+- The egress rule works through DNS, and the lab's host resolves to addresses Vercel shares between many sites. While a session has the rule, code in the Sprite may be able to reach another Vercel site through those addresses. I have not tested that, and a custom domain would not change it. [TOOLS.md](TOOLS.md#the-lab-model-endpoint) has the detail.
 
 ## Model proposals to this repository
 

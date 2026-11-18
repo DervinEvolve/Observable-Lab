@@ -95,6 +95,7 @@ class FakeDb {
     this.modelCalls = []
     this.statements = []
     this.failLedger = false
+    this.usageReads = 0
   }
 
   handle(text, v) {
@@ -140,7 +141,12 @@ class FakeDb {
       const k = this.keys.find(row => row.id === id)
       if (!k) return { rows: [] }
       Object.assign(k, { revoked: true, revoked_at: k.revoked_at ?? revokedAt, revoke_reason: k.revoke_reason ?? reason })
-      return { rows: [{ calls_used: k.calls_used, usd_used: k.usd_used }] }
+      return { rows: [{ calls_used: k.calls_used, usd_used: k.usd_used, busy_until: k.busy_until }] }
+    }
+    if (text.startsWith('SELECT calls_used, usd_used, busy_until FROM live_model_keys WHERE id = ?')) {
+      this.usageReads += 1
+      const k = this.keys.find(row => row.id === v[0])
+      return { rows: k ? [{ calls_used: k.calls_used, usd_used: k.usd_used, busy_until: k.busy_until }] : [] }
     }
     if (text.startsWith('INSERT INTO live_model_calls')) {
       const [key_id, experiment_id, epoch, issued_to, sprite, model_asked, model_served, status, http_status, finish_reason, prompt_tokens, completion_tokens, cost_usd, cost_source, duration_ms, detail] = v
@@ -192,9 +198,10 @@ function response() {
     json(body) { this.body = body; return this },
   }
 }
-async function call(token, body, method = 'POST') {
+async function call(token, body, method = 'POST', contentType = 'application/json') {
   const res = response()
-  await route({ method, headers: { authorization: token === undefined ? undefined : `Bearer ${token}` }, query: {}, body }, res)
+  const headers = { authorization: token === undefined ? undefined : `Bearer ${token}`, ...(contentType ? { 'content-type': contentType } : {}) }
+  await route({ method, headers, query: {}, body }, res)
   return res
 }
 const ask = (extra = {}) => ({ model: MODEL, messages: [{ role: 'user', content: 'What is 2 + 2?' }], ...extra })
@@ -423,6 +430,16 @@ test('only allowlisted models are answered for, and an unknown one is told which
   assert.equal(live.checkLiveRequest(ask({ model: 'thinkingmachines/inkling-2-small' })).ok, true)
   assert.match(live.checkLiveRequest(ask({ model: 'x/y' })).message, /google\/gemini-3\.8-flash, thinkingmachines\/inkling-2-small/)
   assert.deepEqual(live.liveModelList().data.map(m => m.id), ['google/gemini-3.8-flash', 'thinkingmachines/inkling-2-small'])
+
+  // OpenRouter's own router ids pick the model themselves, at a price nobody chose: never allowed, alone or in a list.
+  for (const router of ['openrouter/auto', 'openrouter/free', 'openrouter/anything-new']) {
+    process.env.LAB_LIVE_MODEL_IDS = router
+    assert.deepEqual(live.liveModelIds(), ['google/gemini-3.8-flash'], `${router} alone falls back to the default`)
+    assert.equal(live.checkLiveRequest(ask({ model: router })).ok, false)
+    process.env.LAB_LIVE_MODEL_IDS = `thinkingmachines/inkling-2-small,${router}`
+    assert.deepEqual(live.liveModelIds(), ['thinkingmachines/inkling-2-small'])
+    assert.equal(live.checkLiveRequest(ask({ model: router })).type, 'model_not_allowed')
+  }
   // A list with nothing usable in it falls back to the default instead of allowing nothing or everything.
   process.env.LAB_LIVE_MODEL_IDS = '*, , :free'
   assert.deepEqual(live.liveModelIds(), ['google/gemini-3.8-flash'])
@@ -601,7 +618,9 @@ test('an expired or revoked key is refused with 401 and a short reason', async (
 
   const key = await mint({ sprite: 'observable-claude' })
   assert.equal((await call(key.token, ask())).code, 200)
-  assert.deepEqual(await keys.revokeLiveKey(key.id, 'the Sprite session ended'), { calls_used: 1, usd_used: 0.0004 })
+  assert.deepEqual(await keys.revokeLiveKey(key.id, 'the Sprite session ended'), { calls_used: 1, usd_used: 0.0004, in_flight: false })
+  assert.deepEqual(await keys.liveKeyUsage(key.id), { calls_used: 1, usd_used: 0.0004, in_flight: false })
+  assert.equal(await keys.liveKeyUsage('no-such-id'), null)
   for (const method of ['GET', 'POST']) {
     const res = await call(key.token, ask(), method)
     assert.equal(res.code, 401)
@@ -792,6 +811,109 @@ test('other methods and oversized or unreadable bodies are refused', async () =>
   assert.equal(lab.keys[0].calls_used, 0)
 })
 
+test('a body that was not sent as JSON is refused with the real reason, before a call is counted', async () => {
+  enable()
+  const key = await mint()
+  globalThis.fetch = fakeOpenRouter([])
+  // What Vercel hands the route: nothing at all when there is no Content-Type (Node's https.request),
+  // and the JSON text as the one key of a form object for a form type (what Python's urllib adds by itself).
+  const text = JSON.stringify(ask())
+  for (const [contentType, body] of [[null, undefined], ['application/x-www-form-urlencoded', { [text]: '' }], ['multipart/form-data; boundary=x', undefined], ['application/xml', undefined]]) {
+    const res = await call(key.token, body, 'POST', contentType)
+    assert.equal(res.code, 415, `${contentType}`)
+    assert.equal(res.body.error.type, 'unsupported_media_type')
+    assert.match(res.body.error.message, /Content-Type: application\/json/)
+  }
+  assert.equal(lab.keys[0].calls_used, 0)
+  // JSON by its header (parameters and case do not matter), and the two types that arrive as text.
+  for (const [contentType, body] of [['application/json; charset=utf-8', ask()], ['Application/JSON', ask()], [['application/json'], ask()], ['text/plain', text], ['application/octet-stream', Buffer.from(text)]]) {
+    assert.equal((await call(key.token, body, 'POST', contentType)).code, 200, `${contentType}`)
+  }
+  // The model list has no body, so it needs no header.
+  assert.equal((await call(key.token, undefined, 'GET', null)).code, 200)
+  // Without a key the answer is still 401: the header is only looked at for a live key.
+  assert.equal((await call(undefined, undefined, 'POST', null)).code, 401)
+})
+
+// ===========================================================================
+// Reasoning details: what a tool loop has to hand back
+// ===========================================================================
+test('reasoning_details come back with the answer and are forwarded again on the assistant turn', async () => {
+  enable()
+  const key = await mint()
+  const sent = []
+  const signature = 'c2lnbmF0dXJl'.repeat(40)
+  const details = [
+    { type: 'reasoning.text', text: 'I will add them.', signature: 'sig-1', format: 'anthropic-claude-v1', index: 0, id: null },
+    { type: 'reasoning.encrypted', id: 'call_1', format: 'google-gemini-v1', index: 1, data: signature, provider: { order: ['X'] }, extra: 'dropped' },
+    { type: 'reasoning.summary', summary: 'Adds two numbers.', index: 2 },
+    { type: 'not-reasoning', data: 'left out' },
+    'left out too',
+  ]
+  const kept = [
+    { type: 'reasoning.text', format: 'anthropic-claude-v1', text: 'I will add them.', signature: 'sig-1', index: 0 },
+    { type: 'reasoning.encrypted', id: 'call_1', format: 'google-gemini-v1', data: signature, index: 1 },
+    { type: 'reasoning.summary', summary: 'Adds two numbers.', index: 2 },
+  ]
+  const toolCall = { id: 'call_1', type: 'function', function: { name: 'add', arguments: '{"a":2,"b":2}' } }
+  globalThis.fetch = fakeOpenRouter(sent, () => {
+    const out = completion({ content: null, finish_reason: 'tool_calls', tool_calls: [toolCall] })
+    out.choices[0].message.reasoning_details = details
+    return out
+  })
+  const tools = [{ type: 'function', function: { name: 'add', parameters: { type: 'object' } } }]
+
+  // Round one: the answer carries them, rebuilt from known fields only, payloads whole.
+  const first = await call(key.token, ask({ tools }))
+  assert.equal(first.code, 200)
+  assert.deepEqual(first.body.choices[0].message, { role: 'assistant', content: null, tool_calls: [toolCall], reasoning_details: kept })
+  assert.equal('reasoning' in first.body.choices[0].message, false)
+  assert.equal(lab.calls[0].detail.reasoning_details, 3)
+  assert.doesNotMatch(JSON.stringify(lab.calls), /c2lnbmF0dXJl/) // the record keeps a count, not the payload
+
+  // Round two: the client sends the assistant turn back as it got it, with the tool result.
+  const second = await call(key.token, ask({
+    tools,
+    messages: [
+      { role: 'user', content: 'What is 2 + 2?', reasoning_details: kept },
+      first.body.choices[0].message,
+      { role: 'tool', tool_call_id: 'call_1', content: '4' },
+    ],
+  }))
+  assert.equal(second.code, 200)
+  assert.deepEqual(sent[1].body.messages, [
+    { role: 'user', content: 'What is 2 + 2?' }, // only an assistant message carries them
+    { role: 'assistant', content: null, tool_calls: [toolCall], reasoning_details: kept },
+    { role: 'tool', content: '4', tool_call_id: 'call_1' },
+  ])
+  assert.equal(second.headers['X-Lab-Dropped-Fields'], undefined)
+
+  // On the way in they are held to the same shape: unknown fields are dropped, anything else is a 400.
+  const turn = extra => ask({ messages: [{ role: 'user', content: 'x' }, { role: 'assistant', content: null, tool_calls: [toolCall], ...extra }, { role: 'tool', tool_call_id: 'call_1', content: '4' }] })
+  const caps = { supported_parameters: ['max_tokens'] }
+  const built = live.buildLiveRequest(turn({ reasoning_details: [{ type: 'reasoning.encrypted', data: 'abc', cache_control: { type: 'ephemeral' }, provider: 'X' }] }), caps)
+  assert.deepEqual(built.body.messages[1].reasoning_details, [{ type: 'reasoning.encrypted', data: 'abc' }])
+  for (const empty of [undefined, null, []]) {
+    assert.equal('reasoning_details' in live.buildLiveRequest(turn({ reasoning_details: empty }), caps).body.messages[1], false)
+  }
+  for (const bad of ['text', {}, [7], [{ data: 'no type' }], [{ type: 'reasoning.text', text: 7 }], [{ type: 'image_url' }], [{ type: 'reasoning.text', id: 'x'.repeat(201) }],
+    Array.from({ length: live.LIVE_MAX_REASONING_DETAILS + 1 }, () => ({ type: 'reasoning.text', text: 'x' }))]) {
+    const r = live.buildLiveRequest(turn({ reasoning_details: bad }), caps)
+    assert.equal(r.ok, false, JSON.stringify(bad).slice(0, 60))
+    assert.equal(r.status, 400)
+    assert.match(r.message, /messages\[1\]: "reasoning_details"/)
+  }
+
+  // On the way out the list is bounded: whole entries only, up to the count and size limits.
+  const shape = list => live.shapeLiveCompletion({ choices: [{ message: { content: 'ok', reasoning_details: list } }] }, MODEL).choices[0].message.reasoning_details
+  assert.equal(shape(Array.from({ length: 200 }, () => ({ type: 'reasoning.text', text: 'x' }))).length, live.LIVE_MAX_REASONING_DETAILS)
+  const big = shape(Array.from({ length: 5 }, () => ({ type: 'reasoning.encrypted', data: 'x'.repeat(50_000) })))
+  assert.equal(big.length, 2)
+  for (const d of big) assert.equal(d.data.length, 50_000)
+  assert.equal(shape([]), undefined)
+  assert.equal(shape('nope'), undefined)
+})
+
 // ===========================================================================
 // The Sprite session
 // ===========================================================================
@@ -852,7 +974,11 @@ test('a Sprite session gets the lab host in its egress policy, then a key, and l
     assert.equal(env.OPENAI_API_KEY, token)
     // The only variables shaped like a credential are those two.
     assert.deepEqual(Object.keys(env).filter(k => /TOKEN|SECRET|KEY|PASSWORD|POSTGRES/.test(k)).sort(), ['LAB_MODEL_API_KEY', 'OPENAI_API_KEY'])
+    // A command that holds the key is not told it is CI: the models are told the key is never there in CI.
+    assert.deepEqual(Object.keys(env).sort(), ['FORCE_COLOR', 'LAB_MODEL_API_KEY', 'LAB_MODEL_BASE_URL', 'NO_COLOR', 'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'npm_config_fund', 'npm_config_update_notifier'])
   }
+  // Its stored output ends with what the endpoint was used for.
+  assert.match(session.sessionTranscript(result), /\nlab model endpoint: 0 calls, \$0\.0000$/)
   // No server secret reached the sprite in any argument, variable or URL.
   const everything = calls.map(c => c.url + JSON.stringify(c.body ?? '')).join('\n')
   for (const secret of [OPENROUTER_KEY, OTHER_SECRET, 'test-only-ai-agent-token-value-0000', 'test-only-operator-secret-0000000000000000', 'test-only-db-password']) {
@@ -922,6 +1048,63 @@ test('calls made during a session are reported with the session', async () => {
   assert.equal(result.live_model.cost_usd.toFixed(2), '0.02')
   assert.deepEqual(lab.modelCalls.map(c => [c.experiment_id, c.epoch_number, c.purpose, c.assigned_model_id]), [['exp-9', 4, 'live_model', 'x-ai/grok-4.7'], ['exp-9', 4, 'live_model', 'x-ai/grok-4.7']])
   assert.deepEqual(lab.calls.map(c => [c.sprite, c.issued_to, c.status]), [['observable-grok', 'x-ai/grok-4.7', 'ok'], ['observable-grok', 'x-ai/grok-4.7', 'ok']])
+  assert.equal('call_in_flight' in result.live_model, false)
+  assert.equal(lab.usageReads, 0) // nothing was running at the end, so there was nothing to wait for
+  assert.match(session.sessionTranscript(result), /\nlab model endpoint: 2 calls, \$0\.0200$/)
+})
+
+test('a call still running when the session ends is waited for, and if it outlasts the wait the totals say so', async () => {
+  enable()
+  // The code in the sprite starts a call and the command returns without waiting for it.
+  const run = async (settleWaitMs, answerAfterMs) => {
+    lab = new FakeDb()
+    const calls = []
+    let inFlight
+    const upstream = fakeOpenRouter([], async () => {
+      await new Promise(resolve => setTimeout(resolve, answerAfterMs))
+      return completion({ cost: 0.03 })
+    })
+    const spritesApi = fakeSprites(calls, { answer: () => 'started a call in the background' })
+    globalThis.fetch = async (url, options) => {
+      const u = new URL(String(url))
+      if (u.host === 'openrouter.ai') return upstream(url, options)
+      const res = await spritesApi(url, options)
+      if (u.pathname.endsWith('/exec')) {
+        inFlight = call(envOf(calls[calls.length - 1]).LAB_MODEL_API_KEY, ask())
+        while (!lab.keys[0]?.busy_until) await new Promise(resolve => setTimeout(resolve, 1)) // the call has been let through
+      }
+      return res
+    }
+    const result = await session.runSpriteSession('x-ai/grok-4.7', [{ run: 'nohup node call.js &', timeout_s: 30 }], { liveModel: { experimentId: 'exp-9', epoch: 4, settleWaitMs } })
+    const atEnd = { ...result.live_model }
+    assert.equal((await inFlight).code, 200) // revoking the key did not stop the call that was already let through
+    return { result, atEnd }
+  }
+
+  // It ends inside the wait: the session's totals include its cost and match the ledger.
+  const settled = await run(5_000, 40)
+  assert.deepEqual(settled.atEnd, { offered: true, calls: 1, cost_usd: 0.03 })
+  assert.ok(lab.usageReads >= 1)
+  assert.equal(lab.modelCalls.reduce((s, c) => s + c.cost_usd, 0), settled.atEnd.cost_usd)
+  assert.match(session.sessionTranscript(settled.result), /\nlab model endpoint: 1 call, \$0\.0300$/)
+
+  // It outlasts the wait: the call is counted, the figure is marked as short, and the ledger still gets the cost.
+  const pending = await run(0, 60)
+  assert.deepEqual(pending.atEnd, { offered: true, calls: 1, cost_usd: 0, call_in_flight: true })
+  assert.match(session.sessionTranscript(pending.result), /\nlab model endpoint: 1 call, \$0\.0000 when the session ended; one call was still running and its cost is not in this figure$/)
+  assert.deepEqual(lab.modelCalls.map(c => c.cost_usd), [0.03])
+  assert.equal(Number(lab.keys[0].usd_used), 0.03)
+  assert.equal(lab.keys[0].revoked, true)
+  assert.equal(session.LIVE_SETTLE_WAIT_MS, 10_000)
+
+  // The one-line summary of a session: silent with the endpoint off or unused, plain about the rest.
+  assert.equal(session.liveModelClause(undefined), '')
+  assert.equal(session.liveModelLine(undefined), '')
+  assert.equal(session.liveModelClause({ offered: true, calls: 0, cost_usd: 0 }), '')
+  assert.equal(session.liveModelClause(settled.atEnd), '; 1 call(s) to the lab model endpoint')
+  assert.equal(session.liveModelClause(pending.atEnd), '; 1 call(s) to the lab model endpoint, one still running when the session ended')
+  assert.equal(session.liveModelClause({ offered: false, calls: 0, cost_usd: 0, note: 'the lab has no public https origin set' }), '; the lab model endpoint was not available in this session (the lab has no public https origin set)')
+  for (const text of [session.liveModelLine(pending.atEnd), session.liveModelClause(pending.atEnd)]) assert.doesNotMatch(text, /—/)
 })
 
 test('no key is made unless the sprite confirmed the egress rule, and the session still runs', async () => {
@@ -944,7 +1127,12 @@ test('no key is made unless the sprite confirmed the egress rule, and the sessio
     assert.equal(lab.keys.length, 0, `${name}: a key was made`)
     for (const c of calls.filter(c => c.path.endsWith('/exec'))) {
       assert.deepEqual(Object.keys(envOf(c)).filter(k => /MODEL|OPENAI|KEY/.test(k)), [], name)
+      assert.equal(envOf(c).CI, 'true', `${name}: a session without the key runs as it always did`)
     }
+    // The models are told the endpoint is on, so the stored output has to say this session did not get it.
+    assert.match(session.sessionTranscript(result), /\nlab model endpoint: not available in this session, no key was made: /, name)
+    assert.equal(session.liveModelLine(result.live_model), session.sessionTranscript(result).split('\n').pop(), name)
+    assert.match(session.liveModelClause(result.live_model), /^; the lab model endpoint was not available in this session \(no key was made: /, name)
     // Whatever the sprite was left with, the last thing it is given is the defaults policy again.
     const policies = calls.filter(c => c.method === 'POST' && c.path.endsWith('/policy/network')).map(c => c.body.rules.length)
     assert.deepEqual(policies, [1, 2, 1], name)
@@ -1010,6 +1198,13 @@ test('with the endpoint on, the prompts say what it is and where its limits are,
     /non-streaming only/, /20 calls, one at a time, and \$0\.25/, /15 minutes/, /\$1\.00 a day/, /at most 4096/,
     /not set in CI or in the contribution check, which need no key and keep using a localhost fixture/,
     /Every call is recorded/, /untrusted data/, /every other field is dropped/,
+    // It is conditional: switched on is not the same as this session having the key.
+    /^Lab model endpoint: when the lab can open it for a Sprite session, that session's commands have/,
+    /When the lab cannot open it, the variables are absent and the session's stored output says so/,
+    // What the environment and the request really look like.
+    /A session that has the key is not given the CI variable; a session without the key, like the contribution check, runs with CI=true/,
+    /sent with the header Content-Type: application\/json/,
+    /keeps its tool_calls and its reasoning_details/, /comes back with them unchanged/,
   ]) assert.match(note, words)
   // Abilities and limits only: no suggestion of what to build, and no em dash.
   for (const steer of [/should/i, /you can use (it|this) to/i, /build/i, /adapter/i, /try/i, /recommend/i, /—/]) assert.doesNotMatch(note, steer)
@@ -1018,7 +1213,7 @@ test('with the endpoint on, the prompts say what it is and where its limits are,
   assert.ok(context.includes(note))
   assert.match(context, /during a session, the lab model endpoint in the next line/)
   assert.match(context, /it holds no credentials apart from that endpoint's short-lived key/)
-  assert.match(prompts.executorToolsSection(), /LAB_MODEL_BASE_URL, with that session's key in LAB_MODEL_API_KEY/)
+  assert.match(prompts.executorToolsSection(), /LAB_MODEL_BASE_URL, with that session's key in LAB_MODEL_API_KEY, when the lab could open the endpoint for that session; the session's stored output says whether it did\./)
 
   // Sprite sessions off: the endpoint is not offered, so it is not mentioned either.
   delete process.env.LAB_ENABLE_SPRITE_SESSIONS

@@ -229,20 +229,47 @@ export async function settleLiveCall(keyId: string, costUsd: number): Promise<vo
   await sql`UPDATE live_model_keys SET usd_used = usd_used + ${cost}, busy_until = NULL WHERE id = ${keyId}`
 }
 
-/** Revokes a key and reports what it was used for. Never throws; null when the row could not be read. */
-export async function revokeLiveKey(keyId: string, reason: string, now: Date = new Date()): Promise<{ calls_used: number; usd_used: number } | null> {
+/** What a key has been used for. `in_flight`: a call was still running when this was read, so its cost is not in `usd_used` yet. */
+export interface LiveKeyUsage { calls_used: number; usd_used: number; in_flight: boolean }
+
+function usage(row: Record<string, unknown> | undefined, now: Date): LiveKeyUsage | null {
+  if (!row) return null
+  return {
+    calls_used: Number(row.calls_used) || 0,
+    usd_used: Number(row.usd_used) || 0,
+    in_flight: Boolean(row.busy_until) && new Date(row.busy_until as string).getTime() > now.getTime(),
+  }
+}
+
+/**
+ * Revokes a key and reports what it was used for at that moment. A call that
+ * was let through just before is not stopped by this: it finishes at the
+ * endpoint and is settled on the revoked key afterwards, which `in_flight`
+ * says. Never throws; null when the row could not be read.
+ */
+export async function revokeLiveKey(keyId: string, reason: string, now: Date = new Date()): Promise<LiveKeyUsage | null> {
   try {
     await ensureLiveModelTables()
     const r = await sql`
       UPDATE live_model_keys
       SET revoked = TRUE, revoked_at = COALESCE(revoked_at, ${now.toISOString()}), revoke_reason = COALESCE(revoke_reason, ${reason.slice(0, 120)})
       WHERE id = ${keyId}
-      RETURNING calls_used, usd_used
+      RETURNING calls_used, usd_used, busy_until
     `
-    const row = r.rows[0]
-    return row ? { calls_used: Number(row.calls_used) || 0, usd_used: Number(row.usd_used) || 0 } : null
+    return usage(r.rows[0] as Record<string, unknown> | undefined, now)
   } catch (e) {
     console.warn('[live-model] could not revoke a key:', e instanceof Error ? e.message : e)
+    return null
+  }
+}
+
+/** A key's use, read again: for the totals of a key whose last call was still running when it was revoked. Never throws. */
+export async function liveKeyUsage(keyId: string, now: Date = new Date()): Promise<LiveKeyUsage | null> {
+  try {
+    const r = await sql`SELECT calls_used, usd_used, busy_until FROM live_model_keys WHERE id = ${keyId}`
+    return usage(r.rows[0] as Record<string, unknown> | undefined, now)
+  } catch (e) {
+    console.warn('[live-model] could not read a key\'s use:', e instanceof Error ? e.message : e)
     return null
   }
 }
