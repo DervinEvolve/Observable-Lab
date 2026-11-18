@@ -75,9 +75,11 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
     const g = req.gpu_job as Record<string, unknown>
     const checked = normalizeGpuScript(g && typeof g === 'object' ? g.script : undefined)
     // "weights" on a job is read only while public weights are on; otherwise
-    // the field is left alone, as any extra field always was.
-    const named = config.weights.enabled && config.weights.per_day > 0 && g && typeof g === 'object' && g.weights !== undefined && g.weights !== null && g.weights !== false
-      ? normalizeWeightsRef(g.weights) : null
+    // the field is left alone, as any extra field always was. The field is
+    // optional, so an empty string means none, like leaving it out.
+    const given = g && typeof g === 'object' ? g.weights : undefined
+    const none = given === undefined || given === null || given === false || (typeof given === 'string' && !given.trim())
+    const named = config.weights.enabled && config.weights.per_day > 0 && !none ? normalizeWeightsRef(given) : null
     if ('error' in checked) plan.ignored.push({ tool: 'gpu_job', reason: checked.error })
     // A script written for weights it cannot have would only burn GPU time.
     else if (named && 'error' in named) plan.ignored.push({ tool: 'gpu_job', reason: named.error })

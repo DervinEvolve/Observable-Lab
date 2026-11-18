@@ -14,16 +14,16 @@
  * its shape. The rules themselves (license, gating, file kinds, custom code,
  * size, the shelf) live in one place, the Modal file, and are tested there.
  */
-import { modalGpuUsdPerSecond } from './tools-config.js'
+import { DEFAULT_WEIGHTS_LICENSES, modalGpuUsdPerSecond, weightsLicenses } from './tools-config.js'
+
+export { DEFAULT_WEIGHTS_LICENSES }
 
 /** `org/name`, as Hugging Face spells repository ids. Both parts are required. */
 const REPO_PART = '[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?'
 const REPO_ID = new RegExp(`^${REPO_PART}/${REPO_PART}$`)
 const REVISION = /^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,62}[A-Za-z0-9])?$/
 const SHA = /^[0-9a-f]{40}$/
-const LICENSE = /^[a-z0-9][a-z0-9.+-]{0,39}$/
 
-export const DEFAULT_WEIGHTS_LICENSES = ['apache-2.0', 'mit', 'bsd-3-clause', 'bsd-2-clause', 'cc-by-4.0'] as const
 export const DEFAULT_WEIGHTS_MAX_GB = 3
 export const DEFAULT_WEIGHTS_SHELF_GB = 30
 /** Ceilings the Modal side also enforces (HARD_MAX_GB and HARD_SHELF_GB in modal/gpu_jobs.py). */
@@ -84,9 +84,14 @@ export interface WeightsLimits {
   shelf_gb: number
 }
 
-/** The owner's limits, from the environment. They are sent to the fetcher with every request. */
+/**
+ * The owner's limits, from the environment. They are sent to the fetcher
+ * with every request, and it turns them into its own numbers once. The
+ * license list is tools-config.ts's: empty when LAB_WEIGHTS_LICENSES is set
+ * but unusable (public weights are off then, and an empty list sent anyway
+ * refuses every repository).
+ */
 export function weightsLimits(): WeightsLimits {
-  const listed = (process.env.LAB_WEIGHTS_LICENSES || '').split(',').map(s => s.trim().toLowerCase()).filter(s => LICENSE.test(s))
   const gb = (name: string, fallback: number, ceiling: number) => {
     const raw = (process.env[name] || '').trim()
     const n = raw ? Number(raw) : NaN
@@ -94,7 +99,7 @@ export function weightsLimits(): WeightsLimits {
   }
   const max_gb = gb('LAB_WEIGHTS_MAX_GB', DEFAULT_WEIGHTS_MAX_GB, WEIGHTS_HARD_MAX_GB)
   return {
-    licenses: listed.length ? [...new Set(listed)].sort() : [...DEFAULT_WEIGHTS_LICENSES],
+    licenses: weightsLicenses().licenses,
     max_gb,
     shelf_gb: Math.max(gb('LAB_WEIGHTS_SHELF_GB', DEFAULT_WEIGHTS_SHELF_GB, WEIGHTS_HARD_SHELF_GB), max_gb),
   }
