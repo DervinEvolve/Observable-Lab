@@ -66,6 +66,46 @@ function rateEnv(name: string, fallback: number): number {
   return Number.isFinite(n) && n >= 0 ? n : fallback
 }
 
+/** The licenses a repository of public weights may state when LAB_WEIGHTS_LICENSES is not set. */
+export const DEFAULT_WEIGHTS_LICENSES = ['apache-2.0', 'mit', 'bsd-3-clause', 'bsd-2-clause', 'cc-by-4.0'] as const
+const LICENSE_ID = /^[a-z0-9][a-z0-9.+-]{0,39}$/
+
+export interface WeightsLicenses {
+  /** The list that applies. Empty when the variable is set but names no license id. */
+  licenses: string[]
+  /** How many entries were left out because they are not license ids. */
+  dropped: number
+  /** The variable is set and nothing in it is a license id: public weights stay off. */
+  unusable: boolean
+}
+
+/**
+ * LAB_WEIGHTS_LICENSES, comma separated. The defaults apply only when it is
+ * not set. A list that is set is never widened: an entry that is not a
+ * license id (as Hugging Face writes them, like apache-2.0) is left out, and
+ * if none is left, public weights are off rather than back on the defaults.
+ */
+export function weightsLicenses(): WeightsLicenses {
+  const raw = (process.env.LAB_WEIGHTS_LICENSES || '').trim()
+  if (!raw) return { licenses: [...DEFAULT_WEIGHTS_LICENSES], dropped: 0, unusable: false }
+  const entries = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  const licenses = [...new Set(entries.filter(s => LICENSE_ID.test(s)))].sort()
+  return { licenses, dropped: entries.length - entries.filter(s => LICENSE_ID.test(s)).length, unusable: licenses.length === 0 }
+}
+
+// Said once per value, and only while the switch is on, so the logs show a
+// list that was narrowed or refused without a line on every epoch. The
+// entries themselves are not printed.
+let licensesWarnedFor: string | null = null
+function warnAboutLicenses(found: WeightsLicenses): void {
+  const raw = process.env.LAB_WEIGHTS_LICENSES || ''
+  if (!found.dropped || licensesWarnedFor === raw) return
+  licensesWarnedFor = raw
+  console.warn(found.unusable
+    ? '[Tools] LAB_WEIGHTS_LICENSES is set but names no license id (write them like apache-2.0,mit); public weights stay off'
+    : `[Tools] LAB_WEIGHTS_LICENSES: ${found.dropped} entr${found.dropped === 1 ? 'y is not a license id and was' : 'ies are not license ids and were'} left out; ${found.licenses.length} license${found.licenses.length === 1 ? '' : 's'} allowed`)
+}
+
 export function modalGpuUsdPerSecond(): number {
   return rateEnv('LAB_MODAL_GPU_USD_PER_SECOND', DEFAULT_MODAL_GPU_USD_PER_SECOND)
 }
@@ -95,6 +135,8 @@ export function toolConfig(): ToolConfig {
   const code = codeWritesEnabled()
   const ci = has('LAB_REQUIRED_CI_WORKFLOW_IDS') && has('AI_AGENT_GITHUB_TOKEN') && has('AI_AGENT_GITHUB_OWNER')
   const gpuJobs = flag('LAB_ENABLE_GPU_JOBS') && has('GPU_JOBS_START_URL') && has('GPU_JOBS_STATUS_URL') && has('GPU_JOBS_TOKEN')
+  const licenses = weightsLicenses()
+  if (flag('LAB_ENABLE_WEIGHTS')) warnAboutLicenses(licenses)
   return {
     subagents: status(code, 'LAB_ENABLE_CODE_WRITES is not true', intEnv('LAB_SUBAGENTS_PER_DAY', 24, 0, 200)),
     sprite_session: status(
@@ -108,9 +150,12 @@ export function toolConfig(): ToolConfig {
       intEnv('LAB_GPU_JOBS_PER_DAY', 4, 0, 50),
     ),
     // Public weights are only for GPU jobs, and are fetched by the same Modal app.
+    // A license list with nothing usable in it turns them off: it must never
+    // quietly mean the default list.
     weights: status(
-      flag('LAB_ENABLE_WEIGHTS') && gpuJobs,
-      !flag('LAB_ENABLE_WEIGHTS') ? 'LAB_ENABLE_WEIGHTS is not true' : 'GPU jobs are off',
+      flag('LAB_ENABLE_WEIGHTS') && gpuJobs && !licenses.unusable,
+      !flag('LAB_ENABLE_WEIGHTS') ? 'LAB_ENABLE_WEIGHTS is not true'
+        : !gpuJobs ? 'GPU jobs are off' : 'LAB_WEIGHTS_LICENSES is set but names no license id',
       intEnv('LAB_WEIGHTS_PER_DAY', 2, 0, 20),
     ),
     exhibit: status(

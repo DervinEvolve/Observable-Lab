@@ -25,6 +25,25 @@ const REQUEST_TIMEOUT_MS = 30_000
 /** Seconds charged when the job's real time never came back. */
 export const GPU_JOB_WORST_CASE_S = GPU_JOB_MAX_S + 90
 
+/** How long an epoch waits for a job's result: LAB_GPU_JOB_POLL_MAX_MS, default 300 s, at most 600 s. */
+export function gpuJobWaitMs(): number {
+  const envWait = Number(process.env.LAB_GPU_JOB_POLL_MAX_MS)
+  return Number.isFinite(envWait) && envWait > 0 ? Math.min(envWait, 600_000) : 300_000
+}
+
+/**
+ * The wait left for a GPU job that first waited `waitedMs` for its weights.
+ * The fetch and the job run one after the other, so together they get the
+ * one wait a job always had, not that wait twice. null when too little is
+ * left for a job to finish in (its 120 s limit plus startup, or half the
+ * configured wait when that is shorter): starting it would spend GPU time on
+ * a result the epoch could not collect.
+ */
+export function gpuWaitAfterFetch(configuredMs: number, waitedMs: number): number | null {
+  const left = configuredMs - Math.max(0, waitedMs)
+  return left >= Math.min((GPU_JOB_MAX_S + 30) * 1000, configuredMs / 2) ? left : null
+}
+
 export interface GpuJobResult {
   status: 'ok' | 'error' | 'timeout' | 'crash' | 'failed'
   stage?: string
@@ -65,6 +84,8 @@ export function normalizeJobResult(raw: unknown): GpuJobResult {
   const wall = num(r.wall_seconds)
   // A syntax failure never started a GPU: only the tiny controller ran.
   // The same when the weights it named were not on the shelf (stage "weights").
+  // Stage "mount" (the sandbox could not read them) did start one, and is
+  // charged for its time like any other job.
   const noGpu = r.stage === 'syntax' || r.stage === 'input' || r.stage === 'weights'
   const cost = noGpu ? estimateGpuCost(Math.min(wall ?? 1, 5)) : estimateGpuCost(wall)
   return {
@@ -140,8 +161,7 @@ async function callJobsApp(body: Record<string, unknown>, pollMs: number, maxWai
  */
 export async function runGpuJob(script: string, opts: { pollMs?: number; maxWaitMs?: number; weights?: WeightsRef } = {}): Promise<GpuJobResult> {
   const pollMs = opts.pollMs ?? 5000
-  const envWait = Number(process.env.LAB_GPU_JOB_POLL_MAX_MS)
-  const maxWaitMs = opts.maxWaitMs ?? (Number.isFinite(envWait) && envWait > 0 ? Math.min(envWait, 600_000) : 300_000)
+  const maxWaitMs = opts.maxWaitMs ?? gpuJobWaitMs()
   const failed = (error: string, cost: number): GpuJobResult => ({
     status: 'failed', exit_code: null, log_tail: '', run_seconds: null, wall_seconds: null, gpu: null, error, cost_usd: cost, weights: null,
   })

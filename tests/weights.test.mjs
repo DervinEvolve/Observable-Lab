@@ -202,7 +202,8 @@ test('a repository id is org/name and nothing else', () => {
   assert.equal(pattern('REPO_ID_PATTERN'), `${part}/${part}`)
   assert.ok(tsSource.includes(`const REVISION = /^${pattern('REVISION_PATTERN')}$/`))
   assert.ok(tsSource.includes(`const SHA = /^${pattern('SHA_PATTERN')}$/`))
-  assert.ok(tsSource.includes(`const LICENSE = /^${pattern('LICENSE_PATTERN')}$/`))
+  const configSource = readFileSync(join(root, 'api/_lib/tools-config.ts'), 'utf8')
+  assert.ok(configSource.includes(`const LICENSE_ID = /^${pattern('LICENSE_PATTERN')}$/`))
 })
 
 test('a weights request and the weights a job names are read strictly', () => {
@@ -219,6 +220,21 @@ test('a weights request and the weights a job names are read strictly', () => {
   assert.deepEqual(weights.normalizeWeightsRef(`acme/tiny-model@${SHA}`), { ref: { repo: 'acme/tiny-model', sha: SHA } })
   for (const junk of ['gpt2', 'acme/tiny-model@main', `acme/tiny-model@${SHA}@x`, '@' + SHA, { repo: 'acme/tiny-model' }, 5, '', '/weights/acme/tiny-model']) {
     assert.ok('error' in weights.normalizeWeightsRef(junk), JSON.stringify(junk))
+  }
+})
+
+test('the weights field on a job is optional: left out, null, false or empty all mean a job with no weights', () => {
+  weightsOn()
+  for (const none of [undefined, null, false, '', '   ', '\n']) {
+    const planned = plan({ gpu_job: { purpose: 'tiny MLP', script: 'print(1)', weights: none } })
+    assert.deepEqual(planned.gpu_job, { purpose: 'tiny MLP', script: 'print(1)' }, JSON.stringify(none))
+    assert.deepEqual(planned.ignored, [], JSON.stringify(none))
+  }
+  // Anything else that is not an id still drops the job: it was written for weights it cannot have.
+  for (const bad of ['none', 'gpt2', 0, true, {}, []]) {
+    const planned = plan({ gpu_job: { purpose: 'tiny MLP', script: 'print(1)', weights: bad } })
+    assert.equal(planned.gpu_job, undefined, JSON.stringify(bad))
+    assert.equal(planned.ignored[0].tool, 'gpu_job')
   }
 })
 
@@ -260,6 +276,7 @@ test('with the flag off nothing changes: no prompt text, no request read, the sa
   // The GPU job's own lines are the ones the models had before this tool existed.
   assert.ok(context.includes('- GPU jobs on Modal: as Executor you may send one short Python script (Python 3.11 with torch 2.6 and numpy) to run on an A10G GPU. It has no network and no credentials, it is compiled first (a syntax error never starts the GPU), and it is stopped after 120 s. Its output is stored and shown to visitors.'))
   assert.ok(executor.includes('    "gpu_job": { "purpose": "one line", "script": "Python source, at most 20000 characters" }\n'))
+  assert.ok(executor.includes('\nThe GPU script runs as job.py with no network and no files from the lab. Print what you want to see; the last part of the output is kept.'))
 
   // A request for weights is an unavailable tool; a "weights" field on a job is left alone, as any extra field was.
   const planned = plan({ weights: { repo: 'acme/tiny-model' }, gpu_job: { purpose: 'probe', script: 'print(1)', weights: 'not even an id' } })
@@ -299,7 +316,11 @@ test('when it is on the models are told what it does and its limits, and nothing
   const executor = prompts.executorToolsSection()
   assert.match(executor, /"weights": \{ "repo": "org\/name on Hugging Face", "revision": "a branch, tag or commit \(optional\)" \}/)
   assert.match(executor, /"gpu_job": \{ "purpose": "one line", "script": "Python source, at most 20000 characters", "weights": "org\/name of fetched weights \(optional\)" \}/)
-  assert.match(executor, /fetched before the GPU job starts/)
+  assert.match(executor, /fetched before the GPU job that names them starts/)
+  assert.match(executor, /share one wait: if the fetch leaves too little of it, the job is not started and the weights stay on the shelf/)
+  // The job's own line no longer says "no files from the lab" flatly: a job that names weights has some.
+  assert.match(executor, /runs as job\.py with no network and no files from the lab other than the weights it names \(next paragraph\)\. Print/)
+  assert.doesNotMatch(executor, /no files from the lab\./)
   assert.match(executor, /LAB_WEIGHTS_DIR/)
   assert.match(executor, /a job that names none has no \/weights/)
   assert.match(executor, /the job is not started and the reason is stored/)
@@ -322,8 +343,11 @@ test('the limits come from the environment, with the documented defaults and cei
   assert.deepEqual(weights.weightsLimits(), { licenses: ['apache-2.0', 'mit', 'bsd-3-clause', 'bsd-2-clause', 'cc-by-4.0'], max_gb: 3, shelf_gb: 30 })
   Object.assign(process.env, { LAB_WEIGHTS_LICENSES: ' MIT , not a license!, mit,cc0-1.0 ', LAB_WEIGHTS_MAX_GB: '0.5', LAB_WEIGHTS_SHELF_GB: '10' })
   assert.deepEqual(weights.weightsLimits(), { licenses: ['cc0-1.0', 'mit'], max_gb: 0.5, shelf_gb: 10 })
+  // A list that is set is never widened to the defaults, however badly it is written.
   Object.assign(process.env, { LAB_WEIGHTS_LICENSES: '!!!, ,', LAB_WEIGHTS_MAX_GB: '-3', LAB_WEIGHTS_SHELF_GB: 'lots' })
-  assert.deepEqual(weights.weightsLimits(), { licenses: ['apache-2.0', 'mit', 'bsd-3-clause', 'bsd-2-clause', 'cc-by-4.0'], max_gb: 3, shelf_gb: 30 })
+  assert.deepEqual(weights.weightsLimits(), { licenses: [], max_gb: 3, shelf_gb: 30 })
+  process.env.LAB_WEIGHTS_LICENSES = '   '
+  assert.deepEqual(weights.weightsLimits().licenses, ['apache-2.0', 'mit', 'bsd-3-clause', 'bsd-2-clause', 'cc-by-4.0'])
   Object.assign(process.env, { LAB_WEIGHTS_MAX_GB: '9999', LAB_WEIGHTS_SHELF_GB: '99999' })
   assert.deepEqual([weights.weightsLimits().max_gb, weights.weightsLimits().shelf_gb], [20, 500])
   Object.assign(process.env, { LAB_WEIGHTS_MAX_GB: '8', LAB_WEIGHTS_SHELF_GB: '2' })
@@ -578,6 +602,206 @@ test('weights that are not on the shelf never start a GPU, and a slow fetch does
   assert.deepEqual(plan({ weights: { repo: 'gpt2' } }).ignored, [{ tool: 'weights', reason: 'repo must be a Hugging Face repository id written as org/name' }])
 })
 
+test('a misspelt license list turns public weights off, and never means the default list', async () => {
+  weightsOn()
+  for (const misspelt of ['mit;apache-2.0', 'Apache 2.0', '"mit"', '!!!, ,']) {
+    process.env.LAB_WEIGHTS_LICENSES = misspelt
+    const config = toolsConfig.toolConfig()
+    assert.equal(config.weights.enabled, false, misspelt)
+    assert.equal(config.weights.off_reason, 'LAB_WEIGHTS_LICENSES is set but names no license id', misspelt)
+    assert.deepEqual(toolsConfig.enabledTools(), ['gpu_job'], misspelt)
+    assert.deepEqual(weights.weightsLimits().licenses, [], misspelt)
+    assert.doesNotMatch(`${prompts.toolLines()}\n${prompts.executorToolsSection()}`, /weights|Hugging Face/i, misspelt)
+  }
+  // It is said in the logs, once per value, without printing the value.
+  const said = logs.filter(l => /LAB_WEIGHTS_LICENSES/.test(l))
+  assert.equal(said.length, 4)
+  for (const line of said) {
+    assert.match(line, /is set but names no license id .*public weights stay off/)
+    assert.doesNotMatch(line, /Apache 2\.0|mit;apache/)
+  }
+  toolsConfig.toolConfig()
+  assert.equal(logs.filter(l => /LAB_WEIGHTS_LICENSES/.test(l)).length, 4)
+
+  // No request reaches Modal, and a job is sent as it is with the switch off.
+  const planned = plan({ weights: { repo: 'acme/tiny-model' }, gpu_job: { purpose: 'probe', script: 'print(1)', weights: 'acme/tiny-model' } })
+  assert.deepEqual(planned.ignored, [{ tool: 'weights', reason: 'not enabled' }])
+  const calls = []
+  globalThis.fetch = fakeModal(calls, { fetchResult: FETCH_OK, jobResult: jobOk })
+  await epochTools.runSideTools(ctx(), planned, new Set())
+  assert.deepEqual(calls.filter(c => c.path === '/start').map(c => c.raw), [JSON.stringify({ script: 'print(1)' })])
+  assert.equal(lab.run('gpu_job').request_summary, 'probe')
+
+  // A list with some good entries is narrowed to those, stays on, and says how many were left out.
+  logs = []
+  process.env.LAB_WEIGHTS_LICENSES = 'mit, Apache 2.0, BSD-3-Clause'
+  assert.equal(toolsConfig.toolConfig().weights.enabled, true)
+  assert.deepEqual(weights.weightsLimits().licenses, ['bsd-3-clause', 'mit'])
+  assert.match(prompts.toolLines(), /every license it states is one of bsd-3-clause, mit,/)
+  assert.deepEqual(logs.filter(l => /LAB_WEIGHTS_LICENSES/.test(l)), ['[Tools] LAB_WEIGHTS_LICENSES: 1 entry is not a license id and was left out; 2 licenses allowed'])
+
+  // With the switch off the variable is not looked at aloud.
+  logs = []
+  process.env.LAB_ENABLE_WEIGHTS = 'false'
+  process.env.LAB_WEIGHTS_LICENSES = 'nonsense list'
+  assert.match(toolsConfig.toolConfig().weights.off_reason, /LAB_ENABLE_WEIGHTS is not true/)
+  assert.deepEqual(logs, [])
+})
+
+test('a job that does not name the weights being fetched starts at once, beside the fetch', async () => {
+  weightsOn()
+  process.env.LAB_WEIGHTS_POLL_MAX_MS = '150'
+  for (const [named, sent] of [[undefined, undefined], ['', undefined], ['acme/other-model', { repo: 'acme/other-model' }]]) {
+    lab = new FakeLab()
+    db.handler = (text, values) => lab.handle(text, values)
+    const calls = []
+    // The fetch never finishes inside its wait; the job answers at once.
+    globalThis.fetch = fakeModal(calls, { fetchResult: FETCH_OK, jobResult: jobOk, pending: ['fetch'] })
+    const tools = { weights: { repo: 'acme/tiny-model' }, gpu_job: { purpose: 'tiny MLP', script: 'print(1)' } }
+    if (named !== undefined) tools.gpu_job.weights = named
+    await sideTools(tools)
+
+    const order = calls.map(c => (c.path === '/start' ? (c.body.fetch_weights ? 'start fetch' : 'start job') : `status ${new URL(c.url).searchParams.get('call_id').replace(/-\d+$/, '')}`))
+    // The job was started and answered while the fetch was still being waited for.
+    assert.ok(order.indexOf('status fc-job') >= 0, JSON.stringify(named))
+    assert.ok(order.indexOf('status fc-job') < order.lastIndexOf('status fc-fetch'), `${JSON.stringify(named)}: ${order.join(', ')}`)
+    const job = calls.find(c => c.path === '/start' && c.body.script)
+    assert.deepEqual(job.body.weights && { repo: job.body.weights.repo, sha: job.body.weights.sha }, sent && { repo: sent.repo, sha: undefined }, JSON.stringify(named))
+    assert.equal(lab.run('gpu_job').status, 'ok')
+    assert.equal(lab.run('weights').status, 'timeout')
+  }
+})
+
+/** Runs `fn` with a clock that jumps forward by `jump(call)` milliseconds as each request to Modal is answered. */
+async function withJumpingClock(jump, inner, fn) {
+  const realNow = Date.now
+  let skew = 0
+  Date.now = () => realNow() + skew
+  globalThis.fetch = async (url, options) => {
+    const res = await inner(url, options)
+    const u = new URL(String(url))
+    skew += jump({ path: u.pathname, id: u.searchParams.get('call_id') || '', body: options?.body ? JSON.parse(options.body) : null }) || 0
+    return res
+  }
+  try { return await fn() } finally { Date.now = realNow }
+}
+
+test('a fetch and the job that waits for it share the one wait a job always had', async () => {
+  // The rule itself: what is left of the job's wait, or null when a job could not finish in it.
+  assert.equal(gpu.gpuJobWaitMs(), 300_000)
+  assert.equal(gpu.gpuWaitAfterFetch(300_000, 0), 300_000)
+  assert.equal(gpu.gpuWaitAfterFetch(300_000, 100_000), 200_000)
+  assert.equal(gpu.gpuWaitAfterFetch(300_000, 150_000), 150_000)
+  assert.equal(gpu.gpuWaitAfterFetch(300_000, 150_001), null)
+  assert.equal(gpu.gpuWaitAfterFetch(300_000, 400_000), null)
+  assert.equal(gpu.gpuWaitAfterFetch(600_000, 300_000), 300_000)
+  assert.equal(gpu.gpuWaitAfterFetch(600_000, 450_001), null)   // under the 120 s limit plus startup
+  assert.equal(gpu.gpuWaitAfterFetch(100_000, 50_000), 50_000)  // a short configured wait: half of it
+  assert.equal(gpu.gpuWaitAfterFetch(100_000, 50_001), null)
+  assert.equal(gpu.gpuWaitAfterFetch(300_000, -5), 300_000)
+  for (const [fetchWait, jobWait] of [[180_000, 300_000], [300_000, 300_000], [300_000, 600_000]]) {
+    // Whatever the two settings, a fetch and its job together never wait longer than the job's own setting.
+    for (let waited = 0; waited <= fetchWait; waited += 10_000) {
+      const left = gpu.gpuWaitAfterFetch(jobWait, waited)
+      assert.ok(left === null || waited + left <= jobWait)
+    }
+  }
+  process.env.LAB_GPU_JOB_POLL_MAX_MS = '9999999'
+  assert.equal(gpu.gpuJobWaitMs(), 600_000)
+  delete process.env.LAB_GPU_JOB_POLL_MAX_MS
+
+  weightsOn()
+  const tools = { weights: { repo: 'acme/tiny-model' }, gpu_job: { purpose: 'probe', script: 'print(1)', weights: 'acme/tiny-model' } }
+
+  // The fetch took 100 s of the 300 s. The job then never answers: the lab gives up 200 s later, not 300 s.
+  let calls = []
+  await withJumpingClock(
+    c => (c.id.startsWith('fc-fetch') ? 100_000 : c.id.startsWith('fc-job') ? 250_000 : 0),
+    fakeModal(calls, { fetchResult: FETCH_OK, jobResult: jobOk, pending: ['job'] }),
+    () => sideTools(tools),
+  )
+  assert.equal(lab.run('weights').status, 'ok')
+  let ran = lab.run('gpu_job')
+  assert.equal(ran.status, 'error')
+  assert.equal(ran.output_tail, 'error: no result after 200 s of waiting')
+  assert.equal(calls.filter(c => c.path === '/status' && c.url.includes('fc-job')).length, 1)
+  // Lost, so charged at the worst case and on the ledger.
+  assert.ok(Math.abs(lab.modelCalls.find(c => c.model_id === 'tool/gpu_job').cost_usd - 210 * 0.000306) < 1e-12)
+
+  // The fetch took 160 s: too little is left for a job, so none is started and no GPU time is spent.
+  lab = new FakeLab()
+  db.handler = (text, values) => lab.handle(text, values)
+  calls = []
+  const out = await withJumpingClock(
+    c => (c.id.startsWith('fc-fetch') ? 160_000 : 0),
+    fakeModal(calls, { fetchResult: FETCH_OK, jobResult: jobOk }),
+    () => sideTools(tools),
+  )
+  assert.equal(lab.run('weights').status, 'ok')
+  assert.equal(calls.filter(c => c.path === '/start' && c.body.script).length, 0)
+  ran = lab.run('gpu_job')
+  assert.equal(ran.status, 'skipped')
+  assert.equal(ran.output_tail, 'its weights (acme/tiny-model) took 160 s to arrive, which leaves too little of this epoch\'s wait for a job; they are on the shelf now')
+  assert.deepEqual(lab.modelCalls.map(c => c.model_id), ['tool/weights'])
+  assert.equal(out.find(o => o.tool === 'gpu_job').status, 'skipped')
+
+  // A job that did not wait for a fetch has its whole wait, as before.
+  lab = new FakeLab()
+  db.handler = (text, values) => lab.handle(text, values)
+  calls = []
+  await withJumpingClock(
+    c => (c.id.startsWith('fc-job') ? 350_000 : 0),
+    fakeModal(calls, { jobResult: jobOk, pending: ['job'] }),
+    () => sideTools({ gpu_job: { purpose: 'probe', script: 'print(1)', weights: 'acme/tiny-model' } }),
+  )
+  assert.equal(lab.run('gpu_job').output_tail, 'error: no result after 300 s of waiting')
+})
+
+test('a job that waited for its fetch is checked against the budget without the fetch\'s worst case a second time', async () => {
+  weightsOn()
+  // Worst cases at the default rate: a fetch 960 s ($0.294), a job 210 s ($0.064). Together $0.358.
+  process.env.LAB_DAILY_BUDGET_USD = '0.36'
+  let calls = []
+  globalThis.fetch = fakeModal(calls, { fetchResult: FETCH_OK, jobResult: jobOk })
+  await sideTools({ weights: { repo: 'acme/tiny-model' }, gpu_job: { purpose: 'probe', script: 'print(1)', weights: 'acme/tiny-model' } })
+  // The fetch cost $0.006 for its 20 s. The job's own worst case fits in what is left, so it runs.
+  assert.equal(lab.run('weights').status, 'ok')
+  assert.equal(lab.run('gpu_job').status, 'ok')
+  assert.deepEqual(lab.modelCalls.map(c => c.model_id), ['tool/weights', 'tool/gpu_job'])
+
+  // Started together, both are still checked against their combined worst case.
+  lab = new FakeLab()
+  db.handler = (text, values) => lab.handle(text, values)
+  process.env.LAB_DAILY_BUDGET_USD = '0.35'
+  calls = []
+  globalThis.fetch = fakeModal(calls, { fetchResult: FETCH_OK, jobResult: jobOk })
+  await sideTools({ weights: { repo: 'acme/tiny-model' }, gpu_job: { purpose: 'tiny MLP', script: 'print(1)' } })
+  assert.equal(calls.length, 0)
+  assert.match(lab.run('weights').output_tail, /its worst case \(\$0\.36\) would pass today's budget/)
+  assert.match(lab.run('gpu_job').output_tail, /its worst case \(\$0\.36\) would pass today's budget/)
+})
+
+test('a job whose sandbox could not read its weights is charged, stored with the reason, and carries no label', async () => {
+  weightsOn()
+  const calls = []
+  globalThis.fetch = fakeModal(calls, { jobResult: {
+    status: 'error', stage: 'mount', error: 'the script was not run. acme/tiny-model could not be read at /weights (it may have just been removed from the shelf); ask for it with the weights tool again',
+    exit_code: null, log_tail: '', run_seconds: null, wall_seconds: 25, gpu: 'A10G', weights: null,
+  } })
+  const out = await sideTools({ gpu_job: { purpose: 'probe', script: 'print(1)', weights: 'acme/tiny-model' } })
+  const ran = lab.run('gpu_job')
+  assert.equal(ran.status, 'failed')
+  assert.equal(ran.request_summary, 'probe') // neither "fine-tuned from" nor "from scratch": the script never ran
+  assert.equal(ran.detail.label, undefined)
+  assert.equal(ran.detail.stage, 'mount')
+  assert.match(ran.output_tail, /the script was not run/)
+  assert.ok(Math.abs(ran.cost_usd - 25 * 0.000306) < 1e-12) // a sandbox did start
+  assert.match(out[0].summary, /'s GPU job: error at stage mount$/)
+  // The Modal file has that stage, and reports weights only after the sandbox has read the manifest.
+  assert.match(MODAL_SOURCE, /"stage": "mount"/)
+  assert.ok(MODAL_SOURCE.indexOf('if not mount_matches(seen, found["repo"], found["sha"]):') < MODAL_SOURCE.indexOf('mounted = {"repo": found["repo"], "sha": found["sha"], "license": found["license"]}'))
+})
+
 test('the daily limit, the budget and a resumed epoch stop a fetch before it starts', async () => {
   weightsOn()
   process.env.LAB_WEIGHTS_PER_DAY = '1'
@@ -630,6 +854,14 @@ test('the documents name the switch, the settings and the deploy command', () =>
   assert.ok(ops.includes('oblab-weights'))
   assert.match(tools, /\| `weights` \| `LAB_ENABLE_WEIGHTS=true` \|/)
   assert.match(tools, /apache-2\.0, mit, bsd-3-clause, bsd-2-clause, cc-by-4\.0/)
+  // The check by hand has a command for each step it expects a result from, each with its own poll,
+  // and the token is cleared only after the last of them.
+  const smoke = ops.slice(ops.indexOf('read -s JOBS_TOKEN'), ops.indexOf('unset JOBS_TOKEN'))
+  assert.equal((smoke.match(/curl -sS -X POST "\$START"/g) || []).length, 5)
+  assert.ok((smoke.match(/curl -sS "\$STATUS\?call_id=/g) || []).length >= 5)
+  const withoutWeights = smoke.slice(smoke.indexOf('# d)'), smoke.indexOf('# e)'))
+  assert.match(withoutWeights, /-d '\{"script":"import os/)
+  assert.doesNotMatch(withoutWeights, /"weights":\{/)
   for (const text of [tools, ops]) {
     const section = text.slice(text.indexOf('## Public weights'))
     assert.ok(section.length > 500)

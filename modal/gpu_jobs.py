@@ -31,7 +31,9 @@
 #
 #   A job that names weights gets that one shelf entry mounted read-only at
 #   /weights. Its network stays blocked. A job that names none gets no volume,
-#   exactly as before. The job's result says which weights were mounted.
+#   exactly as before. The job's result says which weights were mounted, and
+#   the controller reads the entry's manifest inside the sandbox before the
+#   script runs, so a result never names weights the job could not read.
 #
 # Deploy:  modal deploy modal/gpu_jobs.py
 # Secret:  modal secret create oblab-gpu-jobs-auth JOBS_TOKEN=<random, 32+ chars>
@@ -44,6 +46,8 @@
 #
 # job result:   {status: ok|error|timeout|crash, stage?, exit_code, log_tail,
 #                run_seconds, wall_seconds, gpu, weights: null | {repo, sha, license}}
+#               stage "weights": the named weights are not on the shelf, no GPU started;
+#               stage "mount": the sandbox could not read them, the script was not run
 # fetch result: {status: ok, cached, repo, sha, license, size_bytes, files, evicted, wall_seconds}
 #             | {status: refused, rule, reason, wall_seconds}
 #             | {status: error, stage, error, wall_seconds}
@@ -88,6 +92,10 @@ DEFAULT_SHELF_GB = 30.0
 HARD_MAX_GB = 20.0
 HARD_SHELF_GB = 500.0
 FETCH_TIMEOUT_S = 900
+# A shelf entry asked for or named by a job this recently is not removed to
+# make room: a job that has just found it may be about to mount it. This is
+# run_job's own time limit (JOB_TIMEOUT_S + 180).
+IN_USE_S = 300
 MAX_WEIGHT_FILES = 64
 MAX_JSON_CHECK_BYTES = 32 * 1024 * 1024
 REPO_ID_PATTERN = r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?"
@@ -151,6 +159,14 @@ finally:
     os.close(fd)
 """
 
+# Run inside the sandbox, before the model's script exists there: prints the
+# repository and commit that the manifest of the mounted shelf entry names.
+WEIGHTS_CHECK = """import json, sys
+with open(sys.argv[1], 'r', encoding='utf-8') as f:
+    m = json.load(f)
+print(json.dumps({'repo': m.get('repo'), 'sha': m.get('sha')}))
+"""
+
 
 # ---------------------------------------------------------------------------
 # Public weights: the rules. Plain functions with the network, the clock and
@@ -169,11 +185,27 @@ def valid_revision(revision) -> bool:
             and ".." not in revision)
 
 
-def weights_limits(raw) -> dict:
-    """The limits for one fetch: the lab server's, held under this file's ceilings. 1 GB is 10^9 bytes."""
+def limits_as_sent(raw) -> dict:
+    """The lab server's limits as it wrote them, {licenses?, max_gb?, shelf_gb?}, and no other key.
+    This is what start hands to fetch_weights. They are turned into numbers once, by weights_limits
+    inside the fetch: weights_limits reads max_gb and shelf_gb, so running it over its own output
+    would put the defaults back."""
     raw = raw if isinstance(raw, dict) else {}
+    return {key: raw[key] for key in ("licenses", "max_gb", "shelf_gb") if key in raw}
+
+
+def weights_limits(raw) -> dict:
+    """The limits for one fetch: the lab server's, held under this file's ceilings. 1 GB is 10^9 bytes.
+
+    `raw` is {licenses?, max_gb?, shelf_gb?} as the lab server sent it. The
+    default licenses apply only when no list was sent. A list that was sent is
+    never widened: if none of its entries is a license id the result is an
+    empty list, and every repository is refused.
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    listed = isinstance(raw.get("licenses"), (list, tuple))
     names = []
-    if isinstance(raw.get("licenses"), (list, tuple)):
+    if listed:
         for item in raw["licenses"][:40]:
             if isinstance(item, str) and re.fullmatch(LICENSE_PATTERN, item.strip().lower()):
                 names.append(item.strip().lower())
@@ -186,7 +218,7 @@ def weights_limits(raw) -> dict:
 
     max_gb = gb("max_gb", DEFAULT_MAX_GB, HARD_MAX_GB)
     shelf_gb = max(gb("shelf_gb", DEFAULT_SHELF_GB, HARD_SHELF_GB), max_gb)
-    return {"licenses": sorted(set(names)) or list(DEFAULT_LICENSES),
+    return {"licenses": sorted(set(names)) if listed else list(DEFAULT_LICENSES),
             "max_bytes": int(max_gb * 1e9), "shelf_bytes": int(shelf_gb * 1e9)}
 
 
@@ -245,7 +277,7 @@ def check_repo(info, repo, limits) -> dict:
         return no("license", "the repository states no license")
     for name in licenses:
         if name not in limits["licenses"]:
-            return no("license", f"license {name[:40]} is not on the lab's list ({', '.join(limits['licenses'])})")
+            return no("license", f"license {name[:40]} is not on the lab's list ({', '.join(limits['licenses']) or 'the list is empty'})")
     siblings = info.get("siblings")
     if not isinstance(siblings, list) or not siblings:
         return no("hub", "the hub listed no files")
@@ -357,6 +389,20 @@ def plan_eviction(entries, need_bytes, cap_bytes, keep=()):
     return out if total + need_bytes <= cap_bytes else None
 
 
+def in_use(entries, now_value, window_s=IN_USE_S) -> set:
+    """Keys of the shelf entries asked for or named by a job in the last `window_s` seconds."""
+    return {e["key"] for e in entries if now_value - e["last_used"] < window_s}
+
+
+def mount_matches(output, repo, sha) -> bool:
+    """True when what WEIGHTS_CHECK printed inside the sandbox names this repository and commit."""
+    try:
+        seen = json.loads(output)
+    except (TypeError, ValueError):
+        return False
+    return isinstance(seen, dict) and seen.get("repo") == repo and seen.get("sha") == sha
+
+
 def fetch_core(repo, revision, limits, root, hub_info, hub_download, used, now) -> dict:
     """One whole fetch. `hub_info(repo, revision) -> (http_status, json or None)`
     and `hub_download(repo, sha, path, dest, declared_size) -> {size, sha256, git_sha1}`
@@ -397,9 +443,13 @@ def fetch_core(repo, revision, limits, root, hub_info, hub_download, used, now) 
         return {"status": "ok", "cached": True, "repo": repo, "sha": sha, "license": manifest["license"],
                 "size_bytes": manifest["size_bytes"], "files": len(manifest.get("files") or []), "evicted": []}
 
-    evict = plan_eviction(entries, checked["size_bytes"], limits["shelf_bytes"])
-    if evict is None:
-        return {"status": "refused", "rule": "shelf", "reason": "it does not fit on the lab's shelf"}
+    # Entries in use just now are kept. This first plan only stops a download
+    # that could not fit; what is removed is decided again after the download,
+    # which can take minutes, from what is in use then.
+    no_room = {"status": "refused", "rule": "shelf",
+               "reason": "it does not fit on the lab's shelf (weights used in the last few minutes are not removed to make room)"}
+    if plan_eviction(entries, checked["size_bytes"], limits["shelf_bytes"], keep=in_use(entries, now())) is None:
+        return no_room
 
     records = []
     try:
@@ -429,6 +479,11 @@ def fetch_core(repo, revision, limits, root, hub_info, hub_download, used, now) 
                             "reason": f"{f['path'][:80]} has an auto_map entry, which needs the repository's own code"}
             records.append({"path": f["path"], "size": got["size"], "sha256": got["sha256"]})
 
+        entries = [e for e in shelf_scan(root, used)[0] if e["key"] != key]
+        evict = plan_eviction(entries, checked["size_bytes"], limits["shelf_bytes"], keep=in_use(entries, now()))
+        if evict is None:
+            shutil.rmtree(target, ignore_errors=True)
+            return no_room
         evicted = []
         for e in entries:
             if e["key"] in evict:
@@ -606,7 +661,10 @@ def run_job(script: str, weights: dict | None = None) -> dict:
     # Named weights: found on the shelf before any GPU starts, and then that
     # one entry (nothing else on the shelf) is mounted read-only. Without a
     # name the sandbox is created exactly as before, with no volume.
+    # `mounted` is what every result reports. It stays None until the sandbox
+    # itself has read that entry's manifest (below).
     mounted = None
+    found = None
     sandbox_extra = {}
     sandbox_env = {"PYTHONUNBUFFERED": "1"}
     if weights is not None:
@@ -614,7 +672,6 @@ def run_job(script: str, weights: dict | None = None) -> dict:
         if not found["ok"]:
             return {"status": "error", "stage": "weights", "error": f"no GPU was started. {found['error']}",
                     "exit_code": None, "log_tail": "", "wall_seconds": time.time() - t0, "gpu": None, "weights": None}
-        mounted = {"repo": found["repo"], "sha": found["sha"], "license": found["license"]}
         sandbox_extra = {"volumes": {WEIGHTS_MOUNT: weights_volume.with_mount_options(
             read_only=True, sub_path=f"/{found['repo']}/{found['sha']}")}}
         sandbox_env["LAB_WEIGHTS_DIR"] = WEIGHTS_MOUNT
@@ -631,6 +688,28 @@ def run_job(script: str, weights: dict | None = None) -> dict:
             cpu=(2, 4), memory=(4096, 16384), block_network=True, secrets=[],
             env=sandbox_env, workdir="/tmp", **sandbox_extra,
         )
+        if found is not None:
+            # The entry was found through the API a moment ago. Modal creates
+            # an empty directory when a sub_path is not there, so if the entry
+            # was removed in between, /weights is empty. Read its manifest
+            # here, before the model's script is in the sandbox, and do not
+            # run the script (or report any weights) unless it is that commit.
+            seen = ""
+            try:
+                check = sb.exec("python", "-I", "-c", WEIGHTS_CHECK, f"{WEIGHTS_MOUNT}/{MANIFEST_NAME}", timeout=20)
+                seen = check.stdout.read()
+                check.wait()
+                if check.returncode != 0:
+                    seen = ""
+            except Exception:
+                seen = ""
+            if not mount_matches(seen, found["repo"], found["sha"]):
+                return {"status": "error", "stage": "mount",
+                        "error": f"the script was not run. {found['repo']} could not be read at {WEIGHTS_MOUNT} "
+                                 "(it may have just been removed from the shelf); ask for it with the weights tool again",
+                        "exit_code": None, "log_tail": "", "run_seconds": None,
+                        "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": None}
+            mounted = {"repo": found["repo"], "sha": found["sha"], "license": found["license"]}
         sb.filesystem.write_text(script, "/tmp/job.py")
         t_run = time.time()
         proc = sb.exec("python", "-c", SUPERVISOR, timeout=JOB_TIMEOUT_S)
@@ -679,7 +758,7 @@ def start(body: dict, request: Request) -> dict:
         revision = fetch.get("revision") if fetch.get("revision") is not None else "main"
         if not valid_revision(revision):
             raise HTTPException(status_code=400, detail="revision must be a branch, tag or commit sha")
-        call = fetch_weights.spawn(fetch["repo"], revision, weights_limits(fetch.get("limits")))
+        call = fetch_weights.spawn(fetch["repo"], revision, limits_as_sent(fetch.get("limits")))
         return {"call_id": call.object_id}
     script = body.get("script") if isinstance(body, dict) else None
     if not isinstance(script, str) or not script.strip() or len(script) > MAX_SCRIPT_CHARS:

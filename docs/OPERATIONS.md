@@ -158,23 +158,36 @@ STATUS=https://dervinevolve--oblab-gpu-jobs-status.us-east.modal.run
 # a) Fetch a small public model (about 18 MB, apache-2.0, safetensors).
 curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
   -d '{"fetch_weights":{"repo":"google/bert_uncased_L-2_H-128_A-2"}}'
-# prints {"call_id":"fc-..."}; poll it until status is "done":
+# prints {"call_id":"fc-..."}; poll it until status is "done". Every call below prints its own
+# call_id, and each is polled the same way with that id:
 curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
 
 # b) A gated repository must be refused.
 curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
   -d '{"fetch_weights":{"repo":"meta-llama/Llama-2-7b-hf"}}'
+curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
 
 # c) A job that names the weights: it must see them, fail to write, and have no network.
 curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
   -d '{"weights":{"repo":"google/bert_uncased_L-2_H-128_A-2"},"script":"import os, urllib.request\nprint(sorted(os.listdir(\"/weights\")))\ntry:\n    open(\"/weights/x\", \"w\")\n    print(\"WRITABLE\")\nexcept OSError as e:\n    print(\"read-only:\", e)\ntry:\n    urllib.request.urlopen(\"https://huggingface.co\", timeout=5)\n    print(\"NETWORK OPEN\")\nexcept Exception as e:\n    print(\"network blocked:\", type(e).__name__)\n"}'
+curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
 
 # d) The same script without "weights": there must be no /weights at all.
+#    This is the path every GPU job takes today, so it also shows the redeploy left plain jobs working.
+curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"script":"import os, urllib.request\nprint(sorted(os.listdir(\"/weights\")))\ntry:\n    open(\"/weights/x\", \"w\")\n    print(\"WRITABLE\")\nexcept OSError as e:\n    print(\"read-only:\", e)\ntry:\n    urllib.request.urlopen(\"https://huggingface.co\", timeout=5)\n    print(\"NETWORK OPEN\")\nexcept Exception as e:\n    print(\"network blocked:\", type(e).__name__)\n"}'
+curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
+
+# e) My limits reach the fetcher: with a 0.01 GB limit the same small model is refused for its size.
+curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fetch_weights":{"repo":"google/bert_uncased_L-2_H-128_A-2","limits":{"max_gb":0.01}}}'
+curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
+
 unset JOBS_TOKEN
 modal volume ls oblab-weights google/bert_uncased_L-2_H-128_A-2
 ```
 
-What I expect: (a) ends with `"status":"ok","cached":false` and a 40 character `sha`, and asking again gives `"cached":true`; (b) ends with `"status":"refused","rule":"gated"`; (c) prints `['_lab_manifest.json', 'config.json', 'model.safetensors', 'vocab.txt']`, a `read-only:` line and a `network blocked:` line, and its result has `"weights":{"repo":"google/bert_uncased_L-2_H-128_A-2",...}`; (d) fails with `FileNotFoundError` and its result has `"weights":null`. If (c) prints `WRITABLE` or `NETWORK OPEN`, or the job in (c) fails at stage `sandbox`, leave the flag off.
+What I expect: (a) ends with `"status":"ok","cached":false` and a 40 character `sha`, and asking again gives `"cached":true`; (b) ends with `"status":"refused","rule":"gated"`; (c) prints `['_lab_manifest.json', 'config.json', 'model.safetensors', 'vocab.txt']`, a `read-only:` line and a `network blocked:` line, and its result has `"weights":{"repo":"google/bert_uncased_L-2_H-128_A-2",...}`; (d) ends with `"status":"error","stage":"run"`, a `FileNotFoundError` for `/weights` in its `log_tail`, and `"weights":null`; (e) ends with `"status":"refused","rule":"size"`, which shows a limit sent with a request is the one the fetcher applies. If (c) prints `WRITABLE` or `NETWORK OPEN`, or the job in (c) fails at stage `sandbox` or `mount`, or (d) ends at any stage but `run`, leave the flag off. If (d) is the one that fails, plain GPU jobs are broken too: deploy `modal/gpu_jobs.py` from the commit before this feature again.
 
 I ran the fetcher's rules and its download and hash checks against the live Hugging Face API from a development machine, and that model passed while a gated one, one with custom code and one with only pickle weights were refused. I have not run any of this on Modal: the fetch function itself, the Volume, and above all the read-only mount of one shelf entry into a sandbox (`with_mount_options(read_only=True, sub_path=...)`, which the Modal SDK 1.6.3 has) are untested there. Step 2 is that test.
 
@@ -184,16 +197,22 @@ I ran the fetcher's rules and its download and hash checks against the live Hugg
 |---|---|---|
 | `LAB_ENABLE_WEIGHTS` | false | The switch. Only the exact value `true` turns it on. |
 | `LAB_WEIGHTS_PER_DAY` | 2 | Requests per UTC day, 0 to 20. A shelf hit and a refusal count; a skipped request does not. |
-| `LAB_WEIGHTS_LICENSES` | apache-2.0, mit, bsd-3-clause, bsd-2-clause, cc-by-4.0 | Comma separated license ids as Hugging Face writes them. |
+| `LAB_WEIGHTS_LICENSES` | apache-2.0, mit, bsd-3-clause, bsd-2-clause, cc-by-4.0 | Comma separated license ids as Hugging Face writes them (lower case, like `apache-2.0`). The defaults apply only when it is not set. An entry that is not an id is left out, and if none is left the tool is off; it never falls back to the defaults. |
 | `LAB_WEIGHTS_MAX_GB` | 3 | Largest download, in GB of 10^9 bytes. The Modal side never allows more than 20. |
 | `LAB_WEIGHTS_SHELF_GB` | 30 | Size of the shelf before the least recently used entries are removed. Never more than 500. |
 | `LAB_WEIGHTS_POLL_MAX_MS` | 180000 | How long an epoch waits for a fetch, at most 300000. |
 
 These limits are read by the server and sent to the fetcher with each request, so changing one needs a Vercel redeploy and no Modal deploy. The next epoch's prompts show the new numbers.
 
-**Timing.** A fetch and the GPU job that waits for it run one after the other, so together they can take up to 180 s plus 300 s of the 800 s an epoch has. If that is too tight, lower `LAB_WEIGHTS_POLL_MAX_MS`: a fetch that is not ready in time carries on at Modal and is on the shelf for the next epoch.
+**A license list I wrote wrongly.** If `LAB_WEIGHTS_LICENSES` is set and nothing in it is a license id (for example `mit;apache-2.0` or `Apache 2.0`), public weights stay off, the models are told nothing about them, and the function log says `LAB_WEIGHTS_LICENSES is set but names no license id`. If only some entries are wrong, the list is the good ones and the log says how many were left out. The Modal side does the same with the list it is sent: a list that was sent is never widened.
+
+**Timing.** Only a GPU job that names the repository asked for in the same answer waits for that fetch. Any other job starts at once, beside the fetch, as GPU jobs always have. A job that does wait shares its own wait with the fetch: together they get `LAB_GPU_JOB_POLL_MAX_MS` (default 300 s), not that plus the fetch's wait. If the fetch leaves less than 150 s of it (or less than half of it, when I have set it under 300 s), the job is not started, it is stored as skipped with the reason, and the weights are on the shelf for a later epoch. So this tool does not make the side tools hold an epoch longer than a GPU job alone already could.
+
+What that does not fix, because it was already so before this tool: a GPU job's row and its spend are written when its result comes back. If Vercel stops the function at 800 s while a job is still running, Modal bills that job, nothing is written to `model_calls`, and the resumed epoch starts the job again. The default 300 s wait leaves room for the roles; raising `LAB_GPU_JOB_POLL_MAX_MS` towards its 600 s ceiling makes this possible.
 
 **Spend.** A fetch is written to `model_calls` as `tool/weights`, an estimate from its measured time at `LAB_MODAL_GPU_USD_PER_SECOND` (about ten times Modal's CPU price, so it errs high), and counts against `LAB_DAILY_BUDGET_USD`. Its worst case, 960 s or about $0.29, is checked against the budget before it starts. Volume storage is billed by Modal and is not in the ledger. Modal's pricing page listed Volumes at $0.09 per GiB per month with 1 TiB per month free when I read it on 18 November 2026; I have not checked what my account is actually billed.
+
+**Weights in use are not evicted.** An entry that was fetched, asked for or named by a job in the last 300 s is not removed to make room, because a job may be about to mount it. A fetch that could only fit by removing one is refused with rule `shelf`. As a second check, a job's controller reads the manifest inside the sandbox before the script is put there; if it is not the commit it found on the shelf, the script is not run and the result is stage `mount` with no weights named (the sandbox's seconds are charged).
 
 **The shelf by hand.** `modal volume ls oblab-weights` lists it. `modal volume rm -r oblab-weights <org>/<name>` removes one repository, and `modal volume delete oblab-weights` removes everything (the next deploy creates an empty one). Narrowing `LAB_WEIGHTS_LICENSES` does not delete what is already there, but a job that names weights whose license is no longer on the list is not started.
 

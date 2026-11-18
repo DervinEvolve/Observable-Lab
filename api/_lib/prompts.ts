@@ -99,10 +99,11 @@ Leave out what you don't need. Use a tool only when it would really help this ep
     }
   }
   if (on('gpu_job')) {
-    text += `\nThe GPU script runs as job.py with no network and no files from the lab. Print what you want to see; the last part of the output is kept.`
+    // With public weights on, "no files from the lab" would be untrue for a job that names some.
+    text += `\nThe GPU script runs as job.py with no network and no files from the lab${on('weights') ? ' other than the weights it names (next paragraph)' : ''}. Print what you want to see; the last part of the output is kept.`
   }
   if (on('weights')) {
-    text += `\nWeights asked for in the same answer are fetched before the GPU job starts. A job that names weights finds that one repository's files at /weights (the same path is in LAB_WEIGHTS_DIR), with the lab's record of them in /weights/_lab_manifest.json; a job that names none has no /weights. If the weights it names are not on the shelf, the job is not started and the reason is stored.`
+    text += `\nWeights asked for in the same answer are fetched before the GPU job that names them starts, and the fetch and that job share one wait: if the fetch leaves too little of it, the job is not started and the weights stay on the shelf. A job that names weights finds that one repository's files at /weights (the same path is in LAB_WEIGHTS_DIR), with the lab's record of them in /weights/_lab_manifest.json; a job that names none has no /weights. If the weights it names are not on the shelf, the job is not started and the reason is stored.`
   }
   if (on('exhibit')) {
     const tri = Object.entries(FIXED_TRIANGLES).map(([k, v]) => `${k} ${v}`).join(', ')

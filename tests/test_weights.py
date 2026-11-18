@@ -11,6 +11,8 @@ import json
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -35,6 +37,7 @@ GB = 10 ** 9
 RULES = {
     "valid_repo_id", "valid_revision", "weights_limits", "repo_licenses", "has_auto_map", "wanted_file", "check_repo",
     "valid_manifest", "read_manifest", "shelf_scan", "plan_eviction", "fetch_core", "shelf_lookup", "hub_host_ok",
+    "limits_as_sent", "in_use", "mount_matches",
 }
 
 
@@ -266,9 +269,29 @@ class RefusalRuleTests(unittest.TestCase):
                          {"licenses": ["mit"], "max_bytes": int(1.5 * GB), "shelf_bytes": 10 * GB})
         self.assertEqual(limits({"max_gb": 10_000, "shelf_gb": 10_000_000})["max_bytes"], W["HARD_MAX_GB"] * GB)
         self.assertEqual(limits({"max_gb": 10_000, "shelf_gb": 10_000_000})["shelf_bytes"], W["HARD_SHELF_GB"] * GB)
-        for junk in [{"max_gb": -1}, {"max_gb": "3"}, {"max_gb": True}, {"max_gb": float("nan")}, {"licenses": []}, "x", []]:
+        for junk in [{"max_gb": -1}, {"max_gb": "3"}, {"max_gb": True}, {"max_gb": float("nan")}, {"licenses": "mit"}, "x", []]:
             self.assertEqual(limits(junk), limits(None), junk)
         self.assertEqual(limits({"max_gb": 5, "shelf_gb": 1})["shelf_bytes"], 5 * GB)  # the shelf holds at least one
+
+    def test_a_license_list_that_was_sent_is_never_widened_to_the_defaults(self):
+        limits = W["weights_limits"]
+        # The defaults are for a request that sent no list at all.
+        for sent in [[], ["Apache 2.0"], ["mit;apache-2.0"], [7, None], ["not a license!"]]:
+            self.assertEqual(limits({"licenses": sent})["licenses"], [], sent)
+            refused = W["check_repo"](Hub().info(), "acme/tiny-model", limits({"licenses": sent}))
+            self.assertEqual((refused["ok"], refused["rule"]), (False, "license"), sent)
+            self.assertIn("the list is empty", refused["reason"])
+        self.assertEqual(limits({"licenses": ["Apache 2.0", "mit"]})["licenses"], ["mit"])  # narrower, never wider
+
+    def test_the_limits_are_turned_into_numbers_once(self):
+        sent = {"licenses": ["mit"], "max_gb": 10, "shelf_gb": 100, "other": 1}
+        as_sent = W["limits_as_sent"](sent)
+        self.assertEqual(as_sent, {"licenses": ["mit"], "max_gb": 10, "shelf_gb": 100})
+        self.assertEqual(W["limits_as_sent"]("x"), {})
+        self.assertEqual(W["weights_limits"](as_sent), {"licenses": ["mit"], "max_bytes": 10 * GB, "shelf_bytes": 100 * GB})
+        # Why start must not do it first: read a second time, the numbers would be the defaults again.
+        twice = W["weights_limits"](W["weights_limits"](sent))
+        self.assertEqual((twice["max_bytes"], twice["shelf_bytes"]), (3 * GB, 30 * GB))
 
 
 class EvictionTests(unittest.TestCase):
@@ -295,6 +318,15 @@ class EvictionTests(unittest.TestCase):
         # Equal times: the order is still fixed (by key), so a plan is repeatable.
         tie = self.entries(("b", 10, 1.0), ("a", 10, 1.0))
         self.assertEqual(plan(tie, 15, 30), ["a"])
+
+    def test_entries_used_in_the_last_few_minutes_count_as_in_use(self):
+        shelf = self.entries(("old", 10, 100.0), ("recent", 10, 950.0), ("now", 10, 1000.0))
+        self.assertEqual(W["in_use"](shelf, 1000.0), {"recent", "now"})
+        self.assertEqual(W["in_use"](shelf, 1000.0 + W["IN_USE_S"]), set())               # exactly the window ago is no longer in use
+        self.assertEqual(W["in_use"](shelf, 1000.0, window_s=1000), {"old", "recent", "now"})
+        self.assertEqual(W["IN_USE_S"], W["JOB_TIMEOUT_S"] + 180)                          # run_job's own time limit
+        self.assertEqual(W["plan_eviction"](shelf, 25, 40, keep=W["in_use"](shelf, 1000.0)), None)
+        self.assertEqual(W["plan_eviction"](shelf, 15, 40, keep=W["in_use"](shelf, 1000.0)), ["old"])
 
     def test_the_plan_does_not_change_its_input(self):
         shelf = self.entries(("old", 10, 100.0), ("new", 10, 300.0))
@@ -407,8 +439,10 @@ class FetchTests(unittest.TestCase):
         first, second, third = Hub("acme/one", SHA_A), Hub("acme/two", SHA_B), Hub("acme/three", SHA_C)
         self.assertEqual(self.fetch(first, limits=limits)["evicted"], [])
         self.assertEqual(self.fetch(second, limits=limits)["evicted"], [])
+        self.clock.now += 3600
         # "one" is used again (a job named it), so "two" is now the least recently used.
         self.used[f"acme/one@{SHA_A}"] = self.clock()
+        self.clock.now += 3600
         result = self.fetch(third, limits=limits)
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["evicted"], [f"acme/two@{SHA_B}"])
@@ -417,14 +451,52 @@ class FetchTests(unittest.TestCase):
         self.assertNotIn(f"acme/two@{SHA_B}", self.used)
         self.assertFalse(any(p.startswith("acme/two/") for p in self.on_disk()))
         # Something larger than the whole shelf is refused, and nothing is removed for it.
+        self.clock.now += 3600
         huge = Hub("acme/huge", "d" * 40, files={"config.json": b"{}", "model.safetensors": b"S" * 2990})
         self.assertEqual(self.fetch(huge, limits={"max_gb": 0.000003, "shelf_gb": 0.000001})["status"], "ok")  # shelf is never smaller than one fetch
         self.assertEqual(self.fetch(Hub("acme/five", "e" * 40), limits={"max_gb": 0.000001, "shelf_gb": 0.000001})["rule"], "size")
+
+    def test_weights_in_use_are_not_removed_to_make_room(self):
+        limits = {"max_gb": 0.000003, "shelf_gb": 0.000005}   # room for two of these, not three
+        first, second, third = Hub("acme/one", SHA_A), Hub("acme/two", SHA_B), Hub("acme/three", SHA_C)
+        self.fetch(first, limits=limits)
+        self.fetch(second, limits=limits)
+        # Both were fetched seconds ago: a job may be about to mount either, so neither goes.
+        result = self.fetch(third, limits=limits)
+        self.assertEqual((result["status"], result["rule"]), ("refused", "shelf"))
+        self.assertEqual(third.downloads, [])
+        self.assertEqual({e["key"] for e in W["shelf_scan"](self.root)[0]}, {f"acme/one@{SHA_A}", f"acme/two@{SHA_B}"})
+
+        # Later both are idle, so the plan before the download says "one" can go.
+        # But a job names "one" and "two" while the download is running: what is
+        # removed is decided again afterwards, and now nothing may be.
+        self.clock.now += 3600
+        download = third.hub_download
+
+        def job_starts_meanwhile(*args):
+            self.used[f"acme/one@{SHA_A}"] = self.clock()
+            self.used[f"acme/two@{SHA_B}"] = self.clock()
+            return download(*args)
+
+        third.hub_download = job_starts_meanwhile
+        result = self.fetch(third, limits=limits)
+        self.assertEqual((result["status"], result["rule"]), ("refused", "shelf"))
+        self.assertTrue(third.downloads)
+        self.assertEqual({e["key"] for e in W["shelf_scan"](self.root)[0]}, {f"acme/one@{SHA_A}", f"acme/two@{SHA_B}"})
+        self.assertFalse(any(p.startswith("acme/three/") for p in self.on_disk()))
+
+        # Only "one" is named during the download: "two" goes instead, though "one" was the older.
+        self.clock.now += 3600
+        third.hub_download = lambda *args: (self.used.__setitem__(f"acme/one@{SHA_A}", self.clock()), download(*args))[1]
+        result = self.fetch(third, limits=limits)
+        self.assertEqual((result["status"], result["evicted"]), ("ok", [f"acme/two@{SHA_B}"]))
+        self.assertEqual({e["key"] for e in W["shelf_scan"](self.root)[0]}, {f"acme/one@{SHA_A}", f"acme/three@{SHA_C}"})
 
     def test_a_failed_download_removes_nothing_from_the_shelf(self):
         limits = {"max_gb": 0.000003, "shelf_gb": 0.000003}
         first = Hub("acme/one", SHA_A)
         self.fetch(first, limits=limits)
+        self.clock.now += 3600
         broken = Hub("acme/two", SHA_B)
         broken.corrupt["model.safetensors"] = b"X" * 2000
         self.assertEqual(self.fetch(broken, limits=limits)["status"], "error")
@@ -532,18 +604,35 @@ class Volume:
 
 
 class JobWeightsTests(unittest.TestCase):
-    def run_job(self, weights=None, shelf=None, script="print('hi')\n"):
+    def run_job(self, weights=None, shelf=None, script="print('hi')\n", in_sandbox="same", create_fails=False):
+        """`in_sandbox` is what /weights holds when the sandbox looks: the entry the
+        controller found ("same"), nothing ("empty"), or another manifest (a dict)."""
         created = []
         used = {}
+        written = []
+        checks = []
         shelf = shelf if shelf is not None else {
             ("acme/tiny-model", SHA_A): {"repo": "acme/tiny-model", "sha": SHA_A, "size_bytes": 10, "license": "mit", "licenses": ["mit"], "fetched_at_unix": 1.0},
         }
 
         class Sandbox:
             terminated = False
-            filesystem = SimpleNamespace(write_text=lambda data, path: None)
+            filesystem = SimpleNamespace(write_text=lambda data, path: written.append(path))
 
             def exec(self, *args, **kwargs):
+                if args[:3] == ("python", "-I", "-c") and args[3] == namespace["WEIGHTS_CHECK"]:
+                    # The real check script, run against a directory standing in for the mount.
+                    checks.append(args[4])
+                    mount = tempfile.mkdtemp(prefix="oblab-mount-test-")
+                    try:
+                        if in_sandbox != "empty":
+                            manifest = shelf[next(iter(shelf))] if in_sandbox == "same" else in_sandbox
+                            Path(mount, "_lab_manifest.json").write_text(json.dumps(manifest))
+                        done = subprocess.run([sys.executable, "-I", "-c", args[3], str(Path(mount, "_lab_manifest.json"))],
+                                              capture_output=True, text=True)
+                    finally:
+                        shutil.rmtree(mount, ignore_errors=True)
+                    return SimpleNamespace(wait=lambda: None, returncode=done.returncode, stdout=SimpleNamespace(read=lambda: done.stdout))
                 return SimpleNamespace(wait=lambda: None, returncode=0, stdout=SimpleNamespace(read=lambda: b"done\n"))
 
             def terminate(self):
@@ -553,9 +642,12 @@ class JobWeightsTests(unittest.TestCase):
 
         def create(**kwargs):
             created.append(kwargs)
+            if create_fails:
+                raise RuntimeError("no capacity")
             return sb
 
-        namespace = load({"run_job", "_check_script", "shelf_lookup", "valid_repo_id", "valid_manifest"}, {
+        self.written, self.checks = written, checks
+        namespace = load({"run_job", "_check_script", "shelf_lookup", "valid_repo_id", "valid_manifest", "mount_matches"}, {
             "modal": SimpleNamespace(Sandbox=SimpleNamespace(create=create)),
             "app": "test-app", "image": "pinned-image", "GPU_KIND": "test-gpu", "SUPERVISOR": "supervisor",
             "weights_volume": Volume(), "weights_use": used,
@@ -574,6 +666,8 @@ class JobWeightsTests(unittest.TestCase):
         self.assertIs(created[0]["block_network"], True)
         self.assertEqual(created[0]["secrets"], [])
         self.assertEqual(used, {})
+        self.assertEqual(self.checks, [])                      # nothing extra runs in a sandbox with no weights
+        self.assertEqual(self.written, ["/tmp/job.py"])
 
     def test_named_weights_are_mounted_read_only_as_that_one_entry_with_the_network_still_blocked(self):
         result, created, sb, used = self.run_job({"repo": "acme/tiny-model"})
@@ -585,7 +679,34 @@ class JobWeightsTests(unittest.TestCase):
         self.assertEqual(created[0]["env"], {"PYTHONUNBUFFERED": "1", "LAB_WEIGHTS_DIR": "/weights"})
         self.assertEqual(created[0]["timeout"], 120 + 60)
         self.assertEqual(list(used), [f"acme/tiny-model@{SHA_A}"])     # counts as use for the shelf's order
+        self.assertEqual(self.checks, ["/weights/_lab_manifest.json"])  # read inside the sandbox before the script is there
+        self.assertEqual(self.written, ["/tmp/job.py"])
         self.assertTrue(sb.terminated)
+
+    def test_a_job_whose_sandbox_cannot_read_the_weights_is_not_run_and_names_none(self):
+        # The entry was on the shelf when the controller looked and gone when the
+        # sandbox started: Modal mounts an empty directory there. Or it holds another commit.
+        other = {"repo": "acme/tiny-model", "sha": SHA_B, "size_bytes": 10, "license": "mit", "licenses": ["mit"]}
+        for inside in ["empty", other, {"repo": "acme/other", "sha": SHA_A}, ["not", "a", "manifest"]]:
+            result, created, sb, _ = self.run_job({"repo": "acme/tiny-model"}, in_sandbox=inside)
+            self.assertEqual((result["status"], result["stage"], result["weights"]), ("error", "mount", None), inside)
+            self.assertIn("the script was not run", result["error"])
+            self.assertEqual(result["gpu"], "test-gpu")        # a sandbox did start, so its time is charged
+            self.assertEqual(len(created), 1)
+            self.assertEqual(self.written, [])                 # the model's script never reached the sandbox
+            self.assertTrue(sb.terminated)
+
+    def test_a_sandbox_that_never_started_names_no_weights(self):
+        result, created, _, _ = self.run_job({"repo": "acme/tiny-model"}, create_fails=True)
+        self.assertEqual((result["status"], result["stage"], result["weights"]), ("crash", "sandbox", None))
+        self.assertEqual(self.written, [])
+
+    def test_what_the_sandbox_printed_must_name_the_same_repository_and_commit(self):
+        match = W["mount_matches"]
+        self.assertTrue(match(json.dumps({"repo": "acme/tiny-model", "sha": SHA_A}) + "\n", "acme/tiny-model", SHA_A))
+        for output in ["", None, b"\xff", "{}", "[]", "null", json.dumps({"repo": "acme/tiny-model", "sha": SHA_B}),
+                       json.dumps({"repo": "acme/other", "sha": SHA_A}), "not json"]:
+            self.assertFalse(match(output, "acme/tiny-model", SHA_A), output)
 
     def test_weights_that_are_not_on_the_shelf_never_start_a_gpu(self):
         for ref in [{"repo": "acme/absent"}, {"repo": "acme/tiny-model", "sha": SHA_B}, {"repo": "../../etc"},
@@ -605,7 +726,7 @@ class JobWeightsTests(unittest.TestCase):
 class EndpointTests(unittest.TestCase):
     def client(self):
         jobs, fetches = [], []
-        namespace = load({"_authed", "start", "valid_repo_id", "valid_revision", "weights_limits"}, {
+        namespace = load({"_authed", "start", "valid_repo_id", "valid_revision", "weights_limits", "limits_as_sent"}, {
             "hmac": hmac, "Request": Request, "HTTPException": HTTPException,
             "run_job": SimpleNamespace(spawn=lambda *args: jobs.append(args) or SimpleNamespace(object_id="job-call")),
             "fetch_weights": SimpleNamespace(spawn=lambda *args: fetches.append(args) or SimpleNamespace(object_id="fetch-call")),
@@ -628,10 +749,46 @@ class EndpointTests(unittest.TestCase):
             ok = client.post("/start", headers=auth, json={"fetch_weights": {
                 "repo": "acme/tiny-model", "revision": "v2", "limits": {"licenses": ["mit", "$bad"], "max_gb": 9999, "shelf_gb": 40}}})
             self.assertEqual(ok.json(), {"call_id": "fetch-call"})
-            self.assertEqual(fetches, [("acme/tiny-model", "v2", {"licenses": ["mit"], "max_bytes": 20 * GB, "shelf_bytes": 40 * GB})])
+            # The limits go on as the lab server wrote them; the fetch turns them into numbers, once.
+            self.assertEqual(fetches, [("acme/tiny-model", "v2", {"licenses": ["mit", "$bad"], "max_gb": 9999, "shelf_gb": 40})])
+            self.assertEqual(W["weights_limits"](fetches[0][2]), {"licenses": ["mit"], "max_bytes": 20 * GB, "shelf_bytes": 40 * GB})
             client.post("/start", headers=auth, json={"fetch_weights": {"repo": "acme/tiny-model"}})
-            self.assertEqual(fetches[1][:2], ("acme/tiny-model", "main"))
+            self.assertEqual(fetches[1], ("acme/tiny-model", "main", {}))
             self.assertEqual(jobs, [])
+
+    def test_the_owners_limits_sent_to_start_are_the_ones_the_fetch_enforces(self):
+        client, _, fetches = self.client()
+        auth = {"Authorization": "Bearer " + TOKEN}
+        root = tempfile.mkdtemp(prefix="oblab-shelf-test-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+
+        def fetch_as_spawned(hub):
+            repo, revision, limits = fetches[-1]
+            return W["fetch_core"](repo, revision, limits, root, hub.hub_info, hub.hub_download, {}, Clock())
+
+        with client, patch.dict(os.environ, {"JOBS_TOKEN": TOKEN}):
+            # A limit below the default: 1000 bytes, where the model is about 2000.
+            client.post("/start", headers=auth, json={"fetch_weights": {"repo": "acme/tiny-model", "limits": {"max_gb": 0.000001, "shelf_gb": 0.000001}}})
+            hub = Hub()
+            refused = fetch_as_spawned(hub)
+            self.assertEqual((refused["status"], refused["rule"]), ("refused", "size"))
+            self.assertEqual(hub.downloads, [])
+            # A limit above the default: a repository of 5 GB passes the size rule under 10 GB.
+            client.post("/start", headers=auth, json={"fetch_weights": {"repo": "acme/tiny-model", "limits": {"max_gb": 10, "shelf_gb": 100}}})
+            limits = W["weights_limits"](fetches[-1][2])
+            self.assertEqual((limits["max_bytes"], limits["shelf_bytes"]), (10 * GB, 100 * GB))
+            info = Hub().info()
+            for entry in info["siblings"]:
+                if entry["rfilename"] == "model.safetensors":
+                    entry["size"] = entry["lfs"]["size"] = 5 * GB
+            self.assertTrue(W["check_repo"](info, "acme/tiny-model", limits)["ok"])
+            self.assertEqual(W["check_repo"](info, "acme/tiny-model", W["weights_limits"](None))["rule"], "size")
+            # The owner's license list too: one license, and the default model (apache-2.0) is refused.
+            client.post("/start", headers=auth, json={"fetch_weights": {"repo": "acme/tiny-model", "limits": {"licenses": ["mit"]}}})
+            self.assertEqual(fetch_as_spawned(Hub())["rule"], "license")
+            # A list with nothing usable in it refuses everything; it does not become the defaults.
+            client.post("/start", headers=auth, json={"fetch_weights": {"repo": "acme/tiny-model", "limits": {"licenses": ["Apache 2.0"]}}})
+            self.assertEqual(fetch_as_spawned(Hub())["rule"], "license")
 
     def test_a_job_may_name_weights_and_a_job_without_them_is_spawned_as_before(self):
         client, jobs, fetches = self.client()
@@ -646,6 +803,9 @@ class EndpointTests(unittest.TestCase):
             self.assertEqual(jobs[1], ("print(2)", {"repo": "acme/tiny-model", "sha": SHA_A, "licenses": ["mit"]}))
             client.post("/start", headers=auth, json={"script": "print(3)", "weights": {"repo": "acme/tiny-model"}})
             self.assertEqual(jobs[2], ("print(3)", {"repo": "acme/tiny-model"}))
+            # A license list with nothing usable in it stays empty, so the shelf entry is refused.
+            client.post("/start", headers=auth, json={"script": "print(4)", "weights": {"repo": "acme/tiny-model", "licenses": ["Apache 2.0"]}})
+            self.assertEqual(jobs[3], ("print(4)", {"repo": "acme/tiny-model", "licenses": []}))
             self.assertEqual(fetches, [])
 
 

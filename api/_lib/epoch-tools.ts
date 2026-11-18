@@ -5,7 +5,9 @@
  *  - side tools (a Sprite session, a GPU job, a request for public weights)
  *    start right after the Executor and run while the Challenger, rebuttal
  *    and Reviewer talk; the runner waits for them before the Commentator.
- *    Weights asked for are fetched before the GPU job starts.
+ *    A GPU job that names the weights asked for in the same answer waits for
+ *    that fetch, and the two share the one wait a job always had; any other
+ *    job starts at once.
  *  - deliverables (an exhibit, a lab proposal) run after the Reviewer, and
  *    only when the Reviewer approved them in "tool_verdicts".
  *
@@ -22,7 +24,7 @@ import { liveModelToolStatus, toolConfig, SPRITE_SESSION_TOTAL_MAX_S, type ToolC
 import { LIVE_KEY_MAX_USD } from './live-model.js'
 import type { ToolPlan } from './tool-requests.js'
 import { estimateSpriteCost, liveModelClause, runSpriteSession, sessionTranscript } from './sprite-session.js'
-import { GPU_JOB_WORST_CASE_S, estimateGpuCost, runGpuJob, runWeightsFetch } from './gpu-jobs.js'
+import { GPU_JOB_WORST_CASE_S, estimateGpuCost, gpuJobWaitMs, gpuWaitAfterFetch, runGpuJob, runWeightsFetch } from './gpu-jobs.js'
 import { describeFetch, estimateWeightsFetchCost, weightsLabel, type WeightsFetchResult } from './weights.js'
 import { contributeExhibit } from './exhibit-contribution.js'
 import { openLabProposal } from './lab-proposals.js'
@@ -101,26 +103,39 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
   // the side tools run at once, so each is checked against their combined worst case
   // a session that comes with a model key can also spend up to that key's limit
   const liveModel = liveModelToolStatus(config).enabled
-  const worstCase = (plan.sprite_session && !done('sprite_session') ? estimateSpriteCost(SPRITE_SESSION_TOTAL_MAX_S * 1000) + (liveModel ? LIVE_KEY_MAX_USD : 0) : 0)
-    + (plan.gpu_job && !done('gpu_job') ? estimateGpuCost(GPU_JOB_WORST_CASE_S) : 0)
-    + (plan.weights && !done('weights') ? estimateWeightsFetchCost(null) : 0)
+  const worst = {
+    sprite_session: plan.sprite_session && !done('sprite_session') ? estimateSpriteCost(SPRITE_SESSION_TOTAL_MAX_S * 1000) + (liveModel ? LIVE_KEY_MAX_USD : 0) : 0,
+    gpu_job: plan.gpu_job && !done('gpu_job') ? estimateGpuCost(GPU_JOB_WORST_CASE_S) : 0,
+    weights: plan.weights && !done('weights') ? estimateWeightsFetchCost(null) : 0,
+  }
+  // A tool that has finished (its real cost is on the ledger) or was skipped
+  // no longer counts at its worst case. This only matters for a GPU job that
+  // waited for its weights: every other check is made at the start, when
+  // nothing has finished and the sum is the combined worst case.
+  const settled = new Set<keyof typeof worst>()
+  const worstCase = () => (settled.has('sprite_session') ? 0 : worst.sprite_session)
+    + (settled.has('gpu_job') ? 0 : worst.gpu_job)
+    + (settled.has('weights') ? 0 : worst.weights)
+  const startedAt = Date.now()
   const weightsOn = config.weights.enabled && config.weights.per_day > 0
 
   // Public weights: the lab's fetcher on Modal checks and downloads them.
-  // The GPU job below waits for this, so a job can use weights asked for in
-  // the same answer.
+  // A GPU job below that names the same repository waits for this, so a job
+  // can use weights asked for in the same answer.
   let fetched: Promise<WeightsFetchResult | null> = Promise.resolve(null)
   if (plan.weights && !done('weights')) {
     const request = plan.weights
     const summary = `public weights ${request.repo}${request.revision === 'main' ? '' : ` at ${request.revision}`}`
     fetched = (async () => {
-      const ok = await allowed('weights', config, worstCase)
+      const ok = await allowed('weights', config, worstCase())
       if (!ok.ok) {
+        settled.add('weights')
         out.push(await skip(ctx, 'weights', summary, ok.reason))
         return null
       }
       const result = await runWeightsFetch(request)
       await ledger(ctx, 'weights', result.cost_usd)
+      settled.add('weights')
       const status: ToolRunStatus = result.status === 'ok' ? 'ok' : result.status === 'refused' ? 'failed' : result.status === 'pending' ? 'timeout' : 'error'
       const line = describeFetch(result)
       await recordToolRun({
@@ -136,6 +151,7 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
       return result
     })().catch(e => {
       console.warn(`[Epoch ${ctx.epochNumber}] side tool failed (non-fatal):`, e instanceof Error ? e.message : e)
+      settled.add('weights')
       return null
     })
     tasks.push(fetched.then(() => undefined))
@@ -144,11 +160,15 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
     const session = plan.sprite_session
     const summary = `${session.purpose || 'Sprite session'} (${session.commands.length} command${session.commands.length === 1 ? '' : 's'})`
     tasks.push((async () => {
-      const ok = await allowed('sprite_session', config, worstCase)
-      if (!ok.ok) return void out.push(await skip(ctx, 'sprite_session', summary, ok.reason))
+      const ok = await allowed('sprite_session', config, worstCase())
+      if (!ok.ok) {
+        settled.add('sprite_session')
+        return void out.push(await skip(ctx, 'sprite_session', summary, ok.reason))
+      }
       const result = await runSpriteSession(ctx.executorModelId, session.commands,
         liveModel ? { liveModel: { experimentId: ctx.experimentId, epoch: ctx.epochNumber } } : {})
       await ledger(ctx, 'sprite_session', result.cost_usd)
+      settled.add('sprite_session')
       const last = result.commands[result.commands.length - 1]
       await recordToolRun({
         experimentId: ctx.experimentId, epoch: ctx.epochNumber, model: ctx.executorModelId, tool: 'sprite_session',
@@ -170,30 +190,47 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
   if (plan.gpu_job && !done('gpu_job')) {
     const job = plan.gpu_job
     const summary = job.purpose || 'GPU job'
+    // Only a job that names the repository asked for in this same answer
+    // waits for that fetch. A job that names other weights, or none, starts
+    // at once beside it, as GPU jobs always have.
+    const waitsForFetch = Boolean(job.weights && plan.weights && !done('weights') && job.weights.repo === plan.weights.repo)
     tasks.push((async () => {
-      // Weights asked for in this same answer come first. When the job names
-      // that repository, it gets exactly the commit that was just checked; if
-      // that fetch ran and did not end with the weights on the shelf (a rule
-      // refused them, or they are still downloading), the job is not started:
-      // it was written for weights it would not find, or may no longer have.
-      // A request that was not run at all (over its daily limit, or already
-      // run before this epoch was resumed) leaves it to the Modal controller,
-      // which starts the job only if the weights are on the shelf.
-      const fetch = await fetched
       let weights = job.weights
-      if (weights && fetch && fetch.repo === weights.repo) {
-        if (fetch.status !== 'ok' || !fetch.sha) {
-          return void out.push(await skip(ctx, 'gpu_job', summary, `the weights it names (${weights.repo}) are not on the shelf: ${describeFetch(fetch)}`))
+      let maxWaitMs: number | undefined
+      if (waitsForFetch && weights) {
+        // The job gets exactly the commit that was just checked. If that
+        // fetch ran and did not end with the weights on the shelf (a rule
+        // refused them, or they are still downloading), the job is not
+        // started: it was written for weights it would not find, or may no
+        // longer have. A request that was not run at all (over its daily
+        // limit) leaves it to the Modal controller, which starts the job only
+        // if the weights are on the shelf.
+        const fetch = await fetched
+        if (fetch) {
+          if (fetch.status !== 'ok' || !fetch.sha) {
+            return void out.push(await skip(ctx, 'gpu_job', summary, `the weights it names (${weights.repo}) are not on the shelf: ${describeFetch(fetch)}`))
+          }
+          if (!weights.sha) weights = { repo: weights.repo, sha: fetch.sha }
+          // The fetch and the job share the one wait a job always had, so the
+          // pair holds the epoch no longer than a job alone did. When the
+          // fetch used too much of it, the job is not started: its GPU time
+          // would be spent on a result this epoch could not collect or count.
+          const waitedMs = Date.now() - startedAt
+          const left = gpuWaitAfterFetch(gpuJobWaitMs(), waitedMs)
+          if (left === null) {
+            return void out.push(await skip(ctx, 'gpu_job', summary, `its weights (${weights.repo}) took ${Math.round(waitedMs / 1000)} s to arrive, which leaves too little of this epoch's wait for a job; they are on the shelf now`))
+          }
+          maxWaitMs = left
         }
-        if (!weights.sha) weights = { repo: weights.repo, sha: fetch.sha }
       }
-      const ok = await allowed('gpu_job', config, worstCase)
+      const ok = await allowed('gpu_job', config, worstCase())
       if (!ok.ok) return void out.push(await skip(ctx, 'gpu_job', summary, ok.reason))
-      const result = await runGpuJob(job.script, weights ? { weights } : {})
+      const result = await runGpuJob(job.script, { ...(weights ? { weights } : {}), ...(maxWaitMs !== undefined ? { maxWaitMs } : {}) })
       await ledger(ctx, 'gpu_job', result.cost_usd)
       // While public weights are on, every job is labelled from what its
-      // sandbox really had mounted. A job that never started gets no label.
-      const started = result.gpu !== null && result.stage !== 'weights'
+      // sandbox really had mounted. A job whose script never ran (nothing
+      // started, or the sandbox could not read its weights) gets no label.
+      const started = result.gpu !== null && result.stage !== 'weights' && result.stage !== 'mount'
       const label = weightsOn && started ? weightsLabel(result.weights) : null
       const status: ToolRunStatus = result.status === 'ok' ? 'ok' : result.status === 'timeout' ? 'timeout' : result.status === 'error' ? 'failed' : 'error'
       await recordToolRun({
