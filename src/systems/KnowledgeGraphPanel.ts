@@ -115,7 +115,7 @@ export class KnowledgeGraphPanel {
   private loadedAt = 0
   private isOpen = false
   // The recall replay: the path a model's question took through the graph, walked one hop at a time.
-  private anim: { path: string[]; start: number; queue: Recall[] } | null = null
+  private anim: { path: string[]; start: number; queue: Recall[]; hold: number } | null = null
   private caption: HTMLDivElement
   // One finger (or the mouse) pans or drags a node; two fingers pinch. Every pointer that is down is in `pointers`.
   private pointers = new Map<number, { x: number; y: number }>()
@@ -939,7 +939,7 @@ export class KnowledgeGraphPanel {
     const reduce = matchMedia('(prefers-reduced-motion: reduce)').matches
     const elapsed = performance.now() - a.start
     const hop = reduce ? a.path.length - 1 : Math.min(a.path.length - 1, Math.floor(elapsed / HOP_MS))
-    return { hop, elapsed, reduce, done: elapsed > (reduce ? 2600 : HOP_MS * (a.path.length - 1) + 1800) }
+    return { hop, elapsed, reduce, done: elapsed > (reduce ? 2600 : HOP_MS * (a.path.length - 1) + a.hold) }
   }
 
   /** Hold a finished path a moment, then go on to the next recall in the queue, if any. */
@@ -1022,7 +1022,8 @@ export class KnowledgeGraphPanel {
       const hops = path.filter((id, i) => i === 0 || typeOf(id) !== typeOf(path[i - 1]))
       if (hops.length > 1) steps = hops
     }
-    this.anim = { path: steps, start: performance.now(), queue }
+    // A walk shortened to bubbles is held at its end for the hops it skipped, so the caption stays up as long as on a large screen.
+    this.anim = { path: steps, start: performance.now(), queue, hold: 1800 + HOP_MS * (path.length - steps.length) }
     // Frame the whole graph in the room left under the caption, at once, so the path is on screen from its first hop.
     for (const b of this.bodies.values()) { b.x = b.vx; b.y = b.vy }
     this.fitSoon = false
