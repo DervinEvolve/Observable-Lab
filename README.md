@@ -53,7 +53,7 @@ Each training run gets a fresh Sandbox. Network access is blocked, credentials s
 
 ## Run 2 so far
 
-Run 2 started on 15 November 2026 with the newest model from each lab, and a round runs every three hours. These notes cover rounds 1 to 19, from the stored record.
+Run 2 started on 15 November 2026 with the newest model from each lab, and a round runs every three hours. These notes cover rounds 1 to 20, from the stored record. The counts below are for rounds 1 to 19.
 
 - **The specification grows by about one capability a round.** It started with a tool registry and a loop for reading tool results. By round 19 it had 20 capabilities, among them sandboxed Python, revisable plans, an observation store, retrieval, subagent delegation, web research, browser use, MCP connectors, code navigation, paired evaluation and an inference bridge. It also has 20 constraints and 20 behaviors.
 - **The Reviewer almost never says yes or no.** Of 66 proposed changes, the Reviewer approved 4 as written, asked for changes to 62 and rejected none. The changes still go in, rewritten. I want to see whether a stricter Reviewer prompt changes that.
@@ -62,8 +62,18 @@ Run 2 started on 15 November 2026 with the newest model from each lab, and a rou
 - **They noticed when they drifted.** In round 17, Grok 4.7 as Planner said: "We can reach the outside world and still cannot find a function we wrote, or treat a failing check as unfinished. Next machine is navigation plus a closed check loop, not another connector." The next additions turned inward: code navigation, then evaluation.
 - **None of their code has landed yet in run 2.** There have been 20 code attempts and no merged pull request. (In run 1, 48 of the models' pull requests merged into AI-Agent.) The early ones failed in the lab's code-writing step (time limits and answers cut off at the output limit), which I've fixed. The latest fail because the lab's token for AI-Agent can't create branches. Both problems are in my setup, not in the models' work.
 - **They've started asking about it.** In round 18, DeepSeek V4 Pro asked the lab's memory: "Has any AgentRuntime implementation actually merged in the AI-Agent repo?" In round 19, GPT-6 Astra asked: "Did epoch 18 ship a working evaluation runner or only partial statistics/report components?"
+- **Round 20 changed course, and that was partly me.** By round 20 the lab's memory was telling them their code record: 20 attempts, nothing merged, and the exact error. The Planner, GPT-6 Astra, opened with: "We have twenty specified capabilities and no merged contributions from this lab." It asked to make one real task run end to end and to get me to unblock delivery. The Executor, Claude Fable 5.2, wrote: "The 403 needs the repo owner (Contents write)." They paused new capabilities, proposed a working runtime core instead, and added a behavior about reporting delivery status honestly. They were right about the 403: it was my token, and I fixed it after this round. I count this change of direction as my influence on the run, not something they found on their own.
 - **Their search reports and the record mostly agree.** The models said they ran 45 web searches, and OpenRouter recorded 135 cited pages. In 8 turns a model said it searched but no citation was recorded. The activity panel flags those.
 - **Cost.** The 19 rounds cost $42.37 in model calls, about $2.20 a round.
+
+### What I changed during run 2
+
+Changing the lab while it runs changes what the models see, so I'm keeping a list. Times are UTC.
+
+- **15 to 17 November:** fixes to how the lab turns a model's code into a pull request (time limits, answers cut off at the output limit, recording why an attempt failed).
+- **17 November, from round 18:** every role gets a short memory summary from the knowledge graph, and can ask it up to three recall questions. Round 18 is the first round with recalls.
+- **17 November, by round 20 at the latest (possibly round 19):** the memory summary started including their code record: how many attempts, how many pull requests, how many merges, and the latest failure. This is the line that told them about the 403.
+- **18 November, 00:14, after round 20:** I gave the lab's GitHub token permission to write to AI-Agent, so their code can open pull requests from round 21 on.
 
 ## The knowledge graph
 
