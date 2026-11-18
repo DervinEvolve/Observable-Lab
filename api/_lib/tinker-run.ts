@@ -121,15 +121,15 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
 
   const status: ToolRunStatus = result.status === 'ok' ? 'ok' : result.status === 'refused' ? 'failed' : 'error'
   // The display name, when the run was given one (names are on and it was free). A label; the lab id is the identity.
-  const name = row.display_name
-  const line = describeTinkerRun(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, name)
+  const displayName = row.display_name
+  const line = describeTinkerRun(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName)
   await recordToolRun({
     experimentId: row.experiment_id, epoch: row.epoch, model: row.model, tool: TINKER_TOOL,
-    requestSummary: tinkerRequestSummary(row.base_model, row.dataset_examples, row.purpose, name),
+    requestSummary: tinkerRequestSummary(row.base_model, row.dataset_examples, row.purpose, displayName),
     status, durationMs: result.wall_seconds === null ? null : result.wall_seconds * 1000, costUsd, outputTail: line,
     detail: {
       ...(result.status === 'ok' ? { adapter: `lab/${row.slug}`, sampler_path: result.sampler_path, expires_at: expiresAt } : {}),
-      ...(name ? { name } : {}),
+      ...(displayName ? { name: displayName } : {}),
       ...(result.status === 'ok' && result.external_path ? { external_path: result.external_path } : {}),
       base_model: row.base_model,
       dataset: { sha256: row.dataset_sha256, examples: row.dataset_examples, bytes: row.dataset_bytes },
