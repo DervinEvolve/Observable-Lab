@@ -62,6 +62,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from typing import Optional  # the deploying Mac may run Python 3.9, which has no "X | None"
 
 import modal
 from fastapi import HTTPException, Request
@@ -622,7 +623,7 @@ def _volume_shas(repo):
 
 @app.function(image=web_image, volumes={SHELF_DIR: weights_volume}, timeout=FETCH_TIMEOUT_S, retries=0,
               max_containers=1, cpu=(1, 2), memory=(1024, 4096))
-def fetch_weights(repo: str, revision: str = "main", limits: dict | None = None) -> dict:
+def fetch_weights(repo: str, revision: str = "main", limits: Optional[dict] = None) -> dict:
     """Fetches one public repository onto the shelf, or says why not.
 
     This is lab code. It is the only function here that downloads anything,
@@ -641,7 +642,7 @@ def fetch_weights(repo: str, revision: str = "main", limits: dict | None = None)
 
 
 @app.function(image=image, timeout=JOB_TIMEOUT_S + 180, retries=0, max_containers=2, cpu=(1, 2), memory=(1024, 4096))
-def run_job(script: str, weights: dict | None = None) -> dict:
+def run_job(script: str, weights: Optional[dict] = None) -> dict:
     """Run one job. Returns a result for every outcome; never raises for job failures.
 
     `weights` is {repo, sha?, licenses?} when the job names public weights
