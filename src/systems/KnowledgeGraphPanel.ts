@@ -219,6 +219,13 @@ export class KnowledgeGraphPanel {
         #kg-overlay .kg-top { padding-right: 16px; }
         #kg-overlay .kg-caption { max-width: calc(100% - 24px); }
       }
+      /* A small phone shows few results at once: the name on one line, its kind and epoch under it. */
+      @media (max-width: 360px) {
+        #kg-overlay .kg-results .kg-section { margin-top: 8px; }
+        #kg-overlay .kg-results button { display: grid; grid-template-columns: auto minmax(0, 1fr); align-items: center; }
+        #kg-overlay .kg-results .kg-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        #kg-overlay .kg-results .kg-tag { grid-column: 2; }
+      }
       /* With the keyboard up there is little height left: give it to the graph and the results. */
       @media (max-height: 420px) and (max-width: 519px) {
         #kg-overlay { grid-template-rows: minmax(0, 2fr) minmax(0, 3fr); }
@@ -1299,7 +1306,7 @@ export class KnowledgeGraphPanel {
   private linkButton(id: string, note: string): string {
     const n = this.byId.get(id)
     if (!n) return ''
-    return `<button data-go="${esc(id)}">${this.markHtml(n, 15)}${esc(n.label)} <span class="kg-tag">${esc(n.type)}${note ? ` · ${esc(note)}` : ''}</span></button>`
+    return `<button data-go="${esc(id)}">${this.markHtml(n, 15)}<span class="kg-name">${esc(n.label)}</span> <span class="kg-tag">${esc(n.type)}${note ? ` · ${esc(note)}` : ''}</span></button>`
   }
 
   /** A model's credited logo, or the coloured dot every other kind of node uses. */
