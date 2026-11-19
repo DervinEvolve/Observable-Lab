@@ -113,8 +113,14 @@ export function describeStoryModel(info: StoryInfo): { title: string; about: str
   const size = m.paramsM !== null ? ` It has about ${m.paramsM < 10 ? m.paramsM.toFixed(1) : Math.round(m.paramsM)} million parameters and reads and writes one byte at a time.` : ''
   const about = `A tiny model trained from scratch on children's stories in ${m.budgetS !== null ? minutes(m.budgetS) : 'a few minutes'}. It only writes story-like text.${size}`
   let note = ''
-  if (surpassed) {
-    note = `The loop has since kept a better run (epoch ${info.bestEpoch}). Its model could not be saved or loaded, so this is the last one that could.`
+  // The newest kept model has not had the lab's own sample yet. When it is
+  // the loop's new best, that is why an older model still answers: it has
+  // not failed, it is being tried.
+  const trying = info.newest !== null && !info.newest.checked
+  if (surpassed && trying && info.newest?.epoch === info.bestEpoch) {
+    note = `The loop has since kept a better run (epoch ${info.bestEpoch}). Its model has just been saved and the lab is trying it out, so for a minute or two this one still answers.`
+  } else if (surpassed) {
+    note = `The loop has since kept a better run (epoch ${info.bestEpoch}). The lab has not been able to save that model and load it again, so this is the last one it could.`
   } else if (info.newest && !info.newest.checked) {
     note = 'A newer model has just been saved and the lab is trying it out.'
   }

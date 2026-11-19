@@ -55,14 +55,15 @@ interface LedgerRow { epoch: number; val_bpb: number | null; status: 'keep' | 'd
 
 /**
  * One line of results.tsv as the lab writes it (appendResultsRow), or null.
- * A row has 9 columns (before the provenance columns were added) or 13, an
+ * A row has 9 columns (before the provenance columns were added), 13, or 14
+ * (with runner_flow, from the first run made with the runner's save step), an
  * epoch number, merged or reverted, a score with four decimals or "-", and
  * keep, discard or crash; a kept row was merged and has a score. The header,
  * blank lines and anything else are not rows.
  */
 function parseLedgerRow(line: string): LedgerRow | null {
   const cols = line.replace(/\r$/, '').split('\t')
-  if (cols.length !== 9 && cols.length !== 13) return null
+  if (cols.length !== 9 && cols.length !== 13 && cols.length !== 14) return null
   if (!/^\d{1,6}$/.test(cols[0])) return null
   if (cols[1] !== 'merged' && cols[1] !== 'reverted') return null
   const status = cols[7]

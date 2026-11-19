@@ -64,12 +64,15 @@ def runner(extra=None, decorated=()):
 
 
 R = runner()
+# The one supervisor that starts train.py, for a run that keeps its model and for one that does not.
+SUPERVISOR = re.search(r'        supervisor = """(.*?)"""\n', SOURCE, re.S).group(1)
 
 
 def status_json(blob, **over):
     parts = -(-len(blob) // R["KEEP_PART_BYTES"])
     s = {"saved": True, "bytes": len(blob), "parts": parts, "sha256": hashlib.sha256(blob).hexdigest(),
-         "params": 1234, "seq_len": 64, "eval_calls": 1, "eval_bpb": 0.75, "module": "GPT", "torch": "2.6.0"}
+         "params": 1234, "seq_len": 64, "eval_calls": 1, "eval_bpb": 0.75, "module": "GPT", "torch": "2.6.0",
+         "save_seconds": 1.5}
     s.update(over)
     return json.dumps(s).encode()
 
@@ -129,15 +132,34 @@ class PlainFunctionTests(unittest.TestCase):
         self.assertTrue(odd["saved"])
         self.assertEqual((odd["params"], odd["seq_len"], odd["eval_bpb"]), (None, None, None))
         self.assertLessEqual(len(odd["module"]), 80)
+        # How long the save step says it took is a number in a sane range or nothing.
+        self.assertEqual(good["save_seconds"], 1.5)
+        for took in [-1, 1e9, "2", True, float("inf"), None]:
+            self.assertIsNone(R["keep_status"](status_json(blob, save_seconds=took))["save_seconds"], took)
 
-    def test_supervisor_report(self):
-        line = b'noise\nOBLAB_KEEP {"train_done_s": 301.5, "total_s": 303.0, "cut": false, "rc": 0}\n'
-        self.assertEqual(R["keep_report"](line), {"train_done_s": 301.5, "total_s": 303.0, "cut": False})
-        self.assertEqual(R["keep_report"](b'OBLAB_KEEP {"train_done_s": null, "total_s": 5, "cut": true}')["train_done_s"], None)
-        self.assertIsNone(R["keep_report"](b""))
-        self.assertIsNone(R["keep_report"](b"OBLAB_KEEP not json"))
-        self.assertIsNone(R["keep_report"](b"OBLAB_KEEP [1]"))
-        self.assertIsNone(R["keep_report"](b'OBLAB_KEEP {"train_done_s": -4, "total_s": "x"}')["train_done_s"])
+    def test_output_a_sandbox_prints_is_read_up_to_a_limit(self):
+        self.assertEqual(R["read_bounded"](iter([b"ab", b"cd"]), 10), (b"abcd", True))
+        self.assertEqual(R["read_bounded"](iter([b"ab", b"cd"]), 4), (b"abcd", True))
+        self.assertEqual(R["read_bounded"](iter([]), 4), (b"", True))
+        self.assertEqual(R["read_bounded"](iter(["text ", "too"]), 100), (b"text too", True))
+        # It stops asking for more as soon as the limit is passed.
+        taken = []
+        def endless():
+            while True:
+                taken.append(1)
+                yield b"x" * 1000
+        data, whole = R["read_bounded"](endless(), 2500)
+        self.assertEqual((len(data), whole, len(taken)), (2500, False, 3))
+        self.assertEqual(R["read_bounded"](iter([b"y" * 10_000_000]), 16), (b"y" * 16, False))
+
+    def test_nothing_is_left_that_asks_the_training_sandbox_when_training_ended(self):
+        # The first version had a second supervisor that believed a marker file train.py could write itself.
+        for gone in ["KEEP_SUPERVISOR", "keep_report", "KEEP_CUT_BEFORE_LIMIT_S"]:
+            self.assertNotIn(gone, R)
+        for word in ["train-done", "train_done", "OBLAB_KEEP"]:
+            self.assertNotIn(word, SOURCE)
+        self.assertEqual(SOURCE.count("supervisor = "), 1)
+        self.assertEqual(SOURCE.count('sb.exec("python", "-c", supervisor,'), 1)
 
     def test_sample_output_is_never_trusted(self):
         def out(obj):
@@ -251,8 +273,7 @@ class KeepRunTests(unittest.TestCase):
     BLOB = b"pickled model " * 1000
 
     def run_keep(self, keep_key=KEY, result=b'RESULT {"val_bpb": 0.75}\n', train_runs_for=330.0, save_seconds=1.5,
-                 cut=False, status=None, break_reader=False, supervisor_says=True, returncode=0, smoke=False,
-                 store_fails=False):
+                 status=None, break_reader=False, returncode=0, smoke=False, store_fails=False, setup_fails=False):
         clock = Clock()
         blob = self.BLOB
         status_bytes = status_json(blob) if status is None else status
@@ -280,13 +301,15 @@ class KeepRunTests(unittest.TestCase):
                 out, code = b"", 0
                 def wait():
                     pass
-                if args[:2] == ("python", "-c"):  # a supervisor
+                if args[0] == "cp" and setup_fails:
+                    code = 1
+                if args[:2] == ("python", "-c"):  # the supervisor
                     def wait():
-                        clock.now += min(train_runs_for + save_seconds, kwargs["timeout"])
+                        # The process is over when training and the save step are, or at the hard stop.
+                        clock.now += min(train_runs_for + (save_seconds if keep_key == KEY else 0), kwargs["timeout"])
                     code = returncode
-                    if supervisor_says and args[2] == R["KEEP_SUPERVISOR"]:
-                        out = ("OBLAB_KEEP " + json.dumps({"train_done_s": train_runs_for, "total_s": train_runs_for + save_seconds,
-                                                           "cut": cut, "rc": returncode})).encode()
+                    # Whatever the sandbox prints here, the controller must not read a word of it.
+                    out = b'OBLAB_KEEP {"train_done_s": 0.05, "total_s": 419.0, "cut": true, "rc": 0}'
                 elif args[:3] == ("python", "-I", "-c") and args[3] == R["KEEP_READER"]:
                     if break_reader:
                         raise RuntimeError("sandbox went away\nwith details")
@@ -336,6 +359,7 @@ class KeepRunTests(unittest.TestCase):
         self.assertEqual(ck["bytes"], len(self.BLOB))
         self.assertEqual(ck["sha256"], hashlib.sha256(self.BLOB).hexdigest())
         self.assertNotIn("reason", ck)
+        self.assertEqual(r.result["runner_flow"], "keep-1")
         self.assertEqual(len(r.stored), 1)
         self.assertEqual(r.stored[0]["data"], self.BLOB)
         self.assertEqual(r.stored[0]["train_py"], "# arbitrary generated code")
@@ -356,29 +380,57 @@ class KeepRunTests(unittest.TestCase):
         self.assertEqual(c["timeout"], limit + 60 + R["KEEP_COLLECT_S"])
         train = [(a, k) for a, k in r.sb.commands if a[:2] == ("python", "-c")]
         self.assertEqual(len(train), 1)
-        self.assertEqual(train[0][0][2], R["KEEP_SUPERVISOR"])
-        self.assertEqual(train[0][0][3], str(limit - R["KEEP_CUT_BEFORE_LIMIT_S"]))
-        self.assertEqual(train[0][1]["timeout"], limit)  # the same hard stop
+        # The same supervisor, arguments and hard stop as a run that keeps nothing.
+        plain = [(a, k) for a, k in self.run_keep(keep_key=None).sb.commands if a[:2] == ("python", "-c")]
+        self.assertEqual(train, plain)
+        self.assertEqual(train[0][0], ("python", "-c", SUPERVISOR))
+        self.assertEqual(train[0][1], {"timeout": limit})
         self.assertEqual(r.sb.writes["/tmp/train.py"], "# arbitrary generated code")
         # The disposable copy is the reviewed harness with the save step appended.
         self.assertEqual(r.sb.writes["/tmp/prepare.py"], "reviewed harness" + R["KEEP_HOOK"])
 
-    def test_save_time_is_not_counted_as_training_time(self):
+    def test_the_measured_time_is_the_whole_process_and_nothing_is_taken_off_it(self):
         r = self.run_keep(train_runs_for=330.0, save_seconds=4.0)
-        self.assertAlmostEqual(r.result["train_wall_seconds"], 330.0)
-        self.assertEqual(r.result["checkpoint"]["save_seconds"], 4.0)
-        # Training that ended just inside the limit still counts although the save ran past limit - 1.
-        late = self.run_keep(train_runs_for=417.0, save_seconds=1.0, cut=True)
-        self.assertEqual(late.result["status"], "ok")
-        self.assertFalse(late.result["checkpoint"]["saved"])
-        self.assertIn("cut short", late.result["checkpoint"]["reason"])
-        self.assertEqual(late.stored, [])
+        self.assertAlmostEqual(r.result["train_wall_seconds"], 334.0)
+        # What the save step says about itself is passed on, checked, as information.
+        self.assertEqual(r.result["checkpoint"]["save_seconds"], 1.5)
+        claimed = self.run_keep(train_runs_for=330.0, save_seconds=4.0, status=status_json(self.BLOB, save_seconds=333.9))
+        self.assertAlmostEqual(claimed.result["train_wall_seconds"], 334.0)
+        self.assertAlmostEqual(self.run_keep(keep_key=None, train_runs_for=330.0).result["train_wall_seconds"], 330.0)
 
-    def test_a_run_stopped_at_the_hard_limit_is_still_a_budget_crash(self):
-        r = self.run_keep(train_runs_for=10_000, save_seconds=0, supervisor_says=False)
-        self.assertEqual((r.result["status"], r.result["stage"]), ("crash", "budget"))
-        self.assertNotIn("checkpoint", r.result)
-        self.assertEqual(r.stored, [])
+    def test_a_run_stopped_at_the_hard_limit_is_a_budget_crash_whatever_the_sandbox_says(self):
+        limit = 300 + self.GRACE
+        # The fake supervisor output claims training ended at 0.05 s and the rest was the save step
+        # (what a train.py that wrote the first version's marker file could make it say).
+        for runs_for, save in [(10_000, 0), (limit - 2.0, 5.0), (limit - 1.0, 0.0), (0.05, limit)]:
+            r = self.run_keep(train_runs_for=runs_for, save_seconds=save)
+            self.assertEqual((r.result["status"], r.result["stage"]), ("crash", "budget"), (runs_for, save))
+            self.assertGreaterEqual(r.result["train_wall_seconds"], limit - 1)
+            self.assertNotIn("checkpoint", r.result)
+            self.assertNotIn("metrics", r.result)
+            self.assertEqual(r.result["runner_flow"], "keep-1")
+            self.assertEqual(r.stored, [])
+            self.assertFalse(any(R["KEEP_READER"] in a for a, _ in r.sb.commands))
+            # Exactly what a run that keeps nothing gets for the same process lifetime.
+            same = self.run_keep(keep_key=None, train_runs_for=runs_for + save)
+            self.assertEqual({k: v for k, v in r.result.items() if k != "runner_flow"}, same.result)
+        # Just inside the limit it is a score, with the raw time beside it.
+        inside = self.run_keep(train_runs_for=limit - 4.0, save_seconds=2.0)
+        self.assertEqual(inside.result["status"], "ok")
+        self.assertAlmostEqual(inside.result["train_wall_seconds"], limit - 2.0)
+
+    def test_every_result_of_a_run_with_the_save_step_says_so(self):
+        for kwargs, stage in [({"returncode": 1}, "train"), ({"result": b"no result line\n"}, "parse"),
+                              ({"result": b"RESULT {not json\n"}, "parse"), ({"setup_fails": True}, "sandbox"),
+                              ({"result": b'RESULT {"val_bpb": 0.5, "train_seconds": 900}\n'}, "budget")]:
+            r = self.run_keep(**kwargs)
+            self.assertEqual((r.result["status"], r.result["stage"]), ("crash", stage))
+            self.assertEqual(r.result["runner_flow"], "keep-1", kwargs)
+            self.assertNotIn("runner_flow", self.run_keep(keep_key=None, **kwargs).result)
+        # A run that never reached a sandbox had no save step.
+        namespace = runner({"modal": None}, decorated={"run_experiment"})
+        syntax = namespace["run_experiment"]("def broken(:\n", 300, False, KEY)
+        self.assertEqual((syntax["stage"], "runner_flow" in syntax), ("syntax", False))
 
     def test_a_crashed_run_keeps_nothing(self):
         r = self.run_keep(returncode=1)
@@ -414,17 +466,17 @@ class KeepRunTests(unittest.TestCase):
         self.assertEqual(r.result["checkpoint"], {"key": None, "saved": False, "reason": "the key the lab sent is not a model key"})
         self.assertEqual(r.creates[0]["timeout"], 300 + self.GRACE + 60)
         self.assertNotIn("/tmp/prepare.py", r.sb.writes)
-        self.assertFalse(any(R["KEEP_SUPERVISOR"] in a for a, _ in r.sb.commands))
+        self.assertNotIn("runner_flow", r.result)
         self.assertEqual(r.stored, [])
 
     def test_without_a_key_nothing_of_this_runs(self):
         r = self.run_keep(keep_key=None, train_runs_for=5.0, save_seconds=0)
         self.assertEqual(r.result["status"], "ok")
         self.assertNotIn("checkpoint", r.result)
+        self.assertNotIn("runner_flow", r.result)
         self.assertEqual(r.creates[0]["timeout"], 300 + self.GRACE + 60)
         self.assertEqual(sorted(r.sb.writes), ["/tmp/train.py"])
         for args, _ in r.sb.commands:
-            self.assertNotIn(R["KEEP_SUPERVISOR"], args)
             self.assertNotIn(R["KEEP_READER"], args)
         self.assertEqual((r.stored, r.committed), ([], []))
 
@@ -436,7 +488,8 @@ class EndpointTests(unittest.TestCase):
             return SimpleNamespace(object_id="test-call")
         namespace = runner({
             "run_experiment": SimpleNamespace(spawn=spawn),
-            "store_op": SimpleNamespace(remote=lambda *a: calls.append(("store", a)) or {"ok": True, "models": []}),
+            "store_op": SimpleNamespace(remote=lambda *a: calls.append(("store", a)) or {"ok": True}),
+            "kept_info": SimpleNamespace(remote=lambda *a: calls.append(("info", a)) or {"models": []}),
             "sample_story": SimpleNamespace(remote=lambda *a: calls.append(("sample", a)) or {"status": "ok", "text": "x"}),
         }, decorated={"start", "models"})
         app = FastAPI()
@@ -467,7 +520,8 @@ class EndpointTests(unittest.TestCase):
             self.assertEqual(client.post("/models", json={"action": "info", "token": TOKEN}).status_code, 401)
             self.assertEqual(calls, [])
             self.assertEqual(client.post("/models", json={"action": "info"}, headers=auth).status_code, 200)
-            self.assertEqual(calls[-1], ("store", ("info",)))
+            # The list is read by a function of its own, never by the one that promotes.
+            self.assertEqual(calls[-1], ("info", ()))
             self.assertEqual(client.post("/models", json={"action": "promote", "key": KEY}, headers=auth).status_code, 200)
             self.assertEqual(calls[-1], ("store", ("promote", KEY)))
             ok = client.post("/models", json={"action": "sample", "key": KEY, "prompt": "A cat", "max_new": 50}, headers=auth)
@@ -485,11 +539,15 @@ class EndpointTests(unittest.TestCase):
 
 
 class SampleSandboxTests(unittest.TestCase):
-    def sample(self, output=None, raises=False, record_check=False, area="kept", key=KEY, prompt="A cat\nsat", root=None):
+    def sample(self, output=None, raises=False, record_check=False, area="kept", key=KEY, prompt="A cat\nsat", root=None,
+               pieces=None):
         if output is None:
             new = base64.b64encode(b" on a mat.\n\n").decode()
             output = ("OBLAB_SAMPLE " + json.dumps({"ok": True, "new_b64": new, "stopped": "end"})).encode()
-        creates, mounts = [], []
+        creates, mounts, waited = [], [], []
+
+        def read_all():
+            raise AssertionError("the sampling sandbox's output must never be read in one piece")
 
         class Sandbox:
             terminated = False
@@ -504,7 +562,12 @@ class SampleSandboxTests(unittest.TestCase):
                 self.commands.append((args, kwargs))
                 if raises:
                     raise RuntimeError("exec failed")
-                return SimpleNamespace(wait=lambda: None, returncode=0, stdout=SimpleNamespace(read=lambda: output))
+                stream = pieces() if pieces else iter([output[:7], output[7:]])
+                class Stdout:
+                    read = staticmethod(read_all)
+                    def __iter__(self):
+                        return stream
+                return SimpleNamespace(wait=lambda: waited.append(True), returncode=0, stdout=Stdout())
 
             def terminate(self):
                 self.terminated = True
@@ -528,7 +591,7 @@ class SampleSandboxTests(unittest.TestCase):
             "app": "test-app", "image": "reviewed-image", **({"MODELS_ROOT": root} if root else {}),
         }, decorated={"sample_story"})
         result = namespace["sample_story"](key, prompt, 60, area, record_check)
-        return SimpleNamespace(result=result, sb=sb, creates=creates, mounts=mounts, store=Store)
+        return SimpleNamespace(result=result, sb=sb, creates=creates, mounts=mounts, store=Store, waited=waited)
 
     def test_sampling_sandbox_has_no_network_no_secrets_and_one_model(self):
         r = self.sample()
@@ -564,6 +627,27 @@ class SampleSandboxTests(unittest.TestCase):
         r = self.sample(output=b"the model printed things\n")
         self.assertEqual(r.result["status"], "error")
 
+    def test_a_sandbox_that_prints_without_end_is_ended_and_little_of_it_is_held(self):
+        asked = []
+        def flood():
+            # What model-written code can do with the sampler's real output: megabytes, for as long as it runs.
+            good = base64.b64encode(b" a story").decode()
+            yield ("OBLAB_SAMPLE " + json.dumps({"ok": True, "new_b64": good, "stopped": "end"}) + "\n").encode()
+            while True:
+                asked.append(1)
+                yield b"x" * (1 << 20)
+        r = self.sample(pieces=flood)
+        self.assertEqual((r.result["status"], r.result["stage"]), ("error", "sandbox"))
+        self.assertIn("printed more than", r.result["error"])
+        self.assertNotIn("text", r.result)          # a story that came with a flood is not passed on
+        self.assertEqual(len(asked), 1)             # one megabyte was looked at, not sixty seconds of them
+        self.assertEqual(r.waited, [])              # the process is not waited for
+        self.assertTrue(r.sb.terminated)            # the sandbox is ended instead
+        self.assertLessEqual(R["SAMPLE_OUTPUT_MAX_BYTES"], 64 * 1024)
+        # An ordinary answer is far below the limit and is waited for as before.
+        ok = self.sample()
+        self.assertEqual((ok.result["status"], ok.waited), ("ok", [True]))
+
     def test_the_check_is_written_beside_the_kept_model_only(self):
         root = tempfile.mkdtemp(prefix="oblab-store-")
         self.addCleanup(shutil.rmtree, root, True)
@@ -593,14 +677,16 @@ class StoreOpTests(unittest.TestCase):
             "MODELS_ROOT": root,
             "model_store": SimpleNamespace(reload=lambda: None, commit=lambda: committed.append(True)),
             "sample_story": SimpleNamespace(spawn=lambda *a: spawned.append(a)),
-        }, decorated={"store_op"})
+        }, decorated={"store_op", "kept_info"})
+        self.info = namespace["kept_info"]
         return namespace["store_op"], spawned, committed
 
     def test_promotion_starts_one_check_and_a_second_promotion_none(self):
         root = tempfile.mkdtemp(prefix="oblab-store-")
         self.addCleanup(shutil.rmtree, root, True)
         store_op, spawned, committed = self.load(root)
-        self.assertEqual(store_op("info"), {"models": []})
+        self.assertEqual(self.info(), {"models": []})
+        self.assertFalse(store_op("info")["ok"])  # the store function only promotes
         self.assertFalse(store_op("promote", KEY)["ok"])
         self.assertEqual(spawned, [])
         save(root, KEY, 1000)
@@ -608,7 +694,7 @@ class StoreOpTests(unittest.TestCase):
         self.assertEqual(spawned, [(KEY, "", R["SAMPLE_CHECK_NEW"], "kept", True)])
         self.assertTrue(store_op("promote", KEY)["already"])
         self.assertEqual(len(spawned), 1)
-        self.assertEqual([m["key"] for m in store_op("info")["models"]], [KEY])
+        self.assertEqual([m["key"] for m in self.info()["models"]], [KEY])
         self.assertFalse(store_op("delete", KEY)["ok"])
         # The owner's command asks for no check and makes it itself.
         save(root, "owner-0a1b2c3d", 3000)
@@ -619,11 +705,12 @@ class StoreOpTests(unittest.TestCase):
 
 class ScriptTextTests(unittest.TestCase):
     def test_scripts_compile_and_the_off_path_text_is_untouched(self):
-        for name in ["KEEP_HOOK", "KEEP_SUPERVISOR", "KEEP_READER", "SAMPLER"]:
+        for name in ["KEEP_HOOK", "KEEP_READER", "SAMPLER"]:
             compile(R[name], name, "exec")
-        # The supervisor and log reader of a run that keeps nothing are still the ones in run_experiment.
-        self.assertIn("p = subprocess.run([sys.executable, '/tmp/train.py'] + sys.argv[1:], stdout=out, stderr=out)", SOURCE)
-        self.assertEqual(SOURCE.count("resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))"), 2)
+        compile(SUPERVISOR, "supervisor", "exec")
+        # The supervisor and log reader are still the ones in run_experiment, and there is one of each.
+        self.assertIn("p = subprocess.run([sys.executable, '/tmp/train.py'] + sys.argv[1:], stdout=out, stderr=out)", SUPERVISOR)
+        self.assertEqual(SOURCE.count("resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))"), 1)
         # The save step writes parts smaller than the file limit train.py runs with.
         self.assertLess(R["KEEP_PART_BYTES"], 8 * 1024 * 1024)
         # The harness with the save step appended is still one valid module.
@@ -690,12 +777,13 @@ class RealScriptsTests(unittest.TestCase):
                 .replace('"/harness"', repr(str(ROOT / "modal" / "harness")))
                 .replace('"/model"', repr(str(self.work / "model"))))
 
-    def train(self, source, cut_at="170"):
+    def train(self, source, timeout=170):
         (self.work / "train.py").write_text(source)
         (self.work / "prepare.py").write_text((ROOT / "modal" / "harness" / "prepare.py").read_text() + self.local(R["KEEP_HOOK"]))
         env = {**os.environ, "RESEARCH_CACHE": str(self.work / "cache"), "TIME_BUDGET_S": "20"}
-        p = subprocess.run([sys.executable, "-c", self.local(R["KEEP_SUPERVISOR"]), cut_at, "--smoke"],
-                           cwd=self.work, env=env, capture_output=True, timeout=170)
+        # The runner's one supervisor; `timeout` stands for the hard stop the sandbox puts on it.
+        p = subprocess.run([sys.executable, "-c", self.local(SUPERVISOR), "--smoke"],
+                           cwd=self.work, env=env, capture_output=True, timeout=timeout)
         return p, (self.work / "train.log").read_text()
 
     def sandbox(self):
@@ -721,12 +809,12 @@ class RealScriptsTests(unittest.TestCase):
         self.assertEqual(p.returncode, 0, log[-800:])
         # The save step printed nothing: the RESULT line is still the last line of the log.
         self.assertTrue(log.strip().splitlines()[-1].startswith("RESULT "), log[-400:])
-        phases = R["keep_report"](p.stdout)
-        self.assertFalse(phases["cut"])
-        self.assertIsNotNone(phases["train_done_s"])
+        self.assertEqual(p.stdout, b"")
+        self.assertEqual(sorted(f.name for f in (self.work / "oblab-keep").iterdir()), ["part-00000", "status.json"])
         report, blob = R["collect_checkpoint"](self.sandbox())
         self.assertTrue(report["saved"], report)
         self.assertEqual((report["module"], report["seq_len"], report["eval_calls"]), ("Tiny", 32, 1))
+        self.assertIsNotNone(report["save_seconds"])
         reported = json.loads(log.strip().splitlines()[-1][len("RESULT "):])["val_bpb"]
         self.assertAlmostEqual(report["eval_bpb"], reported)
         self.assertEqual(hashlib.sha256(blob).hexdigest(), report["sha256"])
@@ -780,30 +868,31 @@ class RealScriptsTests(unittest.TestCase):
             "if __name__ == '__main__':\n"
             "    p = multiprocessing.get_context('spawn').Process(target=work)\n"
             "    p.start(); p.join()\n"
-            "    marker = os.path.join(%r, 'train-done')\n"
-            "    print('RESULT ' + ('{\"val_bpb\": 1.0}' if not os.path.exists(marker) else 'marker written by a worker'))\n"
+            "    report = os.path.join(%r, 'status.json')\n"
+            "    print('RESULT ' + ('{\"val_bpb\": 1.0}' if not os.path.exists(report) else 'report written by a worker'))\n"
         ) % str(self.work / "oblab-keep")
         p, log = self.train(source)
         self.assertEqual(p.returncode, 0, log[-800:])
         self.assertIn('RESULT {"val_bpb": 1.0}', log)
 
-    def test_supervisor_cuts_a_slow_save_but_not_training(self):
-        # "Training" is over at once (the marker is there); what follows stands in for a save that never ends.
-        source = ("import os, time\nos.makedirs(%r, exist_ok=True)\nopen(%r, 'w').close()\nprint('RESULT {}', flush=True)\ntime.sleep(60)\n"
-                  % (str(self.work / "oblab-keep"), str(self.work / "oblab-keep" / "train-done")))
+    def test_a_train_py_that_forges_the_save_steps_files_still_runs_into_the_hard_stop(self):
+        # What got past the hard stop in the first version: train.py writes the "training is over"
+        # marker and a report itself, prints a score, and carries on. The supervisor has no way out
+        # but train.py ending, so the hard stop is what ends it, and the controller turns that into
+        # a crash at stage "budget" (KeepRunTests above).
+        keep = self.work / "oblab-keep"
+        source = ("import os, time\nos.makedirs(%r, exist_ok=True)\nopen(%r, 'w').close()\n"
+                  "open(%r, 'w').write('{\"saved\": false, \"save_seconds\": 9999}')\n"
+                  "print('RESULT {\"val_bpb\": 0.1}', flush=True)\ntime.sleep(8)\n"
+                  % (str(keep), str(keep / "train-done"), str(keep / "status.json")))
         t0 = time.time()
-        p, log = self.train(source, cut_at="1")
-        self.assertLess(time.time() - t0, 30)
-        self.assertEqual(p.returncode, 0)
-        phases = R["keep_report"](p.stdout)
-        self.assertTrue(phases["cut"])
-        self.assertLess(phases["train_done_s"], 1.0)
-        # Without the marker the supervisor never stops train.py: only the outer timeout does.
-        (self.work / "oblab-keep" / "train-done").unlink()
-        (self.work / "train.py").write_text("import time\ntime.sleep(2)\nraise SystemExit(3)\n")
-        p = subprocess.run([sys.executable, "-c", self.local(R["KEEP_SUPERVISOR"]), "0.2"], cwd=self.work, capture_output=True, timeout=60)
-        self.assertEqual(p.returncode, 3)
-        self.assertEqual(R["keep_report"](p.stdout), {"train_done_s": None, "total_s": R["keep_report"](p.stdout)["total_s"], "cut": False})
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.train(source, timeout=3)
+        self.assertGreaterEqual(time.time() - t0, 3)
+        # And one that ends by itself hands back its own exit code, as it always did.
+        (self.work / "train.py").write_text("raise SystemExit(3)\n")
+        p = subprocess.run([sys.executable, "-c", self.local(SUPERVISOR)], cwd=self.work, capture_output=True, timeout=60)
+        self.assertEqual((p.returncode, p.stdout), (3, b""))
 
 
 if __name__ == "__main__":
