@@ -1641,6 +1641,9 @@ export class UIOverlay {
           As the record grows (rounds, merged code, passing tests), the plant breaks out of its dome and slowly takes over the room. With no experiment connected, the room plays a local simulation instead: its desk terminals show placeholder activity, and no model, build or commit is behind it.
         </p>
         <p class="info-description">
+          The practice bench by the compute corner draws the lab's reinforcement learning runs from the stored record: a pen charts the reward of each step, a jar stands for each answer, and the held-out scores are measured by the lab. Click it for the record. It rests when nothing is running.
+        </p>
+        <p class="info-description">
           Click a scientist to see their current role.
         </p>
         <div class="info-seed">

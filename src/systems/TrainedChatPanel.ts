@@ -46,6 +46,10 @@ export interface TrainedAdapterView {
   holdoutExamples: number | null
   lossBefore: number | null
   lossAfter: number | null
+  /** Present, and 'rl', for an adapter made by Tinker RL: its "examples" are tasks and its scores are rubric scores, higher is better. */
+  kind?: 'rl'
+  scoreBefore?: number | null
+  scoreAfter?: number | null
   expiresAt: string | null
   /** The display name its author gave it, when it has one. A label only. */
   name: string | null
@@ -119,6 +123,7 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
       holdoutExamples: num(o.holdout_examples),
       lossBefore: num(o.holdout_loss_before),
       lossAfter: num(o.holdout_loss_after),
+      ...(o.kind === 'rl' ? { kind: 'rl' as const, scoreBefore: num(o.rl_score_before), scoreAfter: num(o.rl_score_after) } : {}),
       expiresAt: expires,
       name: text(o.name, 40),
       kept: o.kept === true,
@@ -149,7 +154,11 @@ export function parseLimits(raw: unknown): ChatLimits {
  * label, there only when the server sent one.
  */
 export function describeAdapter(a: TrainedAdapterView): { title: string; id?: string; mark?: string; origin: string; label?: string; score: string; kept: string } {
-  const score = a.lossBefore !== null && a.lossAfter !== null
+  const score = a.kind === 'rl'
+    ? a.scoreBefore != null && a.scoreAfter != null
+      ? `Held-out rubric score ${a.scoreBefore.toFixed(2)} before training, ${a.scoreAfter.toFixed(2)} after${a.holdoutExamples ? `, on ${a.holdoutExamples} tasks the lab held out` : ''}. Measured by the lab. Higher is better.`
+      : 'No held-out score recorded.'
+    : a.lossBefore !== null && a.lossAfter !== null
     ? `Held-out loss ${a.lossBefore.toFixed(2)} before training, ${a.lossAfter.toFixed(2)} after${a.holdoutExamples ? `, on ${a.holdoutExamples} examples the lab held out` : ''}. Measured by the lab. Lower is better.`
     : 'No held-out score recorded.'
   const until = a.expiresAt ? a.expiresAt.slice(0, 10) : ''
@@ -157,7 +166,9 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
     title: a.name ?? a.modelId,
     ...(a.name ? { id: a.modelId } : {}),
     ...(a.kept ? { mark: 'kept' } : {}),
-    origin: a.dataFrom
+    origin: a.kind === 'rl'
+      ? `Epoch ${a.epoch}. Reinforcement learning on ${a.examples} tasks and a rubric written by ${a.authorName}. Base model ${a.baseModel}.`
+      : a.dataFrom
       ? `Epoch ${a.epoch}. Trained on ${a.examples} rows of the public dataset ${a.dataFrom}, chosen by ${a.authorName}. Nobody at the lab has read those rows. Base model ${a.baseModel}.`
       : `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
     ...(a.dataOrigin ? { label: `Data origin: ${shortOrigin(a.dataOrigin)}.` } : {}),
@@ -356,6 +367,15 @@ export class TrainedChatPanel {
   private stopRefresh(): void {
     if (this.refreshTimer !== null) window.clearInterval(this.refreshTimer)
     this.refreshTimer = null
+  }
+
+  /** Opens the panel with one adapter chosen, as the practice bench's "talk to it" does. */
+  openWith(slug: string): void {
+    if (SLUG.test(slug) && this.chosen !== slug) {
+      this.chosen = slug
+      this.reset()
+    }
+    this.open()
   }
 
   private open(): void {

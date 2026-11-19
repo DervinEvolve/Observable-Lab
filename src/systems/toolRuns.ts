@@ -14,7 +14,7 @@
 
 import { BACKEND_TO_FRONTEND_MODEL, modelDisplayName, type FrontendModelId } from '../shared/types'
 
-export type ToolRunKind = 'sprite_session' | 'gpu_job' | 'explorer' | 'tinker_train'
+export type ToolRunKind = 'sprite_session' | 'gpu_job' | 'explorer' | 'tinker_train' | 'tinker_rl'
 
 export interface ToolRun {
   id: string
@@ -42,6 +42,7 @@ const KIND_ALIASES: Record<string, ToolRunKind> = {
   gpu_job: 'gpu_job',
   subagent_explore: 'explorer',
   tinker_train: 'tinker_train',
+  tinker_rl: 'tinker_rl',
 }
 
 // Control characters and ANSI codes out; length capped. The server cleans
@@ -112,6 +113,16 @@ export function parseToolRuns(raw: unknown): ToolRun[] {
       const after = measured.holdout_loss_after
       const line = status === 'ok' && typeof before === 'number' && typeof after === 'number' && Number.isFinite(before) && Number.isFinite(after)
         ? `held-out loss ${before.toFixed(2)} to ${after.toFixed(2)}, measured by the lab`
+        : cleanText(cleanText(o.output_tail, 4000)?.split('\n').map(l => l.trim()).filter(Boolean).pop(), 200)
+      if (!line) continue
+      run.resultLine = line
+    } else if (kind === 'tinker_rl') {
+      // the line is the lab's own held-out measurement, from the stored record; a run that did not finish shows the stored reason
+      const measured = detail.measured && typeof detail.measured === 'object' ? (detail.measured as Record<string, unknown>) : {}
+      const before = measured.score_before
+      const after = measured.score_after
+      const line = status === 'ok' && typeof before === 'number' && typeof after === 'number' && Number.isFinite(before) && Number.isFinite(after)
+        ? `held-out score ${before.toFixed(2)} to ${after.toFixed(2)}, measured by the lab`
         : cleanText(cleanText(o.output_tail, 4000)?.split('\n').map(l => l.trim()).filter(Boolean).pop(), 200)
       if (!line) continue
       run.resultLine = line

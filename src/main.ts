@@ -5,6 +5,7 @@ import { createLabDetails } from './scene/LabDetails'
 import { CapabilityArchive } from './entities/CapabilityArchive'
 import { KillWall } from './entities/KillWall'
 import { TrainingRig } from './entities/TrainingRig'
+import { PracticeBench } from './entities/PracticeBench'
 import { JSpaceLens } from './entities/JSpaceLens'
 import gsap from 'gsap'
 import { createLighting } from './scene/Lighting'
@@ -32,6 +33,8 @@ import { TranscriptPanel } from './systems/TranscriptPanel'
 import { ActivityPanel } from './systems/ActivityPanel'
 import { KnowledgeGraphPanel } from './systems/KnowledgeGraphPanel'
 import { TrainedChatPanel } from './systems/TrainedChatPanel'
+import { PracticeBenchPanel } from './systems/PracticeBenchPanel'
+import { parsePractice } from './systems/practiceBench'
 import { ResearchStoryBox } from './systems/ResearchStoryBox'
 import { JSpaceReadout } from './systems/JSpaceReadout'
 import { PatinaSystem } from './lib/patina'
@@ -63,6 +66,8 @@ class ObservableLab {
   private exhibitHall: ExhibitHall | null = null
   private toolRuns: ToolRunsService | null = null
   private trainedChat: TrainedChatPanel | null = null
+  private practiceBench: PracticeBench | null = null
+  private practicePanel: PracticeBenchPanel | null = null
   private growthSeen = false // a growth record (or the dev preview) has arrived
   private growthShattered = false // the record says the glass is broken
   private growthTarget = 0
@@ -273,6 +278,18 @@ class ObservableLab {
     // The compute corner comes alive during real GPU training runs
     this.trainingRig = new TrainingRig()
     this.scene.add(this.trainingRig.group)
+
+    // The practice bench beside it draws the lab's Tinker RL runs from the stored record only;
+    // it is dark and still until a run is on record (and while no experiment is connected).
+    this.practiceBench = new PracticeBench()
+    {
+      const mq = window.matchMedia?.('(prefers-reduced-motion: reduce)')
+      if (mq) {
+        this.practiceBench.setReducedMotion(mq.matches)
+        mq.addEventListener?.('change', e => this.practiceBench?.setReducedMotion(e.matches))
+      }
+    }
+    this.scene.add(this.practiceBench.group)
 
     // J-space lens: toggled per-scientist from their hover card
     // (callback wired after UIOverlay exists — see init)
@@ -516,6 +533,9 @@ class ObservableLab {
       tinker_train: run => {
         if (run.resultLine) this.trainingRig?.showJob(run.summary ?? 'Tinker training', run.resultLine, run.modelName, run.status, 45, 'Tinker training')
       },
+      tinker_rl: run => {
+        if (run.resultLine) this.trainingRig?.showJob(run.summary ?? 'Tinker RL', run.resultLine, run.modelName, run.status, 45, 'Tinker RL')
+      },
       explorer: run => {
         // the contribution's own drone may already carry this task
         if (run.task && !this.drones.some(d => !d.dead && d.lockedTask === run.task)) void this.spawnRealSubagentDrone(run.modelName, run.task, true)
@@ -540,6 +560,10 @@ class ObservableLab {
     new KnowledgeGraphPanel()
     // "Talk to what they trained": asks for nothing and shows nothing until the room's state says the visitor chat is on
     this.trainedChat = new TrainedChatPanel()
+    this.practicePanel = new PracticeBenchPanel(modelId => {
+      const slug = modelId.replace(/^lab\//, '')
+      this.trainedChat?.openWith(slug)
+    })
     // The story box of the research loop's kept model lives in the same panel, with its own switch
     this.trainedChat.attachStory(onChange => new ResearchStoryBox(onChange))
 
@@ -591,6 +615,8 @@ class ObservableLab {
       scanners: this.scanners,
       archive: this.archive,
       trainingRig: this.trainingRig,
+      practiceBench: this.practiceBench,
+      practicePanel: () => this.practicePanel,
       jspace: this.jspaceLens,
       voices: this.latestVoice,
       // Frame cost of the last rendered frame (draw calls, triangles)
@@ -1170,6 +1196,12 @@ class ObservableLab {
     // and only then does its panel call its own route.
     this.trainedChat?.setAvailable((state as unknown as { trained_chat_enabled?: unknown }).trained_chat_enabled === true)
     this.trainedChat?.setStoryAvailable((state as unknown as { research_talk_enabled?: unknown }).research_talk_enabled === true)
+    // The practice bench: only what the state stored about the newest Tinker RL run (no record: dark and still)
+    {
+      const practice = parsePractice((state as unknown as { rl_practice?: unknown }).rl_practice)
+      this.practiceBench?.setPractice(practice, false)
+      this.practicePanel?.setPractice(practice, false)
+    }
 
     if (extra.repos !== undefined) {
       const links = repoLinksFrom(extra.repos)
@@ -1885,6 +1917,11 @@ class ObservableLab {
       let o: THREE.Object3D | null = hit.object
       while (o) {
         const tag = o.userData?.inspect as { kind: string; index?: number; modelId?: string } | undefined
+        if (tag?.kind === 'practice') {
+          this.uiOverlay.hideInspectorCard()
+          this.practicePanel?.show()
+          return
+        }
         if (tag) {
           const html = this.buildInspectorHtml(tag)
           if (html) {
@@ -2813,6 +2850,7 @@ class ObservableLab {
 
     // Training rig (lamps, fan, data pulses, gauge)
     this.trainingRig?.update(deltaTime)
+    this.practiceBench?.update(deltaTime)
 
     // J-space lens follows its scientist
     this.jspaceLens?.update(deltaTime, this.camera)
