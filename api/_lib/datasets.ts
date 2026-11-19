@@ -25,7 +25,7 @@
  * are tested there.
  */
 import { DEFAULT_DATASETS_LICENSES, datasetsLicenses, modalGpuUsdPerSecond } from './tools-config.js'
-import { isValidRepoId, isValidRevision } from './weights.js'
+import { isShelfKey, isValidRepoId, isValidRevision, plainLine } from './weights.js'
 import {
   TINKER_MAX_DATASET_BYTES, TINKER_MAX_EXAMPLES, TINKER_MAX_EXAMPLE_BYTES, TINKER_MAX_STEPS, TINKER_MIN_EXAMPLES,
   estimateTinkerRun, normalizeTinkerRequest, plannedSteps, readSettings, tinkerBaseModels, tinkerNamesFlag,
@@ -69,7 +69,12 @@ export const DATASETS_MAX_SYSTEM_BYTES = 2000
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return Boolean(v) && typeof v === 'object' && !Array.isArray(v)
 }
-const text = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '')
+/**
+ * Text the fetcher or the reader sent is stored as plain characters only
+ * (plainLine in weights.ts): the record of a refusal is shown to the models,
+ * and a dataset is written by a stranger.
+ */
+const text = plainLine
 const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
 
 export function isDataPath(v: unknown): v is string {
@@ -239,7 +244,7 @@ export function normalizeDatasetFetchResult(raw: unknown, asked: DatasetRequest)
     ...base, status: 'ok', sha: r.sha, cached: r.cached === true,
     license: text(r.license, 80) || null, size_bytes: count(r.size_bytes), files: count(r.files), rows: count(r.rows),
     data_files: readDataFiles(r.data_files), skipped_files: count(r.skipped_files),
-    evicted: Array.isArray(r.evicted) ? r.evicted.filter((k): k is string => typeof k === 'string').slice(0, 20).map(k => k.slice(0, 240)) : [],
+    evicted: Array.isArray(r.evicted) ? r.evicted.filter(isShelfKey).slice(0, 20) : [],
   }
 }
 

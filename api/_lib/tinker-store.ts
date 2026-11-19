@@ -577,12 +577,26 @@ export function keptByName(keptBy: string): string {
 }
 
 /** A kept adapter with what the server needs to call it. Not for a response body. */
-export interface AdapterTarget { adapter: TrainedAdapter; sampler_path: string; experiment_id: string }
+export interface AdapterTarget {
+  adapter: TrainedAdapter
+  sampler_path: string
+  experiment_id: string
+  /**
+   * Present, and true, only when the run's examples were rows the lab read
+   * from a public dataset. It is set from the stored source itself, whether
+   * or not that source still reads as a well formed one, so the visitor chat
+   * (trained-chat.ts) can leave such an adapter out without trusting it.
+   */
+  from_dataset?: true
+}
 
 function target(row: TinkerRunRow, now: Date, keep: KeepRow | null = null): AdapterTarget | null {
   if (row.status !== 'ok' || !isSamplerPath(row.sampler_path) || !isAdapterSlug(row.slug)) return null
   if (!row.expires_at || !(new Date(row.expires_at).getTime() > now.getTime())) return null
-  return { adapter: publicAdapter(row, keep), sampler_path: row.sampler_path, experiment_id: row.experiment_id }
+  return {
+    adapter: publicAdapter(row, keep), sampler_path: row.sampler_path, experiment_id: row.experiment_id,
+    ...(row.dataset_source ? { from_dataset: true as const } : {}),
+  }
 }
 
 /**

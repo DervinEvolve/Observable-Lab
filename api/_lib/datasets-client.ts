@@ -12,6 +12,7 @@
  */
 import { requireEnv, requireHttpsUrl } from './config.js'
 import { assertNoSecrets } from './sprites.js'
+import { plainLine } from './weights.js'
 import {
   datasetsLimits, datasetsReadWaitMs, datasetsWaitMs, estimateDatasetFetchCost, estimateDatasetReadCost,
   normalizeDatasetFetchResult, normalizeRowsResult,
@@ -67,7 +68,7 @@ async function callDatasetsApp(body: Record<string, unknown>, pollMs: number, ma
       const data = await res.json() as { status?: unknown; result?: unknown; error?: unknown }
       if (data.status === 'running') continue
       if (data.status === 'done') return { state: 'done', result: data.result }
-      return { state: 'failed', error: typeof data.error === 'string' ? data.error.slice(0, 300) : 'unknown status' }
+      return { state: 'failed', error: plainLine(data.error, 300) || 'unknown status' }
     } catch {
       // keep polling until the deadline
     }
