@@ -1362,6 +1362,70 @@ test('an address is remembered by its network alone: the browser string does not
   assert.equal(store.addressNetwork('x'.repeat(200)).length, 80)
 })
 
+test('an adapter trained on rows of a public dataset is not offered to visitors unless the owner allows it', async () => {
+  // The Reviewer approves such a run without seeing a row, and nobody else
+  // has read the data either, so the public chat leaves the adapter out.
+  enableChat()
+  const written = keepAdapter()
+  const fromData = keepAdapter({ slug: 'e42-55556666' })
+  const source = { repo: 'acme/qa-pairs', sha: 'c'.repeat(40), license: 'cc-by-4.0', file: 'data/train.jsonl', user_column: 'text', assistant_column: 'label', rows_used: 20 }
+  lab.tinkerRuns.at(-1).dataset_source = JSON.stringify(source)
+  const sent = []
+  globalThis.fetch = fakeTinker(sent)
+
+  // Off by default: not listed, the usual notice, and a message to it by name is refused before anything is set aside or sent
+  // (it counts toward the visitor's messages, like a message to an adapter that is gone).
+  assert.equal(tinker.trainedChatDatasetAdaptersFlag(), false)
+  const list = await visit(undefined, { method: 'GET' })
+  assert.deepEqual(list.body.adapters.map(a => a.slug), [written])
+  assert.equal(list.body.notice, trainedChat.TRAINED_CHAT_NOTICE)
+  assert.equal(JSON.stringify(list.body).includes('acme/qa-pairs'), false)
+  const refused = await visit(say(fromData))
+  assert.deepEqual([refused.code, refused.body.error, refused.body.message], [404, 'not_offered', 'That model is not offered in this chat.'])
+  assert.deepEqual([sent.length, lab.modelCalls.length, lab.spend('all').reserved_usd, lab.spend('all').spent_usd], [0, 0, 0, 0])
+  // The other adapter answers as it always did.
+  assert.equal((await visit(say(written))).code, 200)
+  assert.equal(sent.length, 1)
+  // A stored source that no longer reads as a well formed one still keeps the adapter out.
+  for (const odd of [{ repo: 'x' }, {}, { repo: 'acme/qa-pairs', sha: 'main' }]) {
+    lab.tinkerRuns.at(-1).dataset_source = JSON.stringify(odd)
+    assert.deepEqual((await visit(undefined, { method: 'GET' })).body.adapters.map(a => a.slug), [written], JSON.stringify(odd))
+    assert.equal((await visit(say(fromData))).body.error, 'not_offered')
+  }
+  lab.tinkerRuns.at(-1).dataset_source = JSON.stringify(source)
+  // Only the value "true" turns it on, as for every switch of the lab.
+  for (const value of ['1', 'yes', 'TRUE', 'on', '']) {
+    process.env.LAB_TRAINED_CHAT_DATASET_ADAPTERS = value
+    assert.equal(tinker.trainedChatDatasetAdaptersFlag(), false, value)
+    assert.equal((await visit(undefined, { method: 'GET' })).body.adapters.length, 1)
+  }
+  // The models are still served by it through the lab model endpoint's own list: only the visitor chat leaves it out.
+  assert.deepEqual((await store.listAdapters()).map(t => [t.adapter.slug, t.from_dataset ?? false]), [[fromData, true], [written, false]])
+
+  // The owner allows it: listed with where its data came from, the notice says so, and it answers.
+  process.env.LAB_TRAINED_CHAT_DATASET_ADAPTERS = 'true'
+  const open = await visit(undefined, { method: 'GET' })
+  assert.deepEqual(open.body.adapters.map(a => [a.slug, a.data_from ?? null]), [[fromData, `acme/qa-pairs@${'c'.repeat(40)}`], [written, null]])
+  assert.equal(open.body.notice, trainedChat.TRAINED_CHAT_NOTICE_DATASETS)
+  assert.match(open.body.notice, /rows of a public dataset that nobody at the lab has read/)
+  assert.doesNotMatch(open.body.notice, /—/)
+  assert.equal(JSON.stringify(open.body).includes('from_dataset'), false)
+  assert.equal((await visit(say(fromData), { ip: '203.0.113.90' })).code, 200)
+  // The panel says where the rows came from in place of "Data written by".
+  const views = panel.parseAdapters(open.body)
+  assert.deepEqual(views.map(v => v.dataFrom), ['acme/qa-pairs', null])
+  const origin = panel.describeAdapter(views[0]).origin
+  assert.equal(origin, `Epoch 41. Trained on 20 rows of the public dataset acme/qa-pairs, chosen by Claude Fable 5.2. Nobody at the lab has read those rows. Base model ${BASE}.`)
+  assert.equal(panel.describeAdapter(views[1]).origin, `Epoch 41. Data written by Claude Fable 5.2 (20 examples). Base model ${BASE}.`)
+  // The panel takes a dataset's name only in the shape the server sends.
+  for (const odd of ['acme/qa-pairs', '<b>@' + 'c'.repeat(40), 'acme/qa pairs@' + 'c'.repeat(40), 5, null]) {
+    assert.equal(panel.parseAdapters({ adapters: [{ ...open.body.adapters[0], data_from: odd }] })[0].dataFrom, null, String(odd))
+  }
+  // With no such adapter alive the notice is the usual one, whatever the flag says.
+  lab.tinkerRuns.pop()
+  assert.equal((await visit(undefined, { method: 'GET' })).body.notice, trainedChat.TRAINED_CHAT_NOTICE)
+})
+
 test('the chat refuses what is out of bounds before anything is counted or sent', async () => {
   enableChat()
   const slug = keepAdapter()

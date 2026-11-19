@@ -25,7 +25,7 @@
  * are tested there.
  */
 import { DEFAULT_DATASETS_LICENSES, datasetsLicenses, modalGpuUsdPerSecond } from './tools-config.js'
-import { isValidRepoId, isValidRevision } from './weights.js'
+import { isShelfKey, isValidRepoId, isValidRevision, plainLine } from './weights.js'
 import {
   TINKER_MAX_DATASET_BYTES, TINKER_MAX_EXAMPLES, TINKER_MAX_EXAMPLE_BYTES, TINKER_MAX_STEPS, TINKER_MIN_EXAMPLES,
   estimateTinkerRun, normalizeTinkerRequest, plannedSteps, readSettings, tinkerBaseModels, tinkerNamesFlag,
@@ -69,7 +69,12 @@ export const DATASETS_MAX_SYSTEM_BYTES = 2000
 function isPlainObject(v: unknown): v is Record<string, unknown> {
   return Boolean(v) && typeof v === 'object' && !Array.isArray(v)
 }
-const text = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '')
+/**
+ * Text the fetcher or the reader sent is stored as plain characters only
+ * (plainLine in weights.ts): the record of a refusal is shown to the models,
+ * and a dataset is written by a stranger.
+ */
+const text = plainLine
 const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
 
 export function isDataPath(v: unknown): v is string {
@@ -239,7 +244,7 @@ export function normalizeDatasetFetchResult(raw: unknown, asked: DatasetRequest)
     ...base, status: 'ok', sha: r.sha, cached: r.cached === true,
     license: text(r.license, 80) || null, size_bytes: count(r.size_bytes), files: count(r.files), rows: count(r.rows),
     data_files: readDataFiles(r.data_files), skipped_files: count(r.skipped_files),
-    evicted: Array.isArray(r.evicted) ? r.evicted.filter((k): k is string => typeof k === 'string').slice(0, 20).map(k => k.slice(0, 240)) : [],
+    evicted: Array.isArray(r.evicted) ? r.evicted.filter(isShelfKey).slice(0, 20) : [],
   }
 }
 
@@ -597,14 +602,16 @@ export function readDatasetRecord(raw: unknown): TinkerDatasetRecord | null {
  * says what the tool does and where its limits are, and nothing about which
  * dataset to ask for or what to do with one. `gpu` and `tinker` say which of
  * the two readers are on, so nothing is described that is not there.
+ * `readsPerDay` is how many reads of rows a day holds (epoch-tools.ts): the
+ * number of Tinker runs a day.
  */
-export function datasetsNote(opts: { perDay: number; gpu: boolean; tinker: boolean; gpuJobMaxS: number }): string {
+export function datasetsNote(opts: { perDay: number; gpu: boolean; tinker: boolean; gpuJobMaxS: number; readsPerDay: number }): string {
   const limits = datasetsLimits()
   const gpu = opts.gpu
     ? ` A GPU job that names a fetched dataset reads that one entry, read-only, at /datasets; its network stays off and it is still stopped after ${opts.gpuJobMaxS} s. The stored result of such a job is labelled "data from <repo>@<commit>" by what the lab mounted, and what the job prints is still self-reported.`
     : ''
   const tinker = opts.tinker
-    ? ` A Tinker training request may name a fetched dataset instead of writing its examples: it names one file, the column that holds the user turn and the column that holds the assistant turn, optional system text of its own, and a row limit. The lab's own code reads the rows, not yours: the first rows that fit, in file order, each row one user turn and one assistant turn. A row is left out, and counted, when a cell is missing, is not text, is empty, holds a control character, would pass ${TINKER_MAX_EXAMPLE_BYTES} bytes, or repeats an earlier row; reading stops at the row limit or at ${TINKER_MAX_DATASET_BYTES} bytes of text in all. Nothing is cut to fit. Only top-level columns that hold text can be mapped, and only ones whose names are letters, digits, underscore, dot, hyphen and space, at most 64 characters. The run then goes on exactly like one with inline examples: the same limits, the same cost estimate and caps, made from the rows that were really read before anything is set aside, and the same held-out slice. Its record names the dataset, the commit, the file, the columns and how many rows were used and left out.`
+    ? ` A Tinker training request may name a fetched dataset instead of writing its examples: it names one file, the column that holds the user turn and the column that holds the assistant turn, optional system text of its own, and a row limit. The lab's own code reads the rows, not yours: the first rows that fit, in file order, each row one user turn and one assistant turn. A row is left out, and counted, when a cell is missing, is not text, is empty, holds a control character, would pass ${TINKER_MAX_EXAMPLE_BYTES} bytes, or repeats an earlier row; reading stops at the row limit or at ${TINKER_MAX_DATASET_BYTES} bytes of text in all. Nothing is cut to fit. Only top-level columns that hold text can be mapped, and only ones whose names are letters, digits, underscore, dot, hyphen and space, at most 64 characters. The run then goes on exactly like one with inline examples: the same limits, the same cost estimate and caps, made from the rows that were really read before anything is set aside, and the same held-out slice. Its record names the dataset, the commit, the file, the columns and how many rows were used and left out. The lab reads rows for at most ${opts.readsPerDay} such request${opts.readsPerDay === 1 ? '' : 's'} a day, and a read counts whether or not a run comes of it.`
     : ''
   return `Public datasets: as Executor you may ask the lab for one public Hugging Face dataset repository by its id, written org/name (and a revision if you want one). The lab's own code downloads it, not yours, and only when all of this holds: it is public and not gated (the lab uses no Hugging Face account), every license its card states is one of ${limits.licenses.join(', ')}, and its data files total at most ${limits.max_gb} GB. Only parquet, jsonl, json, csv, tsv, txt and arrow files are downloaded; a loading script, any other code and every other file is left where it is and never run, so a dataset that exists only as a script or an archive is refused. A refusal is stored with its reason. The fetch's record lists the data files with their rows and column names where the lab could count them. The shelf holds ${limits.shelf_gb} GB; the least recently used datasets are removed to make room, and one in use is not removed. At most ${opts.perDay} request${opts.perDay === 1 ? '' : 's'} a day.${gpu}${tinker}`
 }

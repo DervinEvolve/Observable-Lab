@@ -26,17 +26,25 @@
  * and is not stored or logged by the lab: a call leaves a row of counts.
  * The replies come from a small model fine-tuned on data the lab's models
  * wrote, and nobody reviews them; the room says so beside the chat.
+ *
+ * An adapter trained on rows of a public dataset (datasets.ts) is a
+ * different thing: the Reviewer approved that run without seeing a row, and
+ * neither a model nor the owner has read the data. Such an adapter is not
+ * listed here and a message to it is refused, unless the owner sets
+ * LAB_TRAINED_CHAT_DATASET_ADAPTERS=true. When that is set and one is
+ * listed, the notice beside the chat says so.
  */
 import type { VercelRequest, VercelResponse } from '@vercel/node'
 import { checkDailyBudget, recordModelCall, withSpendContext } from './spend.js'
 import { sanitizeOutput } from './sprites.js'
 import {
-  isAdapterSlug, tinkerChatCostUsd, tinkerChatDailyUsd, tinkerChatWorstCaseUsd, tinkerDailyUsd, trainedChatFlag, trainedChatStatus,
+  isAdapterSlug, tinkerChatCostUsd, tinkerChatDailyUsd, tinkerChatWorstCaseUsd, tinkerDailyUsd, trainedChatDatasetAdaptersFlag, trainedChatFlag,
+  trainedChatStatus,
 } from './tinker.js'
 import { callTinkerChat, tinkerChatCharge, type TinkerChatMessage } from './tinker-chat.js'
 import {
   addressHash, countVisitorMessage, getAdapter, listAdapters, pruneVisitorCounts, recordTrainedChatCall, reserveTinkerSpend, settleTinkerSpend,
-  utcDay, visitorHash, type Reservation,
+  utcDay, visitorHash, type AdapterTarget, type Reservation,
 } from './tinker-store.js'
 
 export const TRAINED_CHAT_PURPOSE = 'trained_chat'
@@ -65,6 +73,17 @@ export const TRAINED_CHAT_TIMEOUT_MS = 45_000
 
 /** Shown beside the chat. Plain, and no dashes. */
 export const TRAINED_CHAT_NOTICE = 'A small model fine-tuned by the lab\'s AI models on data they wrote. Replies are not reviewed.'
+/** Shown instead while the list holds an adapter trained on a public dataset (only with LAB_TRAINED_CHAT_DATASET_ADAPTERS on). */
+export const TRAINED_CHAT_NOTICE_DATASETS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on data the models wrote, and some on rows of a public dataset that nobody at the lab has read. Replies are not reviewed.'
+
+/**
+ * May the visitor chat answer with this adapter? One trained on data a model
+ * wrote into its answer: yes, as ever (the Reviewer saw that data). One
+ * trained on rows of a public dataset: only when the owner has said so.
+ */
+export function chatOffers(target: Pick<AdapterTarget, 'from_dataset'>): boolean {
+  return !target.from_dataset || trainedChatDatasetAdaptersFlag()
+}
 
 const MESSAGES = {
   off: 'The chat with trained models is switched off.',
@@ -73,6 +92,7 @@ const MESSAGES = {
   day: 'You have reached today\'s message limit. It starts again at 00:00 UTC.',
   turns: `This conversation has reached its ${TRAINED_CHAT_MAX_TURNS} turns. Start a new one to keep going.`,
   gone: 'That model is no longer kept. Trained models expire after a while.',
+  notOffered: 'That model is not offered in this chat.',
   busy: 'The model did not answer this time. Please try again in a moment.',
   unavailable: 'The chat is not available just now. Please try again later.',
 }
@@ -157,8 +177,10 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
   if (req.method === 'GET') {
     if (!status.enabled) return res.status(200).json({ enabled: false, adapters: [] })
     try {
-      const adapters = (await listAdapters()).map(t => t.adapter)
-      return res.status(200).json({ enabled: true, adapters, limits: chatLimits(), notice: TRAINED_CHAT_NOTICE })
+      const offered = (await listAdapters()).filter(chatOffers)
+      const adapters = offered.map(t => t.adapter)
+      const notice = offered.some(t => t.from_dataset) ? TRAINED_CHAT_NOTICE_DATASETS : TRAINED_CHAT_NOTICE
+      return res.status(200).json({ enabled: true, adapters, limits: chatLimits(), notice })
     } catch (e) {
       console.warn('[trained-chat] could not list adapters:', e instanceof Error ? e.message : e)
       return res.status(200).json({ enabled: true, adapters: [], limits: chatLimits(), notice: TRAINED_CHAT_NOTICE, unavailable: true })
@@ -216,6 +238,9 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
     return say(res, 503, 'unavailable', MESSAGES.unavailable)
   }
   if (!target) return say(res, 404, 'gone', MESSAGES.gone)
+  // An adapter trained on a public dataset is not on the list unless the
+  // owner allowed it, and asking for it by name gets no further than this.
+  if (!chatOffers(target)) return say(res, 404, 'not_offered', MESSAGES.notOffered)
   const base = target.adapter.base_model
 
   // ---- today's money: the lab's budget, then the chat's cap, then all of Tinker's ----

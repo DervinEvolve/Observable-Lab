@@ -457,6 +457,14 @@ export async function runDeliverables(
       // the most the caps would let this run cost plus the read itself.
       const first = await allowed(TINKER_TOOL, config, datasetRunCeiling(asked).max_cost_usd + estimateDatasetReadCost(null), () => tinkerRunsToday())
       if (!first.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, first.reason))
+      // The reads have a daily limit of their own. A read that is refused or
+      // fails (a column that is not there, a file that cannot be read) opens
+      // no run, so the runs-per-day limit above never counts it, and a read
+      // costs Modal time whatever comes of it. Every read leaves a stored
+      // record (readDatasetForRun), and those are counted here against the
+      // same number a day's runs are held to.
+      const reads = await datasetReadsLeft(config[TINKER_TOOL].per_day)
+      if (!reads.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, reads.reason))
       // The read and the run share the one wait a training run always had, so
       // the pair holds the follow-up no longer than a run alone did. A run
       // still training when the wait ends is collected by a later tick, as ever.
@@ -495,6 +503,22 @@ export async function runDeliverables(
 
   await Promise.all(tasks.map(t => t.catch(e => console.warn(`[Epoch ${ctx.epochNumber}] tool deliverable failed (non-fatal):`, e instanceof Error ? e.message : e))))
   return out
+}
+
+/**
+ * May the lab read dataset rows for one more training request today? A day
+ * holds as many reads as it may hold Tinker runs, counted from the stored
+ * records of the reads, whether or not a run came of each. A count that
+ * cannot be read allows nothing.
+ */
+async function datasetReadsLeft(perDay: number): Promise<{ ok: true } | { ok: false; reason: string }> {
+  try {
+    const used = await toolRunsToday(DATASET_ROWS_TOOL)
+    if (used >= perDay) return { ok: false, reason: `daily limit of ${perDay} dataset read${perDay === 1 ? '' : 's'} reached (a read counts whether or not a run came of it)` }
+  } catch {
+    return { ok: false, reason: 'could not read today\'s dataset reads' }
+  }
+  return { ok: true }
 }
 
 /**

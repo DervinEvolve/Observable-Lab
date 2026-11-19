@@ -157,6 +157,15 @@ export function liveTrainedFlag(): boolean {
 export function trainedChatFlag(): boolean {
   return flag('LAB_ENABLE_TRAINED_CHAT')
 }
+/**
+ * May the visitor chat also answer with an adapter trained on rows of a
+ * public dataset (datasets.ts)? Off unless the owner says so: nobody has
+ * read those rows, not a model, not the Reviewer and not the owner, so such
+ * an adapter stays out of the public chat by default.
+ */
+export function trainedChatDatasetAdaptersFlag(): boolean {
+  return flag('LAB_TRAINED_CHAT_DATASET_ADAPTERS')
+}
 /** A training request may name its adapter (tinker-names.ts). */
 export function tinkerNamesFlag(): boolean {
   return flag('LAB_ENABLE_TINKER_NAMES')
