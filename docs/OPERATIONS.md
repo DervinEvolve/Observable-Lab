@@ -608,6 +608,85 @@ What a keep answers: 200 with `"status": "ok"` and a sentence saying until when 
 
 **Turning it off.** Set `LAB_ENABLE_TINKER_KEEP` to anything but `true` and redeploy: the models are no longer told about it, `keep_adapter` is an unknown tool again, runs stop saving weights for download, and the operator route refuses a new keep. Adapters that are already kept stay kept and keep answering until their time runs out; they are listed in the chat in the ordinary order without the mark. A keep that was still going when I switched off keeps its place until the switch is on again, and so does a kept adapter that expires in the meantime; no money is tied to either. I can still unkeep through the operator route with the switch off. `LAB_ENABLE_TINKER_NAMES` turns off the same way: `name` is an unknown field again, and names already given are shown nowhere but stay in the database, so turning it back on shows them again. To empty the Volume: `modal volume rm -r oblab-kept-models <lab id>` for one adapter, or `modal volume delete oblab-kept-models` for all of it.
 
+## Stories from the research model
+
+One switch, `LAB_ENABLE_RESEARCH_TALK`, default false. With it on, the research loop has the runner save the model each run trains, a run kept as the new best has its model promoted, and visitors can ask that model for a short story in the "Talk to what they trained" panel. What it does, checks and records is in [TOOLS.md](TOOLS.md#the-research-model-talks). With it off nothing changes: the request that starts a run, the prompts, the routes' answers and the database are as before.
+
+It needs the research runner redeployed first. In this order:
+
+**1. Redeploy the runner.** Same file, same command as before, from this repository:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/research_runner.py
+```
+
+The app `oblab-research-runner` now has six functions: `run_experiment`, the `start` and `status` endpoints, and three new ones, `store_op` (lists and promotes kept models), `sample_story` (starts a sampling sandbox) and the `models` endpoint. Modal prints a third URL, for `models`; it goes in Vercel as `RESEARCH_RUNNER_MODELS_URL`. The deploy creates the Modal Volume `oblab-research-models` by itself (`create_if_missing`). There is no new secret: `models` uses `oblab-runner-auth`, like `start` and `status`, and their URLs do not change. The two images are defined exactly as they were, so I expect nothing to be rebuilt; sampling reuses the training image.
+
+**This redeploy is a boundary for the research scores, and I write it down as one.** What I changed and did not change, so that the note is accurate:
+
+- A run started without a key (which is every run while the switch is off) goes through the same code as before: same image, same supervisor, same limits, same result. The only differences in the deployed app are that the controller function now also has the models Volume mounted, which it does not touch, and that its own time limit is 300 seconds longer (1980 instead of 1680), which matters only to a controller that hangs.
+- A run started with a key trains in the same image, from the same command, under the same 8 MB file limit, the same budget and the same hard stop. It is not the same in three ways: the sandbox's disposable copy of `prepare.py` has a block appended that wraps `evaluate_bpb` and holds one reference to the last model scored; a different supervisor starts `train.py` and polls every 50 ms for the moment the save step begins; and at exit the process spends a second or so writing the model. None of that is training, but it is a change to the flow around it, so runs from the epoch where I switch this on are marked as after a boundary, the same way the compiler change was.
+
+An old runner is safe with the new server: it ignores the key, the run trains as before, and the epoch records that the runner said nothing about a saved model. A new runner is safe with an old server, which never sends a key.
+
+**2. Check the whole path cheaply, before any GPU.** This trains the tiny CPU model on synthetic bytes (about 20 seconds of training, no GPU), saves it, and asks it for 64 bytes in a sampling sandbox. Nothing is promoted; the saved candidate is cleared away with the other old candidates within three days. Any `train.py` the loop has written will do; I use the current one from my Research-Lab checkout:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal run modal/research_runner.py::keep_current --train-py ../Research-Lab/train.py --smoke
+```
+
+What I expect: the run's result with `"status": "ok"` and `"checkpoint": {"key": "smoke-...", "saved": true, ...}`, then a second object with `"status": "ok"` and a `"text"` that starts with "Once upon a time" and goes on in nonsense (the model saw twenty seconds of random bytes). If `saved` is false the `reason` beside it says which step failed. If the second object says `"stage": "definitions"` or `"load"`, the model was saved but could not be loaded again, and the error says why.
+
+**3. Have a model to talk to now, without waiting for the loop to improve (optional).** The loop keeps a run only when it beats its best, which can take days. This trains the current `train.py` once more and keeps that model. It is a real run: a GPU for the 300-second budget, about seven minutes in all, about 13 cents at my GPU rate.
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal run modal/research_runner.py::keep_current --train-py ../Research-Lab/train.py
+```
+
+It is not an epoch. Nothing is written to the ledger or the research repository, the manifest says `"source": "owner_rerun"`, and the room labels it "The research loop's training code, run once more by the owner". Its `val_bpb` is that one run's own, which will differ a little from the ledger's best because runs vary. The command promotes the model, then samples it once and prints that story (the same check the lab makes by itself when the loop's own run is kept). Afterwards, and at any time, this lists what is kept:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal run modal/research_runner.py::list_kept
+```
+
+A kept model with `"check": {"ok": true, ...}` is one visitors can ask. `"check": null` means the sample has not finished; `"ok": false` comes with the reason.
+
+**4. Vercel settings, then redeploy the lab.**
+
+| Variable | Default | What it is |
+|---|---|---|
+| `LAB_ENABLE_RESEARCH_TALK` | false | The switch. |
+| `RESEARCH_RUNNER_MODELS_URL` | none | The `https://` URL Modal printed for `models`. Without it the switch does nothing. |
+| `LAB_RESEARCH_TALK_DAILY` | 200 | Stories for all visitors in one UTC day, 0 to 2000. 0 closes the story box and keeps the saving on. |
+| `LAB_RESEARCH_TALK_MAX_NEW` | 200 | New bytes in one story, 20 to 500. The model's tokens are single bytes. |
+| `LAB_RESEARCH_TALK_USD_PER_STORY` | 0.005 | What one story is written to the spend ledger as, 0 to 0.25. A flat estimate that I believe errs high; Modal's bill is not read back. |
+
+At the defaults the most stories can add to a day's ledger is $1. The per-visitor limits are fixed in `api/_lib/research-talk.ts`. There is no new secret in Vercel.
+
+**Vercel functions.** One new function, `api/experiment/research-talk.ts` (the project now has 21; `vercel.json` gives it 120 s, because a story waits for a sandbox to start, load the model and write, and the server gives up after 105). With the switch off nothing calls it: the room's page learns from `GET /api/experiment` whether stories are on, and only then calls the route.
+
+**Database.** Two tables, made by the route the first time a story is asked for: `research_talk_rate` (counts under keyed hashes) and `research_talk_calls` (one row of counts per story, no text). Nothing is added to `epochs`; the key, the runner's report on the saved model and the promotion live inside the `research_run` JSON an epoch already has.
+
+**5. What I check after turning it on.**
+
+- `GET /api/experiment` has `research_talk_enabled: true`.
+- `curl -sS "$HOST/api/experiment/research-talk"` says `"enabled": true` and names the model with its epoch and `val_bpb`, or `"model": null` when nothing has been kept yet.
+- A story:
+
+  ```
+  curl -sS -X POST "$HOST/api/experiment/research-talk" -H 'Content-Type: application/json' -d '{"prompt": "Once upon a time there was a fox"}'
+  ```
+
+  The first one after a quiet spell takes up to a minute (a container and then a sandbox have to start); the next ones about ten to twenty seconds.
+- The next research epoch's row: `research_run.keep_key` is `e<epoch>-<first 8 of the experiment id>`, and once the run is back `research_run.result.checkpoint.saved` is true with a size and SHA-256, or false with a `reason`. If the run is kept as the new best, `research_run.promotion.ok` is true and the finding page has a "Saved model" line.
+- The run takes a little longer than before, the time it takes to copy the model out of the sandbox (I expect ten to thirty seconds for a 40 MB model, but I have not measured it on Modal). `result.checkpoint.collect_seconds` says how long it was. A run that used to come back just inside the 400 seconds one request waits may now be collected by the next hourly tick instead.
+- `modal volume ls oblab-research-models kept` and `modal volume get oblab-research-models kept/<key>/manifest.json -`.
+- `SELECT created_at, model_key, status, stage, prompt_chars, new_bytes, stopped, duration_ms FROM research_talk_calls ORDER BY created_at DESC LIMIT 20`.
+
+**What I have and have not run.** On a development machine with the same torch version (2.6.0, CPU): the appended block, the supervisor, the reader and the sampler, run for real on the loop's current `train.py` in smoke mode and on a small model in the tests. The model was saved, copied, stored, promoted and asked for text; a `train.py` with no main guard and a run that never calls `evaluate_bpb` fail the way the documents say. A model of the loop's real size (about 11 million parameters) wrote 200 bytes in under six seconds on one CPU thread there. I have not run any of this on Modal. Untested there: the deploy itself; copying tens of megabytes out of a sandbox through a command's output; the save at exit on a GPU model that was compiled with `torch.compile`; the write to the Volume and its commit; mounting one kept model's directory into a sandbox with `sub_path`; how long a sampling sandbox takes to start; and the `models` endpoint waiting on `sample_story`. Step 2 is the first real test of most of it, step 3 of the GPU part.
+
+**Turning it off.** Set `LAB_ENABLE_RESEARCH_TALK` to anything but `true` and redeploy: runs are started without a key again, the models are no longer told about it, the story box disappears and the route says it is off. Kept models stay on the Volume and are offered again if I switch it back on. The runner can stay as deployed; without a key it does what it did before. To empty the Volume: `modal volume rm -r oblab-research-models kept/<key>` for one model, or `modal volume delete oblab-research-models` for all of it.
+
 ## Model proposals to this repository
 
 `LAB_ENABLE_LAB_PROPOSALS` (default false) lets a model propose a change to this repository. Proposals arrive as pull requests labelled `model-proposal`, authored by the model on `observable-lab.invalid`, using `LAB_PROPOSALS_GITHUB_TOKEN`: a separate fine-grained token for this one repository with Pull requests and Contents read/write only. Create the `model-proposal` label first. The lab never merges them. Review each like an outside contribution; see [SECURITY.md](../SECURITY.md).

@@ -77,6 +77,9 @@ const PUBLIC_ROUTES = {
   // The visitor chat with trained adapters (api/_lib/trained-chat.ts). Public
   // by design and off by default; its own test below holds it to that.
   'experiment/trained-chat': ['GET', 'POST'],
+  // Stories from the research loop's kept model (api/_lib/research-talk.ts).
+  // Public by design and off by default; tests/research-talk.test.mjs holds it to that.
+  'experiment/research-talk': ['GET', 'POST'],
 }
 // Routes authorised by a scoped key the lab itself issues (the lab model
 // endpoint, api/_lib/live-model.ts). They are neither public nor operator

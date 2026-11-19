@@ -32,6 +32,7 @@ import { TranscriptPanel } from './systems/TranscriptPanel'
 import { ActivityPanel } from './systems/ActivityPanel'
 import { KnowledgeGraphPanel } from './systems/KnowledgeGraphPanel'
 import { TrainedChatPanel } from './systems/TrainedChatPanel'
+import { ResearchStoryBox } from './systems/ResearchStoryBox'
 import { JSpaceReadout } from './systems/JSpaceReadout'
 import { PatinaSystem } from './lib/patina'
 import { batchStatic } from './lib/staticBatch'
@@ -539,6 +540,8 @@ class ObservableLab {
     new KnowledgeGraphPanel()
     // "Talk to what they trained": asks for nothing and shows nothing until the room's state says the visitor chat is on
     this.trainedChat = new TrainedChatPanel()
+    // The story box of the research loop's kept model lives in the same panel, with its own switch
+    this.trainedChat.attachStory(onChange => new ResearchStoryBox(onChange))
 
     // Initialize PatinaSystem
     this.patinaSystem = new PatinaSystem()
@@ -601,6 +604,8 @@ class ObservableLab {
       acceptToolRuns: (raw: unknown) => this.toolRuns?.accept(parseToolRuns(raw)),
       // what the state would say about the visitor chat being switched on (development only)
       trainedChat: (on: boolean) => this.trainedChat?.setAvailable(on === true),
+      // and about stories from the research loop's kept model (development only)
+      researchTalk: (on: boolean) => this.trainedChat?.setStoryAvailable(on === true),
       renderInfo: () => ({ ...this.renderer.info.render, geometries: this.renderer.info.memory.geometries, textures: this.renderer.info.memory.textures }),
       // Replay live per-role activity from a real in-progress/completed epoch object
       liveReplay: (epoch: ExperimentState['recent_epochs'][0]) => { this.liveAnnouncedKeys.clear(); this.streamedBrowsingKeys.clear(); this.driveLiveEpochActivity(epoch) },
@@ -1164,6 +1169,7 @@ class ObservableLab {
     // The visitor chat with trained adapters: the state says whether it is switched on,
     // and only then does its panel call its own route.
     this.trainedChat?.setAvailable((state as unknown as { trained_chat_enabled?: unknown }).trained_chat_enabled === true)
+    this.trainedChat?.setStoryAvailable((state as unknown as { research_talk_enabled?: unknown }).research_talk_enabled === true)
 
     if (extra.repos !== undefined) {
       const links = repoLinksFrom(extra.repos)

@@ -239,6 +239,8 @@ export async function writeFindingPage(args: {
   challengerNotes: string[]
   provenance: ResultProvenance
   experimentId?: string
+  /** One line about the saved model, only for a run that was started with a key (research-talk.ts). */
+  checkpointNote?: string
 }): Promise<string | null> {
   const experimentId = args.experimentId?.trim() || undefined
   if (experimentId && !/^[A-Za-z0-9_-]{1,64}$/.test(experimentId)) throw new Error('writeFindingPage: invalid experimentId')
@@ -256,7 +258,7 @@ export async function writeFindingPage(args: {
 - **Dataset:** ${args.provenance.dataset ?? 'unknown'}
 - **Harness SHA-256:** ${args.provenance.harness_sha256 ? '`' + args.provenance.harness_sha256 + '`' : 'unknown'}
 - **Training wall time (measured by the runner):** ${args.provenance.train_wall_seconds !== null ? args.provenance.train_wall_seconds.toFixed(1) + ' s' : 'unknown'}
-
+${args.checkpointNote ? `- **Saved model:** ${args.checkpointNote.replace(/[\r\n]+/g, ' ').slice(0, 400)}\n` : ''}
 ## Hypothesis
 ${args.hypothesis}
 
@@ -300,6 +302,44 @@ export interface ResearchRunMetrics {
   tokens_seen?: number
 }
 
+/**
+ * What the runner says about saving a run's model (research-talk.ts). Only
+ * on a result whose run was started with a key, which the lab sends only
+ * while LAB_ENABLE_RESEARCH_TALK is on. The save ran in the same process as
+ * the generated train.py, so the saved file is as self-reported as the score.
+ */
+export interface ResearchCheckpoint {
+  key: string | null
+  saved: boolean
+  reason?: string
+  bytes?: number
+  sha256?: string
+  params?: number
+  seq_len?: number
+  /** What the harness's evaluate_bpb returned for the saved model, seen inside the training process. */
+  eval_bpb?: number
+  save_seconds?: number
+  collect_seconds?: number
+}
+
+function cleanCheckpoint(raw: unknown): ResearchCheckpoint | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const c = raw as Record<string, unknown>
+  const num = (v: unknown): number | undefined => (typeof v === 'number' && Number.isFinite(v) && v >= 0 ? v : undefined)
+  const out: ResearchCheckpoint = {
+    key: typeof c.key === 'string' && /^e[0-9]{1,6}-[0-9a-f]{8}$/.test(c.key) ? c.key : null,
+    saved: c.saved === true,
+  }
+  if (typeof c.reason === 'string') out.reason = c.reason.replace(/[^\x20-\x7e]+/g, ' ').trim().slice(0, 300)
+  if (typeof c.sha256 === 'string' && /^[0-9a-f]{64}$/.test(c.sha256)) out.sha256 = c.sha256
+  for (const key of ['bytes', 'params', 'seq_len', 'eval_bpb', 'save_seconds', 'collect_seconds'] as const) {
+    const v = num(c[key])
+    if (v !== undefined) out[key] = v
+  }
+  if (out.key === null || out.sha256 === undefined || out.bytes === undefined) out.saved = false
+  return out
+}
+
 export interface ResearchRunResult {
   status: 'ok' | 'crash' | 'infra_error'
   metrics?: ResearchRunMetrics
@@ -313,6 +353,7 @@ export interface ResearchRunResult {
   harness_sha256?: string
   budget_s?: number
   train_wall_seconds?: number // measured by the runner around train.py
+  checkpoint?: ResearchCheckpoint // only when the run was started with a key
 }
 
 /**
@@ -356,6 +397,9 @@ export function sanitizeRunResult(raw: unknown): ResearchRunResult {
     const v = num(r[key])
     if (v !== undefined) out[key] = v
   }
+  // Present only on a run that was started with a key (research-talk.ts).
+  const checkpoint = status === 'ok' ? cleanCheckpoint(r.checkpoint) : undefined
+  if (checkpoint) out.checkpoint = checkpoint
   return out
 }
 
@@ -387,11 +431,16 @@ export function researchGpuCostUsd(run: Pick<ResearchRunResult, 'wall_seconds'> 
   return seconds * modalGpuUsdPerSecond()
 }
 
-export async function startResearchRun(trainPy: string, budgetS: number): Promise<string> {
+/**
+ * `keepKey` is passed only while LAB_ENABLE_RESEARCH_TALK is on: the runner
+ * then saves the model this run trains as a candidate under that key
+ * (research-talk.ts). Without it the request is the one it always was.
+ */
+export async function startResearchRun(trainPy: string, budgetS: number, keepKey?: string): Promise<string> {
   const res = await fetch(runnerStartUrl(), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${runnerToken()}` },
-    body: JSON.stringify({ train_py: trainPy, budget_s: budgetS }),
+    body: JSON.stringify({ train_py: trainPy, budget_s: budgetS, ...(keepKey ? { keep_key: keepKey } : {}) }),
     signal: AbortSignal.timeout(RUNNER_TIMEOUT_MS),
   })
   if (!res.ok) throw new Error(`runner start failed: ${res.status}`)
