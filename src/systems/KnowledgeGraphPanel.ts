@@ -215,7 +215,8 @@ export class KnowledgeGraphPanel {
       @media ${STACKED} {
         #kg-overlay { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 11fr) minmax(0, 9fr); }
         #kg-overlay .kg-side { border-left: none; border-top: 1px solid rgba(255,255,255,0.08); }
-        #kg-overlay .kg-close { position: absolute; z-index: 2; top: calc(env(safe-area-inset-top) + 4px); right: calc(env(safe-area-inset-right) + 4px); min-width: 44px; min-height: 44px; }
+        /* The x sits over the graph here. With the title band hidden (keyboard up, or a replay's caption in its place) the graph is drawn right behind it, so it carries its own dark disc. */
+        #kg-overlay .kg-close { position: absolute; z-index: 2; top: calc(env(safe-area-inset-top) + 4px); right: calc(env(safe-area-inset-right) + 4px); min-width: 44px; min-height: 44px; background: rgba(18,18,20,0.82); border-radius: 50%; }
         #kg-overlay .kg-top { padding-right: 56px; }
         #kg-overlay .kg-caption { max-width: calc(100% - 24px); }
       }
@@ -230,7 +231,7 @@ export class KnowledgeGraphPanel {
       @media ${SHORT} {
         #kg-overlay { grid-template-columns: minmax(0, 1fr) minmax(260px, 40%); grid-template-rows: minmax(0, 1fr); }
         #kg-overlay .kg-side { border-top: none; border-left: 1px solid rgba(255,255,255,0.08); }
-        #kg-overlay .kg-close { position: static; }
+        #kg-overlay .kg-close { position: static; background: none; border-radius: 0; }
         #kg-overlay .kg-top { padding-right: 16px; }
         #kg-overlay .kg-caption { max-width: calc(100% - 24px); }
       }
