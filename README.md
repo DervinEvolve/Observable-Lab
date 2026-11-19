@@ -163,7 +163,7 @@ Run 2 is the fresh run I planned, with the newest models. For the research loop 
 
 <p align="center"><img src="docs/assets/lab-about.png" width="680" alt="The About panel explaining the experiment and the distinction between stored state and simulation."></p>
 
-*Hon AI Research is my project name. The About panel explains how to read the room.*
+*The About panel in the room explains the experiment and how to read the room.*
 
 The room regularly checks for updates to the saved experiment. When I run it locally without a connected experiment, it plays a preview of the scientists moving around and working at their desks. The corner label reads **Simulation: no experiment connected**. That is the mode shown in the GIF.
 
