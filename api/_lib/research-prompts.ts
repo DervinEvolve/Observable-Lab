@@ -20,7 +20,17 @@ export interface ResearchContextInputs {
   resultsTsv: string
   wikiIndex: string
   recentHistory: Epoch[]
+  /** Set only while LAB_ENABLE_RESEARCH_TALK is on: the lab saves kept models for visitors (research-talk.ts). */
+  storyModel?: boolean
 }
+
+/**
+ * Told to the research models only while the lab saves kept models. A fact
+ * about the lab with its limits, not a task: nothing here asks for anything.
+ */
+export const STORY_MODEL_NOTE = `
+
+WHAT HAPPENS TO A KEPT MODEL (a fact about the lab, not a goal; val_bpb is still the only thing a run is judged on): when a run is kept as the new best, the lab saves the trained model so that visitors can give it an opening line and read the short piece of text it writes next. This is done by the lab's own code, not by train.py, and nothing needs to be added for it. Its limits: the lab saves the model object that was last passed to prepare.evaluate_bpb, as it is when the process exits, with torch.save, up to 256 MB; later it loads train.py's definitions without running its main part and unpickles the model on a CPU, calling model(idx) and reading the scores for the next byte. A model it cannot save or load that way is simply not offered to visitors, and the run's score and verdict are unaffected either way. The saved file is written in the same process as train.py, so it is recorded as self-reported, like the score.`
 
 export function getResearchSharedContext(inp: ResearchContextInputs): string {
   const r = inp.research
@@ -60,7 +70,7 @@ ${inp.recentHistory.map(e => `Epoch ${e.epoch_number}: ${e.commentator_output?.s
 CURRENT train.py (the file under experimentation):
 \`\`\`python
 ${inp.trainPy}
-\`\`\`
+\`\`\`${inp.storyModel ? STORY_MODEL_NOTE : ''}
 
 WHERE YOU ARE: a physical lab watched live by humans — the model-under-training is the plant in the glass terrarium (it grows when val_bpb drops), your terminals show your work, the wall ledger records every kept capability. Your "remark" is spoken aloud in the room; your "reasoning" is read by observers studying how AI does research.
 

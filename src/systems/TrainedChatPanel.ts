@@ -24,6 +24,11 @@
 // when the owner allowed it) says so in place of "Data written by": the
 // dataset's name, and that nobody at the lab has read those rows.
 //
+// The panel can also hold the story box of the research loop's best kept
+// model (ResearchStoryBox.ts), which has its own switch and its own route.
+// main.ts attaches it. The panel's button is on the page while either is on;
+// with only the story box on, the chat's own parts are hidden.
+//
 // All text from the server and from the model is put on the page as text,
 // never as markup.
 
@@ -52,6 +57,16 @@ export interface TrainedAdapterView {
 }
 
 export interface ChatLimits { maxMessageChars: number; maxTurns: number }
+
+/** What the panel needs of a second section it can hold (the story box). */
+export interface PanelSection {
+  readonly element: HTMLElement
+  /** Is the section on the page? */
+  isShown(): boolean
+  setAvailable(on: boolean): void
+  /** Called when the panel is opened. */
+  refresh(): void
+}
 
 const SLUG = /^e[0-9]{1,6}-[0-9a-f]{8}$/
 /** "org/name@commit", as the server names the public dataset an adapter was trained on. */
@@ -157,6 +172,9 @@ export class TrainedChatPanel {
   /** What the room's state last said about the chat being switched on. */
   private available = false
   private refreshTimer: number | null = null
+  /** True while the chat route itself has said the chat is on. */
+  private chatShown = false
+  private story: PanelSection | null = null
 
   constructor() {
     this.container = document.createElement('div')
@@ -195,6 +213,16 @@ export class TrainedChatPanel {
       #trained-chat-panel .tc-send, #trained-chat-panel .tc-new { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid rgba(181,166,66,0.5); background: rgba(181,166,66,0.2); color: #f5f2eb; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600; }
       #trained-chat-panel .tc-new { background: none; border-color: rgba(255,255,255,0.15); font-weight: 400; align-self: flex-start; }
       #trained-chat-panel button:disabled { opacity: 0.4; cursor: default; }
+      #trained-chat-panel .tc-chat { display: flex; flex-direction: column; gap: 10px; }
+      #trained-chat-panel.tc-chat-off .tc-chat, #trained-chat-panel.tc-chat-off .tc-form { display: none; }
+      #trained-chat-panel .tc-story { display: flex; flex-direction: column; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+      #trained-chat-panel.tc-chat-off .tc-story { padding-bottom: 0; border-bottom: 0; }
+      #trained-chat-panel .tc-story-title { color: #f5f2eb; font-size: 12px; font-weight: 600; }
+      #trained-chat-panel .tc-story-about, #trained-chat-panel .tc-story-note { color: rgba(245,242,235,0.62); font-size: 11px; }
+      #trained-chat-panel .tc-story-form { display: flex; gap: 8px; }
+      #trained-chat-panel .tc-story-input { flex: 1; min-width: 0; min-height: 44px; box-sizing: border-box; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: #f5f2eb; padding: 0 10px; font-family: inherit; font-size: 16px; }
+      #trained-chat-panel .tc-story-input:focus-visible { outline: 2px solid #B5A642; outline-offset: 2px; }
+      #trained-chat-panel .tc-story-text { padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.07); white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; }
       @media (max-width: 760px) {
         #trained-chat-panel { right: 10px; left: 10px; width: auto; bottom: 10px; max-height: calc(100dvh - 20px); }
       }
@@ -220,11 +248,13 @@ export class TrainedChatPanel {
     this.panel.innerHTML = `
       <div class="tc-head"><div class="tc-title">Talk to what they trained</div><button type="button" class="tc-close" aria-label="Close">&times;</button></div>
       <div class="tc-body">
-        <div class="tc-notice"></div>
-        <div class="tc-adapters"></div>
-        <div class="tc-log" aria-live="polite"></div>
-        <button type="button" class="tc-new">New conversation</button>
-        <div class="tc-status" role="status"></div>
+        <div class="tc-chat">
+          <div class="tc-notice"></div>
+          <div class="tc-adapters"></div>
+          <div class="tc-log" aria-live="polite"></div>
+          <button type="button" class="tc-new">New conversation</button>
+          <div class="tc-status" role="status"></div>
+        </div>
       </div>
       <form class="tc-form">
         <textarea rows="1" aria-label="Your message" placeholder="Write a message"></textarea>
@@ -267,9 +297,43 @@ export class TrainedChatPanel {
       this.refreshTimer = window.setInterval(() => void this.load(), REFRESH_MS)
     } else {
       this.stopRefresh()
-      this.close()
-      this.container.style.display = 'none'
+      this.chatShown = false
+      this.sync()
     }
+  }
+
+  /**
+   * Puts the story box above the chat. `make` is given the function to call
+   * whenever the section starts or stops being shown. The section stays
+   * hidden, and asks for nothing, until it is switched on.
+   */
+  attachStory(make: (onChange: () => void) => PanelSection): void {
+    if (this.story) return
+    this.story = make(() => this.sync())
+    const body = this.panel.querySelector('.tc-body') as HTMLDivElement
+    body.insertBefore(this.story.element, body.firstChild)
+  }
+
+  /**
+   * Told by the page what the room's state says about stories from the
+   * research loop's kept model. The story box does the rest, and asks for
+   * nothing until this is called with true.
+   */
+  setStoryAvailable(on: boolean): void {
+    this.story?.setAvailable(on)
+  }
+
+  /**
+   * The button is on the page while the chat or the story box is. With
+   * neither, the panel is closed and hidden; with only the story box, the
+   * chat's own parts are hidden.
+   */
+  private sync(): void {
+    const any = this.chatShown || this.story?.isShown() === true
+    if (this.chatShown) this.panel.classList.remove('tc-chat-off')
+    else this.panel.classList.add('tc-chat-off')
+    if (!any) this.close()
+    this.container.style.display = any ? '' : 'none'
   }
 
   private stopRefresh(): void {
@@ -282,7 +346,8 @@ export class TrainedChatPanel {
     this.panel.classList.add('open')
     this.toggle.setAttribute('aria-expanded', 'true')
     void this.load()
-    this.input.focus()
+    this.story?.refresh()
+    if (this.chatShown) this.input.focus()
   }
 
   private close(): void {
@@ -309,11 +374,12 @@ export class TrainedChatPanel {
         // The route itself says the chat is off: stop asking. It is asked
         // again only after the room's state has said off and then on again.
         this.stopRefresh()
-        this.close()
-        this.container.style.display = 'none'
+        this.chatShown = false
+        this.sync()
         return
       }
-      this.container.style.display = ''
+      this.chatShown = true
+      this.sync()
       this.adapters = parseAdapters(data)
       this.limits = parseLimits(data)
       const notice = text(data.notice, 300)
@@ -326,7 +392,10 @@ export class TrainedChatPanel {
       this.renderAdapters()
       this.refreshForm()
     } catch {
-      if (!this.isOpen) this.container.style.display = 'none'
+      if (!this.isOpen) {
+        this.chatShown = false
+        this.sync()
+      }
     }
   }
 

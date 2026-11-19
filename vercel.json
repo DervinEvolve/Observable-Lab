@@ -25,6 +25,9 @@
     },
     "api/experiment/trained-adapters.ts": {
       "maxDuration": 120
+    },
+    "api/experiment/research-talk.ts": {
+      "maxDuration": 120
     }
   },
   "rewrites": [

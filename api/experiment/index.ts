@@ -11,6 +11,7 @@ import { computeGrowth, growthEventsFor, growthFactsFor, repoLinks } from '../_l
 import { getRecentToolRuns } from '../_lib/tool-runs-store.js'
 import { enabledTools } from '../_lib/tools-config.js'
 import { trainedChatStatus } from '../_lib/tinker.js'
+import { researchStoryStatus } from '../_lib/research-talk.js'
 import { exhibitsHandler } from '../_lib/exhibits-reader.js'
 import { researchAlongside } from '../_lib/experiment-modes.js'
 import { researchRunState, researchSummary } from '../_lib/research-alongside.js'
@@ -177,6 +178,9 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
       // Present only while the visitor chat with trained adapters is switched
       // on. The room's chat panel calls its own route only after seeing this.
       ...(trainedChatStatus().enabled ? { trained_chat_enabled: true } : {}),
+      // Present only while stories from the research loop's kept model are
+      // switched on. The story box calls its own route only after seeing this.
+      ...(researchStoryStatus().enabled ? { research_talk_enabled: true } : {}),
       ...(research ? { research } : {}),
     })
   } catch (error) {

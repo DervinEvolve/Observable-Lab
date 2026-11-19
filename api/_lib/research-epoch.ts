@@ -22,6 +22,7 @@ import { releaseEpoch } from './epoch-claim.js'
 import { epochSpend, recordModelCall } from './spend.js'
 import { researchAlongside } from './experiment-modes.js'
 import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
+import { promoteResearchModel, researchModelKey, researchTalkStatus, type Promotion } from './research-talk.js'
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
   provenanceOf, provenanceTrailers, putResearchFile, researchGpuCostUsd, ResearchRunPendingError,
@@ -77,7 +78,7 @@ export async function runResearchEpoch(experimentId: string): Promise<{
   const existingEpochResult = await sql`
     SELECT * FROM epochs WHERE experiment_id = ${experimentId} AND epoch_number = ${epochNumber} LIMIT 1
   `
-  const existingEpoch = existingEpochResult.rows[0] as (Epoch & { research_run?: { call_id?: string; result?: ResearchRunResult } }) | undefined
+  const existingEpoch = existingEpochResult.rows[0] as (Epoch & { research_run?: { call_id?: string; result?: ResearchRunResult; keep_key?: string; promotion?: Promotion } }) | undefined
   const specBefore = (existingEpoch?.spec_before as AgentSpecification) || currentSpec
   const roleAssignments: RoleAssignments = (existingEpoch?.role_assignments as RoleAssignments) || getRoleAssignments(epochNumber)
 
@@ -140,6 +141,8 @@ export async function runResearchEpoch(experimentId: string): Promise<{
       resultsTsv: resultsFile?.content ?? '',
       wikiIndex: wikiIndexFile?.content ?? '',
       recentHistory: recentResult.rows as Epoch[],
+      // Only while the lab saves kept models for visitors (research-talk.ts).
+      ...(researchTalkStatus().enabled ? { storyModel: true } : {}),
     })
 
     const notebook = await getRecentNotebook(experimentId)
@@ -204,12 +207,20 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     // saved before results were cleaned on arrival (sanitizeRunResult).
     let runResult: ResearchRunResult | undefined = existingEpoch?.research_run?.result
       ? sanitizeRunResult(existingEpoch.research_run.result) : undefined
+    // With LAB_ENABLE_RESEARCH_TALK on, the run is started with a key and the
+    // runner saves the model it trains as a candidate (research-talk.ts).
+    // The key stays on the epoch's row. With the flag off there is no key and
+    // the request and the row are what they always were.
+    let keepKey: string | undefined = existingEpoch?.research_run?.keep_key
     if (!runResult) {
       let callId = existingEpoch?.research_run?.call_id
       if (!callId) {
-        callId = await startResearchRun(executorOutput.train_py, RESEARCH_BUDGET_S)
+        keepKey = (researchTalkStatus().enabled ? researchModelKey(experimentId, epochNumber) : null) ?? undefined
+        callId = keepKey
+          ? await startResearchRun(executorOutput.train_py, RESEARCH_BUDGET_S, keepKey)
+          : await startResearchRun(executorOutput.train_py, RESEARCH_BUDGET_S)
         await sql`
-          UPDATE epochs SET research_run = ${JSON.stringify({ call_id: callId, budget_s: RESEARCH_BUDGET_S })}
+          UPDATE epochs SET research_run = ${JSON.stringify({ call_id: callId, budget_s: RESEARCH_BUDGET_S, ...(keepKey ? { keep_key: keepKey } : {}) })}
           WHERE id = ${epochId}
         `
         console.log(`[Research e${epochNumber}] run started: ${callId}`)
@@ -233,7 +244,7 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         totalCost += gpuCost
       }
       await sql`
-        UPDATE epochs SET research_run = ${JSON.stringify({ call_id: callId, budget_s: RESEARCH_BUDGET_S, result: runResult })}
+        UPDATE epochs SET research_run = ${JSON.stringify({ call_id: callId, budget_s: RESEARCH_BUDGET_S, ...(keepKey ? { keep_key: keepKey } : {}), result: runResult })}
         WHERE id = ${epochId}
       `
       console.log(`[Research e${epochNumber}] run finished: ${runResult.status} val_bpb=${runResult.metrics?.val_bpb ?? 'n/a'}`)
@@ -282,6 +293,32 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     const provenance = provenanceOf(runResult)
     const unverified = provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
 
+    // The run was started with a key (LAB_ENABLE_RESEARCH_TALK was on): when
+    // it is kept as the new best and the runner saved its model, ask the
+    // runner to keep that model for visitors. What happened is written on
+    // the epoch's row and on the finding page. A failure here changes
+    // nothing else about the epoch; a later attempt at the epoch asks again.
+    let checkpointNote: string | undefined
+    if (keepKey) {
+      const checkpoint = runResult.checkpoint
+      let promotion: Promotion | undefined = existingEpoch?.research_run?.promotion
+      const newBest = verdict === 'keep' && measuredBpb !== null && measuredBpb < research.best_bpb
+      if (newBest && checkpoint?.saved && checkpoint.key === keepKey && !promotion?.ok && researchTalkStatus().enabled) {
+        promotion = await promoteResearchModel(keepKey)
+        await sql`
+          UPDATE epochs SET research_run = COALESCE(research_run, '{}'::jsonb) || ${JSON.stringify({ promotion })}::jsonb
+          WHERE id = ${epochId}
+        `
+        console.log(`[Research e${epochNumber}] model ${keepKey} ${promotion.ok ? 'kept for visitors' : `not kept: ${promotion.error}`}`)
+      }
+      const saved = checkpoint?.saved
+        ? `saved by the runner as ${keepKey} (${checkpoint.bytes} bytes, SHA-256 \`${checkpoint.sha256}\`); the file was written in the same process as the generated code and is not independently checked`
+        : `not saved (${checkpoint?.reason || (runResult.status === 'ok' ? 'the runner said nothing about a saved model; it may not have been redeployed' : 'the run did not finish with a score')})`
+      const kept = !checkpoint?.saved ? '' : !newBest ? '. Not kept for visitors: the run was not a new best'
+        : promotion?.ok ? '. Kept for visitors to ask for a story' : `. Not kept for visitors: ${promotion?.error ?? 'unknown'}`
+      checkpointNote = saved + kept
+    }
+
     // 6. REPO EFFECTS — the org's memory is the repo, not the database
     // Credit the model that actually wrote train.py (a fallback model, if one answered).
     // The Model: trailer names it, and commit-identity.ts makes it the author.
@@ -323,6 +360,7 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         reviewReason: reviewerOutput.reason,
         challengerNotes: (challengerOutput.challenges || []).map(c => c.issue),
         provenance,
+        ...(checkpointNote ? { checkpointNote } : {}),
       })
     } catch (repoErr) {
       console.warn(`[Research e${epochNumber}] repo write failed (non-fatal):`, repoErr instanceof Error ? repoErr.message : repoErr)
