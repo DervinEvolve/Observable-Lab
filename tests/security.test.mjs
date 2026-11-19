@@ -80,6 +80,10 @@ const PUBLIC_ROUTES = {
   // Stories from the research loop's kept model (api/_lib/research-talk.ts).
   // Public by design and off by default; tests/research-talk.test.mjs holds it to that.
   'experiment/research-talk': ['GET', 'POST'],
+  // How the lab scores results (api/_lib/scoring.ts): read-only JSON with no
+  // dollar amounts. With both of its switches off (the default) it says so
+  // and reads nothing; tests/research-confirm.test.mjs holds it to that.
+  'experiment/scoring': ['GET'],
 }
 // Routes authorised by a scoped key the lab itself issues (the lab model
 // endpoint, api/_lib/live-model.ts). They are neither public nor operator

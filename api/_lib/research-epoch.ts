@@ -13,16 +13,21 @@
  */
 
 import { sql } from '@vercel/postgres'
-import { answeredModel, callModel } from './openrouter.js'
+import { answeredModel, callModel, completionTimeoutMs } from './openrouter.js'
 import { modelTrailers } from './commit-identity.js'
 import { getRoleAssignments } from './role-rotation.js'
 import { generatePlantFromSpec } from './plant-generator.js'
 import { addNotebookNote, getRecentNotebook } from './notebook.js'
 import { releaseEpoch } from './epoch-claim.js'
-import { epochSpend, recordModelCall } from './spend.js'
+import { BudgetPausedError, epochSpend, recordModelCall } from './spend.js'
 import { researchAlongside } from './experiment-modes.js'
 import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
 import { mayRetryPromotion, promoteResearchModel, researchModelKey, researchTalkStatus, type Promotion } from './research-talk.js'
+import {
+  collectRepeats, confirmColumns, confirmNewBest, confirmWaitDeadlineMs, loadRepeats, maybeStartControl, readDecision,
+  researchConfirmEnabled, researchMaxMargin, researchMinMargin, scoringPromptNote, scoringSnapshot, writeRepeatLedger,
+  type ConfirmDecision, type RepeatRow,
+} from './research-confirm.js'
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
   provenanceOf, provenanceTrailers, putResearchFile, researchGpuCostUsd, ResearchRunPendingError,
@@ -84,6 +89,15 @@ async function retryLostPromotion(experimentId: string, bestEpoch: unknown, curr
   }
 }
 
+/** The experiment's lab repeats, or the rows already in hand when they cannot be read. */
+async function loadRepeatsSafely(experimentId: string, fallback: RepeatRow[]): Promise<RepeatRow[]> {
+  try {
+    return await loadRepeats(experimentId)
+  } catch {
+    return fallback
+  }
+}
+
 function getGrowthStage(spec: AgentSpecification): AgentSpecification['meta']['growth_stage'] {
   const caps = spec.capabilities.filter(c => c.status === 'active').length
   if (caps < 1) return 'seed'
@@ -107,6 +121,7 @@ export async function runResearchEpoch(experimentId: string): Promise<{
   newSpec: AgentSpecification
   commentatorOutput: CommentatorOutput
 }> {
+  const requestStartedAt = Date.now()
   const experimentResult = await sql`SELECT * FROM experiments WHERE id = ${experimentId}`
   const experiment = experimentResult.rows[0]
   if (!experiment) throw new Error('Experiment not found')
@@ -120,7 +135,7 @@ export async function runResearchEpoch(experimentId: string): Promise<{
   const existingEpochResult = await sql`
     SELECT * FROM epochs WHERE experiment_id = ${experimentId} AND epoch_number = ${epochNumber} LIMIT 1
   `
-  const existingEpoch = existingEpochResult.rows[0] as (Epoch & { research_run?: { call_id?: string; result?: ResearchRunResult; keep_key?: string; promotion?: Promotion } }) | undefined
+  const existingEpoch = existingEpochResult.rows[0] as (Epoch & { research_run?: { call_id?: string; result?: ResearchRunResult; keep_key?: string; promotion?: Promotion; confirm?: unknown } }) | undefined
   const specBefore = (existingEpoch?.spec_before as AgentSpecification) || currentSpec
   const roleAssignments: RoleAssignments = (existingEpoch?.role_assignments as RoleAssignments) || getRoleAssignments(epochNumber)
 
@@ -166,6 +181,15 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     // Stories on: a promotion that was lost when an earlier epoch ended is asked for again.
     await retryLostPromotion(experimentId, research.best_epoch, epochNumber)
 
+    // LAB_RESEARCH_CONFIRM on: the lab repeats a run before taking it as the
+    // best (research-confirm.ts). Repeats that earlier epochs left open (the
+    // controls it started after them, and a confirmation whose epoch ended
+    // without it) are collected first, so the noise it uses is up to date
+    // and their GPU time is on the ledger. With the switch off nothing below
+    // that mentions it runs.
+    const confirmOn = researchConfirmEnabled()
+    const labRepeats: RepeatRow[] = confirmOn ? await collectRepeats(experimentId, epochNumber, RESEARCH_BUDGET_S) : []
+
     // --- Assemble research context from the repo (the org's real memory) ---
     const [trainPyFile, resultsFile, wikiIndexFile] = await Promise.all([
       getResearchFile('train.py'),
@@ -188,6 +212,8 @@ export async function runResearchEpoch(experimentId: string): Promise<{
       recentHistory: recentResult.rows as Epoch[],
       // Only while the lab saves kept models for visitors (research-talk.ts).
       ...(researchTalkStatus().enabled ? { storyModel: true } : {}),
+      // Only while the lab repeats a run before taking it as the best (research-confirm.ts).
+      ...(confirmOn ? { scoringNote: scoringPromptNote(labRepeats, researchMinMargin(), researchMaxMargin()) } : {}),
     })
 
     const notebook = await getRecentNotebook(experimentId)
@@ -333,8 +359,41 @@ export async function runResearchEpoch(experimentId: string): Promise<{
       await saveNote('Reviewer', roleAssignments.reviewer, reviewerOutput)
     }
 
+    // CONFIRM BEFORE BEST (LAB_RESEARCH_CONFIRM). A run the Reviewer kept,
+    // whose score is below the best, is run once more by the lab: the same
+    // train.py, unchanged. It stays kept only if the mean of the two scores
+    // beats the best by more than the margin. The repeat's call id is stored
+    // the moment it starts, so a request that stops waiting is picked up by
+    // the next tick like the epoch's own run. When the day's cap is reached
+    // before the repeat can start, the epoch stops the same way and repeats
+    // the run once the cap allows. The verdict is written on the
+    // epoch's row first and on the Reviewer's output after, so an epoch that
+    // is picked up again finds it and never repeats the run twice.
+    let confirm: ConfirmDecision | undefined = confirmOn ? readDecision(existingEpoch?.research_run?.confirm) : undefined
+    if (confirmOn && !confirm && reviewerOutput.verdict === 'keep') {
+      const first = runResult.metrics?.val_bpb
+      if (first !== undefined && first < research.best_bpb) {
+        confirm = await confirmNewBest({
+          experimentId, epoch: epochNumber, trainPy: executorOutput.train_py, first, best: research.best_bpb, budgetS: RESEARCH_BUDGET_S,
+          maxWaitMs: Math.min(runPollMaxMs(), confirmWaitDeadlineMs(completionTimeoutMs()) - (Date.now() - requestStartedAt)),
+        })
+        await sql`
+          UPDATE epochs SET research_run = COALESCE(research_run, '{}'::jsonb) || ${JSON.stringify({ confirm })}::jsonb
+          WHERE id = ${epochId}
+        `
+        console.log(`[Research e${epochNumber}] lab repeat: ${confirm.line}`)
+      }
+    }
+    if (confirm && confirm.verdict !== 'confirmed' && reviewerOutput.verdict === 'keep') {
+      reviewerOutput.verdict = 'revert'
+      reviewerOutput.reason += ` [LAB: keep not taken. ${confirm.line}.]`
+      await sql`UPDATE epochs SET reviewer_output = ${JSON.stringify(reviewerOutput)} WHERE id = ${epochId}`
+    }
+
     const verdict = reviewerOutput.verdict
     const measuredBpb = runResult.metrics?.val_bpb ?? null
+    // The score a kept run is recorded as: the mean of the two runs when the lab repeated it.
+    const keptBpb = confirm?.verdict === 'confirmed' && confirm.mean_bpb !== null ? confirm.mean_bpb : measuredBpb
     const provenance = provenanceOf(runResult)
     const unverified = provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
 
@@ -376,7 +435,10 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         await putResearchFile(
           'train.py',
           executorOutput.train_py,
-          `e${epochNumber} KEEP (${measuredBpb?.toFixed(4)} bpb${unverified}): ${plannerOutput.hypothesis.slice(0, 100)}\n\n${executorOutput.change_summary}\n\n` +
+          `e${epochNumber} KEEP (${measuredBpb?.toFixed(4)} bpb${unverified}${
+            confirm?.verdict === 'confirmed' && confirm.repeat_bpb !== null && confirm.mean_bpb !== null
+              ? `; lab repeat ${confirm.repeat_bpb.toFixed(4)}, mean ${confirm.mean_bpb.toFixed(4)}` : ''
+          }): ${plannerOutput.hypothesis.slice(0, 100)}\n\n${executorOutput.change_summary}\n\n` +
             `${modelTrailers({ name: displayName(executorModel), id: executorModel, role: 'executor', fallbackFor })}\n${provenanceTrailers(provenance)}`,
           trainPyFile.sha
         )
@@ -392,6 +454,8 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         status: runResult.status === 'ok' ? (verdict === 'keep' ? 'keep' : 'discard') : 'crash',
         hypothesis: plannerOutput.hypothesis,
         provenance,
+        // The five repeat columns, only while the lab repeats runs: this run's repeat, or none.
+        ...(confirmOn ? { confirm: confirm ? confirmColumns(confirm) : null } : {}),
       })
       await writeFindingPage({
         epoch: epochNumber,
@@ -406,7 +470,10 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         challengerNotes: (challengerOutput.challenges || []).map(c => c.issue),
         provenance,
         ...(checkpointNote ? { checkpointNote } : {}),
+        ...(confirm ? { confirmNote: confirm.line } : {}),
       })
+      // The lab's own repeats (this epoch's, and controls collected at its start) go in their own ledger.
+      if (confirmOn) await writeRepeatLedger(experimentId)
     } catch (repoErr) {
       console.warn(`[Research e${epochNumber}] repo write failed (non-fatal):`, repoErr instanceof Error ? repoErr.message : repoErr)
     }
@@ -414,12 +481,12 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     // 7. SPEC UPDATE — the plant tells the truth about research progress
     const newSpec: AgentSpecification = JSON.parse(JSON.stringify(specBefore))
     const newResearch: ResearchMeta = { ...research }
-    if (verdict === 'keep' && measuredBpb !== null && measuredBpb < newResearch.best_bpb) {
-      newResearch.best_bpb = measuredBpb
+    if (verdict === 'keep' && measuredBpb !== null && keptBpb !== null && keptBpb < newResearch.best_bpb) {
+      newResearch.best_bpb = keptBpb
       newResearch.best_epoch = epochNumber
       newSpec.capabilities.push({
         id: `finding_e${epochNumber}`,
-        description: `${plannerOutput.hypothesis.slice(0, 160)} (val_bpb ${measuredBpb.toFixed(4)}${unverified ? ', self-reported' : ''})`,
+        description: `${plannerOutput.hypothesis.slice(0, 160)} (val_bpb ${confirm?.verdict === 'confirmed' ? 'mean of two runs ' : ''}${keptBpb.toFixed(4)}${unverified ? ', self-reported' : ''})`,
         added_epoch: epochNumber,
         status: 'active',
       })
@@ -433,6 +500,16 @@ export async function runResearchEpoch(experimentId: string): Promise<{
       verdict,
       status: runResult.status,
       hypothesis: plannerOutput.hypothesis,
+      ...(confirm ? { confirm: confirm.verdict } : {}),
+    }
+    // The noise, the margin and the last verdict, for the public state. The
+    // stored repeats are read once more: this epoch's own repeat is among them now.
+    let repeatsNow: RepeatRow[] = labRepeats
+    if (confirmOn) {
+      if (confirm) repeatsNow = await loadRepeatsSafely(experimentId, labRepeats)
+      newResearch.scoring = scoringSnapshot({
+        epoch: epochNumber, rows: repeatsNow, minMargin: researchMinMargin(), maxMargin: researchMaxMargin(), previous: research.scoring, ...(confirm ? { decision: confirm } : {}),
+      })
     }
     newSpec.meta.research = newResearch
     newSpec.meta.stability_score = stabilityFromProgress(newResearch)
@@ -451,6 +528,7 @@ export async function runResearchEpoch(experimentId: string): Promise<{
           verdict,
           bestBpb: newResearch.best_bpb,
           baselineBpb: newResearch.baseline_bpb,
+          ...(confirm ? { labRepeat: confirm.line } : {}),
         }),
         'Narrate this epoch for the observers.'
       )
@@ -490,10 +568,24 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     `
 
     console.log(`[Research e${epochNumber}] ${verdict.toUpperCase()} — best ${newResearch.best_bpb.toFixed(4)} bpb (cost $${epochCost.toFixed(3)})`)
+
+    // The epoch is finished. With LAB_RESEARCH_CONFIRM on, a control run of
+    // the best train.py is started now when one is due, so it trains while
+    // nothing else is waiting for the runner; the next epoch collects it.
+    if (confirmOn) {
+      const bestIsThisRun = newResearch.best_epoch === epochNumber && verdict === 'keep'
+      await maybeStartControl({
+        experimentId, epoch: epochNumber, trainPy: bestIsThisRun ? executorOutput.train_py : trainPyFile.content,
+        bestBpb: newResearch.best_bpb, bestEpoch: newResearch.best_epoch, budgetS: RESEARCH_BUDGET_S,
+        requestElapsedMs: Date.now() - requestStartedAt,
+      })
+    }
     return { success: true, epochNumber, newSpec, commentatorOutput }
   } catch (error) {
     await releaseEpoch(experimentId)
     if (error instanceof ResearchRunPendingError && researchAlongside()) console.log(`[Research e${epochNumber}] ${error.message}`)
+    // Thrown inside an epoch only by the lab's repeat (research-confirm.ts): the day's cap was reached before it could start.
+    else if (error instanceof BudgetPausedError) console.log(`[Research e${epochNumber}] lab repeat not started: ${error.status.reason ?? 'daily budget reached'}; the epoch waits and repeats the run when the cap allows`)
     else console.error(`[Research e${epochNumber}] failed:`, error instanceof Error ? error.message : error)
     throw error
   }

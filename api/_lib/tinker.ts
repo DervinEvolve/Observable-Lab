@@ -174,6 +174,14 @@ export function tinkerNamesFlag(): boolean {
 export function tinkerKeepFlag(): boolean {
   return flag('LAB_ENABLE_TINKER_KEEP')
 }
+/**
+ * Every training run and adapter is labelled with where its examples came
+ * from: written by the models, or rows of a public dataset (dataOrigin in
+ * tinker-store.ts). A label only: it changes nothing about what is allowed.
+ */
+export function tinkerOriginFlag(): boolean {
+  return flag('LAB_TINKER_ORIGIN_LABELS')
+}
 function wholeEnv(name: string, fallback: number, lo: number, hi: number): number {
   const raw = (process.env[name] || '').trim()
   const n = raw ? Number(raw) : NaN

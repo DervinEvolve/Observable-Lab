@@ -39,7 +39,7 @@ import { sql } from '@vercel/postgres'
 import { sanitizeOutput } from './sprites.js'
 import { modelDisplayName } from './types.js'
 import {
-  isAdapterSlug, isExternalPath, isSamplerPath, tinkerKeepFlag, tinkerNamesFlag, type TinkerRequest, type TinkerRunResult,
+  isAdapterSlug, isExternalPath, isSamplerPath, tinkerKeepFlag, tinkerNamesFlag, tinkerOriginFlag, type TinkerRequest, type TinkerRunResult,
 } from './tinker.js'
 import { adapterNameKey } from './tinker-names.js'
 
@@ -501,6 +501,12 @@ export interface TrainedAdapter {
   name?: string
   /** Only for an adapter trained on rows the lab read from a public dataset: "org/name@commit". */
   data_from?: string
+  /**
+   * Where its training examples came from, in the lab's two labels: "written
+   * by the models" or "public dataset org/name@commit". Only while
+   * LAB_TINKER_ORIGIN_LABELS is on.
+   */
+  origin?: string
   /** Present, and true, only for an adapter that is marked to keep. */
   kept?: true
   kept_at?: string
@@ -533,6 +539,7 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
     // to keep, so a lab that uses neither sends exactly what it always sent.
     ...(name ? { name } : {}),
     ...(dataFrom(row) ? { data_from: dataFrom(row) as string } : {}),
+    ...(tinkerOriginFlag() ? { origin: dataOrigin(row) } : {}),
     ...(kept ? {
       kept: true as const,
       ...(kept.kept_at ? { kept_at: kept.kept_at } : {}),
@@ -547,6 +554,112 @@ export function dataFrom(row: Pick<TinkerRunRow, 'dataset_source'>): string | nu
   const s = row.dataset_source
   if (!s || typeof s.repo !== 'string' || typeof s.sha !== 'string') return null
   return /^[A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96}$/.test(s.repo) && /^[0-9a-f]{40}$/.test(s.sha) ? `${s.repo}@${s.sha}` : null
+}
+
+/** The label for examples a model wrote into its training request. */
+export const ORIGIN_MODELS = 'written by the models'
+/** The start of the label for examples the lab read from a shelf dataset. */
+export const ORIGIN_DATASET = 'public dataset'
+
+/**
+ * Where a run's training examples came from, as a label. A run has a stored
+ * dataset source only when the lab read its examples from a public dataset
+ * on the shelf (datasets.ts), and it is stored before anything is sent to
+ * the runner: a run whose source could not be stored is closed without being
+ * started (tinker-run.ts). So a run that trained, and has no stored source,
+ * was trained on examples the model wrote into its request. The label is
+ * read from the row, so every run that trained has one, the ones made before
+ * labels existed included. A row that was opened and never reached the
+ * runner trained on nothing: reachedRunner() tells those apart, and the
+ * summary leaves them out.
+ */
+export function dataOrigin(row: Pick<TinkerRunRow, 'dataset_source'>): string {
+  if (!row.dataset_source) return ORIGIN_MODELS
+  // A stored source that no longer reads as a repository and a commit is still a dataset.
+  return `${ORIGIN_DATASET} ${dataFrom(row) ?? '(its stored source cannot be read)'}`
+}
+
+/**
+ * Did this run reach the runner? It has a call id, is marked as running, or
+ * has an answer from the runner. A row that was opened and closed before
+ * anything was sent (the runner said no, the dataset source could not be
+ * stored, its start was never confirmed) has none of these. Such a row may
+ * be a dataset run whose source never got onto it, so its origin cannot be
+ * told from the row, and it trained on nothing either way.
+ */
+export function reachedRunner(row: Pick<TinkerRunRow, 'status' | 'result'> & { call_id?: string | null }): boolean {
+  return Boolean(row.call_id) || row.status === 'running' || row.status === 'ok' || Boolean(row.result)
+}
+
+/** One origin's runs in the public summary. */
+export interface OriginSummary {
+  origin: typeof ORIGIN_MODELS | typeof ORIGIN_DATASET
+  /** Every run that reached the runner, whatever became of it. */
+  runs: number
+  /** Runs that finished with both held-out losses measured by the lab. */
+  measured: number
+  /** Medians over the measured runs. Mean cross-entropy per trained token on the lab's held-out slice; lower is better. */
+  median_holdout_loss_before: number | null
+  median_holdout_loss_after: number | null
+  /** Only for the dataset origin: which datasets, and how many runs each. */
+  datasets?: { data_from: string; runs: number }[]
+}
+
+function median(values: number[]): number | null {
+  if (!values.length) return null
+  const sorted = [...values].sort((a, b) => a - b)
+  const mid = Math.floor(sorted.length / 2)
+  return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2
+}
+
+/** Per origin: how many runs, and the median held-out loss before and after training. No I/O. */
+export function summarizeOrigins(rows: (Pick<TinkerRunRow, 'dataset_source' | 'status' | 'result'> & { call_id?: string | null })[]): OriginSummary[] {
+  const groups: Record<'models' | 'dataset', { runs: number; before: number[]; after: number[]; datasets: Map<string, number> }> = {
+    models: { runs: 0, before: [], after: [], datasets: new Map() },
+    dataset: { runs: 0, before: [], after: [], datasets: new Map() },
+  }
+  for (const row of rows) {
+    // A row that never reached the runner is not a training run of either origin.
+    if (!reachedRunner(row)) continue
+    const g = row.dataset_source ? groups.dataset : groups.models
+    g.runs += 1
+    if (row.dataset_source) {
+      const from = dataFrom(row) ?? '(its stored source cannot be read)'
+      g.datasets.set(from, (g.datasets.get(from) ?? 0) + 1)
+    }
+    const before = num(row.result?.holdout_loss_before)
+    const after = num(row.result?.holdout_loss_after)
+    if (row.status === 'ok' && before !== null && after !== null) {
+      g.before.push(before)
+      g.after.push(after)
+    }
+  }
+  const one = (origin: OriginSummary['origin'], g: typeof groups.models): OriginSummary => ({
+    origin, runs: g.runs, measured: g.before.length,
+    median_holdout_loss_before: median(g.before), median_holdout_loss_after: median(g.after),
+    ...(origin === ORIGIN_DATASET
+      ? { datasets: [...g.datasets.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 20).map(([data_from, runs]) => ({ data_from, runs })) }
+      : {}),
+  })
+  return [one(ORIGIN_MODELS, groups.models), one(ORIGIN_DATASET, groups.dataset)]
+}
+
+/** How many of the newest runs the origin summary is taken from. */
+export const ORIGIN_SUMMARY_RUNS = 500
+
+/**
+ * The origin summary from the stored runs. It only looks: it never creates
+ * the table, and a lab that has never trained anything gets two empty rows.
+ */
+export async function originSummary(): Promise<OriginSummary[]> {
+  let rows: TinkerRunRow[] = []
+  try {
+    const r = await sql`SELECT * FROM tinker_runs ORDER BY created_at DESC LIMIT ${ORIGIN_SUMMARY_RUNS}`
+    rows = r.rows.map(row => runRow(row as Record<string, unknown>))
+  } catch {
+    rows = [] // no such table yet: nothing has been trained
+  }
+  return summarizeOrigins(rows)
 }
 
 /**

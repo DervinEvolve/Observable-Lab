@@ -22,6 +22,8 @@ export interface ResearchContextInputs {
   recentHistory: Epoch[]
   /** Set only while LAB_ENABLE_RESEARCH_TALK is on: the lab saves kept models for visitors (research-talk.ts). */
   storyModel?: boolean
+  /** Set only while LAB_RESEARCH_CONFIRM is on: how the lab scores a new best, as a fact with its limits (research-confirm.ts). */
+  scoringNote?: string
 }
 
 /**
@@ -45,7 +47,7 @@ SCOREBOARD:
 - Baseline (untouched scaffold): ${r.baseline_bpb.toFixed(4)} val_bpb
 - Current best: ${r.best_bpb.toFixed(4)} val_bpb (epoch ${r.best_epoch})
 - Long-term target: ${r.target_bpb.toFixed(2)} val_bpb
-${r.last_run ? `- Last run (epoch ${r.last_run.epoch}): ${r.last_run.val_bpb !== null ? r.last_run.val_bpb.toFixed(4) : 'CRASHED'} → ${r.last_run.verdict.toUpperCase()} — "${r.last_run.hypothesis.slice(0, 120)}"` : ''}
+${r.last_run ? `- Last run (epoch ${r.last_run.epoch}): ${r.last_run.val_bpb !== null ? r.last_run.val_bpb.toFixed(4) : 'CRASHED'} → ${r.last_run.verdict.toUpperCase()}${r.last_run.confirm ? ` (lab repeat: ${r.last_run.confirm.replace(/_/g, ' ')})` : ''} — "${r.last_run.hypothesis.slice(0, 120)}"` : ''}
 
 THE RULES (violations get reverted on sight):
 1. Only train.py may be modified. prepare.py, the evaluate_bpb harness, and the data are physically immutable — they live outside your reach.
@@ -70,7 +72,7 @@ ${inp.recentHistory.map(e => `Epoch ${e.epoch_number}: ${e.commentator_output?.s
 CURRENT train.py (the file under experimentation):
 \`\`\`python
 ${inp.trainPy}
-\`\`\`${inp.storyModel ? STORY_MODEL_NOTE : ''}
+\`\`\`${inp.storyModel ? STORY_MODEL_NOTE : ''}${inp.scoringNote ?? ''}
 
 WHERE YOU ARE: a physical lab watched live by humans — the model-under-training is the plant in the glass terrarium (it grows when val_bpb drops), your terminals show your work, the wall ledger records every kept capability. Your "remark" is spoken aloud in the room; your "reasoning" is read by observers studying how AI does research.
 
@@ -158,13 +160,15 @@ Respond with JSON:
     verdict: string
     bestBpb: number
     baselineBpb: number
+    /** The lab's repeat of this run in one line, only for a run it repeated (research-confirm.ts). */
+    labRepeat?: string
   }) => `YOUR ROLE THIS EPOCH: COMMENTATOR (Lab Narrator)
 
 Tell the human observers what happened this epoch, plainly and honestly:
 HYPOTHESIS: ${args.hypothesis}
 CHANGE: ${args.changeSummary}
 RESULT: ${JSON.stringify(args.run.metrics ?? { status: args.run.status })}
-VERDICT: ${args.verdict}
+VERDICT: ${args.verdict}${args.labRepeat ? `\nLAB REPEAT (the lab ran the same train.py once more before taking it as the best): ${args.labRepeat}` : ''}
 BEST NOW: ${args.bestBpb.toFixed(4)} (baseline was ${args.baselineBpb.toFixed(4)})
 
 Respond with JSON:

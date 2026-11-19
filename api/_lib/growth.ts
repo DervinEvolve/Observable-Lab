@@ -270,6 +270,8 @@ export interface EpochEventRow {
   review_verdict?: string | null     // research reviewer_output.verdict
   run_status?: string | null         // research_run.result.status
   val_bpb?: number | string | null   // research_run.result.metrics.val_bpb
+  confirm_verdict?: string | null    // research_run.confirm.verdict: only for a run the lab repeated (research-confirm.ts)
+  confirm_mean_bpb?: number | string | null // research_run.confirm.mean_bpb: the mean of the two runs
 }
 
 export interface ContributionEventRow {
@@ -337,7 +339,12 @@ export function buildGrowthEvents(input: {
     const approved = kept ? 2 : decisions.filter(d => d?.verdict === 'approve' || d?.verdict === 'modify').length
     events.push({ id: `epoch:${e.id}`, kind: 'epoch', epoch: e.epoch_number, at, model, magnitude: epochMagnitude(approved), ref: e.review_verdict === 'keep' || e.review_verdict === 'revert' ? e.review_verdict : null })
 
-    const measured = e.val_bpb === null || e.val_bpb === undefined ? NaN : Number(e.val_bpb)
+    const printed = e.val_bpb === null || e.val_bpb === undefined ? NaN : Number(e.val_bpb)
+    // A run the lab repeated and confirmed is on the record, and is the best
+    // later runs had to beat, at the mean of its two runs, not at its first score.
+    const mean = e.confirm_verdict === 'confirmed' && e.confirm_mean_bpb !== null && e.confirm_mean_bpb !== undefined && e.confirm_mean_bpb !== ''
+      ? Number(e.confirm_mean_bpb) : NaN
+    const measured = Number.isFinite(printed) && Number.isFinite(mean) ? mean : printed
     if (kept && e.run_status === 'ok' && Number.isFinite(measured)) {
       if (best !== null && measured < best) {
         events.push({ id: `research:${e.id}`, kind: 'breakthrough', epoch: e.epoch_number, at, model, magnitude: breakthroughMagnitude(best, measured), ref: 'keep' })
@@ -394,7 +401,8 @@ export async function growthEventsFor(experiment: { id: string; current_spec?: A
         SELECT id, epoch_number, completed_at, role_assignments->>'executor' AS assigned_executor,
           executor_output->'served_by' AS executor_served_by, reviewer_output->'decisions' AS decisions,
           reviewer_output->>'verdict' AS review_verdict, research_run->'result'->>'status' AS run_status,
-          research_run->'result'->'metrics'->>'val_bpb' AS val_bpb
+          research_run->'result'->'metrics'->>'val_bpb' AS val_bpb,
+          research_run->'confirm'->>'verdict' AS confirm_verdict, research_run->'confirm'->>'mean_bpb' AS confirm_mean_bpb
         FROM epochs WHERE experiment_id = ${id} AND completed_at IS NOT NULL
         ORDER BY epoch_number DESC LIMIT ${MAX_GROWTH_EVENTS}
       `
