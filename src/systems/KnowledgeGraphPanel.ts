@@ -911,8 +911,9 @@ export class KnowledgeGraphPanel {
       const pill = name.pill
       label(name.text, pill, name.x, size, 650, n.color, 'rgba(18,18,20,0.85)')
       const css: Box = { x0: pill.x0 / dpr, y0: pill.y0 / dpr, x1: pill.x1 / dpr, y1: pill.y1 / dpr }
-      // A finger gets 14 px above and below the drawn name (at least 44 px in all).
-      const grow = this.coarse ? Math.max(14, (44 - (css.y1 - css.y0)) / 2) : 0
+      // A finger gets at least 14 px above and below the drawn name, and enough that the name with one side alone
+      // is 44 px tall: a node right under the name still answers its own tap, so the other side has to be enough.
+      const grow = this.coarse ? Math.max(14, 44 - (css.y1 - css.y0)) : 0
       this.hullLabels.push({ type: n.type, pill: css, reach: { x0: css.x0 - 4, y0: css.y0 - grow, x1: css.x1 + 4, y1: css.y1 + grow } })
     }
 
