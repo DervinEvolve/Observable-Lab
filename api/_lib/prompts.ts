@@ -16,6 +16,7 @@ import {
 import { KEEP_REASON_MAX, keepNote } from './tinker-keep-request.js'
 import { ADAPTER_NAME_MAX, ADAPTER_NAME_MIN } from './tinker-names.js'
 import { weightsLimits } from './weights.js'
+import { DATASETS_DEFAULT_ROWS, DATASETS_MAX_SYSTEM_BYTES, datasetRunCeiling, datasetsNote, type TinkerDatasetRequest } from './datasets.js'
 import { MAX_PARTS, MAX_TRIANGLES, FIXED_TRIANGLES, TUBE_RADIAL_SEGMENTS, MATERIALS, PLACEMENTS, SHAPES } from './exhibits.js'
 
 const PROVIDERS: Record<string, string> = {
@@ -70,13 +71,21 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
     const limits = weightsLimits()
     lines.push(`- Public weights for GPU jobs: as Executor you may ask the lab for one public Hugging Face model repository by its id (and a revision if you want one). The lab's own code downloads it, not your script, and only when all of this holds: it is public and not gated (the lab uses no Hugging Face account), every license it states is one of ${limits.licenses.join(', ')}, it has safetensors weights, it has no code of its own (no .py file and no auto_map), and the files to download total at most ${limits.max_gb} GB. Only safetensors, JSON, text and tokenizer files are kept. A GPU job that names fetched weights reads them, read-only, at /weights; its network stays off and it is still stopped after ${GPU_JOB_MAX_S} s. The shelf holds ${limits.shelf_gb} GB, and the least recently used weights are removed to make room. Each GPU job's stored result is labelled "fine-tuned from <repo>@<commit>" or "from scratch" by what the lab mounted, and what a job prints is still self-reported.`)
   }
+  if (on('datasets')) {
+    // What it is and where its limits are, nothing about which dataset or what to do with it.
+    lines.push(`- ${datasetsNote({ perDay: config.datasets.per_day, gpu: on('gpu_job'), tinker: on('tinker_train'), gpuJobMaxS: GPU_JOB_MAX_S })}`)
+  }
   if (on('exhibit')) {
     lines.push(`- Exhibits for the room: as Executor you may design one object for the room as data (the exhibit format is in the Executor's instructions). If the Reviewer approves it, it becomes a pull request to AI-Agent that adds exhibits/<slug>/exhibit.json, and merges only if AI-Agent's CI passes. Merged exhibits are displayed in the room with the author model's name on them.`)
   }
   if (on('tinker_train')) {
     // What it does and where its limits are, nothing about what to train.
     // The sentence about naming the adapter is there only while names are on.
-    lines.push(`- ${tinkerNote({ perDay: config.tinker_train.per_day, liveTrained: liveTrainedToolStatus(config).enabled, ...(tinkerNamesFlag() ? { names: true } : {}) })}`)
+    // The wording about an adapter being "kept" changes only while adapters can be marked kept.
+    lines.push(`- ${tinkerNote({
+      perDay: config.tinker_train.per_day, liveTrained: liveTrainedToolStatus(config).enabled,
+      ...(tinkerNamesFlag() ? { names: true } : {}), ...(on('keep_adapter') ? { keep: true } : {}),
+    })}`)
   }
   if (on('keep_adapter')) {
     // What keeping does and where its limits are, nothing about which adapter to keep.
@@ -97,8 +106,9 @@ export function executorToolsSection(config: ToolConfig = toolConfig()): string 
   const fields: string[] = []
   if (on('subagents')) fields.push(`    "subagents": { "explore": 0-${PER_EPOCH.explorers}, "test": true | false }`)
   if (on('sprite_session')) fields.push(`    "sprite_session": { "purpose": "one line", "commands": [ { "run": "shell command", "timeout_s": 5-${SPRITE_COMMAND_MAX_S} } ] }`)
-  if (on('gpu_job')) fields.push(`    "gpu_job": { "purpose": "one line", "script": "Python source, at most ${GPU_JOB_SCRIPT_MAX_CHARS} characters"${on('weights') ? ', "weights": "org/name of fetched weights (optional)"' : ''} }`)
+  if (on('gpu_job')) fields.push(`    "gpu_job": { "purpose": "one line", "script": "Python source, at most ${GPU_JOB_SCRIPT_MAX_CHARS} characters"${on('weights') ? ', "weights": "org/name of fetched weights (optional)"' : ''}${on('datasets') ? ', "dataset": "org/name of a fetched dataset (optional)"' : ''} }`)
   if (on('weights')) fields.push(`    "weights": { "repo": "org/name on Hugging Face", "revision": "a branch, tag or commit (optional)" }`)
+  if (on('datasets')) fields.push(`    "datasets": { "repo": "org/name of a dataset on Hugging Face", "revision": "a branch, tag or commit (optional)" }`)
   if (on('exhibit')) fields.push(`    "exhibit": { "slug": "a-z 0-9 and -, 3 to 40 characters", "exhibit": { ...the exhibit, see below } }`)
   if (on('lab_proposal')) fields.push(`    "lab_proposal": { "title": "short", "summary": "what and why, for the owner", "files": [ { "path": "src/... api/... docs/... tests/... or modal/...", "content": "the whole new file" } ] }`)
   if (on('tinker_train')) {
@@ -120,11 +130,15 @@ Leave out what you don't need. Use a tool only when it would really help this ep
     }
   }
   if (on('gpu_job')) {
-    // With public weights on, "no files from the lab" would be untrue for a job that names some.
-    text += `\nThe GPU script runs as job.py with no network and no files from the lab${on('weights') ? ' other than the weights it names (next paragraph)' : ''}. Print what you want to see; the last part of the output is kept.`
+    // With public weights or datasets on, "no files from the lab" would be untrue for a job that names some.
+    const named = [on('weights') ? 'the weights' : '', on('datasets') ? 'the dataset' : ''].filter(Boolean).join(' and ')
+    text += `\nThe GPU script runs as job.py with no network and no files from the lab${named ? ` other than ${named} it names (${on('weights') && on('datasets') ? 'next paragraphs' : 'next paragraph'})` : ''}. Print what you want to see; the last part of the output is kept.`
   }
   if (on('weights')) {
     text += `\nWeights asked for in the same answer are fetched before the GPU job that names them starts, and the fetch and that job share one wait: if the fetch leaves too little of it, the job is not started and the weights stay on the shelf. A job that names weights finds that one repository's files at /weights (the same path is in LAB_WEIGHTS_DIR), with the lab's record of them in /weights/_lab_manifest.json; a job that names none has no /weights. If the weights it names are not on the shelf, the job is not started and the reason is stored.`
+  }
+  if (on('datasets') && on('gpu_job')) {
+    text += `\nA dataset asked for in the same answer is fetched before the GPU job that names it starts, and the fetch and that job share one wait: if the fetch leaves too little of it, the job is not started and the dataset stays on the shelf. A job that names a dataset finds that one repository's data files at /datasets (the same path is in LAB_DATASETS_DIR), laid out as in the repository, with the lab's record of them, their rows and their column names in /datasets/_lab_manifest.json; a job that names none has no /datasets. A job that names a dataset also has pyarrow 26 installed, for parquet and arrow files; nothing else is added. If the dataset it names is not on the shelf, the job is not started and the reason is stored.`
   }
   if (on('exhibit')) {
     const tri = Object.entries(FIXED_TRIANGLES).map(([k, v]) => `${k} ${v}`).join(', ')
@@ -144,6 +158,9 @@ At most ${MAX_TRIANGLES} triangles in all, counted per copy as: ${tri}, tube ${T
       text += ` The name is the one field that cannot refuse the request: a name the lab does not accept is left off, with the reason stored, and the run stands.`
     }
   }
+  if (on('tinker_train') && on('datasets')) {
+    text += `\nIn place of "examples", a Tinker training request may name a dataset that is already on the lab's shelf: "dataset": { "repo": "org/name" or "org/name@<commit>", "file": "the path of one data file (needed when the dataset holds more than one file with rows)", "user_column": "the column for the user turn", "assistant_column": "the column for the assistant turn", "system": "text of yours put before every row as a system message, at most ${DATASETS_MAX_SYSTEM_BYTES} bytes (optional)", "limit": ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} rows (optional, ${DATASETS_DEFAULT_ROWS} when left out) }. Give "examples" or "dataset", never both; the other fields are the same. The dataset must have been fetched in an earlier epoch or asked for in this same answer; one that is not on the shelf refuses the run, with the reason stored. The files, rows and column names of a fetched dataset are in the stored record of its fetch.`
+  }
   if (on('keep_adapter')) {
     text += `\nA request to keep an adapter takes exactly "adapter" and "reason". Nothing is kept without the Reviewer's approval.`
   }
@@ -159,6 +176,21 @@ export function tinkerReviewFacts(request: TinkerRequest): { line: string } {
   const s = request.settings
   return {
     line: `a LoRA fine-tune of ${request.base_model} on the ${request.examples.length} examples in the Executor's "tools" (${request.dataset_bytes} bytes of text), with rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epoch${s.epochs === 1 ? '' : 's'} and batch size ${s.batch_size} (${estimate.steps} optimizer steps). The lab's check: the request meets the format and the limits. The lab's estimate of the most it could cost, from Tinker's published prices: ${usdText(estimate.max_cost_usd)} (a run may cost at most ${usdText(tinkerRunUsd())}). If you approve, the lab's own code holds out ${estimate.holdout} of the examples, trains on the rest, and measures the loss on the held-out ones before and after`,
+  }
+}
+
+/**
+ * What the Reviewer is told about a Tinker training request that names a
+ * shelf dataset. The rows have not been read when the Reviewer rules, so the
+ * line says what was asked, what the lab will do, and the most the limits
+ * would let it cost; it does not pretend to know the rows.
+ */
+export function tinkerDatasetReviewFacts(request: TinkerDatasetRequest): { line: string } {
+  const ceiling = datasetRunCeiling(request)
+  const s = request.settings
+  const d = request.dataset
+  return {
+    line: `a LoRA fine-tune of ${request.base_model} on up to ${d.limit} rows of the public dataset ${d.repo}${d.sha ? `@${d.sha}` : ''}${d.file ? `, file ${d.file}` : ''}, with the user turn taken from the column "${d.user_column}" and the assistant turn from the column "${d.assistant_column}"${d.system ? ', and the system text in the Executor\'s "tools" before every row' : ''}; rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epoch${s.epochs === 1 ? '' : 's'} and batch size ${s.batch_size}. The rows are not in the Executor's answer and the lab has not read them yet, so neither you nor the lab has seen them. If you approve, the lab's own code reads the first rows that fit, in file order, leaves out and counts any row that breaks a limit, and then checks the result exactly as it checks inline examples. The lab then estimates the cost from the rows it really read and refuses the run above ${usdText(tinkerRunUsd())}; the most these limits would let it cost is ${usdText(ceiling.max_cost_usd)}. It holds out about a tenth of the rows, trains on the rest, and measures the loss on the held-out ones before and after. If the dataset is not on the lab's shelf, or the file or the columns are not there, nothing is trained and the reason is stored`,
   }
 }
 

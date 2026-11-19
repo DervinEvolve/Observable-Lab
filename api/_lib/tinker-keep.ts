@@ -104,7 +104,8 @@ export function keepManifest(run: TinkerRunRow, keep: Pick<KeepRow, 'kept_by' | 
     epoch: run.epoch,
     author_model: run.model,
     purpose: run.purpose,
-    dataset: { sha256: run.dataset_sha256, examples: run.dataset_examples, bytes: run.dataset_bytes },
+    // `source` is there only for a run whose examples the lab read from a public dataset.
+    dataset: { sha256: run.dataset_sha256, examples: run.dataset_examples, bytes: run.dataset_bytes, ...(run.dataset_source ? { source: run.dataset_source } : {}) },
     settings: run.settings,
     measured_by_the_lab: {
       what: 'mean cross-entropy per trained token on examples the lab held out; lower is better',
@@ -348,10 +349,25 @@ export async function keepAdapter(request: KeepRequest, asker: KeepWho, opts: { 
   return { tool, status: 'started', summary: `keeping ${label} has started; the lab collects the result at a later hourly check` }
 }
 
-/** A keep still pending this long after it was asked for is given up and its place given back. */
-export const KEEP_LOST_AFTER_MS = 30 * 60 * 1000
-/** A keep with no call id this long after it was asked for never started as far as the lab can tell. */
-export const KEEP_UNCONFIRMED_AFTER_MS = 15 * 60 * 1000
+/**
+ * A keep the runner has not answered for this long after it was asked for is
+ * given up and its place given back. The keeper itself is stopped after 15
+ * minutes, so this is not how long a keep may take: it is how long the lab
+ * goes on asking. The tick comes once an hour and a keep asked for during an
+ * epoch is most of an hour old at the first one, so anything under an hour
+ * would let one status call that did not answer settle a keep that in fact
+ * worked, with its year on Tinker set and nothing in the lab's record. Three
+ * hours is at least three ticks. A runner that says the keep failed, or that
+ * its result has expired, is believed at once.
+ */
+export const KEEP_LOST_AFTER_MS = 3 * 60 * 60 * 1000
+/**
+ * A keep with no call id this long after it was asked for never started as
+ * far as the lab can tell. The runner is asked for the call by the keep's
+ * name on every tick until then, and "no call known" is also what one failed
+ * request looks like, so this is long enough for two ticks.
+ */
+export const KEEP_UNCONFIRMED_AFTER_MS = 90 * 60 * 1000
 /** The most time one tick spends asking the runner about pending keeps. */
 export const KEEP_COLLECT_BUDGET_MS = 30_000
 

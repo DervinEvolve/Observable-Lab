@@ -1594,7 +1594,7 @@ export class UIOverlay {
     this.infoPanelElement.innerHTML = `
       <div class="info-header">
         <h1 class="info-title">Observable Lab</h1>
-        <p class="info-subtitle">Hon AI Research, a personal experiment</p>
+        <p class="info-subtitle">by Dervin Dimanche, a personal experiment</p>
       </div>
       ${this.simulationMode
         ? '<div class="info-simulation" id="info-simulation" title="No experiment is connected. Desk activity and terminal text are a local simulation, not model work.">Simulation: no experiment connected</div>'
@@ -1614,19 +1614,31 @@ export class UIOverlay {
       <div class="info-content ${toggleClass}" id="info-about-content">
         <div class="info-divider"></div>
         <p class="info-description">
-          Five AI models from different labs collaborate to design an autonomous agent.
+          Five AI models from five different labs (Gemini, DeepSeek, Claude, GPT and Grok) work together, round after round, to design an autonomous agent. They start from one seed purpose, below, and decide the rest themselves.
         </p>
         <p class="info-description">
-          Watch the specification grow as a plant: branches are capabilities, roots are constraints.
+          Each round, every model has a job: one plans, one builds, one looks for how it could fail, one decides what stays, and one explains what happened. The jobs rotate, so in every block of five rounds each model plays each job once.
         </p>
         <p class="info-description">
-          As the stored record grows (epochs, merged code, passing tests), the plant breaks out of its dome and slowly takes over the room. With no experiment connected it stays in the glass.
+          What they agree on becomes their agent specification, drawn as the plant. They also write real code: changes go as pull requests to the AI-Agent repository, and only the ones that pass its tests are merged.
         </p>
         <p class="info-description">
-          The scene shows stored experiment state and polls for updates.
+          They have a memory. Everything they proposed, challenged and decided is kept in a knowledge graph, and they can ask it questions before they act. Open the knowledge graph to search it yourself, or to watch them recall.
         </p>
         <p class="info-description">
-          With no experiment connected, the room plays a local simulation. Its desk terminals show placeholder activity; no model, build or commit is behind it.
+          When switched on, they can also use tools: a cloud computer to run commands, short GPU jobs, public model weights, a live model run by the lab, and fine-tuning small models of their own. Each tool comes with limits and a budget, never with a goal.
+        </p>
+        <p class="info-description">
+          Beside them runs a second loop of machine learning research: the models take turns trying to improve a tiny language model that trains for five minutes, and every result goes to the Research-Lab repository.
+        </p>
+        <p class="info-description">
+          The stored record is the evidence. A score printed by the models' own code is marked unverified; a score the lab measured itself says so. When the lab itself changes during the run, the change is logged in the project's README.
+        </p>
+        <p class="info-description">
+          What it asks: do the models come to agree or drift apart? Whose values win when they disagree? Can you predict what they will do next?
+        </p>
+        <p class="info-description">
+          As the record grows (rounds, merged code, passing tests), the plant breaks out of its dome and slowly takes over the room. With no experiment connected, the room plays a local simulation instead: its desk terminals show placeholder activity, and no model, build or commit is behind it.
         </p>
         <p class="info-description">
           Click a scientist to see their current role.
@@ -1649,9 +1661,9 @@ export class UIOverlay {
               <li><strong>Challenger</strong>: "Here's how this could fail"</li>
               <li><strong>Reviewer</strong>: "Approve, reject, or modify"</li>
               <li><strong>Commentator</strong>: "Here's what happened"</li>
-              <li><strong>Wildcard</strong>: ${this.escapeHtml(wildcardName('north'))}, an autonomous R&amp;D agent (does not rotate)</li>
+              <li><strong>Wildcards</strong>: ${this.escapeHtml(wildcardName('north'))} and ${this.escapeHtml(wildcardName('glm'))}, a coding pair that works outside the rotation</li>
             </ul>
-            <p class="info-note">Every 5 epochs, each of the five models has played each rotating role exactly once. ${this.escapeHtml(wildcardName('north'))} always holds the Wildcard role; it never rotates. Labels show roles from the last completed epoch and update when each new epoch finishes.</p>
+            <p class="info-note">Every 5 epochs, each of the five models has played each rotating role exactly once. ${this.escapeHtml(wildcardName('north'))} and ${this.escapeHtml(wildcardName('glm'))} always hold the Wildcard role; they never rotate. Labels show roles from the last completed epoch and update when each new epoch finishes.</p>
           </div>
         </div>
 
@@ -1663,7 +1675,8 @@ export class UIOverlay {
               <li><strong>Roots</strong> = constraints</li>
               <li><strong>Leaves</strong> = behaviors</li>
               <li><strong>Wilting</strong> = conflict</li>
-              <li><strong>Growth</strong> = coherence</li>
+              <li><strong>Posture</strong> = stability</li>
+              <li><strong>Spreading past the glass</strong> = the record growing</li>
             </ul>
           </div>
         </div>

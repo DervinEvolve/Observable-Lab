@@ -35,12 +35,18 @@ const FAMILY_WORDS = [
 ] as const
 
 /**
- * Model names that are also ordinary words or very short. These are refused
- * only as a whole word of the name, so "Opus" is refused and "Octopus" is not.
+ * Model and maker names that are also ordinary words or very short. These
+ * are refused only as a whole word of the name, so "Opus" is refused and
+ * "Octopus" is not. A whole word here is also the word with a version
+ * written straight after it ("Opus4.5", "Fable5.2", "o3mini"), and the word
+ * written as two ("x AI", "o 3").
  */
 const WHOLE_WORDS = [
-  'sonnet', 'opus', 'haiku', 'fable', 'astra', 'glm', 'kimi', 'phi', 'ernie', 'gemma', 'cohere', 'codex', 'tinker', 'o1', 'o3', 'o4',
+  'sonnet', 'opus', 'haiku', 'fable', 'astra', 'glm', 'kimi', 'phi', 'ernie', 'gemma', 'cohere', 'codex', 'tinker', 'xai', 'o1', 'o3', 'o4',
 ] as const
+
+/** What makers write after a model's name and number: "o3-mini", "Phi-4-mini", "GLM-4-Plus". */
+const TIER = /(mini|nano|lite|flash|turbo|plus|pro|max|ultra|preview|high|low)$/
 
 /** Lower case with everything but letters and digits taken out. */
 function plain(text: string): string {
@@ -48,27 +54,44 @@ function plain(text: string): string {
 }
 
 /**
- * The same, with look-alike characters set to the letter they pass for: a
- * capital I for a small l, the digits 0 1 3 4 5 7 for o l e a s t, "rn" for
- * m and "vv" for w. "C1aude", "CIaude" and "Gernini" all come out as the
- * name they imitate.
+ * The same, with characters that pass for one another made one: i, l and 1
+ * are one letter whatever their case (a capital I and a small l are the same
+ * stroke in most typefaces), and the digits 0 3 4 5 7 are o e a s t. Both
+ * sides of a comparison go through this, so it does not matter which of the
+ * look-alikes the real name has and which the imitation.
  */
-function lookalike(text: string): string {
-  const swapped = text.replace(/I/g, 'l').toLowerCase()
-    .replace(/0/g, 'o').replace(/1/g, 'l').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't')
-  return swapped.replace(/[^a-z0-9]/g, '').replace(/rn/g, 'm').replace(/vv/g, 'w')
+function letters(text: string): string {
+  return plain(text).replace(/[i1]/g, 'l')
+    .replace(/0/g, 'o').replace(/3/g, 'e').replace(/4/g, 'a').replace(/5/g, 's').replace(/7/g, 't')
+}
+
+/** And with the pairs that pass for one letter: "rn" for m and "vv" for w. */
+function folded(text: string): string {
+  return letters(text).replace(/rn/g, 'm').replace(/vv/g, 'w')
+}
+
+/** Whether `text` holds `word` once look-alikes are set aside, with and without the pairs. */
+function holds(text: string, word: string): boolean {
+  return letters(text).includes(letters(word)) || folded(text).includes(folded(word))
+}
+
+/** Whether `text` is `word` once look-alikes are set aside. */
+function same(text: string, word: string): boolean {
+  return letters(text) === letters(word) || folded(text) === folded(word)
 }
 
 /**
  * What two names are compared by to decide whether they are the same name:
- * case, separators and look-alike characters do not make a name different.
- * Wider than `lookalike`: here an i and an l are one letter whatever their
- * case, so "QUIET LAMP", "Quiet Lamp" and "Qulet Lamp" are one name. (For
- * telling a real product name that would refuse ordinary names like
- * "William", so there only a capital I passes for an l.)
+ * case, separators and look-alike characters do not make a name different,
+ * so "QUIET LAMP", "Quiet Lamp" and "Qulet Larnp" are one name.
  */
 export function adapterNameKey(name: string): string {
-  return lookalike(name.toLowerCase()).replace(/i/g, 'l')
+  return folded(name)
+}
+
+/** A name without the version written at its end: "Gemini 4" is "Gemini", "claude-fable-5.2" is "claude-fable". */
+function stem(text: string): string {
+  return text.replace(/[0-9 .'-]+$/, '')
 }
 
 /** The whole names of the models this lab runs: display names and the last part of each id. */
@@ -79,18 +102,38 @@ function labModelNames(): string[] {
   return [...display, ...tails, ...ids]
 }
 
+/**
+ * The forms of one word of a name that are compared with a whole word: the
+ * word as written, and the word with what a version adds taken off its end
+ * (digits, then a tier like "mini", then digits again). Digits are taken off
+ * one at a time, since a digit can also stand for a letter ("Opu5").
+ */
+function wordForms(word: string): string[] {
+  const forms = new Set<string>()
+  const trims = (text: string) => {
+    for (let t = text; t; t = /[0-9]$/.test(t) ? t.slice(0, -1) : '') forms.add(t)
+  }
+  trims(word)
+  const lower = word.toLowerCase().replace(/[0-9]+$/, '')
+  if (TIER.test(lower)) trims(lower.replace(TIER, ''))
+  return [...forms]
+}
+
 /** The real name this one could be taken for, or null. */
 function readsLike(name: string): string | null {
-  const keys = [plain(name), lookalike(name)]
+  // One of the lab's own models, as a whole name, with or without its version.
   for (const real of labModelNames()) {
-    if (keys.includes(plain(real)) || keys.includes(lookalike(real))) return real
+    if (same(name, real) || (stem(real).length >= 3 && same(stem(name), stem(real)))) return real
   }
+  // A family or a maker, anywhere in the name.
   for (const word of FAMILY_WORDS) {
-    if (keys.some(k => k.includes(word))) return word
+    if (holds(name, word)) return word
   }
+  // A short or ordinary name, as a whole word: one word of the name, or two that stand next to each other.
   const words = name.split(/[^A-Za-z0-9]+/).filter(Boolean)
+  const candidates = [...words, ...words.slice(1).map((w, i) => words[i] + w)].flatMap(wordForms)
   for (const word of WHOLE_WORDS) {
-    if (words.some(w => w.toLowerCase() === word || lookalike(w) === lookalike(word))) return word
+    if (candidates.some(c => same(c, word))) return word
   }
   return null
 }
@@ -117,8 +160,9 @@ export function readAdapterName(raw: unknown): AdapterNameReading {
   if (/[A-Za-z0-9-]\.[A-Za-z]/.test(name) || /^(www|https?)\b/i.test(name) || plain(name).startsWith('http') || plain(name).startsWith('www')) {
     return { error: 'a name may not look like a web address (a dot must be followed by a digit, a space or the end)' }
   }
-  // "e41-0a1b2c3d" is how the lab names an adapter. A display name that reads like one could be taken for another adapter.
-  if (/^(lab)?e[0-9]{1,6}[0-9a-f]{8}$/.test(plain(name))) return { error: 'a name may not look like a lab id' }
+  // "e41-0a1b2c3d" is how the lab names an adapter. A display name that holds one, anywhere in it, could be taken
+  // for another adapter ("e41-0a1b2c3d v2").
+  if (/e[0-9]{1,6}[0-9a-f]{8}/.test(plain(name))) return { error: 'a name may not look like a lab id' }
   const real = readsLike(name)
   if (real) return { error: `"${name}" reads like the real model or product name "${real}"` }
   return { name }

@@ -248,6 +248,11 @@ export interface TinkerRunRow {
   created_at: string
   /** The name its author gave the adapter, when names were on and the name was free. */
   display_name: string | null
+  /**
+   * Only on a run whose examples the lab read from a shelf dataset
+   * (datasets.ts): the repository, commit, file, columns and row counts.
+   */
+  dataset_source?: Record<string, unknown>
 }
 
 function json(v: unknown): Record<string, unknown> | null {
@@ -290,7 +295,33 @@ function runRow(row: Record<string, unknown>): TinkerRunRow {
     expires_at: iso(row.expires_at),
     created_at: iso(row.created_at) ?? '',
     display_name: row.display_name ? String(row.display_name).slice(0, 40) : null,
+    ...(json(row.dataset_source) ? { dataset_source: json(row.dataset_source) as Record<string, unknown> } : {}),
   }
+}
+
+let datasetColumnReady: Promise<void> | null = null
+/**
+ * What training on a shelf dataset adds to the database: one column on
+ * tinker_runs for where the examples came from. It is added the first time
+ * such a run is opened, so a lab that never uses datasets never has it.
+ */
+export function ensureTinkerDatasetColumn(): Promise<void> {
+  if (!datasetColumnReady) {
+    datasetColumnReady = (async () => {
+      await ensureTinkerTables()
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS dataset_source JSONB`
+    })().catch(e => {
+      datasetColumnReady = null
+      throw e
+    })
+  }
+  return datasetColumnReady
+}
+
+/** Writes where a run's examples came from onto its row. Throws when it could not be stored. */
+export async function setRunDatasetSource(runId: string, source: Record<string, unknown>): Promise<void> {
+  await ensureTinkerDatasetColumn()
+  await sql`UPDATE tinker_runs SET dataset_source = ${JSON.stringify(source)} WHERE id = ${runId}`
 }
 
 /**
@@ -468,6 +499,8 @@ export interface TrainedAdapter {
   expires_at: string | null
   /** The display name its author gave it. A label: the adapter is still addressed by its slug. Absent when it has none. */
   name?: string
+  /** Only for an adapter trained on rows the lab read from a public dataset: "org/name@commit". */
+  data_from?: string
   /** Present, and true, only for an adapter that is marked to keep. */
   kept?: true
   kept_at?: string
@@ -499,6 +532,7 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
     // The fields below exist only for an adapter that has a name or is marked
     // to keep, so a lab that uses neither sends exactly what it always sent.
     ...(name ? { name } : {}),
+    ...(dataFrom(row) ? { data_from: dataFrom(row) as string } : {}),
     ...(kept ? {
       kept: true as const,
       ...(kept.kept_at ? { kept_at: kept.kept_at } : {}),
@@ -506,6 +540,13 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
       ...(kept.reason ? { kept_reason: sanitizeOutput(kept.reason).slice(0, 200) } : {}),
     } : {}),
   }
+}
+
+/** "org/name@commit" of the public dataset a run's examples were read from, or null. */
+export function dataFrom(row: Pick<TinkerRunRow, 'dataset_source'>): string | null {
+  const s = row.dataset_source
+  if (!s || typeof s.repo !== 'string' || typeof s.sha !== 'string') return null
+  return /^[A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96}$/.test(s.repo) && /^[0-9a-f]{40}$/.test(s.sha) ? `${s.repo}@${s.sha}` : null
 }
 
 /**
@@ -661,6 +702,9 @@ export async function getKeep(slug: string, opts: { createTables?: boolean } = {
 
 export type KeepClaim = { ok: true; row: KeepRow } | { ok: false; reason: string }
 
+/** How many times a claim looks again after another request took the slot it was about to take. */
+export const KEEP_CLAIM_ATTEMPTS = 5
+
 /**
  * Takes a place among the kept adapters, or says why not. The cap is held by
  * the database: a place is a slot numbered 1 to `max`, the slot is the
@@ -669,6 +713,13 @@ export type KeepClaim = { ok: true; row: KeepRow } | { ok: false; reason: string
  * both take the last place: one of them finds the slot taken and gets no row
  * back. The same statement cannot keep one adapter twice (slug is unique) or
  * serve two keeps for one epoch (the index on experiment and epoch).
+ *
+ * Two requests arriving together both aim at the lowest free slot, so the
+ * one that gets no row back has not been refused by the cap: it looks again,
+ * and takes the next free slot, finds the adapter or the epoch taken, or
+ * finds the places full. Every round has a winner, so a request only runs
+ * out of attempts when that many others were served ahead of it at the same
+ * moment.
  */
 export async function claimKeepSlot(params: {
   slug: string
@@ -681,30 +732,31 @@ export async function claimKeepSlot(params: {
 }): Promise<KeepClaim> {
   await ensureTinkerExtras()
   if (!(params.max > 0)) return { ok: false, reason: 'no adapter may be kept (the limit is 0)' }
-  const existing = await getKeep(params.slug)
-  if (existing) return { ok: false, reason: existing.status === 'kept' ? 'that adapter is already kept' : 'that adapter is already being kept' }
-  if (params.experimentId !== null && params.epoch !== null) {
-    const same = await sql`SELECT slug FROM tinker_keeps WHERE experiment_id = ${params.experimentId} AND epoch = ${params.epoch} LIMIT 1`
-    if (same.rows[0]) return { ok: false, reason: 'this epoch already asked for one adapter to be kept' }
+  for (let attempt = 0; attempt < KEEP_CLAIM_ATTEMPTS; attempt++) {
+    const existing = await getKeep(params.slug, { createTables: false })
+    if (existing) return { ok: false, reason: existing.status === 'kept' ? 'that adapter is already kept' : 'that adapter is already being kept' }
+    if (params.experimentId !== null && params.epoch !== null) {
+      const same = await sql`SELECT slug FROM tinker_keeps WHERE experiment_id = ${params.experimentId} AND epoch = ${params.epoch} LIMIT 1`
+      if (same.rows[0]) return { ok: false, reason: 'this epoch already asked for one adapter to be kept' }
+    }
+    const r = await sql`
+      INSERT INTO tinker_keeps (slot, slug, status, kept_by, reason, experiment_id, epoch, job_id)
+      SELECT s.slot, ${params.slug}::text, 'pending', ${params.keptBy}::text, ${sanitizeOutput(params.reason).slice(0, 200)}::text,
+        ${params.experimentId}::text, ${params.epoch}::integer, ${params.jobId}::text
+      FROM generate_series(1, ${params.max}::integer) AS s(slot)
+      WHERE NOT EXISTS (SELECT 1 FROM tinker_keeps k WHERE k.slot = s.slot)
+        AND (SELECT COUNT(*) FROM tinker_keeps) < ${params.max}::integer
+      ORDER BY s.slot ASC
+      LIMIT 1
+      ON CONFLICT DO NOTHING
+      RETURNING *
+    `
+    if (r.rows[0]) return { ok: true, row: keepRow(r.rows[0] as Record<string, unknown>) }
+    const held = await sql`SELECT COUNT(*) AS n FROM tinker_keeps`
+    const n = Number(held.rows[0]?.n) || 0
+    if (n >= params.max) return { ok: false, reason: `${n} adapters are kept and at most ${params.max} may be; the owner has to unkeep one first` }
   }
-  const r = await sql`
-    INSERT INTO tinker_keeps (slot, slug, status, kept_by, reason, experiment_id, epoch, job_id)
-    SELECT s.slot, ${params.slug}::text, 'pending', ${params.keptBy}::text, ${sanitizeOutput(params.reason).slice(0, 200)}::text,
-      ${params.experimentId}::text, ${params.epoch}::integer, ${params.jobId}::text
-    FROM generate_series(1, ${params.max}::integer) AS s(slot)
-    WHERE NOT EXISTS (SELECT 1 FROM tinker_keeps k WHERE k.slot = s.slot)
-      AND (SELECT COUNT(*) FROM tinker_keeps) < ${params.max}::integer
-    ORDER BY s.slot ASC
-    LIMIT 1
-    ON CONFLICT DO NOTHING
-    RETURNING *
-  `
-  if (r.rows[0]) return { ok: true, row: keepRow(r.rows[0] as Record<string, unknown>) }
-  const held = await sql`SELECT COUNT(*) AS n FROM tinker_keeps`
-  const n = Number(held.rows[0]?.n) || 0
-  return n >= params.max
-    ? { ok: false, reason: `${n} adapters are kept and at most ${params.max} may be; the owner has to unkeep one first` }
-    : { ok: false, reason: 'another request took the place at the same moment; nothing was changed' }
+  return { ok: false, reason: 'other requests took a place at the same moment, several times over; nothing was changed' }
 }
 
 /**

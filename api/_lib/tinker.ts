@@ -342,7 +342,8 @@ function readExample(raw: unknown, i: number): { example: TinkerExample; bytes: 
   return { example: { messages }, bytes }
 }
 
-function readSettings(raw: unknown): { settings: TinkerSettings } | { error: string } {
+/** The bounded settings of a run, read strictly. Also used for a request that names a shelf dataset (datasets.ts). */
+export function readSettings(raw: unknown): { settings: TinkerSettings } | { error: string } {
   const s = raw === undefined || raw === null ? {} : raw
   if (!isPlainObject(s)) return { error: 'settings is not an object' }
   const extra = onlyKeys(s, ['rank', 'learning_rate', 'epochs', 'batch_size'])
@@ -651,13 +652,21 @@ export function newSplitSalt(): string {
  * to train. `liveTrained` adds the fact that kept adapters answer on the lab
  * model endpoint.
  */
-export function tinkerNote(opts: { perDay: number; liveTrained: boolean; names?: boolean }): string {
+export function tinkerNote(opts: { perDay: number; liveTrained: boolean; names?: boolean; keep?: boolean }): string {
   const models = tinkerBaseModels().models.join(', ')
   const named = opts.names
     ? ` You may give the adapter a display name with "name": ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters, only letters, digits, spaces, hyphens, apostrophes and dots. The name is a label shown beside the adapter's lab id; the lab id stays its identity. A name that another adapter still alive has, that looks like a web address, or that reads like a real model or product name is refused with the reason stored, and the run goes on without a name.`
     : ''
+  // With the two switches off these two sentences are word for word what
+  // they always were. While adapters can be marked kept, "kept" means that
+  // and nothing else, so an adapter that has not expired is called alive;
+  // while adapters can be named, "name" means the display name, so the
+  // address is called the lab id.
   const live = opts.liveTrained
-    ? ` While an adapter is kept, the lab model endpoint also answers for it as the model "lab/<name>", with the name from the run's record: text messages only, no tools.`
+    ? ` While an adapter is ${opts.keep ? 'alive' : 'kept'}, the lab model endpoint also answers for it as the model "lab/<${opts.names ? 'id' : 'name'}>", with the ${opts.names ? 'lab id' : 'name'} from the run's record: text messages only, no tools.`
     : ''
-  return `Tinker training: as Executor you may ask for one LoRA fine-tuning run of an open-weight model on Tinker, a training service. LoRA only: the base model's own weights are not changed. The base model is one of: ${models}. You write the training data into your answer as chat conversations: ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} different examples, each 2 to ${TINKER_MAX_MESSAGES} messages (an optional system message, then user and assistant in turn, ending with the assistant), at most ${TINKER_MAX_EXAMPLE_BYTES} bytes of text in one example and ${TINKER_MAX_DATASET_BYTES} in all. Only the last assistant message of each example is trained on. Settings are bounded: rank ${TINKER_RANKS.join(', ')}; learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}; epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}; batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}; at most ${TINKER_MAX_STEPS} optimizer steps. A request that breaks any of this is refused whole, with the reason stored. The run needs the Reviewer's approval and happens after the epoch, run by the lab's own code: your answer supplies data and settings and no code. The lab estimates the most the run could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} a run or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC), at most ${opts.perDay} run${opts.perDay === 1 ? '' : 's'} a day, inside the lab's daily spending cap. Costs are estimates from Tinker's published prices, because Tinker reports no cost per call. The lab holds out about a tenth of the examples, chosen by the lab after the request so that you cannot know which, and measures the loss on them before and after training: that score is measured by the lab, not reported by you. A few completions on held-out prompts are sampled and stored. The dataset's size and hash, the settings, both scores, the samples and the adapter's name are public. The adapter is kept for ${tinkerTtlDays()} days and then expires.${live}${named}`
+  const expires = opts.keep
+    ? `The adapter stays for ${tinkerTtlDays()} days and then expires, unless it is marked kept.`
+    : `The adapter is kept for ${tinkerTtlDays()} days and then expires.`
+  return `Tinker training: as Executor you may ask for one LoRA fine-tuning run of an open-weight model on Tinker, a training service. LoRA only: the base model's own weights are not changed. The base model is one of: ${models}. You write the training data into your answer as chat conversations: ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} different examples, each 2 to ${TINKER_MAX_MESSAGES} messages (an optional system message, then user and assistant in turn, ending with the assistant), at most ${TINKER_MAX_EXAMPLE_BYTES} bytes of text in one example and ${TINKER_MAX_DATASET_BYTES} in all. Only the last assistant message of each example is trained on. Settings are bounded: rank ${TINKER_RANKS.join(', ')}; learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}; epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}; batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}; at most ${TINKER_MAX_STEPS} optimizer steps. A request that breaks any of this is refused whole, with the reason stored. The run needs the Reviewer's approval and happens after the epoch, run by the lab's own code: your answer supplies data and settings and no code. The lab estimates the most the run could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} a run or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC), at most ${opts.perDay} run${opts.perDay === 1 ? '' : 's'} a day, inside the lab's daily spending cap. Costs are estimates from Tinker's published prices, because Tinker reports no cost per call. The lab holds out about a tenth of the examples, chosen by the lab after the request so that you cannot know which, and measures the loss on them before and after training: that score is measured by the lab, not reported by you. A few completions on held-out prompts are sampled and stored. The dataset's size and hash, the settings, both scores, the samples and the adapter's name are public. ${expires}${live}${named}`
 }
