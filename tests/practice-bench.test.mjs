@@ -212,3 +212,24 @@ test('the visitor panel writes every text as text and has no em dash of its own'
   assert.ok(!source.includes('—'))
   for (const file of ['src/systems/practiceBench.ts', 'src/entities/PracticeBench.ts']) assert.ok(!readFileSync(join(root, file), 'utf8').includes('—'), file)
 })
+
+test('the camera view of the bench stays inside the orbit limits, inside the room, with the bench facing it', async () => {
+  const { BENCH_ANGLE_DEG, BENCH_RADIUS } = await import(pathToFileURL(join(build, 'src/entities/PracticeBench.js')).href)
+  const view = logic.benchCameraView(BENCH_ANGLE_DEG, BENCH_RADIUS)
+  const [px, py, pz] = view.position
+  const [tx, ty, tz] = view.target
+  const distance = Math.hypot(px - tx, py - ty, pz - tz)
+  // OrbitControls in main.ts: distance 6 to 15, polar angle 30 to 82 degrees. Outside them it would push the camera back on the next frame.
+  assert.ok(distance >= 6 && distance <= 15, `distance ${distance}`)
+  const polar = Math.acos((py - ty) / distance)
+  assert.ok(polar >= Math.PI / 6 && polar <= Math.PI / 2.2, `polar ${polar}`)
+  // inside the ring of desks (radius 5.5) and clear of the plant at the middle
+  const r = Math.hypot(px, pz)
+  assert.ok(r > 3 && r < 5, `radius ${r}`)
+  // the bench's front faces the middle of the room, so the camera is on its front side
+  const a = (BENCH_ANGLE_DEG * Math.PI) / 180
+  const front = [-Math.cos(a), -Math.sin(a)]
+  assert.ok(front[0] * (px - tx) + front[1] * (pz - tz) > 0)
+  // the target is the bench itself
+  assert.ok(Math.abs(Math.hypot(tx, tz) - BENCH_RADIUS) < 1e-9)
+})

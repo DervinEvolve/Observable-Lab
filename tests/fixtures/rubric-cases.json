@@ -193,11 +193,6 @@
    "match": true
   },
   {
-   "pattern": "(a*)*b",
-   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
-   "match": false
-  },
-  {
    "pattern": "(a+)+$",
    "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
    "match": false
@@ -294,6 +289,32 @@
    "pattern": "^.$",
    "text": "😀",
    "match": true
+  },
+  {
+   "pattern": "a{16}a{16}a{16}a{16}a{16}a{16}a{16}b",
+   "text": "a",
+   "repeat": 200,
+   "suffix": "b",
+   "match": true,
+   "note": "113 steps a character, 200 characters: inside the step limit"
+  },
+  {
+   "pattern": "a{16}a{16}a{16}a{16}a{16}a{16}a{16}b",
+   "text": "a",
+   "repeat": 3990,
+   "suffix": "b",
+   "match": false,
+   "note": "would match, but the matcher passes its step limit first and scores no match"
+  },
+  {
+   "pattern": "(a|b){2}c",
+   "text": "abc",
+   "match": true
+  },
+  {
+   "pattern": "(^a|b)+",
+   "text": "ba",
+   "match": true
   }
  ],
  "regex_refused": [
@@ -327,7 +348,20 @@
   "[z-a]",
   "\\",
   "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))",
-  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "(){16}",
+  "((){16}){16}",
+  "(((((((((((((((){16}){16}){16}){16}){16}){16}){16}){16}){16}){16}){16}){16}){16}){16})",
+  "(a*)*",
+  "(a?){2}",
+  "(^){3}",
+  "(a|){4}",
+  "(.?){16}",
+  "(a*)+",
+  "($)*",
+  "((a*)|b){2}",
+  "(a*b*){3}",
+  "(a*)*b"
  ],
  "scores": [
   {
@@ -1235,6 +1269,25 @@
      "scope": "last_line"
     }
    ]
+  },
+  {
+   "rules": [
+    {
+     "type": "regex_match",
+     "weight": 0.1,
+     "pattern": "a"
+    },
+    {
+     "type": "regex_match",
+     "weight": 0.1,
+     "pattern": "a"
+    },
+    {
+     "type": "regex_match",
+     "weight": 0.1,
+     "pattern": "a"
+    }
+   ]
   }
  ],
  "rubric_refused": [
@@ -1711,6 +1764,45 @@
       "type": "json_valid",
       "weight": 1,
       "scope": "whole"
+     }
+    ]
+   }
+  },
+  {
+   "why": "four regex rules",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 0.1,
+      "pattern": "a"
+     },
+     {
+      "type": "regex_match",
+      "weight": 0.1,
+      "pattern": "a"
+     },
+     {
+      "type": "regex_match",
+      "weight": 0.1,
+      "pattern": "a"
+     },
+     {
+      "type": "regex_match",
+      "weight": 0.1,
+      "pattern": "a"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a regex rule that repeats an empty group",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "((){16}){16}"
      }
     ]
    }

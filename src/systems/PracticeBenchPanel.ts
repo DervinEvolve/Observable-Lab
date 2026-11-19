@@ -232,6 +232,8 @@ export class PracticeBenchPanel {
     const steps = view.steps
     const stepRows = el('div')
     stepRows.appendChild(this.row('Steps', steps > 0 ? `${view.step} of ${steps}` : 'none yet'))
+    const trained = run.progress?.stepsTrained ?? null
+    if (trained !== null && steps > 0) stepRows.appendChild(this.row('Steps that trained the model', `${trained} of ${view.step}`))
     if (s) {
       stepRows.appendChild(this.row('Answers per task', String(s.groupSize)))
       stepRows.appendChild(this.row('Tasks per step', String(s.tasksPerStep)))

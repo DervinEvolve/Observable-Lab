@@ -25,7 +25,7 @@ import {
   TINKER_PRICE_TABLE_DATE, newAdapterSlug, newSplitSalt, tinkerCostUsd, tinkerDailyUsd, tinkerKeepFlag, tinkerNamesFlag, tinkerRunUsd, tinkerTtlDays, tinkerWaitMs, usdText,
 } from './tinker.js'
 import {
-  TINKER_RL_TOOL, describeTinkerRl, estimateTinkerRl, normalizeRlResult, readRlProgress, rlHackingFlag, rlRecordOf, storedRlProgress, tinkerRlJobBody,
+  TINKER_RL_TOOL, describeTinkerRl, estimateTinkerRl, isNewerProgress, normalizeRlResult, readRlProgress, rlHackingFlag, rlRecordOf, storedRlProgress, tinkerRlJobBody,
   tinkerRlRequestSummary,
   type RlProgress, type TinkerRlRequest, type TinkerRlResult,
 } from './tinker-rl.js'
@@ -54,9 +54,12 @@ export function rlSummary(request: TinkerRlRequest): string {
  * record that is not well formed is dropped and the last good one stays.
  * Never throws.
  */
-export async function storeRlProgress(row: Pick<TinkerRunRow, 'id'>, raw: unknown, now: Date = new Date()): Promise<RlProgress | null> {
+export async function storeRlProgress(row: Pick<TinkerRunRow, 'id'> & Partial<Pick<TinkerRunRow, 'progress'>>, raw: unknown, now: Date = new Date()): Promise<RlProgress | null> {
   const progress = readRlProgress(raw, now)
   if (!progress) return null
+  // A record the lab already holds is not stored again, so its time stays the time the runner last said something new.
+  const held = storedRlProgress(row.progress ?? null)
+  if (held && !isNewerProgress(progress, held)) return held
   await setRlProgress(row.id, progress)
   return progress
 }
@@ -76,6 +79,7 @@ export function finalRlProgress(row: Pick<TinkerRunRow, 'settings'>, result: Tin
     group_size: group, tasks_per_step: perStep, max_reward: result.max_reward ?? 1,
     means: result.step_means, frac_max: result.step_frac_max, attempts: [], samples: result.samples,
     score_before: result.score_before, score_after: result.score_after, wall_seconds: result.wall_seconds ?? 0,
+    steps_trained: result.steps_trained,
   }, now)
 }
 
@@ -135,7 +139,7 @@ export async function completeRlRun(row: TinkerRunRow, poll: Extract<TinkerPoll,
         score_before: result.score_before, score_after: result.score_after,
       },
       training: {
-        steps_planned: result.steps_planned, steps_done: result.steps_done, stopped_early: result.stopped_early,
+        steps_planned: result.steps_planned, steps_done: result.steps_done, steps_trained: result.steps_trained, stopped_early: result.stopped_early,
         reward_first: result.train_score_first, reward_last: result.train_score_last,
         note: 'the reward of the training steps is what the run trained on, not a measurement of what it learned',
       },
@@ -244,10 +248,13 @@ export async function runTinkerRl(ctx: TinkerRunContext, request: TinkerRlReques
     console.warn('[tinker-rl] could not store the call id:', e instanceof Error ? e.message : e))
 
   const waitMs = opts.maxWaitMs ?? tinkerWaitMs()
-  const current = row
+  let held: RlProgress | null = null
   const poll = await waitForTinkerJob(started.callId, waitMs, opts.pollMs, {
     runId: row.slug,
-    onProgress: async raw => { await storeRlProgress(current, raw) },
+    onProgress: async raw => {
+      const stored = await storeRlProgress({ id: row.id, progress: held as unknown as Record<string, unknown> | null }, raw)
+      if (stored) held = stored
+    },
   })
   if (poll.state === 'done' || poll.state === 'failed') {
     const outcome = await completeRlRun({ ...row, call_id: started.callId }, poll)

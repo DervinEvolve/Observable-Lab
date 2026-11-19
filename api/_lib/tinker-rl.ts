@@ -363,7 +363,11 @@ export interface RlProgress {
   score_before: number | null
   score_after: number | null
   wall_seconds: number
-  /** When the lab stored it. */
+  /** Steps in which at least one group had answers that scored differently, so a gradient step really ran. Null when the runner did not say. */
+  steps_trained: number | null
+  /** The runner's own count of the records it has written. It rises with every one, so a record the lab has already stored is told from a new one. Null from an older runner. */
+  seq: number | null
+  /** When the lab first stored this record: the last time the runner reported something new, not the last time the lab asked. */
   updated_at: string
 }
 
@@ -419,9 +423,13 @@ export function readRlProgress(raw: unknown, now: Date = new Date()): RlProgress
   const after = raw.score_after === null || raw.score_after === undefined ? null : unit(raw.score_after)
   if ((raw.score_before != null && before === null) || (raw.score_after != null && after === null)) return null
   const wall = typeof raw.wall_seconds === 'number' && Number.isFinite(raw.wall_seconds) && raw.wall_seconds >= 0 ? Math.min(raw.wall_seconds, 86_400) : 0
+  const trained = raw.steps_trained === undefined || raw.steps_trained === null ? null : whole(raw.steps_trained, 0, RL_STEPS.max)
+  const seq = raw.seq === undefined || raw.seq === null ? null : whole(raw.seq, 0, 1_000_000)
+  if ((raw.steps_trained != null && trained === null) || (raw.seq != null && seq === null)) return null
   const progress: RlProgress = {
     phase: phase as RlPhase, step, steps_planned: planned, group_size: group, tasks_per_step: perStep, max_reward: maxReward,
-    means, frac_max: fracMax, attempts, samples, score_before: before, score_after: after, wall_seconds: wall, updated_at: now.toISOString(),
+    means, frac_max: fracMax, attempts, samples, score_before: before, score_after: after, wall_seconds: wall,
+    steps_trained: trained, seq, updated_at: now.toISOString(),
   }
   // Bounded whatever it was sent: samples go first, then the record is refused.
   while (Buffer.byteLength(JSON.stringify(progress), 'utf8') > RL_PROGRESS_MAX_BYTES && progress.samples.length) progress.samples.pop()
@@ -437,6 +445,20 @@ export function storedRlProgress(raw: unknown): RlProgress | null {
   if (!isObject(value)) return null
   const updated = typeof value.updated_at === 'string' && !Number.isNaN(Date.parse(value.updated_at)) ? new Date(value.updated_at) : new Date(0)
   return readRlProgress({ v: 1, ...value }, updated)
+}
+
+/**
+ * Is this record newer than the one the lab already holds? With the runner's
+ * counter it is, when the counter is higher. Without one (an older runner) it
+ * is, when anything in it differs. A record the lab has already stored is not
+ * new, however often it is asked for again, so asking never makes a run look
+ * alive.
+ */
+export function isNewerProgress(incoming: RlProgress, stored: RlProgress | null): boolean {
+  if (!stored) return true
+  if (incoming.seq !== null && stored.seq !== null) return incoming.seq > stored.seq
+  const strip = (p: RlProgress) => JSON.stringify({ ...p, updated_at: '' })
+  return strip(incoming) !== strip(stored)
 }
 
 /** Is a stored progress record recent enough to say a run is still moving? */
@@ -493,6 +515,8 @@ export interface TinkerRlResult {
   n_holdout: number | null
   steps_planned: number | null
   steps_done: number | null
+  /** Steps in which a gradient step ran. A step whose answers all scored the same teaches nothing and is done but not trained. */
+  steps_trained: number | null
   stopped_early: string | null
   max_reward: number | null
   /** Mean rubric score of the base model on the held-out tasks, measured by the lab. */
@@ -527,7 +551,7 @@ export function normalizeRlResult(raw: unknown): TinkerRlResult {
   const base: TinkerRlResult = {
     status: 'failed', stage: clean(r.stage, 30) || null, reason: null,
     n_tasks: count(r.n_tasks), n_train: count(r.n_train), n_holdout: count(r.n_holdout),
-    steps_planned: count(r.steps_planned), steps_done: count(r.steps_done), stopped_early: clean(r.stopped_early, 200) || null,
+    steps_planned: count(r.steps_planned), steps_done: count(r.steps_done), steps_trained: count(r.steps_trained), stopped_early: clean(r.stopped_early, 200) || null,
     max_reward: unit(r.max_reward), score_before: unit(r.score_before), score_after: unit(r.score_after),
     train_score_first: unit(r.train_score_first), train_score_last: unit(r.train_score_last),
     step_means: list(r.step_means), step_frac_max: list(r.step_frac_max),
@@ -559,7 +583,7 @@ export function describeTinkerRl(r: TinkerRlResult, baseModel: string, slug: str
   const cost = `estimated cost $${costUsd.toFixed(4)} (token counts at Tinker's published prices of ${TINKER_PRICE_TABLE_DATE}, not a billed amount)`
   if (r.status === 'ok') {
     const score = `LAB-MEASURED held-out rubric score ${r.score_before!.toFixed(3)} before training, ${r.score_after!.toFixed(3)} after (best possible ${(r.max_reward ?? 1).toFixed(2)}), on ${r.n_holdout ?? '?'} tasks the lab held out`
-    const steps = `${r.steps_done ?? '?'} of ${r.steps_planned ?? '?'} steps${r.stopped_early ? ` (stopped early: ${r.stopped_early})` : ''}`
+    const steps = `${r.steps_done ?? '?'} of ${r.steps_planned ?? '?'} steps${r.steps_trained !== null && r.steps_trained !== r.steps_done ? ` (${r.steps_trained} of them trained the model)` : ''}${r.stopped_early ? ` (stopped early: ${r.stopped_early})` : ''}`
     const adapter = slug ? `adapter lab/${slug}${name ? ` named "${name}"` : ''} on ${baseModel}${expiresAt ? `, kept until ${expiresAt.slice(0, 10)}` : ''}` : `adapter on ${baseModel}`
     return `${score}; ${steps}${hacking.flag ? '; FLAG: the reward may be gamed (see the record)' : ''}; ${adapter}; ${cost}`
   }

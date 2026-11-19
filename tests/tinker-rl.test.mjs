@@ -103,7 +103,7 @@ test('the rubric engine gives the answers in the shared file of cases', () => {
   for (const c of cases.regex) {
     const x = rubric.compileRegex(c.pattern, c.ignore_case === true)
     assert.ok('regex' in x, `${c.pattern}: ${x.error}`)
-    assert.equal(rubric.regexSearch(x.regex, c.text), c.match, c.pattern)
+    assert.equal(rubric.regexSearch(x.regex, c.text.repeat(c.repeat ?? 1) + (c.suffix ?? '')), c.match, c.pattern.slice(0, 40))
   }
   for (const pattern of cases.regex_refused) {
     const x = rubric.compileRegex(pattern)
@@ -329,7 +329,7 @@ const runnerOk = (extra = {}) => ({
 })
 const progressRecord = (extra = {}) => ({
   v: 1, phase: 'scored', step: 3, steps_planned: 10, group_size: 8, tasks_per_step: 4, max_reward: 1, means: [0.2, 0.25, 0.3], frac_max: [0, 0, 0.1],
-  attempts: [0, 0, 1, 0.3, 0.7, 0, 1, 0.5], samples: [{ prompt: 'What is 3 plus 3?', completion: '6', reward: 1 }], score_before: 0.25, score_after: null, wall_seconds: 61, ...extra,
+  attempts: [0, 0, 1, 0.3, 0.7, 0, 1, 0.5], samples: [{ prompt: 'What is 3 plus 3?', completion: '6', reward: 1 }], score_before: 0.25, score_after: null, wall_seconds: 61, steps_trained: 2, seq: 7, ...extra,
 })
 
 /** fetch that answers like the runner's two endpoints; `statuses` are served in order and the last repeats. */
@@ -468,6 +468,48 @@ test('a run is live only while the lab has heard from the runner recently', () =
   assert.equal(rl.progressIsLive({ ...fresh, phase: 'done' }, 'running', now), false)
 })
 
+test('asking again for a record the lab already holds does not make a run look alive, and an older record never replaces a newer one', async () => {
+  const t0 = new Date('2026-11-19T10:00:00Z')
+  const later = new Date('2026-11-19T10:20:00Z')
+  const a = rl.readRlProgress(progressRecord(), t0)
+  assert.equal(a.seq, 7)
+  assert.equal(a.steps_trained, 2)
+  // the same record again, 20 minutes on: not new
+  const again = rl.readRlProgress(progressRecord(), later)
+  assert.equal(rl.isNewerProgress(again, a), false)
+  assert.equal(rl.isNewerProgress(rl.readRlProgress(progressRecord({ seq: 8 }), later), a), true)
+  assert.equal(rl.isNewerProgress(rl.readRlProgress(progressRecord({ seq: 6 }), later), a), false)
+  // a runner without a counter: new only when something in the record differs
+  const bare = rl.readRlProgress({ ...progressRecord(), seq: undefined }, t0)
+  assert.equal(bare.seq, null)
+  assert.equal(rl.isNewerProgress(rl.readRlProgress({ ...progressRecord(), seq: undefined }, later), bare), false)
+  assert.equal(rl.isNewerProgress(rl.readRlProgress({ ...progressRecord({ step: 4, means: [0.2, 0.25, 0.3, 0.4], frac_max: [0, 0, 0.1, 0.1] }), seq: undefined }, later), bare), true)
+  assert.equal(rl.readRlProgress(progressRecord({ seq: -1 })), null)
+  assert.equal(rl.readRlProgress(progressRecord({ steps_trained: 99 })), null)
+
+  // through the store: the lab asks again and again and the time stays the time it was first told
+  configure({ LAB_TINKER_POLL_MAX_MS: '1' })
+  const plan = planFor(ask())
+  globalThis.fetch = fakeRunner([], [{ status: 'running', call_id: 'fc-rl-1', progress: progressRecord() }])
+  await rlRun.runTinkerRl(CTX, plan.tinker_rl, { maxWaitMs: 1, pollMs: 1 })
+  const row = lab.tinkerRuns[0]
+  assert.equal(rl.storedRlProgress(row.progress).seq, 7)
+  const firstTime = rl.storedRlProgress(row.progress).updated_at
+  await new Promise(r => setTimeout(r, 5))
+  for (let i = 0; i < 3; i++) await rlRun.storeRlProgress({ id: row.id, progress: row.progress }, progressRecord(), new Date())
+  assert.equal(rl.storedRlProgress(row.progress).updated_at, firstTime, 'the same record again is not stored again')
+  // a late older record, from a caller that holds an old row, does not replace the newer one
+  await rlRun.storeRlProgress({ id: row.id, progress: null }, progressRecord({ seq: 9, step: 4, means: [0.2, 0.25, 0.3, 0.4], frac_max: [0, 0, 0.1, 0.1] }))
+  await rlRun.storeRlProgress({ id: row.id, progress: null }, progressRecord({ seq: 8 }))
+  const kept = rl.storedRlProgress(row.progress)
+  assert.equal(kept.seq, 9)
+  assert.equal(kept.step, 4)
+  // a record that moved on (seq 10) is stored and is live
+  const moved = await rlRun.storeRlProgress({ id: row.id, progress: row.progress }, progressRecord({ seq: 10, step: 5, means: [0.2, 0.25, 0.3, 0.4, 0.5], frac_max: [0, 0, 0.1, 0.1, 0.1] }))
+  assert.equal(moved.seq, 10)
+  assert.equal(rl.progressIsLive(rl.storedRlProgress(row.progress), 'running', new Date()), true)
+})
+
 test('the reward-hacking flag: a mean at 95% of the best within 3 steps, or a held-out gain far short of the training gain; it blocks nothing', () => {
   const flag = input => rl.rlHackingFlag({ maxReward: 1, scoreBefore: null, scoreAfter: null, ...input })
   assert.equal(flag({ means: [0.2, 0.3, 0.4, 0.5] }).flag, false)
@@ -570,7 +612,10 @@ class FakeDb {
     }
     if (text.startsWith('UPDATE tinker_runs SET progress = ? WHERE id = ? AND status IN')) {
       const row = this.tinkerRuns.find(r => r.id === v[1] && (r.status === 'reserved' || r.status === 'running'))
-      if (row) row.progress = v[0]
+      // the same guard as the SQL: a record whose counter is not above the stored one does not replace it
+      const seq = v[2]
+      const storedSeq = row && row.progress ? (typeof row.progress === 'string' ? JSON.parse(row.progress) : row.progress).seq : undefined
+      if (row && (seq === null || seq === undefined || !row.progress || storedSeq === undefined || storedSeq === null || Number(storedSeq) < Number(seq))) row.progress = v[0]
       return { rows: [] }
     }
     if (text.startsWith('UPDATE tinker_runs SET status = ?, reason = ?, cost_usd = ?, result = ?, progress = COALESCE(')) {

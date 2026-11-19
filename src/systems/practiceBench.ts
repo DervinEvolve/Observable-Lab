@@ -26,6 +26,8 @@ export interface PracticeProgress {
   samples: PracticeSample[]
   scoreBefore: number | null
   scoreAfter: number | null
+  /** Steps in which some group had answers that scored differently, so training really ran. Null when the runner did not say. */
+  stepsTrained: number | null
 }
 
 export interface PracticeRun {
@@ -114,7 +116,7 @@ function readProgress(raw: unknown): PracticeProgress | null {
   }
   const before = raw.score_before == null ? null : unit(raw.score_before)
   const after = raw.score_after == null ? null : unit(raw.score_after)
-  return { phase, step, stepsPlanned: planned, groupSize: group, tasksPerStep: perStep, maxReward, means, fracMax, attempts, samples, scoreBefore: before, scoreAfter: after }
+  return { phase, step, stepsPlanned: planned, groupSize: group, tasksPerStep: perStep, maxReward, means, fracMax, attempts, samples, scoreBefore: before, scoreAfter: after, stepsTrained: raw.steps_trained == null ? null : whole(raw.steps_trained, 0, 30) }
 }
 
 function readRun(raw: unknown): PracticeRun | null {
@@ -303,4 +305,31 @@ export function scoreText(score: number | null): string {
 export function lampState(view: Pick<BenchView, 'hacking'>, reducedMotion: boolean): 'off' | 'on' | 'blink' {
   if (!view.hacking) return 'off'
   return reducedMotion ? 'on' : 'blink'
+}
+
+// ---------------------------------------------------------------------------
+// Where the camera goes to look at the bench
+// ---------------------------------------------------------------------------
+
+export interface BenchCameraView { position: [number, number, number]; target: [number, number, number] }
+
+/**
+ * The bench stands against the wall at the edge of the default view, with its
+ * front to the middle of the room, so a visitor who has not orbited cannot read
+ * it. This is a view of it from inside the room, about 6.4 m from its
+ * instruments, a little to one side so the plant is not in the way and raised
+ * so the Executor's desk in front of it does not hide it. It stays inside the
+ * orbit limits (6 to 15 m from the target, polar angle 30 to 82 degrees), so
+ * the controls do not push the camera back on the next frame.
+ */
+export function benchCameraView(angleDeg: number, radius: number, sideDeg = -30): BenchCameraView {
+  const a = (angleDeg * Math.PI) / 180
+  const bx = Math.cos(a) * radius
+  const bz = Math.sin(a) * radius
+  const toCentre = Math.atan2(-bz, -bx) + (sideDeg * Math.PI) / 180
+  const distance = 5.7
+  return {
+    position: [bx + Math.cos(toCentre) * distance, 4, bz + Math.sin(toCentre) * distance],
+    target: [bx, 1, bz],
+  }
 }

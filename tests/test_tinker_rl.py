@@ -36,7 +36,7 @@ class RubricCases(unittest.TestCase):
         for case in CASES["regex"]:
             regex, reason = M.compile_regex(case["pattern"], case.get("ignore_case") is True)
             self.assertIsNotNone(regex, "%s: %s" % (case["pattern"], reason))
-            self.assertEqual(M.regex_search(regex, case["text"]), case["match"], case["pattern"])
+            self.assertEqual(M.regex_search(regex, case["text"] * case.get("repeat", 1) + case.get("suffix", "")), case["match"], case["pattern"][:40])
 
     def test_patterns_outside_the_subset_are_refused_with_a_reason(self):
         for pattern in CASES["regex_refused"]:
@@ -208,6 +208,50 @@ class Run(unittest.TestCase):
         self.assertGreater(out["tokens"]["sample_completion"], 0)
         self.assertGreater(out["tokens"]["train"], 0)
 
+    def test_the_run_counts_the_steps_that_really_trained_and_numbers_its_records(self):
+        deps = FakeRl(sum_answer)
+        out, records = self.run_it(deps)
+        self.assertEqual(out["steps_done"], 3)
+        # once the model has been trained the fake always answers right, so only the first step has anything to learn from
+        self.assertEqual(out["steps_trained"], len(deps.trained))
+        self.assertGreaterEqual(out["steps_trained"], 1)
+        seqs = [r["seq"] for r in records]
+        self.assertEqual(seqs, sorted(set(seqs)), "each record the runner writes has a higher number than the one before")
+        self.assertEqual(records[-1]["steps_trained"], out["steps_trained"])
+
+    def test_a_run_where_every_answer_scores_the_same_trains_nothing_and_is_not_offered_as_an_adapter(self):
+        deps = FakeRl(lambda prompt, sampler, k: "thinking\nnot sure")
+        out, records = self.run_it(deps)
+        self.assertEqual(out["status"], "error")
+        self.assertEqual(out["steps_done"], 3)
+        self.assertEqual(out["steps_trained"], 0)
+        self.assertIn("no step trained the model", out["error"])
+        self.assertEqual(deps.trained, [])
+        self.assertIsNone(deps.saved_ttl)
+        self.assertNotIn("sampler_path", out)
+        # what was sampled is still counted, so the lab charges it
+        self.assertGreater(out["tokens"]["sample_completion"], 0)
+        self.assertEqual(out["score_before"], 0.0)
+
+    def test_scoring_that_takes_too_long_stops_the_step_and_every_sampled_token_is_still_counted(self):
+        clock_now = [0.0]
+        calls = [0]
+        real = M.score_completion
+
+        def slow(*args, **kw):
+            calls[0] += 1
+            if calls[0] == 7:  # the first answer scored in the first training step
+                clock_now[0] += M.RL_TRAIN_WALL_S + 10
+            return real(*args, **kw)
+
+        slowed = load({"score_completion": slow})  # the run looks the function up in its own module, so the stand-in goes in there
+        out = slowed.run_rl_core(job(), lambda _j: FakeRl(sum_answer), clock=lambda: clock_now[0], log=lambda *_: None)
+        self.assertEqual(out["status"], "error")
+        self.assertIn("time limit", out["error"])
+        self.assertEqual(out["steps_done"], 0)
+        # 3 held-out tasks x 2 answers, then 2 tasks x 4 answers, 5 tokens each
+        self.assertEqual(out["tokens"]["sample_completion"], (6 + 8) * 5)
+
     def test_the_model_never_trains_on_a_held_out_task(self):
         deps = FakeRl(sum_answer)
         j = job()
@@ -287,10 +331,14 @@ class Run(unittest.TestCase):
 
     def test_no_model_written_code_is_run(self):
         # an answer that looks like code is only text for the rubric to read
-        deps = FakeRl(lambda p, s, k: "__import__('os').system('echo hi')")
+        code = "__import__('os').system('echo hi')"
+        deps = FakeRl(lambda p, s, k: code if k % 2 else "thinking\n%d" % (2 * int(re.findall(r"\d+", p)[0])))
         out, _ = self.run_it(deps)
-        self.assertEqual(out["status"], "ok")
-        self.assertEqual(out["score_before"], 0.0)
+        self.assertEqual(out["status"], "ok", out)
+        self.assertAlmostEqual(out["score_before"], 0.5, places=6)
+        # and an answer that is only code earns nothing
+        only_code = FakeRl(lambda p, s, k: code)
+        self.assertEqual(self.run_it(only_code)[0]["score_before"], 0.0)
         # and nothing in the runner evaluates text a model wrote
         calls = {n.func.id for n in ast.walk(TREE) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
         self.assertFalse(calls & {"eval", "exec", "compile", "__import__"}, calls & {"eval", "exec", "compile"})

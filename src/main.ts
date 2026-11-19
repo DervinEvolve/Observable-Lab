@@ -5,7 +5,7 @@ import { createLabDetails } from './scene/LabDetails'
 import { CapabilityArchive } from './entities/CapabilityArchive'
 import { KillWall } from './entities/KillWall'
 import { TrainingRig } from './entities/TrainingRig'
-import { PracticeBench } from './entities/PracticeBench'
+import { BENCH_ANGLE_DEG, BENCH_RADIUS, PracticeBench } from './entities/PracticeBench'
 import { JSpaceLens } from './entities/JSpaceLens'
 import gsap from 'gsap'
 import { createLighting } from './scene/Lighting'
@@ -34,7 +34,7 @@ import { ActivityPanel } from './systems/ActivityPanel'
 import { KnowledgeGraphPanel } from './systems/KnowledgeGraphPanel'
 import { TrainedChatPanel } from './systems/TrainedChatPanel'
 import { PracticeBenchPanel } from './systems/PracticeBenchPanel'
-import { parsePractice } from './systems/practiceBench'
+import { benchCameraView, parsePractice } from './systems/practiceBench'
 import { ResearchStoryBox } from './systems/ResearchStoryBox'
 import { JSpaceReadout } from './systems/JSpaceReadout'
 import { PatinaSystem } from './lib/patina'
@@ -207,6 +207,7 @@ class ObservableLab {
     // Create UI overlay after scientists are created
     this.uiOverlay = new UIOverlay(this.camera, this.controls, this.scientists)
     this.uiOverlay.onJSpaceToggle = this.wireJSpaceToggle
+    this.uiOverlay.setBenchView(benchCameraView(BENCH_ANGLE_DEG, BENCH_RADIUS))
 
     // Set robot reference + give North the same nameplate design as the scientists
     if (this.robot) {

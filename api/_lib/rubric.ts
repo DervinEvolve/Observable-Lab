@@ -31,6 +31,12 @@ export const RUBRIC_LIST_MAX = 20
 export const RUBRIC_REGEX_MAX_LEN = 120
 /** Instructions in the compiled automaton, counted after counted repeats are unrolled. */
 export const RUBRIC_REGEX_MAX_STATES = 120
+/** Calls the compiler may make while it counts a pattern's repeats out, however small the program stays. */
+export const RUBRIC_REGEX_MAX_EMITS = 2000
+/** Steps the matcher may take on one text. Past it the rule scores 0, the same in both languages. */
+export const RUBRIC_REGEX_MAX_WORK = 100_000
+/** How many regex_match rules one rubric may hold. */
+export const RUBRIC_MAX_REGEX_RULES = 3
 export const RUBRIC_REPEAT_MAX = 16
 /** Code points of a completion the rubric reads. Longer is cut, the same way everywhere. */
 export const RUBRIC_TEXT_MAX = 4000
@@ -223,6 +229,17 @@ const SPACE: Array<[number, number]> = [[9, 13], [32, 32]]
 const SIMPLE_ESCAPES: Record<string, number> = { n: 10, t: 9, r: 13 }
 const PUNCT_ESCAPES = '\\/.-()[]{}*+?|^$'
 
+/** Can this part match without using up a character? A repeat of such a part would do work for nothing, so it is refused. */
+function canBeEmpty(n: Node): boolean {
+  switch (n.t) {
+    case 'char': case 'any': case 'class': return false
+    case 'bol': case 'eol': return true
+    case 'cat': return n.parts.every(canBeEmpty)
+    case 'alt': return n.options.some(canBeEmpty)
+    case 'rep': return n.min === 0 || canBeEmpty(n.node)
+  }
+}
+
 export function compileRegex(pattern: string, ignoreCase = false): { regex: CompiledRegex } | { error: string } {
   const p = points(pattern)
   if (!p.length) return { error: 'the pattern is empty' }
@@ -352,6 +369,7 @@ export function compileRegex(pattern: string, ignoreCase = false): { regex: Comp
       if (quantified) {
         if (atom.t === 'bol' || atom.t === 'eol') return fail('a quantifier cannot follow ^ or $')
         if (p[pos] === 63 || p[pos] === 43 || p[pos] === 42) return fail('lazy and possessive quantifiers are not supported')
+        if (canBeEmpty(atom)) return fail('a repeat cannot follow something that can match no characters, such as an empty group or (a*)')
         atom = { t: 'rep', node: atom, min: min as number, max }
       }
       parts.push(atom)
@@ -374,7 +392,9 @@ export function compileRegex(pattern: string, ignoreCase = false): { regex: Comp
   }
 
   const program: Op[] = []
+  let emits = 0
   const emit = (n: Node): void => {
+    if (++emits > RUBRIC_REGEX_MAX_EMITS) throw new Error('the pattern is too large once its repeats are counted out')
     if (program.length > RUBRIC_REGEX_MAX_STATES) throw new Error(`the pattern needs more than ${RUBRIC_REGEX_MAX_STATES} steps once its repeats are counted out`)
     switch (n.t) {
       case 'char': program.push({ o: 'char', c: n.c }); return
@@ -428,35 +448,51 @@ export function compileRegex(pattern: string, ignoreCase = false): { regex: Comp
   return { regex: { program, ignoreCase } }
 }
 
-/** Does the pattern match anywhere in the text? The automaton is stepped once per character. */
+/**
+ * Does the pattern match anywhere in the text? The automaton is stepped once
+ * per character. Every instruction it visits counts as one step; past
+ * RUBRIC_REGEX_MAX_WORK steps the answer is no match. The order of the walk is
+ * fixed (lists, not sets), so the modal runner counts exactly the same steps.
+ */
 export function regexSearch(regex: CompiledRegex, text: string): boolean {
   const prog = regex.program
   const chars = points(regex.ignoreCase ? asciiLower(text) : text)
   const n = chars.length
-  let current = new Set<number>()
-  const add = (set: Set<number>, start: number, at: number): boolean => {
-    const stack = [start]
-    const seen = new Set<number>()
+  const seen = new Int32Array(prog.length)
+  const listed = new Int32Array(prog.length)
+  const stack: number[] = []
+  let stamp = 0
+  let work = 0
+  // 1 for a match, 0 for none, -1 when the step limit was passed
+  const add = (list: number[], gen: number, start: number, at: number): number => {
+    stamp++
+    stack.length = 0
+    stack.push(start)
     while (stack.length) {
       const pc = stack.pop() as number
-      if (seen.has(pc)) continue
-      seen.add(pc)
+      if (seen[pc] === stamp) continue
+      seen[pc] = stamp
+      if (++work > RUBRIC_REGEX_MAX_WORK) return -1
       const op = prog[pc]
       if (op.o === 'jmp') stack.push(op.a)
       else if (op.o === 'split') { stack.push(op.b); stack.push(op.a) }
       else if (op.o === 'bol') { if (at === 0) stack.push(pc + 1) }
       else if (op.o === 'eol') { if (at === n) stack.push(pc + 1) }
-      else if (op.o === 'match') return true
-      else set.add(pc)
+      else if (op.o === 'match') return 1
+      else if (listed[pc] !== gen) { listed[pc] = gen; list.push(pc) }
     }
-    return false
+    return 0
   }
+  let current: number[] = []
   for (let at = 0; at <= n; at++) {
-    if (add(current, 0, at)) return true
+    const gen = at + 1
+    const first = add(current, gen, 0, at)
+    if (first !== 0) return first === 1
     if (at === n) break
     const c = chars[at]
-    const next = new Set<number>()
+    const next: number[] = []
     for (const pc of current) {
+      if (++work > RUBRIC_REGEX_MAX_WORK) return false
       const op = prog[pc]
       let ok = false
       if (op.o === 'char') ok = op.c === c
@@ -465,7 +501,10 @@ export function regexSearch(regex: CompiledRegex, text: string): boolean {
         const inside = op.ranges.some(([lo, hi]) => c >= lo && c <= hi)
         ok = inside !== op.negate
       }
-      if (ok && add(next, pc + 1, at + 1)) return true
+      if (ok) {
+        const r = add(next, gen + 1, pc + 1, at + 1)
+        if (r !== 0) return r === 1
+      }
     }
     current = next
   }
@@ -705,9 +744,11 @@ export function normalizeRubric(raw: unknown): { rubric: Rubric } | { error: str
   if (!Array.isArray(list) || list.length < 1 || list.length > RUBRIC_MAX_RULES) return { error: `rubric.rules must hold 1 to ${RUBRIC_MAX_RULES} rules` }
   const rules: RubricRule[] = []
   let total = 0
+  let regexRules = 0
   for (const [i, item] of list.entries()) {
     const rule = readRule(item, `rubric.rules[${i}]`)
     if (typeof rule === 'string') return { error: rule }
+    if (rule.type === 'regex_match' && ++regexRules > RUBRIC_MAX_REGEX_RULES) return { error: `rubric.rules may hold at most ${RUBRIC_MAX_REGEX_RULES} regex_match rules` }
     total += rule.weight
     rules.push(rule)
   }

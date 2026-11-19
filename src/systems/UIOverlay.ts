@@ -71,6 +71,9 @@ export class UIOverlay {
   private _hoveredScientist: Scientist | null = null
   private focusedScientist: Scientist | null = null
   private isAnimating: boolean = false
+  // Where the camera goes to read the practice bench, which stands at the edge of the default view.
+  private benchView: { position: [number, number, number]; target: [number, number, number] } | null = null
+  private benchFocused: boolean = false
   private isInfoExpanded: boolean = false
   private currentEpoch: number = 0
   private stabilityScore: number = 0.5
@@ -719,6 +722,25 @@ export class UIOverlay {
           color: #555;
           line-height: 1.55;
           margin: 0;
+        }
+
+        .info-bench-button {
+          margin-top: 8px;
+          min-height: 44px;
+          min-width: 44px;
+          padding: 0 14px;
+          font: inherit;
+          font-size: 12px;
+          color: #3d3a30;
+          background: #f5f2eb;
+          border: 1px solid #b5a642;
+          border-radius: 6px;
+          cursor: pointer;
+          pointer-events: auto;
+        }
+
+        .info-bench-button:hover {
+          background: #ece7d6;
         }
 
         .info-description + .info-description {
@@ -1642,6 +1664,8 @@ export class UIOverlay {
         </p>
         <p class="info-description">
           The practice bench by the compute corner draws the lab's reinforcement learning runs from the stored record: a pen charts the reward of each step, a jar stands for each answer, and the held-out scores are measured by the lab. Click it for the record. It rests when nothing is running.
+          <br>
+          <button type="button" class="info-bench-button" id="info-bench-button">${this.benchFocused ? 'Back to the room' : 'Look at the bench'}</button>
         </p>
         <p class="info-description">
           Click a scientist to see their current role.
@@ -1689,6 +1713,33 @@ export class UIOverlay {
     // Add click handler for toggle
     const toggle = this.infoPanelElement.querySelector('#info-about-toggle')
     toggle?.addEventListener('click', () => this.toggleInfoPanel())
+    this.infoPanelElement.querySelector('#info-bench-button')?.addEventListener('click', () => this.onBenchButton())
+  }
+
+  /** Sets the view the "Look at the bench" button flies the camera to. */
+  public setBenchView(view: { position: [number, number, number]; target: [number, number, number] }): void {
+    this.benchView = view
+  }
+
+  private onBenchButton(): void {
+    if (this.benchFocused) {
+      this.resetCameraView()
+      return
+    }
+    if (!this.benchView || this.isAnimating) return
+    const { position, target } = this.benchView
+    this.focusedScientist = null
+    this.labels.forEach(label => label.classList.remove('focused'))
+    this.isAnimating = true
+    this.benchFocused = true
+    const reduced = window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches === true
+    const duration = reduced ? 0.01 : 1.2
+    gsap.to(this.camera.position, { x: position[0], y: position[1], z: position[2], duration, ease: 'power2.inOut' })
+    gsap.to(this.controls.target, {
+      x: target[0], y: target[1], z: target[2], duration, ease: 'power2.inOut',
+      onComplete: () => { this.isAnimating = false },
+    })
+    this.renderInfoPanel()
   }
 
   private toggleInfoPanel(): void {
@@ -1923,6 +1974,10 @@ export class UIOverlay {
     if (this.isAnimating) return
 
     this.focusedScientist = scientist
+    if (this.benchFocused) {
+      this.benchFocused = false
+      this.renderInfoPanel()
+    }
     this.isAnimating = true
 
     // Get scientist position
@@ -1974,6 +2029,10 @@ export class UIOverlay {
 
     this.isAnimating = true
     this.focusedScientist = null
+    if (this.benchFocused) {
+      this.benchFocused = false
+      this.renderInfoPanel()
+    }
 
     // Animate back to default view
     gsap.to(this.camera.position, {

@@ -437,6 +437,11 @@ RUBRIC_STRING_MAX = 200
 RUBRIC_LIST_MAX = 20
 RUBRIC_REGEX_MAX_LEN = 120
 RUBRIC_REGEX_MAX_STATES = 120
+# Calls the compiler may make while it counts a pattern's repeats out, however small the program stays.
+RUBRIC_REGEX_MAX_EMITS = 2000
+# Steps the matcher may take on one text. Past it the rule scores 0, the same in the TypeScript twin.
+RUBRIC_REGEX_MAX_WORK = 100000
+RUBRIC_MAX_REGEX_RULES = 3
 RUBRIC_REPEAT_MAX = 16
 RUBRIC_TEXT_MAX = 4000
 RUBRIC_LENGTH_MAX = 4000
@@ -552,6 +557,20 @@ def numbers_in(text: str) -> list:
         if math.isfinite(value):
             out.append(-value if signed and text[start] == "-" else value)
     return out
+
+
+def _can_be_empty(n) -> bool:
+    """Can this part match without using up a character? A repeat of such a part would do work for nothing, so it is refused."""
+    kind = n[0]
+    if kind in ("char", "any", "class"):
+        return False
+    if kind in ("bol", "eol"):
+        return True
+    if kind == "cat":
+        return all(_can_be_empty(part) for part in n[1])
+    if kind == "alt":
+        return any(_can_be_empty(option) for option in n[1])
+    return n[2] == 0 or _can_be_empty(n[1])  # rep
 
 
 def compile_regex(pattern: str, ignore_case: bool = False):
@@ -729,6 +748,8 @@ def compile_regex(pattern: str, ignore_case: bool = False):
                     fail("a quantifier cannot follow ^ or $")
                 if peek() in (63, 43, 42):
                     fail("lazy and possessive quantifiers are not supported")
+                if _can_be_empty(atom):
+                    fail("a repeat cannot follow something that can match no characters, such as an empty group or (a*)")
                 atom = ("rep", atom, lo, hi)
             parts.append(atom)
         return ("cat", tuple(parts))
@@ -747,7 +768,12 @@ def compile_regex(pattern: str, ignore_case: bool = False):
         program = []
         too_big = "the pattern needs more than %d steps once its repeats are counted out" % RUBRIC_REGEX_MAX_STATES
 
+        emits = [0]
+
         def emit(n):
+            emits[0] += 1
+            if emits[0] > RUBRIC_REGEX_MAX_EMITS:
+                fail("the pattern is too large once its repeats are counted out")
             if len(program) > RUBRIC_REGEX_MAX_STATES:
                 fail(too_big)
             kind = n[0]
@@ -808,19 +834,33 @@ def compile_regex(pattern: str, ignore_case: bool = False):
 
 
 def regex_search(regex, text: str) -> bool:
-    """Does the pattern match anywhere in the text? The automaton is stepped once per character."""
+    """Does the pattern match anywhere in the text? Stepped once per character.
+
+    Every instruction visited counts as one step; past RUBRIC_REGEX_MAX_WORK steps
+    the answer is no match. The walk is in a fixed order (lists, not sets) so the
+    TypeScript twin counts exactly the same steps.
+    """
     prog = regex["program"]
     chars = [ord(c) for c in (ascii_lower(text) if regex["ignore_case"] else text)]
     n = len(chars)
+    seen = [0] * len(prog)
+    listed = [0] * len(prog)
+    stamp = [0]
+    work = [0]
 
-    def add(target, start, at):
+    def add(target, gen, start, at):
+        """1 for a match, 0 for none, -1 when the step limit was passed."""
+        stamp[0] += 1
+        mark = stamp[0]
         stack = [start]
-        seen = set()
         while stack:
             pc = stack.pop()
-            if pc in seen:
+            if seen[pc] == mark:
                 continue
-            seen.add(pc)
+            seen[pc] = mark
+            work[0] += 1
+            if work[0] > RUBRIC_REGEX_MAX_WORK:
+                return -1
             op = prog[pc]
             kind = op[0]
             if kind == "jmp":
@@ -835,20 +875,26 @@ def regex_search(regex, text: str) -> bool:
                 if at == n:
                     stack.append(pc + 1)
             elif kind == "match":
-                return True
-            else:
-                target.add(pc)
-        return False
+                return 1
+            elif listed[pc] != gen:
+                listed[pc] = gen
+                target.append(pc)
+        return 0
 
-    current = set()
+    current = []
     for at in range(n + 1):
-        if add(current, 0, at):
-            return True
+        gen = at + 1
+        first = add(current, gen, 0, at)
+        if first != 0:
+            return first == 1
         if at == n:
             break
         c = chars[at]
-        nxt = set()
+        nxt = []
         for pc in current:
+            work[0] += 1
+            if work[0] > RUBRIC_REGEX_MAX_WORK:
+                return False
             op = prog[pc]
             kind = op[0]
             if kind == "char":
@@ -858,8 +904,10 @@ def regex_search(regex, text: str) -> bool:
             else:  # class
                 inside = any(lo <= c <= hi for lo, hi in op[1])
                 ok = inside != op[2]
-            if ok and add(nxt, pc + 1, at + 1):
-                return True
+            if ok:
+                r = add(nxt, gen + 1, pc + 1, at + 1)
+                if r != 0:
+                    return r == 1
         current = nxt
     return False
 
@@ -1061,10 +1109,15 @@ def check_rubric(rubric):
     if not isinstance(rules, list) or not (1 <= len(rules) <= RUBRIC_MAX_RULES):
         return "the rubric must hold 1 to %d rules" % RUBRIC_MAX_RULES
     total = 0.0
+    regex_rules = 0
     for i, rule in enumerate(rules):
         problem = _rule_problem(rule, "rubric.rules[%d]" % i)
         if problem:
             return problem
+        if rule.get("type") == "regex_match":
+            regex_rules += 1
+            if regex_rules > RUBRIC_MAX_REGEX_RULES:
+                return "rubric.rules may hold at most %d regex_match rules" % RUBRIC_MAX_REGEX_RULES
         total += rule["weight"]
     if total > 1 + 1e-9:
         return "the rubric weights add up to more than 1"
@@ -1374,6 +1427,8 @@ def rl_progress_payload(job, live: dict, wall: float) -> dict:
         ],
         "score_before": live.get("score_before"),
         "score_after": live.get("score_after"),
+        "steps_trained": int(live.get("steps_trained", 0)),
+        "seq": int(live.get("seq", 0)),
         "wall_seconds": round(wall, 1),
     }
     while len(json.dumps(payload).encode("utf-8")) > RL_PROGRESS_MAX_BYTES and payload["samples"]:
@@ -1397,7 +1452,7 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
     state = {"stage": "input"}
     progress = {}
     secrets = []
-    live = {"phase": "starting", "step": 0, "means": [], "frac_max": [], "attempts": [], "samples": [], "score_before": None, "score_after": None}
+    live = {"phase": "starting", "step": 0, "means": [], "frac_max": [], "attempts": [], "samples": [], "score_before": None, "score_after": None, "steps_trained": 0, "seq": 0}
 
     def done(result: dict) -> dict:
         out = dict(progress)
@@ -1411,6 +1466,7 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
 
     def emit(**changes) -> None:
         live.update(changes)
+        live["seq"] = live.get("seq", 0) + 1  # the lab tells a record that moved from one it already has by this number
         if on_progress is not None:
             try:
                 on_progress(rl_progress_payload(job, live, clock() - started))
@@ -1459,13 +1515,23 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
         closing = rl_closing_tokens(held_lengths, settings)
         one_step = rl_step_tokens(train_lengths, settings)
 
-        def attempts_of(sampler, indexes, count, temperature):
-            """Samples `count` answers to each task and scores them. Returns (rewards per task, results)."""
+        class _TimeUp(Exception):
+            pass
+
+        def attempts_of(sampler, indexes, count, temperature, deadline=None):
+            """Samples `count` answers to each task and scores them. Returns (rewards per task, results).
+
+            Every token is counted before anything is scored. With a `deadline` (seconds since the run began) scoring
+            stops when it is passed, so a rubric that is slow to score cannot hold a step past the time limit.
+            """
             results = deps.sample_batch(sampler, [tasks[i]["prompt"] for i in indexes], count, ceiling, temperature)
-            rewards = []
-            for i, result in zip(indexes, results):
+            for result in results:
                 tokens["sample_prompt"] += int(result["prompt_tokens"])
                 tokens["sample_completion"] += sum(len(c["tokens"]) for c in result["completions"])
+            rewards = []
+            for i, result in zip(indexes, results):
+                if deadline is not None and clock() - started > deadline:
+                    raise _TimeUp()
                 rewards.append([score_completion(rubric, tasks[i], c["text"], patterns) for c in result["completions"]])
             return rewards, results
 
@@ -1494,6 +1560,8 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
         steps = 0
         stopped = None
         progress["steps_done"] = 0
+        progress["steps_trained"] = 0
+        trained = 0
         first_mean = None
         last_mean = None
         for step in range(steps_planned):
@@ -1508,7 +1576,11 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
             emit(phase="sampling", attempts=[])
             if step > 0:
                 sampler = deps.new_sampler()
-            rewards, results = attempts_of(sampler, indexes, group, RL_TRAIN_TEMPERATURE)
+            try:
+                rewards, results = attempts_of(sampler, indexes, group, RL_TRAIN_TEMPERATURE, RL_TRAIN_WALL_S)
+            except _TimeUp:
+                stopped = "the time limit of %d s for training (scoring the answers of a step was taking too long)" % RL_TRAIN_WALL_S
+                break
             flat = [r for per_task in rewards for r in per_task]
             mean = sum(flat) / len(flat)
             at_max = sum(1 for r in flat if r >= max_reward - 1e-9) / float(len(flat))
@@ -1528,6 +1600,9 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
                 for g in kept:
                     tokens["train"] += int(g["prompt_tokens"]) * len(g["completions"]) + sum(len(c["tokens"]) for c in g["completions"])
                 deps.train(kept, settings["learning_rate"], settings["loss"])
+                trained += 1
+                progress["steps_trained"] = trained
+                live["steps_trained"] = trained
             steps += 1
             progress["steps_done"] = steps
             if first_mean is None:
@@ -1543,6 +1618,9 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
             return done({"status": "error", "stage": state["stage"], "error": "no training step was done (%s)" % (stopped or "nothing to train")})
         progress["train_score_first"] = round(first_mean, 6)
         progress["train_score_last"] = round(last_mean, 6)
+        if trained == 0:
+            # Nothing was learned from, so what would be saved is the base model: it is not offered as a trained adapter.
+            return done({"status": "error", "stage": state["stage"], "error": "no step trained the model: in every step every answer to a task earned the same reward, so there was nothing to learn from"})
 
         state["stage"] = "save"
         emit(phase="saving")

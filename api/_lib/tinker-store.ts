@@ -413,7 +413,12 @@ export async function openTinkerRlRun(params: {
 /** Stores the latest progress record of a run that is still open. Never throws: a record that could not be stored costs the room a view, not the run. */
 export async function setRlProgress(id: string, progress: RlProgress): Promise<void> {
   try {
-    await sql`UPDATE tinker_runs SET progress = ${JSON.stringify(progress)} WHERE id = ${id} AND status IN ('reserved', 'running')`
+    // Never backwards: a slower, older answer that lands late does not replace a newer record. Records with no counter (an older runner) are stored as they come.
+    await sql`
+      UPDATE tinker_runs SET progress = ${JSON.stringify(progress)}
+      WHERE id = ${id} AND status IN ('reserved', 'running')
+        AND (${progress.seq}::int IS NULL OR progress IS NULL OR (progress->>'seq') IS NULL OR (progress->>'seq')::int < ${progress.seq}::int)
+    `
   } catch (e) {
     console.warn('[tinker] could not store the progress of a run:', e instanceof Error ? e.message : e)
   }
@@ -435,7 +440,7 @@ function cleanRlResult(result: TinkerRlResult): string {
   return JSON.stringify({
     kind: 'rl',
     n_tasks: result.n_tasks, n_train: result.n_train, n_holdout: result.n_holdout,
-    steps_planned: result.steps_planned, steps_done: result.steps_done, stopped_early: result.stopped_early ? text(result.stopped_early, 200) : null,
+    steps_planned: result.steps_planned, steps_done: result.steps_done, steps_trained: result.steps_trained, stopped_early: result.stopped_early ? text(result.stopped_early, 200) : null,
     max_reward: result.max_reward, score_before: result.score_before, score_after: result.score_after,
     train_score_first: result.train_score_first, train_score_last: result.train_score_last,
     step_means: result.step_means, step_frac_max: result.step_frac_max,

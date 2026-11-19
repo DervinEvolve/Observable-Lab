@@ -26,7 +26,8 @@
 #   uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py rl
 # It calls the deployed `train_rl` function with a toy task set of 16 tasks
 # ("name a fruit") and a rubric of two rules chosen from the lab's menu (the
-# answer is written in capital letters only, and is short), for 4 steps of 2
+# answer is short, and its name starts with a letter from a to m: partial
+# credit the base model reaches about half the time), for 4 steps of 2
 # tasks with 4 answers each, at most 40 tokens an answer. It prints the mean
 # reward of every step, the held-out score before and after (measured with the
 # same rubric on tasks the runner held out), and the last progress record the
@@ -93,12 +94,15 @@ def report(result: dict) -> None:
 
 FRUITS = ["apple", "pear", "plum", "fig", "lime", "kiwi", "peach", "grape", "mango", "melon", "lemon", "cherry", "banana", "orange", "papaya", "guava"]
 
+# A toy with partial credit the base model reaches about half the time, so some groups of answers differ and a
+# training step really runs: a short answer earns half, and a name from the first half of the alphabet earns the
+# other half. The second rule is arbitrary on purpose. It is here to be learned, not to mean anything.
 rl_job = {
     "base_model": "Qwen/Qwen3.5-4B",
-    "tasks": [{"prompt": "Name one fruit that starts with the same letter as the word '%s'. Answer with the name only." % fruit} for fruit in FRUITS],
+    "tasks": [{"prompt": "Name one fruit other than a %s. Answer with the name only." % fruit} for fruit in FRUITS],
     "rubric": {"rules": [
-        {"type": "regex_match", "weight": 0.7, "pattern": "^[A-Z][A-Z ]{2,15}$", "scope": "last_line"},
-        {"type": "length_between", "weight": 0.3, "min": 1, "max": 30},
+        {"type": "length_between", "weight": 0.5, "min": 1, "max": 12, "scope": "last_line"},
+        {"type": "regex_match", "weight": 0.5, "pattern": "^[a-m]", "ignore_case": True, "scope": "last_line"},
     ]},
     "settings": {"rank": 8, "learning_rate": 1e-4, "group_size": 4, "steps": 4, "tasks_per_step": 2, "max_completion_tokens": 40, "loss": "importance_sampling"},
     "split_salt": secrets.token_hex(16),
@@ -133,7 +137,11 @@ def rl() -> int:
     if record:
         print("the last progress record the room would draw from: phase %s, step %s of %s, %d means" % (
             record.get("phase"), record.get("step"), record.get("steps_planned"), len(record.get("means", []))))
+    print("steps that trained the model (some answers in a group scored differently): %s of %s" % (result.get("steps_trained"), result.get("steps_done")))
     print("adapter for the chat check: %s" % result["sampler_path"])
+    if not result.get("steps_trained"):
+        print("rl: no step trained the model, so the training call was not tried; run it again")
+        return 1
     print("rl: all parts ran")
     return 0
 
