@@ -20,6 +20,10 @@
 // to, and a kept adapter gets a small "kept" mark. The server lists kept
 // adapters first.
 //
+// An adapter trained on rows of a public dataset (the server lists one only
+// when the owner allowed it) says so in place of "Data written by": the
+// dataset's name, and that nobody at the lab has read those rows.
+//
 // All text from the server and from the model is put on the page as text,
 // never as markup.
 
@@ -43,11 +47,15 @@ export interface TrainedAdapterView {
   /** Marked to keep, and by whom ("the owner" or a model's name). */
   kept: boolean
   keptBy: string | null
+  /** "org/name" of the public dataset its examples were read from, when they were not written by a model. */
+  dataFrom: string | null
 }
 
 export interface ChatLimits { maxMessageChars: number; maxTurns: number }
 
 const SLUG = /^e[0-9]{1,6}-[0-9a-f]{8}$/
+/** "org/name@commit", as the server names the public dataset an adapter was trained on. */
+const DATA_FROM = /^([A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96})@[0-9a-f]{40}$/
 
 function text(v: unknown, max: number): string | null {
   if (typeof v !== 'string') return null
@@ -86,6 +94,7 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
       name: text(o.name, 40),
       kept: o.kept === true,
       keptBy: o.kept === true ? text(o.kept_by, 60) : null,
+      dataFrom: typeof o.data_from === 'string' ? DATA_FROM.exec(o.data_from)?.[1] ?? null : null,
     })
   }
   return out
@@ -117,7 +126,9 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
     title: a.name ?? a.modelId,
     ...(a.name ? { id: a.modelId } : {}),
     ...(a.kept ? { mark: 'kept' } : {}),
-    origin: `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
+    origin: a.dataFrom
+      ? `Epoch ${a.epoch}. Trained on ${a.examples} rows of the public dataset ${a.dataFrom}, chosen by ${a.authorName}. Nobody at the lab has read those rows. Base model ${a.baseModel}.`
+      : `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
     score,
     kept: a.kept
       ? `Marked to keep${a.keptBy ? ` by ${a.keptBy}` : ''}.${until ? ` Stays until ${until}.` : ''}`

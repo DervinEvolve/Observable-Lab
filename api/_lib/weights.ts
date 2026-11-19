@@ -137,7 +137,22 @@ export interface WeightsFetchResult {
   cost_usd: number
 }
 
-const text = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '')
+/**
+ * A line of text the fetcher (or the dataset reader) sent, as the lab stores
+ * it: letters, digits, spaces and plain punctuation, and nothing else. The
+ * record of a refusal is shown to all five models in the next epoch, and a
+ * repository is written by a stranger. The Modal side already leaves out any
+ * name that failed its check (a file path, a license); this is the second
+ * lock, so that markup, brackets and unusual characters never get through
+ * even if a message there changes.
+ */
+export function plainLine(v: unknown, max: number): string {
+  return typeof v === 'string' ? v.replace(/[^A-Za-z0-9 .,;:()'"@/_+-]+/g, ' ').replace(/ +/g, ' ').trim().slice(0, max) : ''
+}
+/** "org/name@commit", as the fetcher names a shelf entry it removed. */
+const SHELF_KEY = /^[A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96}@[0-9a-f]{40}$/
+export const isShelfKey = (v: unknown): v is string => typeof v === 'string' && SHELF_KEY.test(v)
+const text = plainLine
 const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
 
 /** Reads the fetcher's answer. An "ok" that does not name the repository asked for and a full commit sha is not an ok. */
@@ -159,7 +174,7 @@ export function normalizeFetchResult(raw: unknown, asked: WeightsRequest): Weigh
   return {
     ...base, status: 'ok', sha: r.sha, cached: r.cached === true,
     license: text(r.license, 80) || null, size_bytes: count(r.size_bytes), files: count(r.files),
-    evicted: Array.isArray(r.evicted) ? r.evicted.filter((k): k is string => typeof k === 'string').slice(0, 20).map(k => k.slice(0, 240)) : [],
+    evicted: Array.isArray(r.evicted) ? r.evicted.filter(isShelfKey).slice(0, 20) : [],
   }
 }
 

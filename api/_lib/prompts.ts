@@ -73,7 +73,7 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
   }
   if (on('datasets')) {
     // What it is and where its limits are, nothing about which dataset or what to do with it.
-    lines.push(`- ${datasetsNote({ perDay: config.datasets.per_day, gpu: on('gpu_job'), tinker: on('tinker_train'), gpuJobMaxS: GPU_JOB_MAX_S })}`)
+    lines.push(`- ${datasetsNote({ perDay: config.datasets.per_day, gpu: on('gpu_job'), tinker: on('tinker_train'), gpuJobMaxS: GPU_JOB_MAX_S, readsPerDay: config.tinker_train.per_day })}`)
   }
   if (on('exhibit')) {
     lines.push(`- Exhibits for the room: as Executor you may design one object for the room as data (the exhibit format is in the Executor's instructions). If the Reviewer approves it, it becomes a pull request to AI-Agent that adds exhibits/<slug>/exhibit.json, and merges only if AI-Agent's CI passes. Merged exhibits are displayed in the room with the author model's name on them.`)

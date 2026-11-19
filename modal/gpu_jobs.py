@@ -299,7 +299,10 @@ def check_repo(info, repo, limits) -> dict:
         return no("license", "the repository states no license")
     for name in licenses:
         if name not in limits["licenses"]:
-            return no("license", f"license {name[:40]} is not on the lab's list ({', '.join(limits['licenses']) or 'the list is empty'})")
+            # The card's author wrote this name, and a refusal is read by the
+            # models. It is repeated only when it has the shape of a license id.
+            shown = f"license {name}" if re.fullmatch(LICENSE_PATTERN, name) else "a license id the lab cannot read"
+            return no("license", f"{shown} is not on the lab's list ({', '.join(limits['licenses']) or 'the list is empty'})")
     siblings = info.get("siblings")
     if not isinstance(siblings, list) or not siblings:
         return no("hub", "the hub listed no files")
@@ -308,7 +311,11 @@ def check_repo(info, repo, limits) -> dict:
             return no("hub", "the hub's file list could not be read")
     for entry in siblings:
         if entry["rfilename"].lower().endswith(".py"):
-            return no("custom_code", f"the repository contains Python code ({entry['rfilename'][:80]}); "
+            # The file's name is repeated only when it is a path the lab
+            # would accept: its author chose it, and a refusal is read by the models.
+            path = entry["rfilename"]
+            shown = path[:80] if re.fullmatch(SAFE_PATH_PATTERN, path) and ".." not in path else "a .py file"
+            return no("custom_code", f"the repository contains Python code ({shown}); "
                                      "the lab never loads a repository's own code")
     if has_auto_map(info.get("config")):
         return no("custom_code", "its config has an auto_map entry, which needs the repository's own code")
@@ -322,7 +329,10 @@ def check_repo(info, repo, limits) -> dict:
     for entry in wanted:
         path = entry["rfilename"]
         if re.fullmatch(SAFE_PATH_PATTERN, path) is None or ".." in path:
-            return no("paths", f"a file path the lab does not accept: {path[:80]}")
+            # The path is not repeated: it was refused for what it holds, its
+            # author chose it, and a refusal is read by the models.
+            return no("paths", "a file has a path the lab does not accept (a path may hold letters, digits, dot, "
+                               "underscore and hyphen, in at most four parts)")
         lfs = entry.get("lfs") if isinstance(entry.get("lfs"), dict) else None
         size = (lfs or entry).get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
@@ -711,6 +721,20 @@ def fetch_weights(repo: str, revision: str = "main", limits: Optional[dict] = No
         result = {"status": "error", "stage": "fetcher", "error": str(exc)[-1500:]}
     result["wall_seconds"] = time.time() - t0
     return result
+
+
+@app.function(image=data_image, timeout=60, retries=0, max_containers=1)
+def build_data_image() -> bool:
+    """Nothing calls this. It is here so that `modal deploy` builds data_image.
+
+    Modal builds an image at deploy only when a function uses it. A job that
+    names a dataset runs in a sandbox, and an image used only by a sandbox is
+    built the first time one is created, inside run_job's own time limit: the
+    first such job could then time out for no fault of its own. With this
+    function the pyarrow layer is built once, at deploy, and that job finds it
+    ready. It runs no model code and touches nothing if it is ever called.
+    """
+    return True
 
 
 @app.function(image=image, timeout=JOB_TIMEOUT_S + 180, retries=0, max_containers=2, cpu=(1, 2), memory=(1024, 4096))

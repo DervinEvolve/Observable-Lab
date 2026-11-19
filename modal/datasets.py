@@ -90,8 +90,9 @@ HARD_SHELF_GB = 200.0
 FETCH_TIMEOUT_S = 900
 READ_TIMEOUT_S = 300
 # A shelf entry asked for, read or named by a job this recently is not
-# removed to make room: a GPU job that has just found it may be about to
-# mount it (its own time limit is 300 s), and a read takes seconds.
+# removed to make room: a GPU job's controller that has just found it may be
+# about to mount it (the controller's own time limit is 300 s; the script
+# gets 120 s of that), and a read takes seconds.
 IN_USE_S = 300
 MAX_DATA_FILES = 200
 REPO_ID_PATTERN = r"[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9._-]{0,94}[A-Za-z0-9])?"
@@ -255,7 +256,10 @@ def check_repo(info, repo, limits) -> dict:
         return no("license", "the dataset states no license")
     for name in licenses:
         if name not in limits["licenses"]:
-            return no("license", f"license {name[:40]} is not on the lab's list ({', '.join(limits['licenses']) or 'the list is empty'})")
+            # The card's author wrote this name, and a refusal is read by the
+            # models. It is repeated only when it has the shape of a license id.
+            shown = f"license {name}" if re.fullmatch(LICENSE_PATTERN, name) else "a license id the lab cannot read"
+            return no("license", f"{shown} is not on the lab's list ({', '.join(limits['licenses']) or 'the list is empty'})")
     siblings = info.get("siblings")
     if not isinstance(siblings, list) or not siblings:
         return no("hub", "the hub listed no files")
@@ -273,7 +277,10 @@ def check_repo(info, repo, limits) -> dict:
     for entry in wanted:
         path = entry["rfilename"]
         if re.fullmatch(SAFE_PATH_PATTERN, path) is None or ".." in path:
-            return no("paths", f"a file path the lab does not accept: {path[:80]}")
+            # The path is not repeated: it was refused for what it holds, its
+            # author chose it, and a refusal is read by the models.
+            return no("paths", "a data file has a path the lab does not accept (a path may hold letters, digits, dot, "
+                               "underscore and hyphen, in at most six parts)")
         lfs = entry.get("lfs") if isinstance(entry.get("lfs"), dict) else None
         size = (lfs or entry).get("size")
         if isinstance(size, bool) or not isinstance(size, int) or size < 0:
@@ -558,6 +565,12 @@ def open_data_file(root, repo, sha, path):
     return full
 
 
+class ReadProblem(ValueError):
+    """Something the reader itself says about a file. Its message is the lab's
+    own words, so it may be repeated to the models. The message of any other
+    error may quote the file, which a stranger wrote, and is never repeated."""
+
+
 def _text_lines(full):
     """Lines of a text file as str, each at most MAX_FIELD_BYTES. Bytes that are not UTF-8 become lone surrogates, which no example may hold."""
     with open(full, "r", encoding="utf-8", errors="surrogateescape", newline="") as fh:
@@ -595,14 +608,14 @@ def iter_rows(full, kind, columns=None):
             yield row if isinstance(row, dict) else None
     elif kind == "json":
         if os.path.getsize(full) > MAX_JSON_BYTES:
-            raise ValueError(f"a .json file over {MAX_JSON_BYTES // (1024 * 1024)} MB is not read (it has to be loaded whole)")
+            raise ReadProblem(f"a .json file over {MAX_JSON_BYTES // (1024 * 1024)} MB is not read (it has to be loaded whole)")
         with open(full, "r", encoding="utf-8", errors="surrogateescape") as fh:
             try:
                 data = json.load(fh)
             except RecursionError:
-                raise ValueError("the .json file is nested too deeply to read")
+                raise ReadProblem("the .json file is nested too deeply to read")
         if not isinstance(data, list):
-            raise ValueError("the .json file is not a list of rows")
+            raise ReadProblem("the .json file is not a list of rows")
         for row in data:
             yield row if isinstance(row, dict) else None
     elif kind in ("csv", "tsv"):
@@ -659,7 +672,7 @@ def iter_rows(full, kind, columns=None):
                 for row in batch.to_pylist():
                     yield row
     else:
-        raise ValueError("this kind of file has no rows with named columns")
+        raise ReadProblem("this kind of file has no rows with named columns")
 
 
 def describe_one(full, kind, deadline, clock=time.time) -> dict:
@@ -853,12 +866,20 @@ def read_rows_core(spec, root, used, now, rows_of=iter_rows) -> dict:
                 stopped = "limit"
                 break
     except KeyError as exc:
-        name = str(exc.args[0]) if exc.args else ""
+        # Only a name the request itself gave is repeated, and only column
+        # names of the shape the manifest stores are listed.
+        name = exc.args[0] if exc.args and exc.args[0] in (user_column, assistant_column) else None
+        listed = [c for c in (record.get("columns") or []) if valid_column(c)][:20]
         return {"status": "refused", "rule": "columns",
-                "reason": f"{record['path'][:120]} has no column named {name[:64]}"
-                          + (f" (its columns: {', '.join((record.get('columns') or [])[:20])})" if record.get("columns") else "")}
+                "reason": (f"{record['path'][:120]} has no column named {name}" if name
+                           else f"{record['path'][:120]} does not have the columns asked for")
+                          + (f" (its columns: {', '.join(listed)})" if listed else "")}
+    except ReadProblem as exc:
+        return {"status": "error", "stage": "read", "error": f"{record['path'][:120]} could not be read: {exc}"}
     except Exception as exc:
-        return {"status": "error", "stage": "read", "error": f"{record['path'][:120]} could not be read: {type(exc).__name__}: {str(exc)[:300]}"}
+        # Only the kind of error. A parser's message can quote the file it
+        # was reading, and this line is read by the models.
+        return {"status": "error", "stage": "read", "error": f"{record['path'][:120]} could not be read ({type(exc).__name__})"}
     # A file whose rows never had the columns is a wrong mapping, not an empty dataset.
     if not examples and scanned and skipped.get("column_missing") == scanned:
         return {"status": "refused", "rule": "columns",
@@ -1002,7 +1023,7 @@ def read_rows(spec: dict) -> dict:
     try:
         result = read_rows_core(spec, READ_DIR, {}, time.time)
     except Exception as exc:
-        result = {"status": "error", "stage": "reader", "error": str(exc)[-600:]}
+        result = {"status": "error", "stage": "reader", "error": f"the reader failed ({type(exc).__name__})"}
     result["wall_seconds"] = time.time() - t0
     return result
 
