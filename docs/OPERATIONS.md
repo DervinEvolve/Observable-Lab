@@ -365,7 +365,7 @@ It starts a run under a made-up name, sends the same start a second time, asks f
 | `LAB_ENABLE_TRAINED_CHAT` | false | The visitor chat in the room. Needs `TINKER_API_KEY`. |
 | `LAB_TINKER_CHAT_DAILY_USD` | 1 | The most all visitor chat may cost per UTC day, by the estimate, inside the $10. Never more than 10. |
 
-I turn them on one at a time: `LAB_ENABLE_TINKER` first, and the two chat switches only after a model's run has left a kept adapter and I have read its samples.
+I turn them on one at a time: `LAB_ENABLE_TINKER` first, then the two chat switches whenever I choose. Nobody reviews an adapter before it can be talked to; every finished adapter is listed until it expires (or for good once kept), and the chat says beside every reply that replies are not reviewed.
 
 **Vercel functions.** The visitor chat is one new function, `api/experiment/trained-chat.ts` (the project now has 19; `vercel.json` gives it 60 s). With the chat off nothing calls it: the room's page learns from `GET /api/experiment`, which it reads anyway, whether the chat is on, and only then calls the chat route. Adapters on the lab model endpoint use the existing function and its `/models` rewrite. The tick collects finished runs inside the existing cron function, once per tick, before it advances any experiment.
 
