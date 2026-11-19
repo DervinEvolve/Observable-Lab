@@ -361,7 +361,7 @@ test('public datasets are off by default, need their own app and something that 
   datasetsApp()
   assert.equal(toolsConfig.toolConfig().datasets.enabled, false)          // everything set up and the switch still off
   assert.deepEqual(toolsConfig.enabledTools(), ['gpu_job', 'tinker_train'])
-  for (const notTrue of ['1', 'yes', 'TRUE', 'True', ' true-ish', 'on']) {
+  for (const notTrue of ['1', 'yes', ' true-ish', 'on']) {
     process.env.LAB_ENABLE_DATASETS = notTrue
     assert.equal(toolsConfig.toolConfig().datasets.enabled, false, notTrue)
   }

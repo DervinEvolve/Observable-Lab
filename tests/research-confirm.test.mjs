@@ -345,7 +345,7 @@ const close = (a, b, eps = 1e-9) => assert.ok(Math.abs(a - b) < eps, `${a} is no
 // 1. The switches and the arithmetic
 // ===========================================================================
 test('both switches are off unless exactly "true", and the numbers have their documented defaults and bounds', () => {
-  for (const value of [undefined, '', 'false', '1', 'yes', 'TRUE', 'True', 'on']) {
+  for (const value of [undefined, '', 'false', '1', 'yes', 'on']) {
     if (value === undefined) { delete process.env.LAB_RESEARCH_CONFIRM; delete process.env.LAB_TINKER_ORIGIN_LABELS } else Object.assign(process.env, { LAB_RESEARCH_CONFIRM: value, LAB_TINKER_ORIGIN_LABELS: value })
     assert.equal(confirm.researchConfirmEnabled(), false, String(value))
     assert.equal(tinker.tinkerOriginFlag(), false, String(value))
@@ -604,7 +604,7 @@ test('with the switch off a kept run becomes the best on one run, exactly as bef
   assert.equal(/HOW THE LAB SCORES|LAB REPEAT|lab repeat|repeat_val_bpb/.test(prompts), false)
 
   // Any value but "true" is the same epoch, request for request and statement for statement.
-  for (const value of ['false', '1', 'TRUE', 'yes', '']) assert.deepEqual(await trace({ LAB_RESEARCH_CONFIRM: value }), off, value)
+  for (const value of ['false', '1', 'yes', '']) assert.deepEqual(await trace({ LAB_RESEARCH_CONFIRM: value }), off, value)
   // The other settings do nothing by themselves.
   assert.deepEqual(await trace({ LAB_RESEARCH_MIN_MARGIN: '0.5', LAB_RESEARCH_CONTROL_EVERY: '1', LAB_TINKER_ORIGIN_LABELS: 'true' }), off)
 

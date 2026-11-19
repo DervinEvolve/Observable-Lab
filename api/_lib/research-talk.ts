@@ -107,7 +107,7 @@ const MESSAGES = {
 }
 
 function flag(name: string): boolean {
-  return (process.env[name] || '').trim() === 'true'
+  return (process.env[name] || '').trim().toLowerCase() === 'true'
 }
 function boundedNumber(name: string, fallback: number, min: number, max: number): number {
   const raw = (process.env[name] || '').trim()

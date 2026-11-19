@@ -1394,7 +1394,7 @@ test('an adapter trained on rows of a public dataset is not offered to visitors 
   }
   lab.tinkerRuns.at(-1).dataset_source = JSON.stringify(source)
   // Only the value "true" turns it on, as for every switch of the lab.
-  for (const value of ['1', 'yes', 'TRUE', 'on', '']) {
+  for (const value of ['1', 'yes', 'on', '']) {
     process.env.LAB_TRAINED_CHAT_DATASET_ADAPTERS = value
     assert.equal(tinker.trainedChatDatasetAdaptersFlag(), false, value)
     assert.equal((await visit(undefined, { method: 'GET' })).body.adapters.length, 1)

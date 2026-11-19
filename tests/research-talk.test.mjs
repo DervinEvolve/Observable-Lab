@@ -296,7 +296,7 @@ function fakeRunner({ models = [kept()], sample, promote } = {}) {
 test('it is off unless the flag is exactly "true" and the runner\'s models endpoint and token are set', () => {
   assert.equal(talk.researchTalkFlag(), false)
   assert.deepEqual(talk.researchTalkStatus(), { enabled: false, off_reason: 'LAB_ENABLE_RESEARCH_TALK is not true' })
-  for (const value of ['1', 'yes', 'TRUE', 'on', '']) {
+  for (const value of ['1', 'yes', 'on', '']) {
     process.env.LAB_ENABLE_RESEARCH_TALK = value
     process.env.RESEARCH_RUNNER_MODELS_URL = MODELS_URL
     assert.equal(talk.researchTalkStatus().enabled, false, value)

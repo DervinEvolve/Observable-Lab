@@ -52,7 +52,7 @@ import type { ResearchConfirmVerdict, ResearchScoring } from './types.js'
 
 /** On only when the flag is exactly "true". */
 export function researchConfirmEnabled(): boolean {
-  return (process.env.LAB_RESEARCH_CONFIRM || '').trim() === 'true'
+  return (process.env.LAB_RESEARCH_CONFIRM || '').trim().toLowerCase() === 'true'
 }
 
 export const DEFAULT_MIN_MARGIN_BPB = 0.002
