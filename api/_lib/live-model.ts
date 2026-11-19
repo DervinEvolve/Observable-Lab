@@ -51,7 +51,7 @@ export const LIVE_UPSTREAM_TIMEOUT_MS = 90_000
 const MODEL_ID = /^[a-z0-9][a-z0-9._-]{0,60}\/[A-Za-z0-9][A-Za-z0-9._-]{0,100}$/
 
 export function liveModelFlag(): boolean {
-  return (process.env.LAB_ENABLE_LIVE_MODEL || '').trim() === 'true'
+  return (process.env.LAB_ENABLE_LIVE_MODEL || '').trim().toLowerCase() === 'true'
 }
 
 /** OpenRouter's own router ids ("openrouter/auto" and the rest): OpenRouter picks the model, so the price is not known in advance. */

@@ -29,7 +29,7 @@ export type ExperimentMode = 'classic' | 'research'
 
 /** Research beside the classic experiment: on only when the flag is exactly "true". */
 export function researchAlongside(): boolean {
-  return (process.env.LAB_RESEARCH_ALONGSIDE || '').trim() === 'true'
+  return (process.env.LAB_RESEARCH_ALONGSIDE || '').trim().toLowerCase() === 'true'
 }
 
 /** The stored mode of one experiment. An unknown id reads as classic. */

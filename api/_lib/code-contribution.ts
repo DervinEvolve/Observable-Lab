@@ -276,7 +276,7 @@ export async function contributeCode(params: {
   const exploreCount = Math.max(0, Math.min(EXPLORER_ANGLES.length,
     params.subagents ? Math.floor(params.subagents.explore) || 0 : params.deployExplorerSubagent ? 1 : 0))
   const deployTest = params.subagents ? params.subagents.test === true : Boolean(params.deploySubagent)
-  if (process.env.LAB_ENABLE_CODE_WRITES !== 'true') {
+  if ((process.env.LAB_ENABLE_CODE_WRITES || '').trim().toLowerCase() !== 'true') {
     return { merged: false, files: [], subagent_files: [], author, cost }
   }
   try {

@@ -36,7 +36,7 @@ export const ROTATION_LINE = 'Roles rotate every epoch: in each aligned block of
  * built from the same switches.
  */
 export function contributionLines(): string {
-  if (process.env.LAB_ENABLE_CODE_WRITES !== 'true') {
+  if ((process.env.LAB_ENABLE_CODE_WRITES || '').trim().toLowerCase() !== 'true') {
     return `- A shared code repository (AI-Agent). Code contributions are switched off for this run, so approved mutations change the specification only. Do not claim code was written, merged or tested.`
   }
   const sprite = spritesConfigured()
@@ -256,7 +256,7 @@ YOUR TEAM:
 Five frontier models share this lab: ${teamLine()}. Each epoch, every model is assigned one of five roles (Planner, Executor, Challenger, Reviewer, Commentator). ${ROTATION_LINE} You are colleagues, not competitors — the agent you're building is a joint creation, and the best idea should win regardless of who proposed it.
 
 THE MISSION:
-Build a genuinely state-of-the-art AI agent — as capable, general, reliable, and useful as this team can make it. Not a demo, not a toy, not a narrow single-purpose tool. You are designing the specification${process.env.LAB_ENABLE_CODE_WRITES === 'true' ? ' AND writing the real, tested code' : ''} for an agent that should push the frontier: the kind that plans, uses tools, reasons over long tasks, remembers, retrieves knowledge, writes and runs code, catches its own mistakes, and improves. Every epoch should move the agent measurably closer to the state of the art. Judge every proposal against that bar: "does a truly capable agent need this, and are we building it for real?"
+Build a genuinely state-of-the-art AI agent — as capable, general, reliable, and useful as this team can make it. Not a demo, not a toy, not a narrow single-purpose tool. You are designing the specification${(process.env.LAB_ENABLE_CODE_WRITES || '').trim().toLowerCase() === 'true' ? ' AND writing the real, tested code' : ''} for an agent that should push the frontier: the kind that plans, uses tools, reasons over long tasks, remembers, retrieves knowledge, writes and runs code, catches its own mistakes, and improves. Every epoch should move the agent measurably closer to the state of the art. Judge every proposal against that bar: "does a truly capable agent need this, and are we building it for real?"
 
 THE LAB IS REAL, AND SO ARE YOUR TOOLS — this is not a thought experiment:
 ${contributionLines()}${toolLines() ? `\n${toolLines()}` : ''}
@@ -267,7 +267,7 @@ ${contributionLines()}${toolLines() ? `\n${toolLines()}` : ''}
 
 WHERE YOU ARE: the agent you're growing is shown in the lab as a living plant in a glass terrarium; your desk terminal displays the code and searches you're working on${toolConfig().subagents.enabled ? '; deployed subagents appear as drones over the terrarium' : ''}${spritesConfigured() ? '; the screen above your desk shows what really ran in your Sprite' : ''}. Human observers watch all of this in real time — your remarks are spoken aloud in the room and your reasoning is read. You move and collaborate like a team: you walk to a colleague to talk through a handoff, you debate proposals face to face (the Executor answers the Challenger before the Reviewer rules), and the work passes Planner → Executor → Challenger → Reviewer → Commentator each epoch.
 
-Over many epochs the specification evolves as the team proposes capabilities, defines constraints, adds behaviors and resolves conflicts${process.env.LAB_ENABLE_CODE_WRITES === 'true' ? ', with at most one piece of working code per epoch backing it' : ''}.
+Over many epochs the specification evolves as the team proposes capabilities, defines constraints, adds behaviors and resolves conflicts${(process.env.LAB_ENABLE_CODE_WRITES || '').trim().toLowerCase() === 'true' ? ', with at most one piece of working code per epoch backing it' : ''}.
 
 THE SPECIFICATION STRUCTURE:
 - identity: { purpose, domain } — What is this agent for?

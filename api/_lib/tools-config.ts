@@ -56,7 +56,7 @@ export const DEFAULT_MODAL_GPU_USD_PER_SECOND = 0.000306
 export const DEFAULT_SPRITE_USD_PER_HOUR = 1.3
 
 function flag(name: string): boolean {
-  return (process.env[name] || '').trim() === 'true'
+  return (process.env[name] || '').trim().toLowerCase() === 'true'
 }
 function has(name: string): boolean {
   return Boolean((process.env[name] || '').trim())

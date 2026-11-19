@@ -450,14 +450,16 @@ const noNetwork = () => { globalThis.fetch = async (url) => { throw new Error(`n
 // ===========================================================================
 // 1. The flag and the two modes
 // ===========================================================================
-test('research alongside is off unless the flag is exactly "true"', () => {
+test('research alongside is off unless the flag is "true" (any capitalisation)', () => {
   assert.equal(modes.researchAlongside(), false)
-  for (const value of ['1', 'yes', 'TRUE', 'on', '']) {
+  for (const value of ['1', 'yes', 'on', '']) {
     process.env.LAB_RESEARCH_ALONGSIDE = value
     assert.equal(modes.researchAlongside(), false, value)
   }
-  process.env.LAB_RESEARCH_ALONGSIDE = ' true '
-  assert.equal(modes.researchAlongside(), true)
+  for (const value of [' true ', 'TRUE', 'True']) {
+    process.env.LAB_RESEARCH_ALONGSIDE = value
+    assert.equal(modes.researchAlongside(), true, value)
+  }
 })
 
 test('an experiment\'s mode is read from its stored spec', async () => {

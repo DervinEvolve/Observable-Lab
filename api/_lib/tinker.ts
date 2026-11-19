@@ -135,7 +135,7 @@ export const TINKER_KEEP_WAIT_MS = 45_000
 // ---------------------------------------------------------------------------
 
 function flag(name: string): boolean {
-  return (process.env[name] || '').trim() === 'true'
+  return (process.env[name] || '').trim().toLowerCase() === 'true'
 }
 function has(name: string): boolean {
   return Boolean((process.env[name] || '').trim())

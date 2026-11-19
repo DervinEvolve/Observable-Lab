@@ -238,9 +238,14 @@ test('with the switch off there is no endpoint, no key, no variable in a Sprite 
   assert.deepEqual(live.liveModelStatus(), { enabled: false, off_reason: 'LAB_ENABLE_LIVE_MODEL is not true' })
   assert.equal(toolsConfig.liveModelToolStatus().enabled, false)
   assert.deepEqual(toolsConfig.enabledTools(), ['sprite_session'])
-  for (const value of ['1', 'yes', 'TRUE', 'on']) {
+  for (const value of ['1', 'yes', 'on', 'truthy']) {
     process.env.LAB_ENABLE_LIVE_MODEL = value
     assert.equal(live.liveModelFlag(), false, `"${value}" must not switch it on`)
+  }
+  // Any capitalisation of true, with spaces around it, is on (the owner typed TRUE once).
+  for (const value of ['TRUE', 'True', ' true ']) {
+    process.env.LAB_ENABLE_LIVE_MODEL = value
+    assert.equal(live.liveModelFlag(), true, `"${value}" should switch it on`)
   }
   delete process.env.LAB_ENABLE_LIVE_MODEL
 

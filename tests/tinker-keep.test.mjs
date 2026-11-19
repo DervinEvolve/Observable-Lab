@@ -631,12 +631,12 @@ test('with both switches off nothing changes: no field, no tool, no prompt text,
   // The stored record of the run names no name either.
   assert.equal(JSON.stringify(keptRuns('tinker_train')).includes('Left Over'), false)
 
-  // Both flags need exactly "true", and keeping needs the runner.
-  for (const value of ['1', 'yes', 'TRUE', ' true']) {
+  // Both flags need "true" (any capitalisation, spaces trimmed), and keeping needs the runner.
+  for (const value of ['1', 'yes', 'TRUE', ' true', 'True ']) {
     process.env.LAB_ENABLE_TINKER_NAMES = value
     process.env.LAB_ENABLE_TINKER_KEEP = value
-    assert.equal(tinker.tinkerNamesFlag(), value.trim() === 'true')
-    assert.equal(tinker.tinkerKeepFlag(), value.trim() === 'true')
+    assert.equal(tinker.tinkerNamesFlag(), value.trim().toLowerCase() === 'true')
+    assert.equal(tinker.tinkerKeepFlag(), value.trim().toLowerCase() === 'true')
   }
   process.env = { ...BASE_ENV, LAB_ENABLE_TINKER_KEEP: 'true' }
   assert.equal(tinker.tinkerKeepStatus().off_reason, 'TINKER_JOBS_START_URL, TINKER_JOBS_STATUS_URL or TINKER_JOBS_TOKEN is not set')
