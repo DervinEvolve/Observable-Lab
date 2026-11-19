@@ -13,6 +13,9 @@ import {
   estimateTinkerRun, tinkerBaseModels, tinkerNamesFlag, tinkerNote, tinkerRunUsd, usdText,
   type TinkerRequest,
 } from './tinker.js'
+import { RL_COMPLETION_TOKENS, RL_GROUP_SIZE, RL_LEARNING_RATE, RL_LOSSES, RL_MAX_TASKS, RL_MIN_TASKS, RL_STEPS, RL_TASKS_PER_STEP, tinkerRlNote, tinkerRlReviewFacts } from './tinker-rl.js'
+import { RUBRIC_TYPES } from './rubric.js'
+import { trainedChatStatus } from './tinker.js'
 import { KEEP_REASON_MAX, keepNote } from './tinker-keep-request.js'
 import { ADAPTER_NAME_MAX, ADAPTER_NAME_MIN } from './tinker-names.js'
 import { weightsLimits } from './weights.js'
@@ -87,6 +90,10 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
       ...(tinkerNamesFlag() ? { names: true } : {}), ...(on('keep_adapter') ? { keep: true } : {}),
     })}`)
   }
+  if (on('tinker_rl')) {
+    // What it does and where its limits are, nothing about which tasks or what to reward.
+    lines.push(`- ${tinkerRlNote({ perDay: config.tinker_rl.per_day, ...(tinkerNamesFlag() ? { names: true } : {}), ...(trainedChatStatus().enabled ? { chat: true } : {}) })}`)
+  }
   if (on('keep_adapter')) {
     // What keeping does and where its limits are, nothing about which adapter to keep.
     lines.push(`- ${keepNote({ perDay: config.keep_adapter.per_day })}`)
@@ -113,6 +120,9 @@ export function executorToolsSection(config: ToolConfig = toolConfig()): string 
   if (on('lab_proposal')) fields.push(`    "lab_proposal": { "title": "short", "summary": "what and why, for the owner", "files": [ { "path": "src/... api/... docs/... tests/... or modal/...", "content": "the whole new file" } ] }`)
   if (on('tinker_train')) {
     fields.push(`    "tinker_train": { "purpose": "one line", "base_model": "${tinkerBaseModels().models.join('" | "')}" (optional), "examples": [ { "messages": [ { "role": "system" | "user" | "assistant", "content": "text" } ] }, ... ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} of them ], "settings": { "rank": ${TINKER_RANKS.join(' | ')}, "learning_rate": ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, "epochs": ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, "batch_size": ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max} } (optional)${tinkerNamesFlag() ? `, "name": "a display name, ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters (optional)"` : ''} }`)
+  }
+  if (on('tinker_rl')) {
+    fields.push(`    "tinker_rl": { "purpose": "one line", "task_set": "a short name for the task set (optional)", "base_model": "${tinkerBaseModels().models.join('" | "')}" (optional), "tasks": [ { "prompt": "text", "expected": "text (optional)", "data": { "name": whole number or short text } (optional) }, ... ${RL_MIN_TASKS} to ${RL_MAX_TASKS} of them ], "rubric": { "rules": [ { "type": ${RUBRIC_TYPES.map(t => `"${t}"`).join(' | ')}, "weight": above 0 and at most 1, ...the fields of that rule (see below) } ] }, "settings": { "rank": ${TINKER_RANKS.join(' | ')}, "learning_rate": ${RL_LEARNING_RATE.min} to ${RL_LEARNING_RATE.max}, "group_size": ${RL_GROUP_SIZE.min} to ${RL_GROUP_SIZE.max}, "steps": ${RL_STEPS.min} to ${RL_STEPS.max}, "tasks_per_step": ${RL_TASKS_PER_STEP.min} to ${RL_TASKS_PER_STEP.max}, "max_completion_tokens": ${RL_COMPLETION_TOKENS.min} to ${RL_COMPLETION_TOKENS.max}, "loss": ${RL_LOSSES.map(l => `"${l}"`).join(' | ')} } (optional)${tinkerNamesFlag() ? `, "name": "a display name, ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters (optional)"` : ''} }`)
   }
   if (on('keep_adapter')) fields.push(`    "keep_adapter": { "adapter": "the lab id of a trained adapter that is alive, like lab/e41-0a1b2c3d", "reason": "one line, at most ${KEEP_REASON_MAX} characters" }`)
   if (!fields.length) return ''
@@ -161,6 +171,9 @@ At most ${MAX_TRIANGLES} triangles in all, counted per copy as: ${tri}, tube ${T
   if (on('tinker_train') && on('datasets')) {
     text += `\nIn place of "examples", a Tinker training request may name a dataset that is already on the lab's shelf: "dataset": { "repo": "org/name" or "org/name@<commit>", "file": "the path of one data file (needed when the dataset holds more than one file with rows)", "user_column": "the column for the user turn", "assistant_column": "the column for the assistant turn", "system": "text of yours put before every row as a system message, at most ${DATASETS_MAX_SYSTEM_BYTES} bytes (optional)", "limit": ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} rows (optional, ${DATASETS_DEFAULT_ROWS} when left out) }. Give "examples" or "dataset", never both; the other fields are the same. The dataset must have been fetched in an earlier epoch or asked for in this same answer; one that is not on the shelf refuses the run, with the reason stored. The files, rows and column names of a fetched dataset are in the stored record of its fetch.`
   }
+  if (on('tinker_rl')) {
+    text += `\nA Tinker RL request takes exactly the fields shown: any other field, a value out of range, a malformed task or rule, or a rule that reads "expected" or "data.<name>" from a task that has none refuses the whole request. Rule fields: exact_match { "value" or "from", "scope" }; contains { "any" or "all" (lists of strings) or "value" or "from", "ignore_case" (default true), "scope" }; not_contains { "any" or "value" or "from", "ignore_case", "scope" }; number_close { "value" (a number) or "from", "tolerance" (default 0.000001), "relative" (true or false), "pick" ("first" or "last", default last), "scope" }; regex_match { "pattern", "ignore_case", "scope" }; json_valid { "schema": { "type", "required", "properties", "items" } (optional) }; length_between { "min", "max", "scope" }. "from" is "expected" or "data.<name>"; "scope" is "whole", "first_line" or "last_line". A task's prompt is shown to the model as one user message. Settings left out get rank 16, learning_rate ${RL_LEARNING_RATE.fallback}, group_size ${RL_GROUP_SIZE.fallback}, steps ${RL_STEPS.fallback}, tasks_per_step ${RL_TASKS_PER_STEP.fallback}, max_completion_tokens ${RL_COMPLETION_TOKENS.fallback} and loss ${RL_LOSSES[0]}. An epoch has one Tinker run, so this and tinker_train cannot both be asked for. Nothing runs without the Reviewer's approval.`
+  }
   if (on('keep_adapter')) {
     text += `\nA request to keep an adapter takes exactly "adapter" and "reason". Nothing is kept without the Reviewer's approval.`
   }
@@ -169,6 +182,8 @@ At most ${MAX_TRIANGLES} triangles in all, counted per copy as: ${tri}, tube ${T
   }
   return text
 }
+
+export { tinkerRlReviewFacts }
 
 /** What the Reviewer is told about a Tinker training request: its size, its settings and the most it could cost. */
 export function tinkerReviewFacts(request: TinkerRequest): { line: string } {
@@ -203,25 +218,28 @@ export function reviewerToolSection(requests: {
   exhibit?: { slug: string; check: string }
   lab_proposal?: { title: string; files: string[] }
   tinker_train?: { line: string }
+  tinker_rl?: { line: string }
   keep_adapter?: { line: string }
 }): string {
   const parts: string[] = []
   if (requests.exhibit) parts.push(`- An exhibit for the room, "${requests.exhibit.slug}" (it is in the Executor's "tools"). The lab's contract check: ${requests.exhibit.check}.`)
   if (requests.lab_proposal) parts.push(`- A proposal to the lab's own repository: "${requests.lab_proposal.title}" changing ${requests.lab_proposal.files.join(', ')}. The owner reviews it before anything merges.`)
   if (requests.tinker_train) parts.push(`- A Tinker training run: ${requests.tinker_train.line}.`)
+  if (requests.tinker_rl) parts.push(`- A Tinker RL run: ${requests.tinker_rl.line}.`)
   if (requests.keep_adapter) parts.push(`- Keeping a trained adapter: ${requests.keep_adapter.line}.`)
   if (!parts.length) return ''
   const keys = [
     requests.exhibit ? '"exhibit": "approve" | "reject"' : '',
     requests.lab_proposal ? '"lab_proposal": "approve" | "reject"' : '',
     requests.tinker_train ? '"tinker_train": "approve" | "reject"' : '',
+    requests.tinker_rl ? '"tinker_rl": "approve" | "reject"' : '',
     requests.keep_adapter ? '"keep_adapter": "approve" | "reject"' : '',
   ].filter(Boolean).join(', ')
   return `
 
 THE EXECUTOR ALSO ASKED FOR:
 ${parts.join('\n')}
-Rule on each with a "tool_verdicts" object in your JSON: { ${keys} }. Nothing is opened${requests.tinker_train ? ' or started' : ''}${requests.keep_adapter ? ' or kept' : ''} without "approve".`
+Rule on each with a "tool_verdicts" object in your JSON: { ${keys} }. Nothing is opened${requests.tinker_train || requests.tinker_rl ? ' or started' : ''}${requests.keep_adapter ? ' or kept' : ''} without "approve".`
 }
 
 // Create a compressed version of the spec for context (removes pruned items, summarizes older content)

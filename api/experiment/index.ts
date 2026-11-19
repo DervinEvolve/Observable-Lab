@@ -11,6 +11,7 @@ import { computeGrowth, growthEventsFor, growthFactsFor, repoLinks } from '../_l
 import { getRecentToolRuns } from '../_lib/tool-runs-store.js'
 import { enabledTools } from '../_lib/tools-config.js'
 import { trainedChatStatus } from '../_lib/tinker.js'
+import { rlPractice } from '../_lib/tinker-rl-public.js'
 import { researchStoryStatus } from '../_lib/research-talk.js'
 import { exhibitsHandler } from '../_lib/exhibits-reader.js'
 import { researchAlongside } from '../_lib/experiment-modes.js'
@@ -172,6 +173,8 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
     // Research running beside this experiment, in brief (only with the flag on,
     // and only when this is not the research experiment itself).
     const research = researchAlongside() && !currentSpec.meta.research ? await researchSummary() : null
+    // Tinker RL, for the practice bench: whether it is on and the newest run, from the stored record only.
+    const practice = await rlPractice().catch(() => null)
 
     return res.status(200).json({
       ...response, growth_events: growthEvents, tool_runs: toolRuns, tools_enabled: enabledTools(),
@@ -182,6 +185,8 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
       // switched on. The story box calls its own route only after seeing this.
       ...(researchStoryStatus().enabled ? { research_talk_enabled: true } : {}),
       ...(research ? { research } : {}),
+      // Present while Tinker RL is on or has ever run. The bench rests without it.
+      ...(practice && (practice.enabled || practice.run) ? { rl_practice: practice } : {}),
     })
   } catch (error) {
     console.error('[API] Error fetching experiment:', error)

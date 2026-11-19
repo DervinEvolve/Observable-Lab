@@ -61,6 +61,8 @@ for (const name of Object.keys(process.env)) {
   if (/^(OPENROUTER|POSTGRES|LAB_|AI_AGENT|RESEARCH_|SPRITES|MODAL|EPOCH_|NORTH_|GPU_JOBS|VERCEL|TINKER|CRON_|DATASETS)/.test(name)) delete process.env[name]
 }
 process.env.OPENROUTER_API_KEY = 'test-only-openrouter-placeholder' // read once at import
+// Tinker RL (tests/tinker-rl.test.mjs) is on by default; these tests are about the training run, so it is switched off here.
+process.env.LAB_ENABLE_TINKER_RL = 'false'
 const BASE_ENV = { ...process.env }
 
 let logs = []

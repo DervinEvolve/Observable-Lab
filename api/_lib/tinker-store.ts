@@ -41,6 +41,7 @@ import { modelDisplayName } from './types.js'
 import {
   isAdapterSlug, isExternalPath, isSamplerPath, tinkerKeepFlag, tinkerNamesFlag, tinkerOriginFlag, type TinkerRequest, type TinkerRunResult,
 } from './tinker.js'
+import type { RlProgress, RlRecord, TinkerRlRequest, TinkerRlResult } from './tinker-rl.js'
 import { adapterNameKey } from './tinker-names.js'
 
 export type TinkerScope = 'all' | 'chat'
@@ -79,6 +80,11 @@ export function ensureTinkerTables(): Promise<void> {
         )
       `
       await sql`CREATE INDEX IF NOT EXISTS idx_tinker_runs_status ON tinker_runs(status, created_at)`
+      // Tinker RL (tinker-rl.ts) shares this table: kind is 'rl' for its runs and empty for training runs,
+      // progress is the latest record the runner wrote while the run went, rl is what was asked.
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS kind TEXT`
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS progress JSONB`
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS rl JSONB`
       await sql`
         CREATE TABLE IF NOT EXISTS tinker_spend_days (
           day TEXT NOT NULL,
@@ -246,8 +252,15 @@ export interface TinkerRunRow {
   sampler_path: string | null
   expires_at: string | null
   created_at: string
+  finished_at: string | null
   /** The name its author gave the adapter, when names were on and the name was free. */
   display_name: string | null
+  /** 'rl' for a Tinker RL run (tinker-rl.ts). Null for a training run. */
+  kind: string | null
+  /** The latest progress record of an RL run, as the lab stored it. */
+  progress: Record<string, unknown> | null
+  /** What an RL run was asked to do: its rubric, settings and estimate (RlRecord in tinker-rl.ts). */
+  rl: Record<string, unknown> | null
   /**
    * Only on a run whose examples the lab read from a shelf dataset
    * (datasets.ts): the repository, commit, file, columns and row counts.
@@ -294,7 +307,11 @@ function runRow(row: Record<string, unknown>): TinkerRunRow {
     sampler_path: row.sampler_path ? String(row.sampler_path) : null,
     expires_at: iso(row.expires_at),
     created_at: iso(row.created_at) ?? '',
+    finished_at: iso(row.finished_at),
     display_name: row.display_name ? String(row.display_name).slice(0, 40) : null,
+    kind: row.kind ? String(row.kind) : null,
+    progress: json(row.progress),
+    rl: json(row.rl),
     ...(json(row.dataset_source) ? { dataset_source: json(row.dataset_source) as Record<string, unknown> } : {}),
   }
 }
@@ -352,6 +369,105 @@ export async function openTinkerRun(params: {
       ${params.spendDay}, ${usd(params.reservedUsd)}
     )
     ON CONFLICT (experiment_id, epoch) DO NOTHING
+    RETURNING *
+  `
+  return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
+}
+
+/**
+ * Opens the one run an epoch may have, for a Tinker RL request. The same
+ * table and the same rule as openTinkerRun (an epoch has one run of either
+ * kind): null means the epoch already has one. `dataset_examples` holds the
+ * number of tasks and `settings` the RL settings; `rl` is the public record
+ * of what was asked.
+ */
+export async function openTinkerRlRun(params: {
+  experimentId: string
+  epoch: number
+  model: string
+  assignedModel: string
+  slug: string
+  request: TinkerRlRequest
+  record: RlRecord
+  splitSalt: string
+  spendDay: string
+  reservedUsd: number
+}): Promise<TinkerRunRow | null> {
+  await ensureTinkerTables()
+  const r = await sql`
+    INSERT INTO tinker_runs (
+      experiment_id, epoch, model, assigned_model, slug, base_model, purpose, dataset_sha256, dataset_examples, dataset_bytes,
+      settings, split_salt, status, spend_day, reserved_usd, kind, rl
+    ) VALUES (
+      ${params.experimentId}, ${params.epoch}, ${params.model}, ${params.assignedModel}, ${params.slug}, ${params.request.base_model},
+      ${sanitizeOutput(params.request.purpose).slice(0, 200)}, ${params.request.dataset_sha256}, ${params.request.tasks.length},
+      ${params.request.dataset_bytes}, ${JSON.stringify(params.request.settings)}, ${params.splitSalt}, ${'reserved'},
+      ${params.spendDay}, ${usd(params.reservedUsd)}, ${'rl'}, ${JSON.stringify(params.record)}
+    )
+    ON CONFLICT (experiment_id, epoch) DO NOTHING
+    RETURNING *
+  `
+  return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
+}
+
+/** Stores the latest progress record of a run that is still open. Never throws: a record that could not be stored costs the room a view, not the run. */
+export async function setRlProgress(id: string, progress: RlProgress): Promise<void> {
+  try {
+    await sql`UPDATE tinker_runs SET progress = ${JSON.stringify(progress)} WHERE id = ${id} AND status IN ('reserved', 'running')`
+  } catch (e) {
+    console.warn('[tinker] could not store the progress of a run:', e instanceof Error ? e.message : e)
+  }
+}
+
+/** The newest RL run, whatever state it is in. Only looks: null when there is none or the table does not exist yet. */
+export async function latestRlRun(): Promise<TinkerRunRow | null> {
+  try {
+    const r = await sql`SELECT * FROM tinker_runs WHERE kind = 'rl' ORDER BY created_at DESC LIMIT 1`
+    return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
+  } catch {
+    return null
+  }
+}
+
+/** Short, cleaned text for the stored result of an RL run: the samples are model output. */
+function cleanRlResult(result: TinkerRlResult): string {
+  const text = (v: string, max: number) => sanitizeOutput(v).slice(0, max)
+  return JSON.stringify({
+    kind: 'rl',
+    n_tasks: result.n_tasks, n_train: result.n_train, n_holdout: result.n_holdout,
+    steps_planned: result.steps_planned, steps_done: result.steps_done, stopped_early: result.stopped_early ? text(result.stopped_early, 200) : null,
+    max_reward: result.max_reward, score_before: result.score_before, score_after: result.score_after,
+    train_score_first: result.train_score_first, train_score_last: result.train_score_last,
+    step_means: result.step_means, step_frac_max: result.step_frac_max,
+    tokens: result.tokens, ttl_seconds: result.ttl_seconds, wall_seconds: result.wall_seconds, stage: result.stage,
+    samples: result.samples.map(s => ({ prompt: text(s.prompt, 300), completion: text(s.completion, 600), reward: s.reward })),
+    scores: 'held-out rubric scores measured by the lab',
+    cost: 'estimate from published prices',
+    ...(isExternalPath(result.external_path) ? { external_path: result.external_path } : {}),
+  })
+}
+
+/**
+ * Closes an RL run, with the same rule as finishTinkerRun: only a run that is
+ * still open is closed, and the row comes back only to the caller that closed
+ * it, so two requests collecting one result cannot both settle its money.
+ */
+export async function finishTinkerRlRun(id: string, params: {
+  status: 'ok' | 'refused' | 'error' | 'failed' | 'lost'
+  reason: string | null
+  costUsd: number
+  result: TinkerRlResult | null
+  expiresAt: string | null
+  progress: RlProgress | null
+}): Promise<TinkerRunRow | null> {
+  const path = params.status === 'ok' && params.result && isSamplerPath(params.result.sampler_path) ? params.result.sampler_path : null
+  const r = await sql`
+    UPDATE tinker_runs
+    SET status = ${params.status}, reason = ${params.reason ? sanitizeOutput(params.reason).slice(0, 500) : null},
+      cost_usd = ${usd(params.costUsd)}, result = ${params.result ? cleanRlResult(params.result) : null},
+      progress = COALESCE(${params.progress ? JSON.stringify(params.progress) : null}::jsonb, progress),
+      sampler_path = ${path}, expires_at = ${path ? params.expiresAt : null}, finished_at = NOW()
+    WHERE id = ${id} AND status IN ('reserved', 'running')
     RETURNING *
   `
   return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
@@ -471,7 +587,17 @@ export async function tinkerRunsToday(now: Date = new Date()): Promise<number> {
   await ensureTinkerTables()
   const r = await sql`
     SELECT COUNT(*) AS n FROM tinker_runs
-    WHERE spend_day = ${utcDay(now)} AND (status IN ('reserved', 'running', 'ok') OR COALESCE(cost_usd, 0) > 0)
+    WHERE spend_day = ${utcDay(now)} AND (status IN ('reserved', 'running', 'ok') OR COALESCE(cost_usd, 0) > 0) AND kind IS DISTINCT FROM 'rl'
+  `
+  return Number(r.rows[0]?.n) || 0
+}
+
+/** The same count for Tinker RL runs (LAB_TINKER_RL_PER_DAY): they have a limit of their own. */
+export async function tinkerRlRunsToday(now: Date = new Date()): Promise<number> {
+  await ensureTinkerTables()
+  const r = await sql`
+    SELECT COUNT(*) AS n FROM tinker_runs
+    WHERE spend_day = ${utcDay(now)} AND (status IN ('reserved', 'running', 'ok') OR COALESCE(cost_usd, 0) > 0) AND kind = 'rl'
   `
   return Number(r.rows[0]?.n) || 0
 }
@@ -497,6 +623,11 @@ export interface TrainedAdapter {
   holdout_loss_after: number | null
   created_at: string
   expires_at: string | null
+  /** Present, and 'rl', only for an adapter made by Tinker RL: its examples are tasks, and its scores are rubric scores, not losses. */
+  kind?: 'rl'
+  /** For an RL adapter: the mean rubric score on the held-out tasks, measured by the lab, before and after. Higher is better. */
+  rl_score_before?: number | null
+  rl_score_after?: number | null
   /** The display name its author gave it. A label: the adapter is still addressed by its slug. Absent when it has none. */
   name?: string
   /** Only for an adapter trained on rows the lab read from a public dataset: "org/name@commit". */
@@ -537,6 +668,7 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
     expires_at: row.expires_at,
     // The fields below exist only for an adapter that has a name or is marked
     // to keep, so a lab that uses neither sends exactly what it always sent.
+    ...(row.kind === 'rl' ? { kind: 'rl' as const, rl_score_before: num(result.score_before), rl_score_after: num(result.score_after) } : {}),
     ...(name ? { name } : {}),
     ...(dataFrom(row) ? { data_from: dataFrom(row) as string } : {}),
     ...(tinkerOriginFlag() ? { origin: dataOrigin(row) } : {}),
@@ -613,7 +745,7 @@ function median(values: number[]): number | null {
 }
 
 /** Per origin: how many runs, and the median held-out loss before and after training. No I/O. */
-export function summarizeOrigins(rows: (Pick<TinkerRunRow, 'dataset_source' | 'status' | 'result'> & { call_id?: string | null })[]): OriginSummary[] {
+export function summarizeOrigins(rows: (Pick<TinkerRunRow, 'dataset_source' | 'status' | 'result'> & { call_id?: string | null; kind?: string | null })[]): OriginSummary[] {
   const groups: Record<'models' | 'dataset', { runs: number; before: number[]; after: number[]; datasets: Map<string, number> }> = {
     models: { runs: 0, before: [], after: [], datasets: new Map() },
     dataset: { runs: 0, before: [], after: [], datasets: new Map() },
@@ -621,6 +753,8 @@ export function summarizeOrigins(rows: (Pick<TinkerRunRow, 'dataset_source' | 's
   for (const row of rows) {
     // A row that never reached the runner is not a training run of either origin.
     if (!reachedRunner(row)) continue
+    // A Tinker RL run is scored with a rubric, not a loss: its scores are another unit and have their own record.
+    if (row.kind === 'rl') continue
     const g = row.dataset_source ? groups.dataset : groups.models
     g.runs += 1
     if (row.dataset_source) {

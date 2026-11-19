@@ -1,0 +1,1719 @@
+{
+ "normalise": [
+  {
+   "input": "  The  Answer\n is 42.  ",
+   "expected": "the answer is 42"
+  },
+  {
+   "input": "\"Paris\"",
+   "expected": "paris"
+  },
+  {
+   "input": "`Paris!`",
+   "expected": "paris"
+  },
+  {
+   "input": "ＡＢＣ　def",
+   "expected": "abc def"
+  },
+  {
+   "input": "Zürich.",
+   "expected": "zürich"
+  },
+  {
+   "input": "ÉCOLE",
+   "expected": "École"
+  },
+  {
+   "input": "a.b",
+   "expected": "a.b"
+  },
+  {
+   "input": "",
+   "expected": ""
+  },
+  {
+   "input": "...",
+   "expected": ""
+  }
+ ],
+ "numbers": [
+  {
+   "input": "The answer is 42.",
+   "expected": [
+    42
+   ]
+  },
+  {
+   "input": "x = -3.5 and y = +2",
+   "expected": [
+    -3.5,
+    2
+   ]
+  },
+  {
+   "input": "1,234,567 apples",
+   "expected": [
+    1234567
+   ]
+  },
+  {
+   "input": "1234,567",
+   "expected": [
+    1234,
+    567
+   ]
+  },
+  {
+   "input": "12,34",
+   "expected": [
+    12,
+    34
+   ]
+  },
+  {
+   "input": "3-4",
+   "expected": [
+    3,
+    4
+   ]
+  },
+  {
+   "input": "a-5",
+   "expected": [
+    5
+   ]
+  },
+  {
+   "input": "(-5)",
+   "expected": [
+    -5
+   ]
+  },
+  {
+   "input": ".5 + 1.",
+   "expected": [
+    0.5,
+    1
+   ]
+  },
+  {
+   "input": "007",
+   "expected": [
+    7
+   ]
+  },
+  {
+   "input": "none here",
+   "expected": []
+  },
+  {
+   "input": "-.25",
+   "expected": [
+    -0.25
+   ]
+  },
+  {
+   "input": "1.2.3",
+   "expected": [
+    1.2,
+    0.3
+   ]
+  }
+ ],
+ "regex": [
+  {
+   "pattern": "abc",
+   "text": "xxabcxx",
+   "match": true
+  },
+  {
+   "pattern": "^abc$",
+   "text": "abc",
+   "match": true
+  },
+  {
+   "pattern": "^abc$",
+   "text": "abcd",
+   "match": false
+  },
+  {
+   "pattern": "^abc",
+   "text": "xabc",
+   "match": false
+  },
+  {
+   "pattern": "a.c",
+   "text": "a\nc",
+   "match": false
+  },
+  {
+   "pattern": "a.c",
+   "text": "abc",
+   "match": true
+  },
+  {
+   "pattern": "\\d{3}-\\d{4}",
+   "text": "call 555-1234 now",
+   "match": true
+  },
+  {
+   "pattern": "\\d{3}-\\d{4}",
+   "text": "call 55-1234 now",
+   "match": false
+  },
+  {
+   "pattern": "(cat|dog)s?",
+   "text": "two dogs",
+   "match": true
+  },
+  {
+   "pattern": "^(cat|dog)s?$",
+   "text": "bird",
+   "match": false
+  },
+  {
+   "pattern": "[a-c]+x",
+   "text": "zzabcabx",
+   "match": true
+  },
+  {
+   "pattern": "[^a-c]x",
+   "text": "ax bx",
+   "match": false
+  },
+  {
+   "pattern": "[^a-c]x",
+   "text": "ax dx",
+   "match": true
+  },
+  {
+   "pattern": "colou?r",
+   "text": "color",
+   "match": true
+  },
+  {
+   "pattern": "(a*)*b",
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaac",
+   "match": false
+  },
+  {
+   "pattern": "(a+)+$",
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa!",
+   "match": false
+  },
+  {
+   "pattern": "(x+x+)+y",
+   "text": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+   "match": false
+  },
+  {
+   "pattern": "A{2}",
+   "ignore_case": true,
+   "text": "xaax",
+   "match": true
+  },
+  {
+   "pattern": "A{2}",
+   "ignore_case": false,
+   "text": "xaax",
+   "match": false
+  },
+  {
+   "pattern": "[A-C]+",
+   "ignore_case": true,
+   "text": "zzbz",
+   "match": true
+  },
+  {
+   "pattern": "a{2,3}$",
+   "text": "baaaa",
+   "match": true
+  },
+  {
+   "pattern": "^a{2,3}$",
+   "text": "aaaa",
+   "match": false
+  },
+  {
+   "pattern": "^a{2,}$",
+   "text": "aaaaaaa",
+   "match": true
+  },
+  {
+   "pattern": "\\.",
+   "text": "a.b",
+   "match": true
+  },
+  {
+   "pattern": "\\.",
+   "text": "ab",
+   "match": false
+  },
+  {
+   "pattern": "\\w+@\\w+",
+   "text": "mail me@host",
+   "match": true
+  },
+  {
+   "pattern": "\\s\\S",
+   "text": "a b",
+   "match": true
+  },
+  {
+   "pattern": "\\D",
+   "text": "123",
+   "match": false
+  },
+  {
+   "pattern": "(?:ab)+c",
+   "text": "ababc",
+   "match": true
+  },
+  {
+   "pattern": "a|",
+   "text": "zzz",
+   "match": true
+  },
+  {
+   "pattern": "[]a]",
+   "text": "]",
+   "match": true
+  },
+  {
+   "pattern": "[a\\]]+",
+   "text": "x]",
+   "match": true
+  },
+  {
+   "pattern": "é+",
+   "text": "caféé",
+   "match": true
+  },
+  {
+   "pattern": "^.$",
+   "text": "😀",
+   "match": true
+  }
+ ],
+ "regex_refused": [
+  "",
+  "(",
+  ")",
+  "a)",
+  "[abc",
+  "*a",
+  "+",
+  "a**",
+  "a+?",
+  "a*+",
+  "a??",
+  "(?=a)",
+  "(?<n>a)",
+  "(?!a)",
+  "\\b",
+  "\\1",
+  "\\p",
+  "a{",
+  "a{x}",
+  "a{2,1}",
+  "a{17}",
+  "a{1,17}",
+  "(a{16}){16}",
+  "^*",
+  "$+",
+  "{1}",
+  "[\\D]",
+  "[z-a]",
+  "\\",
+  "((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))))",
+  "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+ ],
+ "scores": [
+  {
+   "name": "exact match ignores case and ending punctuation",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "value": "Paris"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "  paris. ",
+   "score": 1
+  },
+  {
+   "name": "exact match is not contains",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "value": "Paris"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "The capital is Paris",
+   "score": 0
+  },
+  {
+   "name": "exact match from expected",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "from": "expected"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?",
+    "expected": "Lima"
+   },
+   "completion": "\"lima\"",
+   "score": 1
+  },
+  {
+   "name": "exact match on the last line",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "scope": "last_line",
+      "from": "expected"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?",
+    "expected": "42"
+   },
+   "completion": "Let me think.\r\nSo the answer is:\n\n42\n\n",
+   "score": 1
+  },
+  {
+   "name": "exact match on the first line",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "scope": "first_line",
+      "value": "yes"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "\n Yes!\nbecause",
+   "score": 1
+  },
+  {
+   "name": "contains any",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "red",
+       "blue"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "A DEEP BLUE sea",
+   "score": 1
+  },
+  {
+   "name": "contains any case sensitive",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "red",
+       "blue"
+      ],
+      "ignore_case": false
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "A DEEP BLUE sea",
+   "score": 0
+  },
+  {
+   "name": "contains all needs every string",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "all": [
+       "red",
+       "blue"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "red and green",
+   "score": 0
+  },
+  {
+   "name": "contains all",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "all": [
+       "red",
+       "blue"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "Red and BLUE",
+   "score": 1
+  },
+  {
+   "name": "contains from data",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "from": "data.word"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?",
+    "data": {
+     "word": "Zürich"
+    }
+   },
+   "completion": "I like ZÜRICH",
+   "score": 0
+  },
+  {
+   "name": "contains full width letters",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "abc"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "ＡＢＣ",
+   "score": 1
+  },
+  {
+   "name": "not contains passes when none appear",
+   "rubric": {
+    "rules": [
+     {
+      "type": "not_contains",
+      "weight": 1,
+      "any": [
+       "sorry",
+       "cannot"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "Here you go",
+   "score": 1
+  },
+  {
+   "name": "not contains fails when one appears",
+   "rubric": {
+    "rules": [
+     {
+      "type": "not_contains",
+      "weight": 1,
+      "any": [
+       "sorry",
+       "cannot"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "I CANNOT",
+   "score": 0
+  },
+  {
+   "name": "number close within tolerance",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "from": "expected",
+      "tolerance": 0.5
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?",
+    "expected": "10"
+   },
+   "completion": "about 10.4",
+   "score": 1
+  },
+  {
+   "name": "number close outside tolerance",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 10,
+      "tolerance": 0.5
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "about 10.6",
+   "score": 0
+  },
+  {
+   "name": "number close takes the last number",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 7
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "3 + 4 = 7",
+   "score": 1
+  },
+  {
+   "name": "number close can take the first",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 3,
+      "pick": "first"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "3 + 4 = 7",
+   "score": 1
+  },
+  {
+   "name": "number close reads thousands",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 1234567
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "It is 1,234,567.",
+   "score": 1
+  },
+  {
+   "name": "number close relative",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 1000,
+      "tolerance": 0.01,
+      "relative": true
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "1009",
+   "score": 1
+  },
+  {
+   "name": "number close relative outside",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 1000,
+      "tolerance": 0.01,
+      "relative": true
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "1011",
+   "score": 0
+  },
+  {
+   "name": "number close with no number",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 1
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "one",
+   "score": 0
+  },
+  {
+   "name": "number close from a data number",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "from": "data.n",
+      "tolerance": 0
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?",
+    "data": {
+     "n": 12
+    }
+   },
+   "completion": "12",
+   "score": 1
+  },
+  {
+   "name": "regex",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "^\\d{2}:\\d{2}$"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": " 09:30 ",
+   "score": 1
+  },
+  {
+   "name": "regex on the last line",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "^Answer: [a-z]+$",
+      "scope": "last_line"
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "thinking\nAnswer: yes",
+   "score": 1
+  },
+  {
+   "name": "regex ignoring case",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "HELLO",
+      "ignore_case": true
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "oh hello there",
+   "score": 1
+  },
+  {
+   "name": "json valid",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{\"a\": [1, 2, {\"b\": null}]}",
+   "score": 1
+  },
+  {
+   "name": "json in a fence",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "```json\n{\"a\": 1}\n```",
+   "score": 1
+  },
+  {
+   "name": "json with trailing text is not json",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{\"a\": 1} thanks",
+   "score": 0
+  },
+  {
+   "name": "json NaN is refused",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{\"a\": NaN}",
+   "score": 0
+  },
+  {
+   "name": "json single quotes are refused",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{'a': 1}",
+   "score": 0
+  },
+  {
+   "name": "json a string containing NaN is fine",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{\"a\": \"NaN\"}",
+   "score": 1
+  },
+  {
+   "name": "json schema accepts",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "type": "object",
+       "required": [
+        "name",
+        "age"
+       ],
+       "properties": {
+        "name": {
+         "type": "string"
+        },
+        "age": {
+         "type": "integer"
+        },
+        "tags": {
+         "type": "array",
+         "items": {
+          "type": "string"
+         }
+        }
+       }
+      }
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{\"name\": \"x\", \"age\": 3.0, \"tags\": [\"a\"]}",
+   "score": 1
+  },
+  {
+   "name": "json schema refuses a missing key",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "type": "object",
+       "required": [
+        "name"
+       ]
+      }
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{\"age\": 3}",
+   "score": 0
+  },
+  {
+   "name": "json schema refuses a wrong type",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "type": "object",
+       "properties": {
+        "age": {
+         "type": "integer"
+        }
+       }
+      }
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "{\"age\": 3.5}",
+   "score": 0
+  },
+  {
+   "name": "json schema a boolean is not a number",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "type": "number"
+      }
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "true",
+   "score": 0
+  },
+  {
+   "name": "json schema items",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "type": "array",
+       "items": {
+        "type": "number"
+       }
+      }
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "[1, 2, \"3\"]",
+   "score": 0
+  },
+  {
+   "name": "json schema required on a non object",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "required": [
+        "a"
+       ]
+      }
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "[1]",
+   "score": 0
+  },
+  {
+   "name": "length between",
+   "rubric": {
+    "rules": [
+     {
+      "type": "length_between",
+      "weight": 1,
+      "min": 3,
+      "max": 5
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "  four  ",
+   "score": 1
+  },
+  {
+   "name": "length counts characters not bytes",
+   "rubric": {
+    "rules": [
+     {
+      "type": "length_between",
+      "weight": 1,
+      "max": 2
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "😀é",
+   "score": 1
+  },
+  {
+   "name": "length too long",
+   "rubric": {
+    "rules": [
+     {
+      "type": "length_between",
+      "weight": 1,
+      "max": 3
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "four",
+   "score": 0
+  },
+  {
+   "name": "weighted sum",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 0.5,
+      "any": [
+       "yes"
+      ]
+     },
+     {
+      "type": "length_between",
+      "weight": 0.3,
+      "max": 5
+     },
+     {
+      "type": "not_contains",
+      "weight": 0.2,
+      "any": [
+       "no"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "yes, indeed",
+   "score": 0.7
+  },
+  {
+   "name": "weights that add to less than one cap the score",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 0.25,
+      "any": [
+       "a"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "a",
+   "score": 0.25
+  },
+  {
+   "name": "the text is cut at 4000 characters",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "needle"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxneedle",
+   "score": 0
+  },
+  {
+   "name": "the text just inside the cut",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "needle"
+      ]
+     }
+    ]
+   },
+   "task": {
+    "prompt": "?"
+   },
+   "completion": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxneedle",
+   "score": 1
+  }
+ ],
+ "rubric_ok": [
+  {
+   "rules": [
+    {
+     "type": "exact_match",
+     "weight": 1,
+     "value": "x"
+    }
+   ]
+  },
+  {
+   "rules": [
+    {
+     "type": "contains",
+     "weight": 0.5,
+     "all": [
+      "a",
+      "b"
+     ]
+    },
+    {
+     "type": "length_between",
+     "weight": 0.5,
+     "min": 1
+    }
+   ]
+  },
+  {
+   "rules": [
+    {
+     "type": "json_valid",
+     "weight": 1,
+     "schema": {
+      "type": "object",
+      "required": [
+       "a"
+      ],
+      "properties": {
+       "a": {
+        "type": "string"
+       }
+      }
+     }
+    }
+   ]
+  },
+  {
+   "rules": [
+    {
+     "type": "regex_match",
+     "weight": 1,
+     "pattern": "^(a|b)+$",
+     "ignore_case": true,
+     "scope": "last_line"
+    }
+   ]
+  }
+ ],
+ "rubric_refused": [
+  {
+   "why": "not an object",
+   "rubric": []
+  },
+  {
+   "why": "no rules",
+   "rubric": {
+    "rules": []
+   }
+  },
+  {
+   "why": "nine rules",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.1,
+      "any": [
+       "a"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "unknown field",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "a"
+      ]
+     }
+    ],
+    "extra": 1
+   }
+  },
+  {
+   "why": "unknown type",
+   "rubric": {
+    "rules": [
+     {
+      "type": "python",
+      "weight": 1
+     }
+    ]
+   }
+  },
+  {
+   "why": "weights above one",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 0.7,
+      "any": [
+       "a"
+      ]
+     },
+     {
+      "type": "contains",
+      "weight": 0.7,
+      "any": [
+       "b"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "weight zero",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 0,
+      "any": [
+       "a"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "weight as text",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": "1",
+      "any": [
+       "a"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "a field the rule does not have",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "a"
+      ],
+      "pattern": "x"
+     }
+    ]
+   }
+  },
+  {
+   "why": "both any and all",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "a"
+      ],
+      "all": [
+       "b"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "not_contains with all",
+   "rubric": {
+    "rules": [
+     {
+      "type": "not_contains",
+      "weight": 1,
+      "all": [
+       "a"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "an empty string",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       ""
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "a long string",
+   "rubric": {
+    "rules": [
+     {
+      "type": "contains",
+      "weight": 1,
+      "any": [
+       "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+      ]
+     }
+    ]
+   }
+  },
+  {
+   "why": "both value and from",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "value": "a",
+      "from": "expected"
+     }
+    ]
+   }
+  },
+  {
+   "why": "neither value nor from",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1
+     }
+    ]
+   }
+  },
+  {
+   "why": "a bad from",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "from": "answer"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a bad data name",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "from": "data.a-b"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a bad scope",
+   "rubric": {
+    "rules": [
+     {
+      "type": "exact_match",
+      "weight": 1,
+      "value": "a",
+      "scope": "middle"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a bad tolerance",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 1,
+      "tolerance": -1
+     }
+    ]
+   }
+  },
+  {
+   "why": "a text value for number_close",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": "1"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a bad pick",
+   "rubric": {
+    "rules": [
+     {
+      "type": "number_close",
+      "weight": 1,
+      "value": 1,
+      "pick": "middle"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a catastrophic regex written with a lazy quantifier",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "(a+?)+b"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a lookahead",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "(?=a)a"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a back reference",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "(a)\\1"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a repeat that unrolls too far",
+   "rubric": {
+    "rules": [
+     {
+      "type": "regex_match",
+      "weight": 1,
+      "pattern": "((a{16}){16}){16}"
+     }
+    ]
+   }
+  },
+  {
+   "why": "a schema with an unknown key",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "type": "object",
+       "pattern": "x"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "why": "a schema with an unknown type",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "type": "date"
+      }
+     }
+    ]
+   }
+  },
+  {
+   "why": "a schema nested too deep",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "schema": {
+       "items": {
+        "items": {
+         "items": {
+          "items": {
+           "items": {
+            "type": "string"
+           }
+          }
+         }
+        }
+       }
+      }
+     }
+    ]
+   }
+  },
+  {
+   "why": "length with nothing in it",
+   "rubric": {
+    "rules": [
+     {
+      "type": "length_between",
+      "weight": 1
+     }
+    ]
+   }
+  },
+  {
+   "why": "length min above max",
+   "rubric": {
+    "rules": [
+     {
+      "type": "length_between",
+      "weight": 1,
+      "min": 5,
+      "max": 2
+     }
+    ]
+   }
+  },
+  {
+   "why": "length above the cap",
+   "rubric": {
+    "rules": [
+     {
+      "type": "length_between",
+      "weight": 1,
+      "max": 4001
+     }
+    ]
+   }
+  },
+  {
+   "why": "a json_valid with a scope",
+   "rubric": {
+    "rules": [
+     {
+      "type": "json_valid",
+      "weight": 1,
+      "scope": "whole"
+     }
+    ]
+   }
+  }
+ ]
+}

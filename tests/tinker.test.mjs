@@ -71,6 +71,8 @@ const TINKER_KEY = 'tml-test-only-tinker-placeholder-0000'
 const JOBS_TOKEN = 'test-only-tinker-jobs-token-000000000000'
 const SPRITES_TOKEN = 'test-org/test-id/test-only-sprites-secret'
 process.env.OPENROUTER_API_KEY = OPENROUTER_KEY
+// Tinker RL (tests/tinker-rl.test.mjs) is on by default; these tests are about the training run, so it is switched off here.
+process.env.LAB_ENABLE_TINKER_RL = 'false'
 const BASE_ENV = { ...process.env }
 
 let logs = []
