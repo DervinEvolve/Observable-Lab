@@ -744,6 +744,8 @@ export class KnowledgeGraphPanel {
     const logos: Array<Disc & { id: string }> = []
     const clear = (b: Box, own: NodeType) => b.x0 >= 0 && b.x1 <= W && free(b) && !discs.some(d => d.own !== own && touches(b, d))
     const within = (x: number, half: number) => Math.max(half + 2 * dpr, Math.min(W - half - 2 * dpr, x))
+    // A name follows its bubble or node off the canvas: one that is out of view (but for `show` px) gets no name at all.
+    const inView = (x: number, y: number, r: number, show = 0) => x + r > show && x - r < W - show && y + r > show && y - r < H - show
 
     // 1. The open clusters' areas, each with its name and how many it holds (click the name to close it).
     this.hullLabels = []
@@ -847,6 +849,7 @@ export class KnowledgeGraphPanel {
       ctx.fillText(text, cx, (box.y0 + box.y1) / 2)
     }
     const nodeLabel = (w: { b: Body; x: number; y: number; r: number; on: boolean }, forced: boolean): void => {
+      if (!inView(w.x, w.y, w.r)) return
       const text = w.b.node?.label ?? ''
       const size = 12 * fs * dpr
       ctx.font = `500 ${size}px ${FONT}`
@@ -916,6 +919,7 @@ export class KnowledgeGraphPanel {
     const mid = this.toScreen(0, 0)[1]
     const bubbles = wanted.filter(w => w.b.isCluster).sort((p, q) => (q.b.count ?? 0) - (p.b.count ?? 0))
     for (const { b, x, y, r, on } of bubbles) {
+      if (!inView(x, y, r, 6 * dpr)) continue
       // A bubble's name goes below it, or above, or beside it; with no clear place, only its count is written
       // inside (the legend, or the list of kinds on a phone, names the colour).
       const text = `${this.data.clusters.find(c => c.id === b.cluster)?.label ?? b.cluster}  ${b.count}`
@@ -928,7 +932,11 @@ export class KnowledgeGraphPanel {
       const right: Box = { x0: x + r + 3 * dpr, y0: y - tall / 2, x1: x + r + 3 * dpr + w, y1: y + tall / 2 }
       const left: Box = { ...right, x0: x - r - 3 * dpr - w, x1: x - r - 3 * dpr }
       // With little room the name goes on the outer side of the ring first, away from the lines and the other bubbles.
-      const tries = this.tight && y < mid ? [above, below, right, left] : [below, above, right, left]
+      // A bubble with its middle past the left or right edge shows only a part: its name goes beside that part,
+      // and under or over it only when enough of it shows for the name to read as its own.
+      const showing = Math.min(W, x + r) - Math.max(0, x - r)
+      const past = x < 0 ? right : x > W ? left : null
+      const tries = past ? (showing >= 16 * dpr ? [past, below, above] : [past]) : this.tight && y < mid ? [above, below, right, left] : [below, above, right, left]
       const box = tries.find(c => clear(c, b.cluster))
       const fill = on ? '#F5F2EB' : 'rgba(245,242,235,0.45)'
       if (box) { label(text, box, (box.x0 + box.x1) / 2, size, 650, fill, 'rgba(18,18,20,0.82)'); continue }
