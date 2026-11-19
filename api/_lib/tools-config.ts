@@ -10,13 +10,14 @@
  * The lab model endpoint (LAB_ENABLE_LIVE_MODEL) is reported here too, as
  * liveModelToolStatus: it is part of a Sprite session, not a tool of its own.
  * Tinker training (LAB_ENABLE_TINKER) is a tool; its settings and dollar
- * caps live in tinker.ts.
+ * caps live in tinker.ts. Keeping a trained adapter (LAB_ENABLE_TINKER_KEEP)
+ * is a tool too; how many may be kept is in tinker.ts.
  */
 import { spritesConfigured } from './sprites.js'
 import { liveModelStatus, type LiveModelStatus } from './live-model.js'
-import { liveTrainedStatus, tinkerStatus } from './tinker.js'
+import { liveTrainedStatus, tinkerKeepStatus, tinkerStatus } from './tinker.js'
 
-export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train'] as const
+export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'keep_adapter'] as const
 export type ToolName = (typeof TOOL_NAMES)[number]
 
 /** Per-epoch limits. Not tunable: one of each kind per epoch at most. */
@@ -29,6 +30,7 @@ export const PER_EPOCH = {
   exhibits: 1,
   lab_proposals: 1,
   tinker_runs: 1,         // LoRA fine-tuning runs on Tinker
+  adapter_keeps: 1,       // requests to keep a trained adapter
 } as const
 
 /** Sprite session limits. */
@@ -142,6 +144,7 @@ export function toolConfig(): ToolConfig {
   const licenses = weightsLicenses()
   if (flag('LAB_ENABLE_WEIGHTS')) warnAboutLicenses(licenses)
   const tinker = tinkerStatus()
+  const keep = tinkerKeepStatus()
   return {
     subagents: status(code, 'LAB_ENABLE_CODE_WRITES is not true', intEnv('LAB_SUBAGENTS_PER_DAY', 24, 0, 200)),
     sprite_session: status(
@@ -177,6 +180,9 @@ export function toolConfig(): ToolConfig {
     // Tinker training (tinker.ts): a fine-tuning run by the lab's own runner
     // on Modal. Its dollar caps are separate settings; this is the count.
     tinker_train: status(tinker.enabled, tinker.off_reason ?? '', intEnv('LAB_TINKER_PER_DAY', 2, 0, 10)),
+    // Keeping a trained adapter (tinker-keep.ts). How many may be kept at one
+    // time is LAB_TINKER_KEEP_MAX; this is how many requests a day may be run.
+    keep_adapter: status(keep.enabled, keep.off_reason ?? '', intEnv('LAB_TINKER_KEEPS_PER_DAY', 2, 0, 10)),
   }
 }
 

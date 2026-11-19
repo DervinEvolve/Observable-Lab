@@ -13,6 +13,7 @@ In a classic epoch the Executor may return an optional `tools` object next to it
 | `exhibit` | `LAB_ENABLE_EXHIBITS=true` | `LAB_ENABLE_CODE_WRITES=true`, `AI_AGENT_GITHUB_TOKEN`, `AI_AGENT_GITHUB_OWNER`, `LAB_REQUIRED_CI_WORKFLOW_IDS` | 1 | `LAB_EXHIBITS_PER_DAY` (2) |
 | `lab_proposal` | `LAB_ENABLE_LAB_PROPOSALS=true` | `LAB_PROPOSALS_GITHUB_TOKEN`, `LAB_PROPOSALS_GITHUB_OWNER` | 1 | `LAB_LAB_PROPOSALS_PER_DAY` (1) |
 | `tinker_train` | `LAB_ENABLE_TINKER=true` | `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL`, `TINKER_JOBS_TOKEN`, and `modal/tinker_jobs.py` deployed with its two Modal secrets | 1 | `LAB_TINKER_PER_DAY` (2), and the dollar caps in [Tinker training](#tinker-training) |
+| `keep_adapter` | `LAB_ENABLE_TINKER_KEEP=true` | the same three `TINKER_JOBS_*` settings, and `modal/tinker_jobs.py` deployed from a version that has the keeper | 1 | `LAB_TINKER_KEEPS_PER_DAY` (2), and at most `LAB_TINKER_KEEP_MAX` (10) adapters kept at one time, see [Keeping a trained adapter](#keeping-a-trained-adapter) |
 
 A Sprite session can also come with [the lab model endpoint](#the-lab-model-endpoint) (`LAB_ENABLE_LIVE_MODEL=true`). It is not a tool the Executor asks for, so it is not in this table.
 
@@ -22,7 +23,7 @@ Web search is not on this menu: the Planner and Executor calls, and the explorer
 
 - **Side tools** (`sprite_session`, `gpu_job`, `weights`) start as soon as the Executor has answered and run while the Challenger, the rebuttal and the Reviewer talk. The runner waits for them before the Commentator, who is given a one-line summary of each, built from the stored records. Weights asked for are fetched before that epoch's GPU job starts.
 - **Subagents** are part of the epoch's one code contribution, after the Reviewer.
-- **Deliverables** (`exhibit`, `lab_proposal`, `tinker_train`) run after the Reviewer, alongside the code contribution, and only when the Reviewer answered `"tool_verdicts": { "exhibit": "approve" }`, `{ "lab_proposal": "approve" }` or `{ "tinker_train": "approve" }`. Anything else is a no. A Tinker training run can outlast the follow-up that starts it; a later tick collects its result.
+- **Deliverables** (`exhibit`, `lab_proposal`, `tinker_train`, `keep_adapter`) run after the Reviewer, alongside the code contribution, and only when the Reviewer answered `"tool_verdicts": { "exhibit": "approve" }`, `{ "lab_proposal": "approve" }`, `{ "tinker_train": "approve" }` or `{ "keep_adapter": "approve" }`. Anything else is a no. A Tinker training run, or the keeping of an adapter, can outlast the follow-up that starts it; a later tick collects its result.
 - The recent runs (not the skipped ones) go into the next epoch's shared context as `RECENT TOOL RUNS`, so the models see what really happened.
 
 ## Subagents
@@ -199,6 +200,80 @@ The room's own state (`GET /api/experiment`) carries `trained_chat_enabled: true
 
 The models are not told about the visitor chat.
 
+## Naming a trained adapter
+
+While `LAB_ENABLE_TINKER_NAMES=true`, a `tinker_train` request may carry one more optional field, `"name"`: a display name for the adapter that run trains. It is off by default, and while it is off `name` is an unknown field like any other, which refuses the request as it always did, and no name is shown anywhere.
+
+```
+"tinker_train": { "purpose": "...", "examples": [ ... ], "name": "Brass Finch" }
+```
+
+**The name is a label, not an identity.** The adapter is still `lab/e<epoch>-<8 hex>`. That id is what the model endpoint takes as `model`, what the chat sends a message to, what a keep request names and what every record is stored under. Two adapters can never be confused by their ids, whatever they are called.
+
+**What a name may be** (`api/_lib/tinker-names.ts`). It is read strictly and never changed to fit:
+
+- 2 to 40 characters, only letters (A to Z, a to z), digits, spaces, hyphens, apostrophes and dots. It starts with a letter or digit, has at least two letters, and has no two spaces in a row.
+- Nothing that looks like a web address. A dot may be followed by a digit, a space or the end ("v1.5", "Dr. Lin"), not by a letter ("example.com"), and it may not start with www or http.
+- Nothing that looks like one of the lab's own ids.
+- Nothing that reads like a real model or product: the five models of the panel, the fallbacks and the wildcards by their display names and their ids, and the family and maker names a visitor could take an adapter for (GPT, ChatGPT, OpenAI, Claude, Anthropic, Gemini, Google, Grok, DeepSeek, Llama, Qwen, Mistral and so on, and as whole words Sonnet, Opus, Haiku, Fable, Astra, GLM, Kimi, Phi, Ernie, Gemma, Cohere, Codex, Tinker, o1, o3, o4). Case and separators are ignored, and so are the usual look-alike characters: a capital I for a small l, 0 1 3 4 5 7 for o l e a s t, "rn" for m, "vv" for w. So "C1aude", "G.P.T", "gem ini" and "Gr0k" are all refused.
+- Not the name of another adapter that is still alive, or of a run that is still open. Names are compared the same forgiving way, so "Quiet Lamp" and "quiet-lamp" are one name. The database holds this: there is a unique index on the compared form, so two runs asking for one name at the same moment cannot both get it. A name is free again once its adapter has expired.
+
+**A refused name never refuses the run.** The request stands, the run goes ahead without a name, and the reason is stored in `tool_runs` as a `skipped` row under the tool `tinker_name` (not `tinker_train`, so it never reads as the epoch's run having been dealt with). The list above cannot be complete, so I can also take a name away afterwards: `{"action": "clear_name", "adapter": "lab/..."}` on the operator route below, which is stored too.
+
+**Where a name is shown.** In the visitor chat panel it is the adapter's title, with the lab id under it. In the record of the run (`tool_runs`: the request line, the result line and `detail.name`), which is what the Activity panel and the models' `RECENT TOOL RUNS` are built from. On the lab model endpoint, `GET <base>/models` gives the adapter a `description` with its name; the `id` stays `lab/<id>`. In the manifest of a kept copy. Everywhere it is put on a page as text, never as markup, and it is cleaned like any other stored text on the way out. With the switch turned off again, names already given stay in the database and are shown nowhere.
+
+**What the models are told.** One more sentence in the Tinker line and the `name` field in the Executor's instructions, only while names are on: the alphabet and length, that the name is a label beside the lab id, and that a name that is taken, looks like a web address or reads like a real model or product is refused with the reason stored while the run goes on. Nothing about what to call anything.
+
+## Keeping a trained adapter
+
+An adapter normally expires `LAB_TINKER_TTL_DAYS` (14) after it was trained. While `LAB_ENABLE_TINKER_KEEP=true`, an adapter that is still alive can be marked **kept**. It is off by default; with it off the tool is an unknown tool, nothing about it is in a prompt, the tick makes no query for it and a training run is sent to the runner exactly as before.
+
+**Who can keep.**
+
+- **A model**, as the Executor, with one small request. The Reviewer must approve it, like the other deliverables:
+
+  ```
+  "keep_adapter": { "adapter": "lab/e41-0a1b2c3d", "reason": "one line, at most 200 characters" }
+  ```
+
+  Exactly those two fields; anything else is refused with the reason stored. The Reviewer is told the lab's own record of that adapter (who trained it, on how many examples, the held-out loss the lab measured, when it expires), how many places are taken, and whether a copy of its weights can be stored. So that a model can name an adapter at all, the shared context lists the adapters that are alive under `TRAINED ADAPTERS`, from the lab's stored runs, only while keeping is on.
+- **I can**, through an operator route (`api/experiment/trained-adapters.ts`, `Authorization: Bearer LAB_OPERATOR_SECRET` like the other operator routes): `GET /api/experiment/trained-adapters` shows every adapter that is alive, which are kept, by whom and why; `POST /api/experiment/trained-adapters?confirm=true` with `{"action": "keep", "adapter": "lab/...", "reason": "..."}` keeps one.
+
+**The limits.** They are held by the database, not by arithmetic in the code (`tinker_keeps` in `api/_lib/tinker-store.ts`):
+
+- At most `LAB_TINKER_KEEP_MAX` (default 10, never more than 40) adapters are kept at one time, mine and the models' together. A kept adapter holds a numbered place, the place number is the table's primary key, and a place is taken by one statement that finds the lowest free number only while fewer than the limit exist. Two requests arriving together cannot both take the last place. When every place is taken a request is refused, and only I can make room.
+- One epoch may ask for one keep (a unique index on experiment and epoch), and the models together get `LAB_TINKER_KEEPS_PER_DAY` (default 2) a UTC day. My own keeps are not counted against the per-day number, but they do take places.
+- An adapter can be kept once. It has to be alive: trained, saved and not expired.
+
+**What keeping does.** Both parts are done by my own runner on Modal (`keeper` in `modal/tinker_jobs.py`), the only place besides the chat file where the Tinker key lives. The request a model writes is two fields of data; no code of a model's runs, and nothing a model wrote goes to Tinker or to the Volume except its one-line reason inside the manifest.
+
+1. **A long life on Tinker.** The runner sets the time to live of the adapter's sampler checkpoint to `LAB_TINKER_KEEP_DAYS` (default 365, 30 to 3650) from that moment, with Tinker's `set_checkpoint_ttl_from_tinker_path`. That is what keeps it answering on the lab model endpoint and in the visitor chat. The lab's own record of when the adapter expires is moved to match. If this step fails the adapter is not kept and its place is given back.
+2. **A copy on the lab's own storage.** The runner downloads the adapter's LoRA weights from Tinker and writes them to the Modal Volume `oblab-kept-models`, under `<lab id>/`, as `adapter_config.json` and `adapter_model.safetensors` in PEFT format (the form `peft`, vLLM and SGLang load) with `lab_manifest.json` beside them. A copy may weigh at most `LAB_TINKER_KEEP_MAX_MB` (default 1024; a LoRA of rank 8 to 32 is tens of MB). If the copy fails, the keep still stands and the record says there is no copy and why.
+
+**Why a copy needs the switch to have been on at training time.** Tinker lets a sampler checkpoint be used but not downloaded. Weights can only be downloaded if the training run itself saved them for download (`save_weights_external`) while it was open. So while keeping is on, every training run is asked to save its weights that way too, with the same time to live as the adapter, and the path is stored with the run. An adapter trained while keeping was off has nothing to download: keeping it extends its life and the record says there is no copy. The Reviewer is told which case it is before it rules.
+
+**The conversion to PEFT.** Tinker's export has the two files already, with Tinker's own names for the weights; the cookbook's `build_lora_adapter` renames them to the names of the base model's parameters. For that it needs the base model's `config.json` and the names and shapes of its weights. Given a model's name, the cookbook downloads the whole repository to find them, which is 9 GB for `Qwen/Qwen3.5-4B` and about 70 GB for the largest base model I allow. The runner does not do that: it reads `config.json` and the header of each safetensors file from the public Hugging Face repository (a few hundred KB in all, by byte range, pinned to one revision) and gives the conversion a folder holding just those. No weights of the base model are downloaded and no code from the repository is run. If the conversion fails, the files are stored as Tinker exported them, the manifest says `"format": "tinker"` and why, and I can convert them later with the same cookbook call.
+
+**The manifest** (`lab_manifest.json`) is the lab's own record of the run, written by the lab's code: the lab id and display name, the base model, the Tinker run id and both checkpoint paths, the epoch and the model that wrote the data, its one-line purpose, the dataset's SHA-256, size and number of examples, the settings, the held-out loss before and after as the lab measured it and on how many examples, when it was trained, who kept it, the one-line reason, when, and for the copy its format, files with their sizes and SHA-256, the base model revision the names were converted against, and where on Tinker it came from.
+
+**Tinker's free storage.** Tinker stores 100 checkpoints or 100 GB per organisation for free, and past either a training session is stopped. A kept adapter is one checkpoint for a year instead of two weeks, so `LAB_TINKER_KEEP_MAX` bounds that part at 10. The larger effect is the second checkpoint every run saves while keeping is on: with the defaults (2 runs a day, 14 days) that is up to 56 checkpoints from runs at any time instead of 28, plus the kept ones. After a copy has reached the Volume the downloadable checkpoint is left to expire on its own date; if the copy failed it is given the adapter's long life too, so the copy can still be made. Every keep stores how many checkpoints the lab's Tinker key holds at that moment, and I check `tinker billing checkpoint-storage` myself. If I raise `LAB_TINKER_PER_DAY` with keeping on, I lower `LAB_TINKER_TTL_DAYS` to stay under 100.
+
+**Cost.** Keeping uses no Tinker tokens: it opens no training session and samples nothing, so nothing is set aside and nothing goes on the spend ledger. A model's request is refused like any tool when the lab's daily budget is already spent. The keeper's own time on Modal is a few seconds of CPU and is not on the ledger. The caps on keeping are counts and sizes: places, requests a day, and MB per copy.
+
+**Waiting.** The request waits 45 seconds for the runner. A keep still going then keeps its place and is collected by a later tick, once, before the tick advances any experiment. If the runner never confirms the start within 15 minutes, or gives no answer within 30, the place is given back and the record says so. A runner that was lost may already have set the long time to live before it stopped; the lab cannot know, so that record says the time to live on Tinker is unknown. Keeping the adapter again settles it.
+
+**How long a keep lasts.** As long as the life it set on Tinker. When that has run out, the adapter is gone like any other: the lab stops offering it, its place is given back by the next tick (or by the next keep request, whichever comes first), and a record is stored under `kept_adapter_expired`. The copy on the Volume stays. To keep one for longer I unkeep it and keep it again before it expires, which sets a fresh time to live and reuses the copy that is already there.
+
+**Unkeeping is mine alone.** `{"action": "unkeep", "adapter": "lab/...", "remove_copy": false}` on the operator route. The runner sets the checkpoint's time to live back to the usual `LAB_TINKER_TTL_DAYS`, counted from now, and the place is free. The copy on the Volume stays unless I pass `"remove_copy": true`. The mark is taken off only after the runner has answered, so a call that times out changes nothing and can be made again. It works with `LAB_ENABLE_TINKER_KEEP` off as well, so a keep can always be undone. No model can unkeep, and nothing a model writes reaches this route.
+
+**Where it shows.** Kept adapters are listed first in the visitor chat panel, the most recently kept at the top, each with a small "kept" mark and a line saying who marked it; the rest follow, newest first. On the lab model endpoint the adapter's `description` says it is kept and by whom. The models see `KEPT by ...` in `TRAINED ADAPTERS`.
+
+**The record.** Every step is a `tool_runs` row, so it is in the public state and the Activity panel: a model's request under `keep_adapter` (kept, refused with the reason, or not kept and why), mine under `owner_keep_adapter`, an unkeep under `owner_unkeep_adapter`, a name I took away under `owner_clear_adapter_name`, and an expiry under `kept_adapter_expired`. A kept row carries who kept it, the reason, the date it is kept until, the time to live that was set, the number of checkpoints the key holds, and for the copy the Volume, folder, format, size and each file's SHA-256. A model's request is stored under the epoch that asked; mine are stored under the adapter's own epoch with the model given as `owner`, which the Activity panel shows as "The owner". The request, the reason and what was done are public.
+
+**Limits to keep in mind.** Keeping says someone wanted this adapter to stay; it says nothing about how good it is beyond the held-out loss already on its record. A copy in PEFT format has been converted by the cookbook's code against the base model's parameter names; I have not loaded one into a serving stack from here, and the first real keep is the first real test of the export, the download and the conversion ([OPERATIONS.md](OPERATIONS.md#naming-and-keeping-trained-adapters) has the check). The copy is the adapter only: using it needs the base model.
+
+**What the models are told.** One line in the shared context and the field in the Executor's instructions, only while keeping is on: that an adapter that is alive can be asked to be kept by its lab id with a one-line reason, that the Reviewer must approve, the per-epoch, per-day and total limits, that only the owner can unkeep, how long a kept adapter stays, that a copy with a manifest is stored and when it cannot be, and that the request and its reason are public. Nothing about which adapter to keep or why. While keeping is on, the training line also stops using the word "kept" for an adapter that has merely not expired yet (it says the adapter stays for 14 days and is alive), so that "kept" means one thing. In the same way, while names are on, the line about the model endpoint says "lab id" where it used to say "name". With both switches off those sentences are word for word what they were.
+
 ## Exhibits
 
 `"exhibit": { "slug": "...", "exhibit": { ... } }`. See [EXHIBITS.md](EXHIBITS.md) for the contract, the pull request and how the room reads them. Exhibit pull requests cost no model or compute money beyond AI-Agent's CI.
@@ -217,4 +292,4 @@ Tinker is counted differently, because Tinker reports no cost per call: a traini
 
 ## The record
 
-`tool_runs` is created at runtime: `experiment_id`, `epoch`, `model`, `tool`, `request_summary`, `status` (`ok`, `failed`, `error`, `timeout`, `skipped`, `opened`, `merged`, `closed`), `exit_code`, `duration_ms`, `cost_usd`, `output_tail` (cleaned, at most 4 KB), `detail` (small JSON: commands, slug, pull request URL) and `created_at`. `GET /api/experiment` returns the 12 most recent for the current experiment as `tool_runs`, cleaned again on the way out, and the switched-on tools as `tools_enabled`. `tools_enabled` also lists `live_model` while Sprite sessions come with the lab model endpoint, and `live_trained` while that endpoint also answers for trained adapters. A Tinker training run has a second, fuller row in `tinker_runs`, and the money set aside and spent on Tinker per UTC day is in `tinker_spend_days`.
+`tool_runs` is created at runtime: `experiment_id`, `epoch`, `model`, `tool`, `request_summary`, `status` (`ok`, `failed`, `error`, `timeout`, `skipped`, `opened`, `merged`, `closed`), `exit_code`, `duration_ms`, `cost_usd`, `output_tail` (cleaned, at most 4 KB), `detail` (small JSON: commands, slug, pull request URL) and `created_at`. `GET /api/experiment` returns the 12 most recent for the current experiment as `tool_runs`, cleaned again on the way out, and the switched-on tools as `tools_enabled`. `tools_enabled` also lists `live_model` while Sprite sessions come with the lab model endpoint, and `live_trained` while that endpoint also answers for trained adapters. A Tinker training run has a second, fuller row in `tinker_runs`, and the money set aside and spent on Tinker per UTC day is in `tinker_spend_days`. Naming and keeping add to the database only once one of them is used: two columns on `tinker_runs` (`display_name`, and `name_key` with its unique index) and the table `tinker_keeps` (`slot`, `slug`, `status`, `kept_by`, `reason`, `experiment_id`, `epoch`, the runner's `job_id` and `call_id`, `requested_at`, `kept_at`, `detail`). A lab that never switches them on never has them.

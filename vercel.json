@@ -22,6 +22,9 @@
     },
     "api/experiment/trained-chat.ts": {
       "maxDuration": 60
+    },
+    "api/experiment/trained-adapters.ts": {
+      "maxDuration": 120
     }
   },
   "rewrites": [

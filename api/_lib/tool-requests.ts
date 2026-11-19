@@ -12,6 +12,7 @@ import { normalizeWeightsRef, normalizeWeightsRequest, type WeightsRef, type Wei
 import { isValidSlug } from './exhibits.js'
 import { normalizeProposal, type ProposalRequest } from './lab-proposals.js'
 import { normalizeTinkerRequest, type TinkerRequest } from './tinker.js'
+import { KEEP_TOOL, TINKER_NAME_TOOL, normalizeKeepRequest, type KeepRequest } from './tinker-keep-request.js'
 
 /** What the contribution gets when the Executor does not choose: one explorer and the test writer, as before. */
 export const DEFAULT_SUBAGENTS = { explore: 1, test: true } as const
@@ -24,6 +25,7 @@ export interface ToolPlan {
   exhibit?: { slug: string; exhibit: unknown }
   lab_proposal?: ProposalRequest
   tinker_train?: TinkerRequest
+  keep_adapter?: KeepRequest
   ignored: Array<{ tool: string; reason: string }>
 }
 
@@ -37,8 +39,10 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
     return plan
   }
   const req = raw as Record<string, unknown>
+  const keepOn = config.keep_adapter.enabled && config.keep_adapter.per_day > 0
   for (const key of Object.keys(req)) {
-    if (!(TOOL_NAMES as readonly string[]).includes(key)) plan.ignored.push({ tool: key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 40) || '_', reason: 'unknown tool' })
+    const known = (TOOL_NAMES as readonly string[]).includes(key) && (key !== KEEP_TOOL || keepOn)
+    if (!known) plan.ignored.push({ tool: key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 40) || '_', reason: 'unknown tool' })
   }
   const off = (tool: (typeof TOOL_NAMES)[number]) => {
     if (req[tool] === undefined || req[tool] === null || req[tool] === false) return true
@@ -112,7 +116,23 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
     // Strict: a request that is not exactly what the lab accepts is refused whole, with the reason.
     const checked = normalizeTinkerRequest(req.tinker_train)
     if ('error' in checked) plan.ignored.push({ tool: 'tinker_train', reason: checked.error })
-    else plan.tinker_train = checked.request
+    else {
+      plan.tinker_train = checked.request
+      // A name that broke a rule is refused on its own, under its own tool
+      // name, and the run stands without one. (Stored under "tinker_train"
+      // it would read as the epoch's run having been dealt with.)
+      if (checked.request.name_refused) {
+        plan.ignored.push({ tool: TINKER_NAME_TOOL, reason: `name refused: ${checked.request.name_refused}; the run stands and the adapter gets no name` })
+      }
+    }
+  }
+
+  // Keeping a trained adapter (tinker-keep.ts). While it is off the key is
+  // an unknown tool, as it always was.
+  if (keepOn && req[KEEP_TOOL] !== undefined && req[KEEP_TOOL] !== null && req[KEEP_TOOL] !== false) {
+    const checked = normalizeKeepRequest(req[KEEP_TOOL])
+    if ('error' in checked) plan.ignored.push({ tool: KEEP_TOOL, reason: checked.error })
+    else plan.keep_adapter = checked.request
   }
   return plan
 }

@@ -11,6 +11,9 @@
  *                        a browser string, has sent, by keyed hashes. No
  *                        address is stored.
  *   trained_chat_calls   one row of counts per visitor chat call. No text.
+ *   tinker_keeps         one row per adapter that is marked to keep, or is
+ *                        being kept. Its slot number is the cap: there are
+ *                        only as many slots as adapters may be kept.
  *
  * The caps are held by the database, not by this code's own arithmetic. A
  * reservation is one conditional UPDATE that adds the amount only while
@@ -24,14 +27,21 @@
  * LAB_TINKER_DAILY_USD. Scope 'chat' counts visitor chat against
  * LAB_TINKER_CHAT_DAILY_USD as well.
  *
- * All four tables are created at runtime, like the other run 2 tables.
+ * The first four tables are created at runtime, like the other run 2 tables.
+ * tinker_keeps, and the two name columns on tinker_runs, are added only by
+ * the paths that name or keep an adapter (ensureTinkerExtras): a lab that
+ * never switches those on never has them, and none of the statements the
+ * other paths run mention them.
  */
 import { createHash, createHmac } from 'node:crypto'
 import { isIPv4, isIPv6 } from 'node:net'
 import { sql } from '@vercel/postgres'
 import { sanitizeOutput } from './sprites.js'
 import { modelDisplayName } from './types.js'
-import { isAdapterSlug, isSamplerPath, type TinkerRequest, type TinkerRunResult } from './tinker.js'
+import {
+  isAdapterSlug, isExternalPath, isSamplerPath, tinkerKeepFlag, tinkerNamesFlag, type TinkerRequest, type TinkerRunResult,
+} from './tinker.js'
+import { adapterNameKey } from './tinker-names.js'
 
 export type TinkerScope = 'all' | 'chat'
 
@@ -108,6 +118,47 @@ export function ensureTinkerTables(): Promise<void> {
     })
   }
   return tablesReady
+}
+
+let extrasReady: Promise<void> | null = null
+/**
+ * What naming and keeping add to the database: two columns on tinker_runs
+ * for a display name, and the table of kept adapters. A name is unique among
+ * the rows that hold a name key, which the database enforces; a row gives its
+ * key up when its adapter is gone (claimAdapterName). A kept adapter holds a
+ * slot, and slots are numbered 1 to the cap, so the primary key is the cap.
+ * One epoch may ask for one keep, which the second index enforces.
+ */
+export function ensureTinkerExtras(): Promise<void> {
+  if (!extrasReady) {
+    extrasReady = (async () => {
+      await ensureTinkerTables()
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS display_name TEXT`
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS name_key TEXT`
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_tinker_runs_name_key ON tinker_runs(name_key) WHERE name_key IS NOT NULL`
+      await sql`
+        CREATE TABLE IF NOT EXISTS tinker_keeps (
+          slot INTEGER PRIMARY KEY,
+          slug TEXT NOT NULL UNIQUE,
+          status TEXT NOT NULL,
+          kept_by TEXT NOT NULL,
+          reason TEXT,
+          experiment_id TEXT,
+          epoch INTEGER,
+          job_id TEXT NOT NULL,
+          call_id TEXT,
+          requested_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          kept_at TIMESTAMP WITH TIME ZONE,
+          detail JSONB
+        )
+      `
+      await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_tinker_keeps_epoch ON tinker_keeps(experiment_id, epoch) WHERE epoch IS NOT NULL`
+    })().catch(e => {
+      extrasReady = null
+      throw e
+    })
+  }
+  return extrasReady
 }
 
 /** The UTC day a moment falls on, as YYYY-MM-DD. */
@@ -195,6 +246,8 @@ export interface TinkerRunRow {
   sampler_path: string | null
   expires_at: string | null
   created_at: string
+  /** The name its author gave the adapter, when names were on and the name was free. */
+  display_name: string | null
 }
 
 function json(v: unknown): Record<string, unknown> | null {
@@ -236,6 +289,7 @@ function runRow(row: Record<string, unknown>): TinkerRunRow {
     sampler_path: row.sampler_path ? String(row.sampler_path) : null,
     expires_at: iso(row.expires_at),
     created_at: iso(row.created_at) ?? '',
+    display_name: row.display_name ? String(row.display_name).slice(0, 40) : null,
   }
 }
 
@@ -272,6 +326,44 @@ export async function openTinkerRun(params: {
   return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
 }
 
+const UNIQUE_VIOLATION = '23505'
+
+/**
+ * Gives a run's adapter its display name, if no other adapter has it. "Has
+ * it" means a run that is still open, or an adapter that is still alive
+ * (kept ones are alive for as long as they are kept): any other row that
+ * holds the name gives it up first. Then the name is written, and the unique
+ * index decides: two runs asking for one name at the same moment cannot both
+ * get it. False means the name is taken. Names are compared by their key
+ * (tinker-names.ts), so case, separators and look-alike characters do not
+ * make a name different.
+ */
+export async function claimAdapterName(runId: string, name: string, now: Date = new Date()): Promise<boolean> {
+  await ensureTinkerExtras()
+  const key = adapterNameKey(name)
+  await sql`
+    UPDATE tinker_runs SET name_key = NULL
+    WHERE name_key = ${key} AND id <> ${runId}
+      AND status NOT IN ('reserved', 'running')
+      AND NOT (status = 'ok' AND expires_at > ${now.toISOString()})
+  `
+  try {
+    const r = await sql`UPDATE tinker_runs SET display_name = ${name}, name_key = ${key} WHERE id = ${runId} RETURNING id`
+    return Boolean(r.rows[0])
+  } catch (e) {
+    if ((e as { code?: unknown } | null)?.code === UNIQUE_VIOLATION) return false
+    throw e
+  }
+}
+
+/** Takes an adapter's display name away (the owner's route). True when it had one. */
+export async function clearAdapterName(slug: string): Promise<boolean> {
+  if (!isAdapterSlug(slug)) return false
+  await ensureTinkerExtras()
+  const r = await sql`UPDATE tinker_runs SET display_name = NULL, name_key = NULL WHERE slug = ${slug} AND display_name IS NOT NULL RETURNING id`
+  return Boolean(r.rows[0])
+}
+
 /** Marks a run as started on Modal, with the id its result is collected by. */
 export async function markTinkerRunStarted(id: string, callId: string): Promise<void> {
   await sql`UPDATE tinker_runs SET status = ${'running'}, call_id = ${callId} WHERE id = ${id} AND status = ${'reserved'}`
@@ -289,6 +381,8 @@ function cleanResult(result: TinkerRunResult): string {
     samples: result.samples.map(s => ({ prompt: text(s.prompt, 300), completion: text(s.completion, 600) })),
     scores: 'held-out loss measured by the lab',
     cost: 'estimate from published prices',
+    // Present only when the runner was asked to save weights for download (adapters can be kept).
+    ...(isExternalPath(result.external_path) ? { external_path: result.external_path } : {}),
   })
 }
 
@@ -372,12 +466,22 @@ export interface TrainedAdapter {
   holdout_loss_after: number | null
   created_at: string
   expires_at: string | null
+  /** The display name its author gave it. A label: the adapter is still addressed by its slug. Absent when it has none. */
+  name?: string
+  /** Present, and true, only for an adapter that is marked to keep. */
+  kept?: true
+  kept_at?: string
+  /** Who marked it: "the owner" or a model's display name. */
+  kept_by?: string
+  kept_reason?: string
 }
 
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 
-export function publicAdapter(row: TinkerRunRow): TrainedAdapter {
+export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): TrainedAdapter {
   const result = row.result ?? {}
+  const name = shownName(row)
+  const kept = keep && keep.status === 'kept' ? keep : null
   return {
     slug: row.slug,
     model_id: `lab/${row.slug}`,
@@ -392,19 +496,62 @@ export function publicAdapter(row: TinkerRunRow): TrainedAdapter {
     holdout_loss_after: num(result.holdout_loss_after),
     created_at: row.created_at,
     expires_at: row.expires_at,
+    // The fields below exist only for an adapter that has a name or is marked
+    // to keep, so a lab that uses neither sends exactly what it always sent.
+    ...(name ? { name } : {}),
+    ...(kept ? {
+      kept: true as const,
+      ...(kept.kept_at ? { kept_at: kept.kept_at } : {}),
+      kept_by: keptByName(kept.kept_by),
+      ...(kept.reason ? { kept_reason: sanitizeOutput(kept.reason).slice(0, 200) } : {}),
+    } : {}),
   }
+}
+
+/**
+ * An adapter's display name as it may be shown and recorded, or null. Only
+ * while names are switched on: with LAB_ENABLE_TINKER_NAMES off, a name
+ * given earlier stays in the database and goes nowhere.
+ */
+export function shownName(row: Pick<TinkerRunRow, 'display_name'>): string | null {
+  if (!tinkerNamesFlag() || !row.display_name) return null
+  return sanitizeOutput(row.display_name).slice(0, 40) || null
+}
+
+/**
+ * What the lab model endpoint says about an adapter beside its id: its
+ * display name, and that it is kept. Empty when it has neither.
+ */
+export function adapterDescription(adapter: TrainedAdapter): string {
+  const parts: string[] = []
+  if (adapter.name) parts.push(`"${adapter.name}"`)
+  if (adapter.kept) parts.push(`kept${adapter.kept_by ? ` by ${adapter.kept_by}` : ''}`)
+  if (!parts.length) return ''
+  return `${parts.join(', ')}. A LoRA adapter trained in this lab on ${adapter.base_model}; the id is its identity, the name is a label.`
+}
+
+/** Who marked an adapter to keep, in words. */
+export function keptByName(keptBy: string): string {
+  return keptBy === KEPT_BY_OWNER ? 'the owner' : modelDisplayName(keptBy) || keptBy.split('/').pop() || keptBy
 }
 
 /** A kept adapter with what the server needs to call it. Not for a response body. */
 export interface AdapterTarget { adapter: TrainedAdapter; sampler_path: string; experiment_id: string }
 
-function target(row: TinkerRunRow, now: Date): AdapterTarget | null {
+function target(row: TinkerRunRow, now: Date, keep: KeepRow | null = null): AdapterTarget | null {
   if (row.status !== 'ok' || !isSamplerPath(row.sampler_path) || !isAdapterSlug(row.slug)) return null
   if (!row.expires_at || !(new Date(row.expires_at).getTime() > now.getTime())) return null
-  return { adapter: publicAdapter(row), sampler_path: row.sampler_path, experiment_id: row.experiment_id }
+  return { adapter: publicAdapter(row, keep), sampler_path: row.sampler_path, experiment_id: row.experiment_id }
 }
 
-/** Adapters that were trained, saved and have not expired, newest first. */
+/**
+ * Adapters that were trained, saved and have not expired, newest first.
+ *
+ * While adapters can be kept (LAB_ENABLE_TINKER_KEEP), the kept ones come
+ * first, the most recently kept at the top, and are listed however old they
+ * are; the rest follow, newest first. With that switch off this is the one
+ * query it always was.
+ */
 export async function listAdapters(now: Date = new Date(), limit = 20): Promise<AdapterTarget[]> {
   await ensureTinkerTables()
   const r = await sql`
@@ -413,7 +560,36 @@ export async function listAdapters(now: Date = new Date(), limit = 20): Promise<
     ORDER BY created_at DESC
     LIMIT ${limit}
   `
-  return r.rows.map(row => target(runRow(row as Record<string, unknown>), now)).filter((t): t is AdapterTarget => t !== null)
+  const rows = r.rows.map(row => runRow(row as Record<string, unknown>))
+  if (!tinkerKeepFlag()) return rows.map(row => target(row, now)).filter((t): t is AdapterTarget => t !== null)
+
+  const kept = (await listKeeps()).filter(k => k.status === 'kept')
+    .sort((a, b) => Date.parse(b.kept_at ?? '') - Date.parse(a.kept_at ?? ''))
+  const bySlug = new Map(rows.map(row => [row.slug, row]))
+  const first: AdapterTarget[] = []
+  for (const keep of kept) {
+    // A kept adapter older than the newest ones is read on its own.
+    const row = bySlug.get(keep.slug) ?? await getRun(keep.slug)
+    const t = row ? target(row, now, keep) : null
+    if (t) first.push(t)
+  }
+  const keptSlugs = new Set(first.map(t => t.adapter.slug))
+  const rest = rows.filter(row => !keptSlugs.has(row.slug)).map(row => target(row, now)).filter((t): t is AdapterTarget => t !== null)
+  return [...first, ...rest]
+}
+
+/** One run by its adapter's slug, whatever state it is in. */
+export async function getRun(slug: string): Promise<TinkerRunRow | null> {
+  if (!isAdapterSlug(slug)) return null
+  await ensureTinkerTables()
+  const r = await sql`SELECT * FROM tinker_runs WHERE slug = ${slug} LIMIT 1`
+  return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
+}
+
+/** The weights a run saved for download, if it saved any. */
+export function externalPathOf(row: TinkerRunRow): string | null {
+  const path = row.result?.external_path
+  return isExternalPath(path) ? path : null
 }
 
 export async function getAdapter(slug: string, now: Date = new Date()): Promise<AdapterTarget | null> {
@@ -421,6 +597,191 @@ export async function getAdapter(slug: string, now: Date = new Date()): Promise<
   await ensureTinkerTables()
   const r = await sql`SELECT * FROM tinker_runs WHERE slug = ${slug} LIMIT 1`
   return r.rows[0] ? target(runRow(r.rows[0] as Record<string, unknown>), now) : null
+}
+
+// ---------------------------------------------------------------------------
+// Adapters marked to keep
+// ---------------------------------------------------------------------------
+
+/** What kept_by holds when the owner marked the adapter. Otherwise it is the id of the model that asked. */
+export const KEPT_BY_OWNER = 'owner'
+
+export interface KeepRow {
+  slot: number
+  slug: string
+  /** pending: the runner is extending its life and copying it. kept: done. */
+  status: 'pending' | 'kept'
+  kept_by: string
+  reason: string | null
+  /** The epoch a model asked in. Both null when the owner asked. */
+  experiment_id: string | null
+  epoch: number | null
+  /** The lab's name for this attempt at the runner. */
+  job_id: string
+  call_id: string | null
+  requested_at: string
+  kept_at: string | null
+  detail: Record<string, unknown> | null
+}
+
+function keepRow(row: Record<string, unknown>): KeepRow {
+  return {
+    slot: Number(row.slot) || 0,
+    slug: String(row.slug ?? ''),
+    status: row.status === 'kept' ? 'kept' : 'pending',
+    kept_by: String(row.kept_by ?? ''),
+    reason: row.reason ? String(row.reason) : null,
+    experiment_id: row.experiment_id ? String(row.experiment_id) : null,
+    epoch: row.epoch === null || row.epoch === undefined ? null : Number(row.epoch),
+    job_id: String(row.job_id ?? ''),
+    call_id: row.call_id ? String(row.call_id) : null,
+    requested_at: iso(row.requested_at) ?? '',
+    kept_at: iso(row.kept_at),
+    detail: json(row.detail),
+  }
+}
+
+/**
+ * Every adapter that is kept or being kept, by slot. `createTables: false`
+ * only looks, for a server where keeping is switched off; the caller treats
+ * a failure (no such table) as none.
+ */
+export async function listKeeps(opts: { createTables?: boolean } = {}): Promise<KeepRow[]> {
+  if (opts.createTables !== false) await ensureTinkerExtras()
+  const r = await sql`SELECT * FROM tinker_keeps ORDER BY slot ASC`
+  return r.rows.map(row => keepRow(row as Record<string, unknown>))
+}
+
+export async function getKeep(slug: string, opts: { createTables?: boolean } = {}): Promise<KeepRow | null> {
+  if (!isAdapterSlug(slug)) return null
+  if (opts.createTables !== false) await ensureTinkerExtras()
+  const r = await sql`SELECT * FROM tinker_keeps WHERE slug = ${slug} LIMIT 1`
+  return r.rows[0] ? keepRow(r.rows[0] as Record<string, unknown>) : null
+}
+
+export type KeepClaim = { ok: true; row: KeepRow } | { ok: false; reason: string }
+
+/**
+ * Takes a place among the kept adapters, or says why not. The cap is held by
+ * the database: a place is a slot numbered 1 to `max`, the slot is the
+ * table's primary key, and the statement takes the lowest free one only
+ * while fewer than `max` rows exist. Two requests arriving together cannot
+ * both take the last place: one of them finds the slot taken and gets no row
+ * back. The same statement cannot keep one adapter twice (slug is unique) or
+ * serve two keeps for one epoch (the index on experiment and epoch).
+ */
+export async function claimKeepSlot(params: {
+  slug: string
+  keptBy: string
+  reason: string
+  experimentId: string | null
+  epoch: number | null
+  jobId: string
+  max: number
+}): Promise<KeepClaim> {
+  await ensureTinkerExtras()
+  if (!(params.max > 0)) return { ok: false, reason: 'no adapter may be kept (the limit is 0)' }
+  const existing = await getKeep(params.slug)
+  if (existing) return { ok: false, reason: existing.status === 'kept' ? 'that adapter is already kept' : 'that adapter is already being kept' }
+  if (params.experimentId !== null && params.epoch !== null) {
+    const same = await sql`SELECT slug FROM tinker_keeps WHERE experiment_id = ${params.experimentId} AND epoch = ${params.epoch} LIMIT 1`
+    if (same.rows[0]) return { ok: false, reason: 'this epoch already asked for one adapter to be kept' }
+  }
+  const r = await sql`
+    INSERT INTO tinker_keeps (slot, slug, status, kept_by, reason, experiment_id, epoch, job_id)
+    SELECT s.slot, ${params.slug}::text, 'pending', ${params.keptBy}::text, ${sanitizeOutput(params.reason).slice(0, 200)}::text,
+      ${params.experimentId}::text, ${params.epoch}::integer, ${params.jobId}::text
+    FROM generate_series(1, ${params.max}::integer) AS s(slot)
+    WHERE NOT EXISTS (SELECT 1 FROM tinker_keeps k WHERE k.slot = s.slot)
+      AND (SELECT COUNT(*) FROM tinker_keeps) < ${params.max}::integer
+    ORDER BY s.slot ASC
+    LIMIT 1
+    ON CONFLICT DO NOTHING
+    RETURNING *
+  `
+  if (r.rows[0]) return { ok: true, row: keepRow(r.rows[0] as Record<string, unknown>) }
+  const held = await sql`SELECT COUNT(*) AS n FROM tinker_keeps`
+  const n = Number(held.rows[0]?.n) || 0
+  return n >= params.max
+    ? { ok: false, reason: `${n} adapters are kept and at most ${params.max} may be; the owner has to unkeep one first` }
+    : { ok: false, reason: 'another request took the place at the same moment; nothing was changed' }
+}
+
+/**
+ * Keeps models asked for today (UTC) that the runner has not answered yet. A
+ * keep is written to tool_runs only when it is closed, so the requests-per-day
+ * limit adds these to the stored ones.
+ */
+export async function pendingModelKeepsToday(now: Date = new Date()): Promise<number> {
+  await ensureTinkerExtras()
+  const r = await sql`
+    SELECT COUNT(*) AS n FROM tinker_keeps
+    WHERE status = ${'pending'} AND kept_by <> ${KEPT_BY_OWNER} AND requested_at >= ${`${utcDay(now)}T00:00:00.000Z`}
+  `
+  return Number(r.rows[0]?.n) || 0
+}
+
+/** Stores the runner's call for a keep that was started. */
+export async function markKeepStarted(slug: string, callId: string): Promise<void> {
+  await sql`UPDATE tinker_keeps SET call_id = ${callId} WHERE slug = ${slug} AND status = ${'pending'}`
+}
+
+/**
+ * Closes a keep that worked: the adapter is kept, and its life in the lab's
+ * own record is set to what the runner set on Tinker. Only a pending keep is
+ * closed, and the row comes back only to the caller that closed it.
+ */
+export async function finishKeep(slug: string, detail: Record<string, unknown>, expiresAt: string): Promise<KeepRow | null> {
+  const r = await sql`
+    UPDATE tinker_keeps SET status = ${'kept'}, kept_at = NOW(), detail = ${JSON.stringify(detail)}
+    WHERE slug = ${slug} AND status = ${'pending'}
+    RETURNING *
+  `
+  if (!r.rows[0]) return null
+  await sql`UPDATE tinker_runs SET expires_at = ${expiresAt} WHERE slug = ${slug} AND status = ${'ok'}`
+  return keepRow(r.rows[0] as Record<string, unknown>)
+}
+
+/**
+ * Gives a place back. `status` says which rows may go: a keep that failed
+ * gives back a pending row only, the owner's unkeep a kept one. The row comes
+ * back only to the caller that removed it.
+ */
+export async function releaseKeep(slug: string, status: 'pending' | 'kept'): Promise<KeepRow | null> {
+  const r = await sql`DELETE FROM tinker_keeps WHERE slug = ${slug} AND status = ${status} RETURNING *`
+  return r.rows[0] ? keepRow(r.rows[0] as Record<string, unknown>) : null
+}
+
+/**
+ * Kept adapters whose time on Tinker has run out give their places back. A
+ * keep lasts as long as the life it set on Tinker; after that the adapter is
+ * gone like any other, and a place held by it would be a place nothing can
+ * use. Each row comes back only to the caller that removed it.
+ */
+export async function releaseExpiredKeeps(now: Date = new Date()): Promise<KeepRow[]> {
+  const r = await sql`
+    DELETE FROM tinker_keeps WHERE status = ${'kept'} AND slug IN (
+      SELECT slug FROM tinker_runs WHERE status <> ${'ok'} OR expires_at IS NULL OR expires_at <= ${now.toISOString()}
+    )
+    RETURNING *
+  `
+  return r.rows.map(row => keepRow(row as Record<string, unknown>))
+}
+
+/** Sets when the lab stops offering an adapter (after an unkeep). */
+export async function setAdapterExpiry(slug: string, expiresAt: string): Promise<void> {
+  await sql`UPDATE tinker_runs SET expires_at = ${expiresAt} WHERE slug = ${slug} AND status = ${'ok'}`
+}
+
+/**
+ * Keeps that were started and not closed yet, oldest first. `createTables:
+ * false` only looks, for a server where keeping is switched off; the caller
+ * treats a failure (no such table) as none.
+ */
+export async function openKeeps(opts: { createTables?: boolean } = {}): Promise<KeepRow[]> {
+  if (opts.createTables !== false) await ensureTinkerExtras()
+  const r = await sql`SELECT * FROM tinker_keeps WHERE status = ${'pending'} ORDER BY requested_at ASC LIMIT 5`
+  return r.rows.map(row => keepRow(row as Record<string, unknown>))
 }
 
 // ---------------------------------------------------------------------------

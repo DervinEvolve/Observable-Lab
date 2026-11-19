@@ -12,6 +12,7 @@ import { loadTickExperiment, researchAlongside, type TickSlot } from '../_lib/ex
 import { ensureResearchExperiment, type ResearchActivation } from '../_lib/research-alongside.js'
 import { ResearchRunPendingError } from '../_lib/research.js'
 import { collectTinkerRuns } from '../_lib/tinker-run.js'
+import { collectTinkerKeeps } from '../_lib/tinker-keep.js'
 
 type TickBody = Record<string, unknown>
 
@@ -39,6 +40,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // even a query. It never throws.
   const collected = await collectTinkerRuns()
   if (collected.length) console.log(`[CRON] Collected ${collected.length} Tinker training run(s)`)
+  // The same for adapters that were still being kept when their request
+  // ended. With LAB_ENABLE_TINKER_KEEP off this does nothing, not even a
+  // query. It never throws.
+  const kept = await collectTinkerKeeps()
+  if (kept.length) console.log(`[CRON] Collected ${kept.length} adapter keep(s)`)
 
   if (!researchAlongside()) {
     try {

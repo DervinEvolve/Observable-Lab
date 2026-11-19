@@ -23,14 +23,16 @@ import { budgetScopeFor } from './experiment-modes.js'
 import { recordModelCall, refreshEpochCost, withSpendContext } from './spend.js'
 import { recordToolRun, type ToolRunStatus } from './tool-runs-store.js'
 import { modelDisplayName } from './types.js'
+import { TINKER_NAME_TOOL } from './tinker-keep-request.js'
 import {
   TINKER_PRICE_TABLE_DATE, TINKER_RUN_TIMEOUT_S, TINKER_TOOL, describeTinkerRun, estimateTinkerRun, newAdapterSlug, newSplitSalt,
-  normalizeTinkerResult, tinkerCostUsd, tinkerDailyUsd, tinkerFlag, tinkerJobsConfigured, tinkerRunUsd, tinkerTtlDays, tinkerWaitMs, usdText,
+  normalizeTinkerResult, tinkerCostUsd, tinkerDailyUsd, tinkerFlag, tinkerJobsConfigured, tinkerKeepFlag, tinkerNamesFlag, tinkerRunUsd, tinkerTtlDays,
+  tinkerWaitMs, usdText,
   type TinkerRequest, type TinkerRunResult,
 } from './tinker.js'
 import { findTinkerCall, pollTinkerJob, startTinkerJob, tinkerJobBody, waitForTinkerJob, type TinkerPoll } from './tinker-client.js'
 import {
-  finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend, settleTinkerSpend,
+  claimAdapterName, shownName, finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend, settleTinkerSpend,
   type TinkerRunRow,
 } from './tinker-store.js'
 
@@ -49,14 +51,24 @@ export interface TinkerOutcome {
 
 const name = (id: string) => modelDisplayName(id) || id.split('/').pop() || id
 
-/** What was asked, in one line, for the stored record. */
-export function tinkerRequestSummary(baseModel: string, examples: number, purpose: string | null): string {
-  return `LoRA fine-tune of ${baseModel} on ${examples} examples${purpose ? `: ${purpose}` : ''}`
+/** What was asked, in one line, for the stored record. `name` is the adapter's display name, when it has one. */
+export function tinkerRequestSummary(baseModel: string, examples: number, purpose: string | null, name: string | null = null): string {
+  return `LoRA fine-tune of ${baseModel} on ${examples} examples${name ? `, named "${name}"` : ''}${purpose ? `: ${purpose}` : ''}`
 }
 
 /** The most this request could cost, for the checks made before it is run. */
 export function tinkerWorstCaseUsd(request: TinkerRequest): number {
   return estimateTinkerRun(request).max_cost_usd
+}
+
+/** Stores why an adapter got no name. The run itself goes on. Never throws. */
+async function recordNameRefusal(ctx: TinkerRunContext, slug: string, reason: string): Promise<void> {
+  console.warn(`[Epoch ${ctx.epochNumber}] adapter name refused: ${reason}`)
+  await recordToolRun({
+    experimentId: ctx.experimentId, epoch: ctx.epochNumber, model: ctx.executorModelId, tool: TINKER_NAME_TOOL,
+    requestSummary: `a display name for adapter lab/${slug}`, status: 'skipped',
+    outputTail: `name refused: ${reason}; the run goes on and the adapter has no name`,
+  })
 }
 
 /** A lost runner whose result never came: nothing measured. */
@@ -108,13 +120,18 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
   }
 
   const status: ToolRunStatus = result.status === 'ok' ? 'ok' : result.status === 'refused' ? 'failed' : 'error'
-  const line = describeTinkerRun(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt)
+  // The display name, when the run was given one (names are on and it was free). A label; the lab id is the identity.
+  const displayName = shownName(row)
+  const line = describeTinkerRun(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName)
   await recordToolRun({
     experimentId: row.experiment_id, epoch: row.epoch, model: row.model, tool: TINKER_TOOL,
-    requestSummary: tinkerRequestSummary(row.base_model, row.dataset_examples, row.purpose),
+    requestSummary: tinkerRequestSummary(row.base_model, row.dataset_examples, row.purpose, displayName),
     status, durationMs: result.wall_seconds === null ? null : result.wall_seconds * 1000, costUsd, outputTail: line,
     detail: {
       ...(result.status === 'ok' ? { adapter: `lab/${row.slug}`, sampler_path: result.sampler_path, expires_at: expiresAt } : {}),
+      ...(displayName ? { name: displayName } : {}),
+      ...(result.status === 'ok' && result.external_path ? { external_path: result.external_path } : {}),
+      ...(result.status === 'ok' && result.export_error ? { export_error: result.export_error } : {}),
       base_model: row.base_model,
       dataset: { sha256: row.dataset_sha256, examples: row.dataset_examples, bytes: row.dataset_bytes },
       settings: row.settings,
@@ -181,8 +198,25 @@ export async function runTinkerTrain(ctx: TinkerRunContext, request: TinkerReque
     return skipped('this epoch already has a training run')
   }
 
+  // The display name, while names are on. It never decides the run: a name
+  // another adapter still has is left off with the reason stored, and the
+  // run goes on. (A name that broke a rule was refused, and stored, when the
+  // request was read: tool-requests.ts.)
+  if (tinkerNamesFlag() && request.name) {
+    let refused: string | null = null
+    try {
+      if (await claimAdapterName(row.id, request.name)) row = { ...row, display_name: request.name }
+      else refused = `"${request.name}" is the name of another adapter that is still alive`
+    } catch (e) {
+      console.warn('[tinker] could not store the adapter name:', e instanceof Error ? e.message : e)
+      refused = 'the lab could not store the name'
+    }
+    if (refused) await recordNameRefusal(ctx, row.slug, refused)
+  }
+
   let started = await startTinkerJob(tinkerJobBody(request, {
     splitSalt, budgetUsd: reservation.usd, label: `epoch ${ctx.epochNumber} ${row.slug}`, runId: row.slug,
+    ...(tinkerKeepFlag() ? { exportWeights: true } : {}),
   }))
   if (!started.ok && started.unconfirmed) {
     // The answer was lost or came from a gateway. The runner keeps the call

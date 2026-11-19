@@ -14,6 +14,12 @@
 // and a small daily budget) and answers with a plain sentence when one is
 // reached.
 //
+// An adapter may carry a display name its author gave it, and may be marked
+// to keep. Both are labels from the lab's record: the name is shown above the
+// lab id, which stays the adapter's identity and is what a message is sent
+// to, and a kept adapter gets a small "kept" mark. The server lists kept
+// adapters first.
+//
 // All text from the server and from the model is put on the page as text,
 // never as markup.
 
@@ -32,6 +38,11 @@ export interface TrainedAdapterView {
   lossBefore: number | null
   lossAfter: number | null
   expiresAt: string | null
+  /** The display name its author gave it, when it has one. A label only. */
+  name: string | null
+  /** Marked to keep, and by whom ("the owner" or a model's name). */
+  kept: boolean
+  keptBy: string | null
 }
 
 export interface ChatLimits { maxMessageChars: number; maxTurns: number }
@@ -72,6 +83,9 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
       lossBefore: num(o.holdout_loss_before),
       lossAfter: num(o.holdout_loss_after),
       expiresAt: expires,
+      name: text(o.name, 40),
+      kept: o.kept === true,
+      keptBy: o.kept === true ? text(o.kept_by, 60) : null,
     })
   }
   return out
@@ -88,16 +102,26 @@ export function parseLimits(raw: unknown): ChatLimits {
   }
 }
 
-/** The lines shown for one adapter: where it came from, and the score the lab measured. */
-export function describeAdapter(a: TrainedAdapterView): { title: string; origin: string; score: string; kept: string } {
+/**
+ * The lines shown for one adapter: where it came from, and the score the lab
+ * measured. A named adapter is titled by its name with its lab id under it;
+ * an unnamed one by its lab id alone. `id` is there only for a named adapter
+ * and `mark` ("kept") only for a kept one.
+ */
+export function describeAdapter(a: TrainedAdapterView): { title: string; id?: string; mark?: string; origin: string; score: string; kept: string } {
   const score = a.lossBefore !== null && a.lossAfter !== null
     ? `Held-out loss ${a.lossBefore.toFixed(2)} before training, ${a.lossAfter.toFixed(2)} after${a.holdoutExamples ? `, on ${a.holdoutExamples} examples the lab held out` : ''}. Measured by the lab. Lower is better.`
     : 'No held-out score recorded.'
+  const until = a.expiresAt ? a.expiresAt.slice(0, 10) : ''
   return {
-    title: a.modelId,
+    title: a.name ?? a.modelId,
+    ...(a.name ? { id: a.modelId } : {}),
+    ...(a.kept ? { mark: 'kept' } : {}),
     origin: `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
     score,
-    kept: a.expiresAt ? `Kept until ${a.expiresAt.slice(0, 10)}.` : '',
+    kept: a.kept
+      ? `Marked to keep${a.keptBy ? ` by ${a.keptBy}` : ''}.${until ? ` Stays until ${until}.` : ''}`
+      : until ? `Kept until ${until}.` : '',
   }
 }
 
@@ -144,7 +168,10 @@ export class TrainedChatPanel {
       #trained-chat-panel .tc-adapter { display: block; width: 100%; min-height: 44px; text-align: left; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: inherit; cursor: pointer; font: inherit; }
       #trained-chat-panel .tc-adapter[aria-pressed="true"] { border-color: #B5A642; background: rgba(181,166,66,0.14); }
       #trained-chat-panel .tc-adapter b { color: #f5f2eb; font: 12px/1.3 ui-monospace, Menlo, monospace; word-break: break-all; }
+      #trained-chat-panel .tc-adapter b.tc-name { font: 600 13px/1.3 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; word-break: break-word; }
       #trained-chat-panel .tc-adapter span { display: block; color: rgba(245,242,235,0.62); font-size: 11px; margin-top: 2px; }
+      #trained-chat-panel .tc-adapter span.tc-id { font: 11px/1.3 ui-monospace, Menlo, monospace; word-break: break-all; }
+      #trained-chat-panel .tc-adapter i.tc-kept { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; border: 1px solid rgba(181,166,66,0.6); color: #e8dfb0; font: 600 10px/16px 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; letter-spacing: 0.4px; text-transform: uppercase; vertical-align: 1px; }
       #trained-chat-panel .tc-adapters { display: flex; flex-direction: column; gap: 6px; }
       #trained-chat-panel .tc-empty { color: rgba(245,242,235,0.5); font-style: italic; }
       #trained-chat-panel .tc-log { display: flex; flex-direction: column; gap: 6px; }
@@ -309,7 +336,20 @@ export class TrainedChatPanel {
       button.setAttribute('aria-pressed', String(a.slug === this.chosen))
       const title = document.createElement('b')
       title.textContent = d.title
+      if (d.id) title.className = 'tc-name'
       button.appendChild(title)
+      if (d.mark) {
+        const mark = document.createElement('i')
+        mark.className = 'tc-kept'
+        mark.textContent = d.mark
+        button.appendChild(mark)
+      }
+      if (d.id) {
+        const id = document.createElement('span')
+        id.className = 'tc-id'
+        id.textContent = d.id
+        button.appendChild(id)
+      }
       for (const line of [a.purpose, d.origin, d.score, d.kept]) {
         if (!line) continue
         const span = document.createElement('span')
