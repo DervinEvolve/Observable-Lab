@@ -11,13 +11,15 @@
  * liveModelToolStatus: it is part of a Sprite session, not a tool of its own.
  * Tinker training (LAB_ENABLE_TINKER) is a tool; its settings and dollar
  * caps live in tinker.ts. Keeping a trained adapter (LAB_ENABLE_TINKER_KEEP)
- * is a tool too; how many may be kept is in tinker.ts.
+ * is a tool too; how many may be kept is in tinker.ts. Public datasets
+ * (LAB_ENABLE_DATASETS) are a tool with their own Modal app; their limits
+ * are in datasets.ts.
  */
 import { spritesConfigured } from './sprites.js'
 import { liveModelStatus, type LiveModelStatus } from './live-model.js'
 import { liveTrainedStatus, tinkerKeepStatus, tinkerStatus } from './tinker.js'
 
-export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'keep_adapter'] as const
+export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'keep_adapter', 'datasets'] as const
 export type ToolName = (typeof TOOL_NAMES)[number]
 
 /** Per-epoch limits. Not tunable: one of each kind per epoch at most. */
@@ -31,6 +33,7 @@ export const PER_EPOCH = {
   lab_proposals: 1,
   tinker_runs: 1,         // LoRA fine-tuning runs on Tinker
   adapter_keeps: 1,       // requests to keep a trained adapter
+  datasets: 1,            // public datasets fetched onto the lab's shelf
 } as const
 
 /** Sprite session limits. */
@@ -99,6 +102,37 @@ export function weightsLicenses(): WeightsLicenses {
   return { licenses, dropped: entries.length - entries.filter(s => LICENSE_ID.test(s)).length, unusable: licenses.length === 0 }
 }
 
+/** The licenses a public dataset may state when LAB_DATASETS_LICENSES is not set. */
+export const DEFAULT_DATASETS_LICENSES = ['apache-2.0', 'mit', 'cc-by-4.0', 'cc-by-sa-4.0', 'cc0-1.0', 'odc-by', 'bsd-3-clause'] as const
+
+/**
+ * LAB_DATASETS_LICENSES, comma separated, read the same way as the weights
+ * list: the defaults apply only when it is not set, and a list that is set
+ * is never widened. If nothing in it is a license id, public datasets are off.
+ */
+export function datasetsLicenses(): WeightsLicenses {
+  const raw = (process.env.LAB_DATASETS_LICENSES || '').trim()
+  if (!raw) return { licenses: [...DEFAULT_DATASETS_LICENSES], dropped: 0, unusable: false }
+  const entries = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  const licenses = [...new Set(entries.filter(s => LICENSE_ID.test(s)))].sort()
+  return { licenses, dropped: entries.length - entries.filter(s => LICENSE_ID.test(s)).length, unusable: licenses.length === 0 }
+}
+
+let datasetLicensesWarnedFor: string | null = null
+function warnAboutDatasetLicenses(found: WeightsLicenses): void {
+  const raw = process.env.LAB_DATASETS_LICENSES || ''
+  if (!found.dropped || datasetLicensesWarnedFor === raw) return
+  datasetLicensesWarnedFor = raw
+  console.warn(found.unusable
+    ? '[Tools] LAB_DATASETS_LICENSES is set but names no license id (write them like apache-2.0,mit); public datasets stay off'
+    : `[Tools] LAB_DATASETS_LICENSES: ${found.dropped} entr${found.dropped === 1 ? 'y is not a license id and was' : 'ies are not license ids and were'} left out; ${found.licenses.length} license${found.licenses.length === 1 ? '' : 's'} allowed`)
+}
+
+/** The dataset shelf's two HTTPS endpoints on Modal (modal/datasets.py) and the token they ask for. */
+export function datasetsAppConfigured(): boolean {
+  return has('DATASETS_START_URL') && has('DATASETS_STATUS_URL') && has('DATASETS_TOKEN')
+}
+
 // Said once per value, and only while the switch is on, so the logs show a
 // list that was narrowed or refused without a line on every epoch. The
 // entries themselves are not printed.
@@ -145,6 +179,13 @@ export function toolConfig(): ToolConfig {
   if (flag('LAB_ENABLE_WEIGHTS')) warnAboutLicenses(licenses)
   const tinker = tinkerStatus()
   const keep = tinkerKeepStatus()
+  // Public datasets (datasets.ts). A dataset on the shelf is read by a GPU job
+  // or by a Tinker training run, so with neither on there is nothing to use
+  // it with and the tool stays off.
+  const datasetsFlag = flag('LAB_ENABLE_DATASETS')
+  const datasetLicenses = datasetsLicenses()
+  if (datasetsFlag) warnAboutDatasetLicenses(datasetLicenses)
+  const datasetUsers = gpuJobs || tinker.enabled
   return {
     subagents: status(code, 'LAB_ENABLE_CODE_WRITES is not true', intEnv('LAB_SUBAGENTS_PER_DAY', 24, 0, 200)),
     sprite_session: status(
@@ -183,6 +224,14 @@ export function toolConfig(): ToolConfig {
     // Keeping a trained adapter (tinker-keep.ts). How many may be kept at one
     // time is LAB_TINKER_KEEP_MAX; this is how many requests a day may be run.
     keep_adapter: status(keep.enabled, keep.off_reason ?? '', intEnv('LAB_TINKER_KEEPS_PER_DAY', 2, 0, 10)),
+    datasets: status(
+      datasetsFlag && datasetsAppConfigured() && !datasetLicenses.unusable && datasetUsers,
+      !datasetsFlag ? 'LAB_ENABLE_DATASETS is not true'
+        : !datasetsAppConfigured() ? 'DATASETS_START_URL, DATASETS_STATUS_URL or DATASETS_TOKEN is not set'
+          : datasetLicenses.unusable ? 'LAB_DATASETS_LICENSES is set but names no license id'
+            : 'neither GPU jobs nor Tinker training is on, so nothing could read a dataset',
+      intEnv('LAB_DATASETS_PER_DAY', 2, 0, 20),
+    ),
   }
 }
 

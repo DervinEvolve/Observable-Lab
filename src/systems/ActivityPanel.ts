@@ -60,6 +60,7 @@ const ROLE_LABEL: Record<string, string> = {
 }
 const TOOL_LABEL: Record<string, string> = {
   sprite_session: 'ran commands in its Sprite', gpu_job: 'ran a GPU job', weights: 'asked for public weights',
+  datasets: 'asked for a public dataset', dataset_rows: 'had the lab read rows of a public dataset',
   subagent_explore: 'sent an explorer subagent',
   subagent_test: 'sent a test subagent', exhibit: 'proposed an exhibit', lab_proposal: 'proposed a change to the lab',
   tinker_train: 'fine-tuned a model on Tinker (scores measured by the lab)',
