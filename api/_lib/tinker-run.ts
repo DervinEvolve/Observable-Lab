@@ -26,13 +26,13 @@ import { modelDisplayName } from './types.js'
 import { TINKER_NAME_TOOL } from './tinker-keep-request.js'
 import {
   TINKER_PRICE_TABLE_DATE, TINKER_RUN_TIMEOUT_S, TINKER_TOOL, describeTinkerRun, estimateTinkerRun, newAdapterSlug, newSplitSalt,
-  normalizeTinkerResult, tinkerCostUsd, tinkerDailyUsd, tinkerFlag, tinkerJobsConfigured, tinkerKeepFlag, tinkerNamesFlag, tinkerRunUsd, tinkerTtlDays,
+  normalizeTinkerResult, tinkerCostUsd, tinkerDailyUsd, tinkerFlag, tinkerJobsConfigured, tinkerKeepFlag, tinkerNamesFlag, tinkerOriginFlag, tinkerRunUsd, tinkerTtlDays,
   tinkerWaitMs, usdText,
   type TinkerRequest, type TinkerRunResult,
 } from './tinker.js'
 import { findTinkerCall, pollTinkerJob, startTinkerJob, tinkerJobBody, waitForTinkerJob, type TinkerPoll } from './tinker-client.js'
 import {
-  claimAdapterName, shownName, finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend, setRunDatasetSource,
+  claimAdapterName, dataOrigin, shownName, finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend, setRunDatasetSource,
   settleTinkerSpend,
   type TinkerRunRow,
 } from './tinker-store.js'
@@ -133,7 +133,9 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
   // later tick records it too. Absent for every other run.
   const source = readDatasetRecord(row.dataset_source)
   const described = describeTinkerRun(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName)
-  const line = source ? `${described}; examples: ${datasetRecordLine(source)}, read by the lab` : described
+  // The origin label, while labels are on: every run says where its examples came from.
+  const origin = tinkerOriginFlag() ? dataOrigin(row) : null
+  const line = `${source ? `${described}; examples: ${datasetRecordLine(source)}, read by the lab` : described}${origin ? `; data origin: ${origin}` : ''}`
   await recordToolRun({
     experimentId: row.experiment_id, epoch: row.epoch, model: row.model, tool: TINKER_TOOL,
     requestSummary: tinkerRequestSummary(row.base_model, row.dataset_examples, row.purpose, displayName, source ? `${source.repo}@${source.sha.slice(0, 12)}` : null),
@@ -144,7 +146,7 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
       ...(result.status === 'ok' && result.external_path ? { external_path: result.external_path } : {}),
       ...(result.status === 'ok' && result.export_error ? { export_error: result.export_error } : {}),
       base_model: row.base_model,
-      dataset: { sha256: row.dataset_sha256, examples: row.dataset_examples, bytes: row.dataset_bytes, ...(source ? { source } : {}) },
+      dataset: { sha256: row.dataset_sha256, examples: row.dataset_examples, bytes: row.dataset_bytes, ...(source ? { source } : {}), ...(origin ? { origin } : {}) },
       settings: row.settings,
       measured: {
         by: 'the lab, on examples it held out and the model could not choose',

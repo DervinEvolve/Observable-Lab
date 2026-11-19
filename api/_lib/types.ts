@@ -175,6 +175,49 @@ export interface ResearchMeta {
     verdict: 'keep' | 'revert'
     status: string         // ok | crash | infra_error
     hypothesis: string
+    /** Only for a run the lab repeated before taking it as the best (LAB_RESEARCH_CONFIRM). */
+    confirm?: ResearchConfirmVerdict
+  }
+  /** How the lab scores a new best. Written only while LAB_RESEARCH_CONFIRM is on. */
+  scoring?: ResearchScoring
+}
+
+/**
+ * What the lab's repeat of a run said. confirmed: the mean of the two runs
+ * beat the best by more than the margin. within_noise: it did not.
+ * not_confirmed: the repeat gave no score.
+ */
+export type ResearchConfirmVerdict = 'confirmed' | 'within_noise' | 'not_confirmed'
+
+/**
+ * The lab's scoring state for the research loop (LAB_RESEARCH_CONFIRM): the
+ * run-to-run spread of val_bpb it has measured by running the same train.py
+ * more than once, the margin a new best has to clear, and the last verdict.
+ * Every score in it was printed by the generated train.py and is unverified.
+ */
+export interface ResearchScoring {
+  noise_bpb: number | null   // null until at least three repeated scores exist
+  noise_samples: number      // scores that have another run of the same train.py beside them
+  margin_bpb: number         // max(2 x noise, the floor), and never more than the ceiling
+  margin_basis?: 'noise' | 'floor' | 'ceiling' // which of the three the margin is now
+  min_margin_bpb: number     // the floor, LAB_RESEARCH_MIN_MARGIN
+  max_margin_bpb?: number    // the ceiling, LAB_RESEARCH_MAX_MARGIN
+  updated_epoch: number
+  last_verdict?: {
+    epoch: number
+    verdict: ResearchConfirmVerdict
+    first_bpb: number
+    repeat_bpb: number | null
+    mean_bpb: number | null
+    best_bpb: number         // the best the run had to beat
+    margin_bpb: number
+    line: string             // the verdict in one plain line
+  }
+  last_control?: {
+    epoch: number            // the epoch after which the lab re-ran the best train.py unchanged
+    status: string           // ok | crash | infra_error | lost
+    val_bpb: number | null
+    reference_bpb: number | null // the best on record for that train.py at the time
   }
 }
 
@@ -408,6 +451,7 @@ export interface ResearchAlongside {
   best_epoch: number | null
   target_bpb: number | null
   last_run: ResearchMeta['last_run'] | null
+  scoring?: ResearchScoring // only when the lab has scored a new best with a repeat (LAB_RESEARCH_CONFIRM)
 }
 
 // How far the specimen has taken over the room (api/_lib/growth.ts, docs/GROWTH.md).

@@ -14,6 +14,10 @@ function envMs(name: string, fallback: number): number {
 // A reasoning model writing a whole file can take a few minutes; a hung
 // connection must not eat the function's 800 s budget.
 const COMPLETION_TIMEOUT_MS = envMs('OPENROUTER_TIMEOUT_MS', 240_000)
+/** The longest one completion request may run, for code that plans the rest of a request around it. */
+export function completionTimeoutMs(): number {
+  return COMPLETION_TIMEOUT_MS
+}
 const CATALOG_TIMEOUT_MS = 15_000
 const CATALOG_TTL_MS = 6 * 60 * 60 * 1000
 const CATALOG_RETRY_MS = 5 * 60 * 1000

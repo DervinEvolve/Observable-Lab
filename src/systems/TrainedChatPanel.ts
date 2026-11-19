@@ -54,6 +54,12 @@ export interface TrainedAdapterView {
   keptBy: string | null
   /** "org/name" of the public dataset its examples were read from, when they were not written by a model. */
   dataFrom: string | null
+  /**
+   * The lab's label for where its training examples came from: "written by
+   * the models" or "public dataset org/name@commit". Only when the server
+   * sends one (LAB_TINKER_ORIGIN_LABELS).
+   */
+  dataOrigin?: string
 }
 
 export interface ChatLimits { maxMessageChars: number; maxTurns: number }
@@ -71,6 +77,13 @@ export interface PanelSection {
 const SLUG = /^e[0-9]{1,6}-[0-9a-f]{8}$/
 /** "org/name@commit", as the server names the public dataset an adapter was trained on. */
 const DATA_FROM = /^([A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96})@[0-9a-f]{40}$/
+/** The two origin labels the server sends. Anything else is not shown. */
+const DATA_ORIGIN = /^(?:written by the models|public dataset (?:[A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96}@[0-9a-f]{40}|\(its stored source cannot be read\)))$/
+
+/** A dataset origin with its commit shortened to twelve characters, for a narrow panel. */
+function shortOrigin(origin: string): string {
+  return origin.replace(/@([0-9a-f]{12})[0-9a-f]{28}$/, '@$1')
+}
 
 function text(v: unknown, max: number): string | null {
   if (typeof v !== 'string') return null
@@ -94,6 +107,7 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
     const epoch = num(o.epoch)
     if (!base || epoch === null) continue
     const expires = typeof o.expires_at === 'string' && !Number.isNaN(Date.parse(o.expires_at)) ? o.expires_at : null
+    const origin = typeof o.origin === 'string' && DATA_ORIGIN.test(o.origin) ? o.origin : null
     out.push({
       slug: o.slug,
       modelId: `lab/${o.slug}`,
@@ -110,6 +124,7 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
       kept: o.kept === true,
       keptBy: o.kept === true ? text(o.kept_by, 60) : null,
       dataFrom: typeof o.data_from === 'string' ? DATA_FROM.exec(o.data_from)?.[1] ?? null : null,
+      ...(origin ? { dataOrigin: origin } : {}),
     })
   }
   return out
@@ -130,9 +145,10 @@ export function parseLimits(raw: unknown): ChatLimits {
  * The lines shown for one adapter: where it came from, and the score the lab
  * measured. A named adapter is titled by its name with its lab id under it;
  * an unnamed one by its lab id alone. `id` is there only for a named adapter
- * and `mark` ("kept") only for a kept one.
+ * and `mark` ("kept") only for a kept one. `label` is the lab's data origin
+ * label, there only when the server sent one.
  */
-export function describeAdapter(a: TrainedAdapterView): { title: string; id?: string; mark?: string; origin: string; score: string; kept: string } {
+export function describeAdapter(a: TrainedAdapterView): { title: string; id?: string; mark?: string; origin: string; label?: string; score: string; kept: string } {
   const score = a.lossBefore !== null && a.lossAfter !== null
     ? `Held-out loss ${a.lossBefore.toFixed(2)} before training, ${a.lossAfter.toFixed(2)} after${a.holdoutExamples ? `, on ${a.holdoutExamples} examples the lab held out` : ''}. Measured by the lab. Lower is better.`
     : 'No held-out score recorded.'
@@ -144,6 +160,7 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
     origin: a.dataFrom
       ? `Epoch ${a.epoch}. Trained on ${a.examples} rows of the public dataset ${a.dataFrom}, chosen by ${a.authorName}. Nobody at the lab has read those rows. Base model ${a.baseModel}.`
       : `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
+    ...(a.dataOrigin ? { label: `Data origin: ${shortOrigin(a.dataOrigin)}.` } : {}),
     score,
     kept: a.kept
       ? `Marked to keep${a.keptBy ? ` by ${a.keptBy}` : ''}.${until ? ` Stays until ${until}.` : ''}`
@@ -430,7 +447,7 @@ export class TrainedChatPanel {
         id.textContent = d.id
         button.appendChild(id)
       }
-      for (const line of [a.purpose, d.origin, d.score, d.kept]) {
+      for (const line of [a.purpose, d.origin, d.label, d.score, d.kept]) {
         if (!line) continue
         const span = document.createElement('span')
         span.textContent = line

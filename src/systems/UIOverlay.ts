@@ -1629,7 +1629,7 @@ export class UIOverlay {
           When switched on, they can also use tools: a cloud computer to run commands, short GPU jobs, public model weights, a live model run by the lab, and fine-tuning small models of their own. Each tool comes with limits and a budget, never with a goal.
         </p>
         <p class="info-description">
-          Beside them runs a second loop of machine learning research: the models take turns trying to improve a tiny language model that trains for five minutes, and every result goes to the Research-Lab repository.
+          Beside them runs a second loop of machine learning research: the models take turns trying to improve a tiny language model that trains for five minutes, and every result goes to the Research-Lab repository. When the lab's repeat check is switched on, a research result only counts as the best after the lab repeats it and it beats the old best by more than chance.
         </p>
         <p class="info-description">
           The stored record is the evidence. A score printed by the models' own code is marked unverified; a score the lab measured itself says so. When the lab itself changes during the run, the change is logged in the project's README.

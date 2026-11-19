@@ -388,6 +388,20 @@ The lab waits 45 seconds for the runner's answer to a promotion. If none comes (
 
 **What is recorded.** On the epoch's row, `research_run.keep_key` (the key the run was started with), `research_run.result.runner_flow` (`keep-1` when the runner made the run with its save step), `research_run.result.checkpoint` (saved or not, why not, size, SHA-256, parameters, the seconds the save says it took and the seconds the copy took) and `research_run.promotion` (kept for visitors or not, when, the runner's reason if not, `refused` when the runner said no, and `attempts` when the lab asked more than once). The epoch's finding page in the research repository gets one line, "Saved model", saying the same. On the Volume, each model's `manifest.json` and, for a kept one, `check.json` with the lab's own sample.
 
+## How a research result is scored
+
+Not a tool either. It is how the lab's own code treats a research run that would become the best, and it is off unless `LAB_RESEARCH_CONFIRM=true`. With it off the research loop is what it was.
+
+With it on, a run the Reviewer kept, whose `val_bpb` is below the best, is run once more by the lab: the same `train.py`, unchanged, through the same runner and harness. It becomes the new best only if the mean of the two scores beats the best by more than the margin, `max(2 x the measured noise, LAB_RESEARCH_MIN_MARGIN)`, which is never more than `LAB_RESEARCH_MAX_MARGIN`. Otherwise it is recorded as within noise, or as not confirmed when the repeat gave no score, and `train.py` stays as it was. The noise is the spread between runs of the same file, from confirmation pairs and from control runs of the current best `train.py`. It is a median, and the margin has a ceiling, because the scores it is measured from are printed by generated code: one wild pair cannot move it, and many cannot lift the margin without limit. The code is `api/_lib/research-confirm.ts`; the owner's side is in [OPERATIONS.md](OPERATIONS.md#scoring-research-results).
+
+**What the research models are told while it is on** (and not at all while it is off): the rule, the margin as it is now and where it comes from, its ceiling, the names of the five new columns in `results.tsv`, and its limits: a repeat tells a lucky run from one that repeats and nothing more, because both scores are printed by `train.py` itself. It is given as a fact about the lab. Nothing in the prompt asks them to do anything about it, and `val_bpb` stays the only thing a run is judged on. The Commentator is also given the lab's verdict in one line for a run that was repeated, so that it narrates what was decided.
+
+**What it does not do.** It does not check that a score is honest. A `train.py` that prints a false score prints it twice.
+
+## Where the training data came from
+
+A label, off unless `LAB_TINKER_ORIGIN_LABELS=true`. With it on, every Tinker training run and trained adapter says where its examples came from: `written by the models` (the model wrote them into its request) or `public dataset <repository>@<commit>` (the lab read them from the [dataset shelf](#public-datasets)). It is shown with the adapter in the chat panel and the adapter lists, stored with the run in `tool_runs`, and summed up in `GET /api/experiment/scoring`: per origin, the count of runs that reached the runner and the median held-out loss before and after training, as the lab measured it. It changes nothing about what is allowed, and the models are told nothing new.
+
 ## Exhibits
 
 `"exhibit": { "slug": "...", "exhibit": { ... } }`. See [EXHIBITS.md](EXHIBITS.md) for the contract, the pull request and how the room reads them. Exhibit pull requests cost no model or compute money beyond AI-Agent's CI.

@@ -55,15 +55,18 @@ interface LedgerRow { epoch: number; val_bpb: number | null; status: 'keep' | 'd
 
 /**
  * One line of results.tsv as the lab writes it (appendResultsRow), or null.
- * A row has 9 columns (before the provenance columns were added), 13, or 14
- * (with runner_flow, from the first run made with the runner's save step), an
- * epoch number, merged or reverted, a score with four decimals or "-", and
- * keep, discard or crash; a kept row was merged and has a score. The header,
- * blank lines and anything else are not rows.
+ * A row has 9 columns (before the provenance columns were added), 13, 14
+ * (with runner_flow, from the first run made with the runner's save step) or
+ * 19 (with the five columns of the lab's repeat, from the first row written
+ * with LAB_RESEARCH_CONFIRM on), an epoch number, merged or reverted, a
+ * score with four decimals or "-", and keep, discard or crash; a kept row
+ * was merged and has a score. The header, blank lines and anything else are
+ * not rows. A kept row the lab confirmed with a repeat counts at the mean of
+ * its two runs, which is what the experiment holds as its best.
  */
 function parseLedgerRow(line: string): LedgerRow | null {
   const cols = line.replace(/\r$/, '').split('\t')
-  if (cols.length !== 9 && cols.length !== 13 && cols.length !== 14) return null
+  if (cols.length !== 9 && cols.length !== 13 && cols.length !== 14 && cols.length !== 19) return null
   if (!/^\d{1,6}$/.test(cols[0])) return null
   if (cols[1] !== 'merged' && cols[1] !== 'reverted') return null
   const status = cols[7]
@@ -71,7 +74,9 @@ function parseLedgerRow(line: string): LedgerRow | null {
   const scored = /^\d{1,3}\.\d{4}$/.test(cols[2])
   if (!scored && cols[2] !== '-') return null
   if (status === 'keep' && (!scored || cols[1] !== 'merged')) return null
-  return { epoch: Number(cols[0]), val_bpb: scored ? Number(cols[2]) : null, status }
+  const confirmedMean = cols.length === 19 && status === 'keep' && cols[18] === 'confirmed' && /^\d{1,3}\.\d{4}$/.test(cols[15])
+    ? Number(cols[15]) : null
+  return { epoch: Number(cols[0]), val_bpb: confirmedMean ?? (scored ? Number(cols[2]) : null), status }
 }
 
 /**
@@ -371,6 +376,8 @@ export async function researchSummary(): Promise<ResearchSummary | null> {
         best_epoch: finite(meta.best_epoch),
         target_bpb: finite(meta.target_bpb),
         last_run: meta.last_run ?? null,
+        // Only when the lab has scored with repeats (LAB_RESEARCH_CONFIRM was on for an epoch).
+        ...(meta.scoring && typeof meta.scoring === 'object' ? { scoring: meta.scoring } : {}),
       }
     }
   } catch (e) {

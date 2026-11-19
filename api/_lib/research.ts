@@ -180,6 +180,25 @@ const RESULTS_HEADER = `${RESULTS_HEADER_V1}\tmetrics_source\tdataset\tharness_s
 // run, "-" for a plain one. A ledger that never sees such a run keeps the
 // header above and its rows keep thirteen columns.
 const RESULTS_HEADER_FLOW = `${RESULTS_HEADER}\trunner_flow`
+// With five more columns for the lab's repeat of a run (research-confirm.ts,
+// LAB_RESEARCH_CONFIRM): the repeat's score, the mean of the two runs, the
+// noise and the margin the verdict used, and the verdict. A ledger gets them
+// the first time a row is written while that switch is on, together with the
+// runner_flow column if it did not have it yet, so there is one such header.
+// From then on every row has nineteen columns; a row whose run was not
+// repeated has "-" in the five. A ledger that never sees the switch keeps
+// the header it has.
+const RESULTS_CONFIRM_COLUMNS = 'repeat_val_bpb\tmean_val_bpb\tnoise_bpb\tmargin_bpb\tconfirm'
+export const RESULTS_HEADER_CONFIRM = `${RESULTS_HEADER_FLOW}\t${RESULTS_CONFIRM_COLUMNS}`
+
+/** What the lab's repeat of a run adds to its row in results.tsv. */
+export interface ResultConfirmColumns {
+  repeat_bpb: number | null
+  mean_bpb: number | null
+  noise_bpb: number | null
+  margin_bpb: number | null
+  verdict: 'confirmed' | 'within_noise' | 'not_confirmed'
+}
 
 // Append one row to results.tsv (read-modify-write; single writer per epoch).
 // Older ledgers get the provenance columns added to their header; their
@@ -201,6 +220,12 @@ export async function appendResultsRow(fields: {
   status: 'keep' | 'discard' | 'crash'
   hypothesis: string
   provenance: ResultProvenance
+  /**
+   * Passed only while LAB_RESEARCH_CONFIRM is on: the lab's repeat of this
+   * run, or null when the run was not repeated. Left out, the ledger and the
+   * row are what they always were.
+   */
+  confirm?: ResultConfirmColumns | null
 }): Promise<boolean> {
   const existing = await getResearchFile('results.tsv')
   let base = existing?.content?.trimEnd() || RESULTS_HEADER
@@ -208,9 +233,14 @@ export async function appendResultsRow(fields: {
   const header = (newline === -1 ? base : base.slice(0, newline)).replace(/\r$/, '')
   const rest = newline === -1 ? '' : base.slice(newline)
   const flow = fields.provenance.runner_flow
-  let withFlow = header === RESULTS_HEADER_FLOW
+  let withConfirm = header === RESULTS_HEADER_CONFIRM
+  let withFlow = withConfirm || header === RESULTS_HEADER_FLOW
   if (!withFlow && header !== RESULTS_HEADER_V1 && header !== RESULTS_HEADER) throw new Error('results.tsv does not start with a known header; not rewriting it')
-  if (!withFlow && flow) {
+  if (!withConfirm && fields.confirm !== undefined) {
+    base = RESULTS_HEADER_CONFIRM + rest
+    withConfirm = true
+    withFlow = true
+  } else if (!withFlow && flow) {
     base = RESULTS_HEADER_FLOW + rest
     withFlow = true
   } else if (header === RESULTS_HEADER_V1) base = RESULTS_HEADER + rest
@@ -235,11 +265,72 @@ export async function appendResultsRow(fields: {
     fields.provenance.harness_sha256 ?? '-',
     fmt(fields.provenance.train_wall_seconds, 1),
     ...(withFlow ? [flow ?? '-'] : []),
+    ...(withConfirm ? [
+      fmt(fields.confirm?.repeat_bpb), fmt(fields.confirm?.mean_bpb), fmt(fields.confirm?.noise_bpb),
+      fmt(fields.confirm?.margin_bpb), fields.confirm?.verdict ?? '-',
+    ] : []),
   ].map(cell => String(cell).replace(/[\t\n\r]/g, ' ')).join('\t')
   if (base.split('\n').some(line => line.replace(/\r$/, '') === row)) return false
   const unverified = fields.provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
+  const repeated = fields.confirm ? `; lab repeat: ${fields.confirm.verdict.replace(/_/g, ' ')}` : ''
   await putResearchFile('results.tsv', base + '\n' + row + '\n',
-    `results: epoch ${fields.epoch} — ${fields.status} (val_bpb ${fmt(fields.val_bpb)}${unverified})\n\n${provenanceTrailers(fields.provenance)}`,
+    `results: epoch ${fields.epoch} — ${fields.status} (val_bpb ${fmt(fields.val_bpb)}${unverified}${repeated})\n\n${provenanceTrailers(fields.provenance)}`,
+    existing?.sha)
+  return true
+}
+
+// The lab's own repeat runs (research-confirm.ts), one row each, in a ledger
+// of their own: a repeat is not a model's epoch and has no row in
+// results.tsv. `kind` is confirm (the repeat of a run that would have become
+// the best; reference is that run's own score, in the same epoch) or control
+// (the best train.py run again unchanged; reference is the best on record
+// and the epoch it came from). The file is made the first time a repeat is
+// written, so a research repository whose lab never repeats a run has none.
+const LAB_REPEATS_HEADER = 'kind\tepoch\ttrain_sha256\tval_bpb\tstatus\treference_bpb\treference_epoch\tmetrics_source\tdataset\tharness_sha256\ttrain_wall_seconds\tcall_id'
+export const LAB_REPEATS_FILE = 'lab-repeats.tsv'
+
+/**
+ * Appends one lab repeat to lab-repeats.tsv. Idempotent like
+ * appendResultsRow: the same row is not written twice, and a file that does
+ * not start with the lab's header is left alone. Returns false when the row
+ * was already there.
+ */
+export async function appendLabRepeatRow(fields: {
+  kind: 'confirm' | 'control'
+  epoch: number
+  train_sha256: string
+  val_bpb: number | null
+  status: string
+  reference_bpb: number | null
+  reference_epoch: number | null
+  provenance: ResultProvenance
+  call_id: string | null
+}): Promise<boolean> {
+  if (!Number.isSafeInteger(fields.epoch) || fields.epoch < 0) throw new Error('appendLabRepeatRow: epoch is not a whole number')
+  const existing = await getResearchFile(LAB_REPEATS_FILE)
+  const base = existing?.content?.trimEnd() || LAB_REPEATS_HEADER
+  if (base.split('\n')[0].replace(/\r$/, '') !== LAB_REPEATS_HEADER) throw new Error(`${LAB_REPEATS_FILE} does not start with the lab's header; not rewriting it`)
+  const fmt = (v: unknown, digits = 4) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '-')
+  const word = (v: unknown, pattern: RegExp) => (typeof v === 'string' && pattern.test(v) ? v : '-')
+  const row = [
+    fields.kind,
+    fields.epoch,
+    word(fields.train_sha256, /^[0-9a-f]{64}$/),
+    fmt(fields.val_bpb),
+    word(fields.status, /^[a-z_]{1,20}$/),
+    fmt(fields.reference_bpb),
+    typeof fields.reference_epoch === 'number' && Number.isSafeInteger(fields.reference_epoch) && fields.reference_epoch >= 0 ? fields.reference_epoch : '-',
+    fields.provenance.metrics_source ?? '-',
+    fields.provenance.dataset ?? '-',
+    fields.provenance.harness_sha256 ?? '-',
+    fmt(fields.provenance.train_wall_seconds, 1),
+    word(fields.call_id, /^[A-Za-z0-9_-]{1,80}$/),
+  ].map(cell => String(cell).replace(/[\t\n\r]/g, ' ')).join('\t')
+  if (base.split('\n').some(line => line.replace(/\r$/, '') === row)) return false
+  const unverified = fields.provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
+  const what = fields.kind === 'confirm' ? `repeat of epoch ${fields.epoch}` : `control after epoch ${fields.epoch}`
+  await putResearchFile(LAB_REPEATS_FILE, base + '\n' + row + '\n',
+    `lab repeat: ${what}, ${word(fields.status, /^[a-z_]{1,20}$/)} (val_bpb ${fmt(fields.val_bpb)}${unverified})\n\n${provenanceTrailers(fields.provenance)}`,
     existing?.sha)
   return true
 }
@@ -272,6 +363,8 @@ export async function writeFindingPage(args: {
   experimentId?: string
   /** One line about the saved model, only for a run that was started with a key (research-talk.ts). */
   checkpointNote?: string
+  /** The lab's repeat of this run in one plain line, only for a run it repeated (research-confirm.ts). */
+  confirmNote?: string
 }): Promise<string | null> {
   const experimentId = args.experimentId?.trim() || undefined
   if (experimentId && !/^[A-Za-z0-9_-]{1,64}$/.test(experimentId)) throw new Error('writeFindingPage: invalid experimentId')
@@ -284,7 +377,12 @@ export async function writeFindingPage(args: {
 - **val_bpb:** ${args.valBpb !== null ? args.valBpb.toFixed(4) : 'no result'} (Δ vs best-at-time: ${delta})
 - **Score source:** ${args.provenance.metrics_source ?? 'none'}${
   args.provenance.metrics_source === 'experiment_stdout_unverified'
-    ? ' (printed by the generated train.py itself; not independently evaluated or repeated)'
+    ? (args.confirmNote
+      ? ' (printed by the generated train.py itself; not independently evaluated)'
+      : ' (printed by the generated train.py itself; not independently evaluated or repeated)')
+    : ''}${
+  args.confirmNote
+    ? `\n- **Lab repeat:** ${args.confirmNote.replace(/[\r\n]+/g, ' ').slice(0, 600)}. Both scores were printed by the generated train.py and are unverified: a repeat checks luck, not honesty`
     : ''}
 - **Dataset:** ${args.provenance.dataset ?? 'unknown'}
 - **Harness SHA-256:** ${args.provenance.harness_sha256 ? '`' + args.provenance.harness_sha256 + '`' : 'unknown'}
@@ -487,8 +585,15 @@ export async function startResearchRun(trainPy: string, budgetS: number, keepKey
   return data.call_id as string
 }
 
+/**
+ * `reported` is set on a failure only when the runner itself answered that
+ * the call failed or that its result is gone. A failure without it means the
+ * status endpoint could not be read (a gateway error, an answer that is not
+ * the runner's), which says nothing about the run. The lab's own repeats
+ * (research-confirm.ts) tell the two apart; an epoch's own run does not.
+ */
 export async function pollResearchRun(callId: string): Promise<
-  { status: 'running' } | { status: 'done'; result: ResearchRunResult } | { status: 'failed'; error: string }
+  { status: 'running' } | { status: 'done'; result: ResearchRunResult } | { status: 'failed'; error: string; reported?: true }
 > {
   const url = new URL(runnerStatusUrl())
   url.searchParams.set('call_id', callId)
@@ -496,7 +601,7 @@ export async function pollResearchRun(callId: string): Promise<
   if (!res.ok) return { status: 'failed', error: `status endpoint HTTP ${res.status}` }
   const data = await res.json()
   if (data.status === 'done') return { status: 'done', result: sanitizeRunResult(data.result) }
-  if (data.status === 'failed') return { status: 'failed', error: String(data.error || 'unknown') }
+  if (data.status === 'failed') return { status: 'failed', error: String(data.error || 'unknown'), reported: true }
   if (data.status === 'running') return { status: 'running' }
   return { status: 'failed', error: 'Runner returned an invalid status' }
 }
