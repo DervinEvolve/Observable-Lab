@@ -342,7 +342,8 @@ function readExample(raw: unknown, i: number): { example: TinkerExample; bytes: 
   return { example: { messages }, bytes }
 }
 
-function readSettings(raw: unknown): { settings: TinkerSettings } | { error: string } {
+/** The bounded settings of a run, read strictly. Also used for a request that names a shelf dataset (datasets.ts). */
+export function readSettings(raw: unknown): { settings: TinkerSettings } | { error: string } {
   const s = raw === undefined || raw === null ? {} : raw
   if (!isPlainObject(s)) return { error: 'settings is not an object' }
   const extra = onlyKeys(s, ['rank', 'learning_rate', 'epochs', 'batch_size'])

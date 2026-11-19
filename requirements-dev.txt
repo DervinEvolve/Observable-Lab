@@ -3,3 +3,7 @@
 # torch and the training stack are not needed here.
 fastapi==0.162.0
 httpx==0.28.1
+# tests/test_datasets.py reads real parquet and arrow files through the
+# dataset reader (modal/datasets.py), which uses the same pinned pyarrow on
+# Modal. Without it that one test is skipped.
+pyarrow==26.0.1

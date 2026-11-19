@@ -12,6 +12,10 @@
  * reached through the same two endpoints with the same token:
  * runWeightsFetch asks for a public repository, and runGpuJob can name
  * fetched weights for the job's sandbox to read.
+ *
+ * A job may also name a dataset from the lab's dataset shelf (datasets.ts).
+ * That shelf is filled by another Modal app; this one only mounts the named
+ * entry, read-only, in the job's sandbox.
  */
 import { requireEnv, requireHttpsUrl } from './config.js'
 import { GPU_JOB_MAX_S, GPU_JOB_SCRIPT_MAX_CHARS, modalGpuUsdPerSecond } from './tools-config.js'
@@ -20,6 +24,7 @@ import {
   estimateWeightsFetchCost, normalizeFetchResult, normalizeMounted, weightsLimits, weightsWaitMs,
   type MountedWeights, type WeightsFetchResult, type WeightsRef, type WeightsRequest,
 } from './weights.js'
+import { datasetsLimits, normalizeMountedDataset, type DatasetRef, type MountedDataset } from './datasets.js'
 
 const REQUEST_TIMEOUT_MS = 30_000
 /** Seconds charged when the job's real time never came back. */
@@ -56,6 +61,11 @@ export interface GpuJobResult {
   cost_usd: number
   /** The public weights the sandbox had mounted, as the controller reported them; null when it had none. */
   weights: MountedWeights | null
+  /**
+   * Only on a job that named a dataset: the public dataset its sandbox had
+   * mounted, as the controller reported it, or null when it had none.
+   */
+  dataset?: MountedDataset | null
 }
 
 function authHeaders(): Record<string, string> {
@@ -86,7 +96,8 @@ export function normalizeJobResult(raw: unknown): GpuJobResult {
   // The same when the weights it named were not on the shelf (stage "weights").
   // Stage "mount" (the sandbox could not read them) did start one, and is
   // charged for its time like any other job.
-  const noGpu = r.stage === 'syntax' || r.stage === 'input' || r.stage === 'weights'
+  // Stage "dataset" is the same for a named dataset that is not on its shelf.
+  const noGpu = r.stage === 'syntax' || r.stage === 'input' || r.stage === 'weights' || r.stage === 'dataset'
   const cost = noGpu ? estimateGpuCost(Math.min(wall ?? 1, 5)) : estimateGpuCost(wall)
   return {
     status,
@@ -99,6 +110,8 @@ export function normalizeJobResult(raw: unknown): GpuJobResult {
     error: typeof r.error === 'string' ? r.error.slice(0, 1500) : undefined,
     cost_usd: cost,
     weights: normalizeMounted(r.weights),
+    // The controller sends this field only for a job that named a dataset.
+    ...(r.dataset !== undefined ? { dataset: normalizeMountedDataset(r.dataset) } : {}),
   }
 }
 
@@ -157,9 +170,10 @@ async function callJobsApp(body: Record<string, unknown>, pollMs: number, maxWai
  *
  * `weights` names public weights from the lab's shelf for the sandbox to
  * read at /weights. It is sent only when given, so a job without it is the
- * same request as before.
+ * same request as before. `dataset` names a public dataset from the lab's
+ * dataset shelf for the sandbox to read at /datasets, and is sent the same way.
  */
-export async function runGpuJob(script: string, opts: { pollMs?: number; maxWaitMs?: number; weights?: WeightsRef } = {}): Promise<GpuJobResult> {
+export async function runGpuJob(script: string, opts: { pollMs?: number; maxWaitMs?: number; weights?: WeightsRef; dataset?: DatasetRef } = {}): Promise<GpuJobResult> {
   const pollMs = opts.pollMs ?? 5000
   const maxWaitMs = opts.maxWaitMs ?? gpuJobWaitMs()
   const failed = (error: string, cost: number): GpuJobResult => ({
@@ -168,6 +182,7 @@ export async function runGpuJob(script: string, opts: { pollMs?: number; maxWait
   try { assertNoSecrets([script]) } catch { return failed('refusing to send a server credential into a GPU job', 0) }
   const body: Record<string, unknown> = { script }
   if (opts.weights) body.weights = { ...opts.weights, licenses: weightsLimits().licenses }
+  if (opts.dataset) body.dataset = { ...opts.dataset, licenses: datasetsLimits().licenses }
   const call = await callJobsApp(body, pollMs, maxWaitMs)
   // Not known to have started: nothing charged.
   if (call.state === 'not_started') return failed(call.error, 0)

@@ -248,6 +248,11 @@ export interface TinkerRunRow {
   created_at: string
   /** The name its author gave the adapter, when names were on and the name was free. */
   display_name: string | null
+  /**
+   * Only on a run whose examples the lab read from a shelf dataset
+   * (datasets.ts): the repository, commit, file, columns and row counts.
+   */
+  dataset_source?: Record<string, unknown>
 }
 
 function json(v: unknown): Record<string, unknown> | null {
@@ -290,7 +295,33 @@ function runRow(row: Record<string, unknown>): TinkerRunRow {
     expires_at: iso(row.expires_at),
     created_at: iso(row.created_at) ?? '',
     display_name: row.display_name ? String(row.display_name).slice(0, 40) : null,
+    ...(json(row.dataset_source) ? { dataset_source: json(row.dataset_source) as Record<string, unknown> } : {}),
   }
+}
+
+let datasetColumnReady: Promise<void> | null = null
+/**
+ * What training on a shelf dataset adds to the database: one column on
+ * tinker_runs for where the examples came from. It is added the first time
+ * such a run is opened, so a lab that never uses datasets never has it.
+ */
+export function ensureTinkerDatasetColumn(): Promise<void> {
+  if (!datasetColumnReady) {
+    datasetColumnReady = (async () => {
+      await ensureTinkerTables()
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS dataset_source JSONB`
+    })().catch(e => {
+      datasetColumnReady = null
+      throw e
+    })
+  }
+  return datasetColumnReady
+}
+
+/** Writes where a run's examples came from onto its row. Throws when it could not be stored. */
+export async function setRunDatasetSource(runId: string, source: Record<string, unknown>): Promise<void> {
+  await ensureTinkerDatasetColumn()
+  await sql`UPDATE tinker_runs SET dataset_source = ${JSON.stringify(source)} WHERE id = ${runId}`
 }
 
 /**
@@ -468,6 +499,8 @@ export interface TrainedAdapter {
   expires_at: string | null
   /** The display name its author gave it. A label: the adapter is still addressed by its slug. Absent when it has none. */
   name?: string
+  /** Only for an adapter trained on rows the lab read from a public dataset: "org/name@commit". */
+  data_from?: string
   /** Present, and true, only for an adapter that is marked to keep. */
   kept?: true
   kept_at?: string
@@ -499,6 +532,7 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
     // The fields below exist only for an adapter that has a name or is marked
     // to keep, so a lab that uses neither sends exactly what it always sent.
     ...(name ? { name } : {}),
+    ...(dataFrom(row) ? { data_from: dataFrom(row) as string } : {}),
     ...(kept ? {
       kept: true as const,
       ...(kept.kept_at ? { kept_at: kept.kept_at } : {}),
@@ -506,6 +540,13 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
       ...(kept.reason ? { kept_reason: sanitizeOutput(kept.reason).slice(0, 200) } : {}),
     } : {}),
   }
+}
+
+/** "org/name@commit" of the public dataset a run's examples were read from, or null. */
+export function dataFrom(row: Pick<TinkerRunRow, 'dataset_source'>): string | null {
+  const s = row.dataset_source
+  if (!s || typeof s.repo !== 'string' || typeof s.sha !== 'string') return null
+  return /^[A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96}$/.test(s.repo) && /^[0-9a-f]{40}$/.test(s.sha) ? `${s.repo}@${s.sha}` : null
 }
 
 /**

@@ -229,6 +229,124 @@ What that does not fix, because it was already so before this tool: a GPU job's 
 
 **Turning it off.** Set `LAB_ENABLE_WEIGHTS` to anything but `true` and redeploy Vercel. The models are no longer told about it, requests for weights are ignored, and GPU jobs get no volume and no label. The shelf stays where it is until I delete it.
 
+## Public datasets
+
+`LAB_ENABLE_DATASETS` (default false) lets the Executor ask for one public Hugging Face dataset repository per epoch. My own fetcher on Modal checks it and downloads its data files onto a shelf. A GPU job that names it reads it read-only at `/datasets` with the network still blocked, and a Tinker training request may take its examples from two columns of one of its files instead of writing them inline. What is checked, and why, is in [TOOLS.md](TOOLS.md#public-datasets). With the flag off nothing changes: no prompt text, no request to Modal, a GPU job and a training run are sent exactly as before, `"datasets"` in an answer is an unknown tool and `"dataset"` in a training request is an unknown field.
+
+It needs GPU jobs or Tinker training switched on, since those are the two things that can read a dataset. With neither on, the tool stays off and says so in the log. There is no Hugging Face token anywhere, and the Tinker key is not part of this: the reader has no secret at all, and `modal/tinker_jobs.py` is not changed and needs no deploy.
+
+**What exists after these steps.** One new Modal app, `oblab-datasets` (`modal/datasets.py`), with five functions: `fetch_dataset` (the only one with the network), `describe_files` and `read_rows` (no network, no secrets, the shelf read-only), and the `start` and `status` endpoints. One new Volume, `oblab-datasets` (the shelf), and one new Dict, `oblab-datasets-use` (when each entry was last used). One new Modal secret, `oblab-datasets-auth`, holding `JOBS_TOKEN`, which only lets the lab server reach the two endpoints. `modal/gpu_jobs.py` changes too: it can now mount one shelf entry in a job's sandbox.
+
+**1. The Modal secret.** From my Mac:
+
+```
+JOBS_TOKEN=$(openssl rand -hex 32)
+modal secret create oblab-datasets-auth JOBS_TOKEN="$JOBS_TOKEN"
+echo "$JOBS_TOKEN"   # this one goes in Vercel as DATASETS_TOKEN
+unset JOBS_TOKEN
+```
+
+**2. Deploy the two Modal apps.** From this repository. The datasets app first, because it creates the Volume the GPU jobs app only looks up:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/datasets.py
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/gpu_jobs.py
+```
+
+The first prints two endpoint URLs; they go in Vercel as `DATASETS_START_URL` and `DATASETS_STATUS_URL`. Its first deploy builds the reader's image (pyarrow 26.0.1). The second keeps the GPU jobs URLs it had; its first deploy builds one more image, the GPU job image with pyarrow added, which only a job that names a dataset runs in. A plain GPU job, and one that names weights, run in the image they always had.
+
+**3. Check it by hand before any model can use it.** These calls go straight to the Modal endpoints. Each token is read into a shell variable without being shown or saved in the shell history. The two URLs in the first block are the ones the deploy printed.
+
+```
+read -s DATASETS_TOKEN
+DSTART=https://...the start URL modal/datasets.py printed...
+DSTATUS=https://...the status URL modal/datasets.py printed...
+
+# a) Fetch a small public dataset (one 8 MB .json file, cc-by-4.0).
+curl -sS -X POST "$DSTART" -H "Authorization: Bearer $DATASETS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fetch_dataset":{"repo":"sahil2801/CodeAlpaca-20k"}}'
+# prints {"call_id":"fc-..."}; poll it until status is "done". Every call below prints its own
+# call_id, and each is polled the same way with that id:
+curl -sS "$DSTATUS?call_id=fc-..." -H "Authorization: Bearer $DATASETS_TOKEN"
+
+# b) A dataset under a license that is not on my list must be refused.
+curl -sS -X POST "$DSTART" -H "Authorization: Bearer $DATASETS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fetch_dataset":{"repo":"HuggingFaceH4/no_robots"}}'
+curl -sS "$DSTATUS?call_id=fc-..." -H "Authorization: Bearer $DATASETS_TOKEN"
+
+# c) A gated dataset must be refused.
+curl -sS -X POST "$DSTART" -H "Authorization: Bearer $DATASETS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fetch_dataset":{"repo":"mozilla-foundation/common_voice_11_0"}}'
+curl -sS "$DSTATUS?call_id=fc-..." -H "Authorization: Bearer $DATASETS_TOKEN"
+
+# d) My limits reach the fetcher: with a 0.001 GB limit the same small dataset is refused for its size.
+curl -sS -X POST "$DSTART" -H "Authorization: Bearer $DATASETS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"fetch_dataset":{"repo":"sahil2801/CodeAlpaca-20k","limits":{"max_gb":0.001}}}'
+curl -sS "$DSTATUS?call_id=fc-..." -H "Authorization: Bearer $DATASETS_TOKEN"
+
+# e) The reader: 20 rows, two columns mapped into chat examples.
+curl -sS -X POST "$DSTART" -H "Authorization: Bearer $DATASETS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"read_rows":{"repo":"sahil2801/CodeAlpaca-20k","user_column":"instruction","assistant_column":"output","limit":20}}'
+curl -sS "$DSTATUS?call_id=fc-..." -H "Authorization: Bearer $DATASETS_TOKEN"
+
+# f) A column that is not there must be refused, not guessed.
+curl -sS -X POST "$DSTART" -H "Authorization: Bearer $DATASETS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"read_rows":{"repo":"sahil2801/CodeAlpaca-20k","user_column":"prompt","assistant_column":"output","limit":20}}'
+curl -sS "$DSTATUS?call_id=fc-..." -H "Authorization: Bearer $DATASETS_TOKEN"
+unset DATASETS_TOKEN
+
+read -s JOBS_TOKEN
+START=https://dervinevolve--oblab-gpu-jobs-start.us-east.modal.run
+STATUS=https://dervinevolve--oblab-gpu-jobs-status.us-east.modal.run
+
+# g) A GPU job that names the dataset: it must see it, fail to write, and have no network.
+curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"dataset":{"repo":"sahil2801/CodeAlpaca-20k"},"script":"import json, os, urllib.request\nprint(sorted(os.listdir(\"/datasets\")))\nprint(len(json.load(open(\"/datasets/code_alpaca_20k.json\"))), \"rows\")\ntry:\n    open(\"/datasets/x\", \"w\")\n    print(\"WRITABLE\")\nexcept OSError as e:\n    print(\"read-only:\", e)\ntry:\n    urllib.request.urlopen(\"https://huggingface.co\", timeout=5)\n    print(\"NETWORK OPEN\")\nexcept Exception as e:\n    print(\"network blocked:\", type(e).__name__)\n"}'
+curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
+
+# h) A plain job, with no dataset: there must be no /datasets at all.
+#    This is the path every GPU job takes today, so it also shows the redeploy left plain jobs working.
+curl -sS -X POST "$START" -H "Authorization: Bearer $JOBS_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"script":"import os\nprint(os.path.exists(\"/datasets\"), os.path.exists(\"/weights\"))\n"}'
+curl -sS "$STATUS?call_id=fc-..." -H "Authorization: Bearer $JOBS_TOKEN"
+
+unset JOBS_TOKEN
+modal volume ls oblab-datasets sahil2801/CodeAlpaca-20k
+```
+
+What I expect: (a) ends with `"status":"ok","cached":false`, a 40 character `sha`, `"files":1`, `"rows":20022` and a `data_files` entry with the columns `instruction`, `input` and `output`; asking again gives `"cached":true`. (b) ends with `"status":"refused","rule":"license"`. (c) ends with `"status":"refused","rule":"not_public"`, because without a token a gated dataset looks like one that is not there. (d) ends with `"status":"refused","rule":"size"`. (e) ends with `"status":"ok","rows_used":20,"stopped":"limit"` and 20 examples, each a user message and an assistant message. (f) ends with `"status":"refused","rule":"columns"`. (g) prints `['_lab_manifest.json', 'code_alpaca_20k.json']`, `20022 rows`, a `read-only:` line and a `network blocked:` line, and its result has `"dataset":{"repo":"sahil2801/CodeAlpaca-20k",...}`. (h) prints `False False`, ends with `"status":"ok"` and has no `dataset` field at all.
+
+If (g) prints `WRITABLE` or `NETWORK OPEN`, or fails at stage `sandbox` or `mount`, leave the flag off. If (h) fails, plain GPU jobs are broken too: deploy `modal/gpu_jobs.py` from the commit before this feature again. If (a) is `ok` but its `rows` is null, or (e) fails at stage `reader`, the reader's two settings are the first thing to look at (see the next paragraph).
+
+**What I have and have not run.** I ran the fetcher's rules, its download and hash checks, the row counting and the column mapping against the live Hugging Face API from a development machine, without Modal: the dataset in (a) was fetched and read, and the ones in (b) and (c) were refused as written above. I have not run any of this on Modal. Untested there: the fetch function and the Volume; the fetcher calling `describe_files` after a commit; the reader functions running with `block_network=True`, `restrict_modal_access=True` and one container per call (if Modal refuses a function with those settings, or the reader cannot return its result under them, remove `restrict_modal_access=True` from the two decorators in `modal/datasets.py` first and say so here); the read-only mount of one dataset entry into a GPU job's sandbox; and the second sandbox image with pyarrow. Step 3 is that test.
+
+**4. Turn it on in Vercel.** Set these for Production and redeploy:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LAB_ENABLE_DATASETS` | false | The switch. Only the exact value `true` turns it on. |
+| `DATASETS_START_URL` | none | The `start` endpoint Modal printed for `modal/datasets.py`. An `https://` URL with no query string. |
+| `DATASETS_STATUS_URL` | none | The `status` endpoint. |
+| `DATASETS_TOKEN` | none | The value from step 1. Mark it Sensitive. |
+| `LAB_DATASETS_PER_DAY` | 2 | Requests for a dataset per UTC day, 0 to 20. A shelf hit and a refusal count; a skipped request does not. |
+| `LAB_DATASETS_LICENSES` | apache-2.0, mit, cc-by-4.0, cc-by-sa-4.0, cc0-1.0, odc-by, bsd-3-clause | Comma separated license ids as Hugging Face writes them. The defaults apply only when it is not set. An entry that is not an id is left out, and if none is left the tool is off; it never falls back to the defaults. |
+| `LAB_DATASETS_MAX_GB` | 1 | Largest download, in GB of 10^9 bytes. The Modal side never allows more than 20. |
+| `LAB_DATASETS_SHELF_GB` | 20 | Size of the shelf before the least recently used entries are removed. Never more than 200. |
+| `LAB_DATASETS_POLL_MAX_MS` | 180000 | How long an epoch waits for a fetch, at most 300000. |
+| `LAB_DATASETS_READ_POLL_MAX_MS` | 150000 | How long the follow-up waits for the reader before a training run on a dataset is given up, at most 240000. |
+
+The limits are read by the server and sent to the fetcher with each request, so changing one needs a Vercel redeploy and no Modal deploy. The next epoch's prompts show the new numbers. The row limits for a training run (6,000 bytes an example, 120,000 in all, 10 to 2,000 rows) are not settings: they are the Tinker tool's own limits, written in `api/_lib/tinker.ts` and again in `modal/datasets.py`, and a test holds the two files to each other.
+
+**Spend.** A fetch is written to `model_calls` as `tool/datasets` and a read for a training run as `tool/dataset_rows`, both estimates from measured time at `LAB_MODAL_GPU_USD_PER_SECOND` (about ten times Modal's CPU price, so they err high), and both count against `LAB_DAILY_BUDGET_USD`. A fetch's worst case, 960 s or about $0.29, is checked against the budget before it starts. A training run on a dataset is checked twice: before the read, against the most the limits would let such a run cost plus the read; and after it, against the estimate made from the rows that were really read. That second estimate is what is set aside under `LAB_TINKER_DAILY_USD`, and a run over `LAB_TINKER_RUN_USD` is refused, exactly as for inline examples. Volume storage is billed by Modal and is not in the ledger.
+
+**The database.** The first training run on a dataset adds one column, `tinker_runs.dataset_source` (JSONB). Nothing else changes, and a lab that never trains on a dataset never has it.
+
+**A dataset in use is not evicted.** An entry that was fetched, asked for, read or named by a job in the last 300 s is not removed to make room. A fetch that could only fit by removing one is refused with rule `shelf`.
+
+**The shelf by hand.** `modal volume ls oblab-datasets` lists it, and `modal volume get oblab-datasets <org>/<name>/<sha>/_lab_manifest.json -` prints one manifest. `modal volume rm -r oblab-datasets <org>/<name>` removes one dataset, and `modal volume delete oblab-datasets` removes everything (the next deploy of `modal/datasets.py` creates an empty one). Narrowing `LAB_DATASETS_LICENSES` does not delete what is already there, but a job or a training run that names a dataset whose license is no longer on the list is not started.
+
+**Turning it off.** Set `LAB_ENABLE_DATASETS` to anything but `true` and redeploy Vercel. The models are no longer told about it, requests for datasets are ignored, GPU jobs get no `/datasets`, and a training request that names a dataset is refused as an unknown field. Adapters already trained on a dataset keep their record. The shelf stays where it is until I delete it.
+
 ## The lab model endpoint
 
 `LAB_ENABLE_LIVE_MODEL` (default false) lets code that a model runs in its own Sprite session make a real model call. I am the host: the lab serves an OpenAI-compatible endpoint at `<origin>/api/live-model/v1`, and it forwards the call to OpenRouter with my key. The models never see that key. What they get is a scoped key that the lab makes for one Sprite session and takes away when the session ends. [TOOLS.md](TOOLS.md#the-lab-model-endpoint) has the details of what a key can do and what a request may contain.

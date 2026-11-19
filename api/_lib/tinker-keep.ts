@@ -104,7 +104,8 @@ export function keepManifest(run: TinkerRunRow, keep: Pick<KeepRow, 'kept_by' | 
     epoch: run.epoch,
     author_model: run.model,
     purpose: run.purpose,
-    dataset: { sha256: run.dataset_sha256, examples: run.dataset_examples, bytes: run.dataset_bytes },
+    // `source` is there only for a run whose examples the lab read from a public dataset.
+    dataset: { sha256: run.dataset_sha256, examples: run.dataset_examples, bytes: run.dataset_bytes, ...(run.dataset_source ? { source: run.dataset_source } : {}) },
     settings: run.settings,
     measured_by_the_lab: {
       what: 'mean cross-entropy per trained token on examples the lab held out; lower is better',

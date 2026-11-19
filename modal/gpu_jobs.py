@@ -35,12 +35,19 @@
 #   the controller reads the entry's manifest inside the sandbox before the
 #   script runs, so a result never names weights the job could not read.
 #
+# Public datasets (docs/TOOLS.md, "Public datasets"). The lab's dataset shelf
+# is another Modal Volume, "oblab-datasets", filled by the lab's own fetcher in
+# modal/datasets.py. A job that names a dataset gets that one entry mounted
+# read-only at /datasets, under the same rules as weights: found before any GPU
+# starts, its manifest read inside the sandbox before the script is there, the
+# network still blocked. A job that names none never touches that Volume.
+#
 # Deploy:  modal deploy modal/gpu_jobs.py
 # Secret:  modal secret create oblab-gpu-jobs-auth JOBS_TOKEN=<random, 32+ chars>
 #          (the same value goes in the lab server's GPU_JOBS_TOKEN)
 #
 # HTTP API (for the Vercel backend), Authorization: Bearer <JOBS_TOKEN> on both:
-#   POST /start   {script, weights?: {repo, sha?, licenses?}}        -> {call_id}
+#   POST /start   {script, weights?: {repo, sha?, licenses?}, dataset?: {repo, sha?, licenses?}} -> {call_id}
 #   POST /start   {fetch_weights: {repo, revision?, limits?}}        -> {call_id}
 #   GET  /status  ?call_id=...   -> {status: running} | {status: done, result} | {status: failed, error}
 #
@@ -48,6 +55,8 @@
 #                run_seconds, wall_seconds, gpu, weights: null | {repo, sha, license}}
 #               stage "weights": the named weights are not on the shelf, no GPU started;
 #               stage "mount": the sandbox could not read them, the script was not run
+#               a job that named a dataset also carries dataset: null | {repo, sha, license};
+#               stage "dataset": the named dataset is not on the shelf, no GPU started
 # fetch result: {status: ok, cached, repo, sha, license, size_bytes, files, evicted, wall_seconds}
 #             | {status: refused, rule, reason, wall_seconds}
 #             | {status: error, stage, error, wall_seconds}
@@ -106,6 +115,10 @@ LICENSE_PATTERN = r"[a-z0-9][a-z0-9.+-]{0,39}"
 SAFE_PATH_PATTERN = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}(?:/[A-Za-z0-9][A-Za-z0-9._-]{0,99}){0,3}"
 ALLOWED_SUFFIXES = (".safetensors", ".json", ".txt")
 TOKENIZER_FILES = ("tokenizer.model", "spiece.model", "sentencepiece.bpe.model")
+# Public datasets: the shelf modal/datasets.py fills, laid out like the weights shelf.
+DATASETS_VOLUME_NAME = "oblab-datasets"
+DATASETS_USE_DICT_NAME = "oblab-datasets-use"
+DATASETS_MOUNT = "/datasets"                  # read-only; one entry, in a job's sandbox
 
 app = modal.App(APP_NAME)
 
@@ -125,6 +138,11 @@ image = (
     # the file imports fastapi: without this line run_job never started.
     .pip_install("fastapi==0.162.0")
 )
+
+# The sandbox of a job that names a public dataset: the same image with
+# pyarrow added, so the job's script can read parquet and arrow files. A job
+# that names no dataset runs in `image`, exactly as before.
+data_image = image.pip_install("pyarrow==26.0.1")
 
 web_image = modal.Image.from_registry(PYTHON_BASE_IMAGE).pip_install("fastapi[standard]==0.162.0")
 
@@ -541,6 +559,31 @@ def shelf_lookup(ref, manifest_at, shas_of) -> dict:
     return {"ok": True, "repo": repo, "sha": manifest["sha"], "license": manifest["license"], "size_bytes": manifest["size_bytes"]}
 
 
+def dataset_lookup(ref, manifest_at, shas_of) -> dict:
+    """Which entry of the dataset shelf a job means by {repo, sha?, licenses?}: that
+    commit, or the newest one fetched for the repository. The dataset shelf is laid
+    out like the weights shelf and its manifests carry the same fields, so the rule
+    is the same one; only the words differ."""
+    if not isinstance(ref, dict) or not valid_repo_id(ref.get("repo")):
+        return {"ok": False, "error": "a dataset must be named as org/name"}
+    repo, sha = ref["repo"], ref.get("sha")
+    if sha is not None and (not isinstance(sha, str) or re.fullmatch(SHA_PATTERN, sha) is None):
+        return {"ok": False, "error": "the dataset commit must be a 40 character sha"}
+    candidates = [sha] if sha else [s for s in shas_of(repo) if isinstance(s, str) and re.fullmatch(SHA_PATTERN, s)]
+    found = []
+    for candidate in candidates[:50]:
+        manifest = manifest_at(repo, candidate)
+        if valid_manifest(manifest) and manifest["repo"] == repo and manifest["sha"] == candidate:
+            found.append(manifest)
+    if not found:
+        return {"ok": False, "error": f"{repo} is not on the lab's dataset shelf; ask for it with the datasets tool first"}
+    manifest = max(found, key=lambda m: m.get("fetched_at_unix") if isinstance(m.get("fetched_at_unix"), (int, float)) else 0)
+    allowed = ref.get("licenses")
+    if isinstance(allowed, list) and any(name not in allowed for name in manifest["licenses"]):
+        return {"ok": False, "error": f"{repo} is on the dataset shelf under a license ({manifest['license'][:60]}) that is no longer on the lab's list"}
+    return {"ok": True, "repo": repo, "sha": manifest["sha"], "license": manifest["license"], "size_bytes": manifest["size_bytes"]}
+
+
 # ---------------------------------------------------------------------------
 # Public weights: the network and the shelf. Only fetch_weights uses these.
 # ---------------------------------------------------------------------------
@@ -624,6 +667,32 @@ def _volume_shas(repo):
         return []
 
 
+# The dataset shelf. Its handles are made only when a job names a dataset, so
+# a job that names none never asks Modal for that Volume or its Dict. The
+# Volume is not created from here: if modal/datasets.py was never deployed
+# there is nothing to find, and the job is told the dataset is not there.
+def _datasets_volume():
+    return modal.Volume.from_name(DATASETS_VOLUME_NAME)
+
+
+def _datasets_use():
+    return modal.Dict.from_name(DATASETS_USE_DICT_NAME, create_if_missing=True)
+
+
+def _dataset_manifest(repo, sha):
+    try:
+        return json.loads(b"".join(_datasets_volume().read_file(f"{repo}/{sha}/{MANIFEST_NAME}")))
+    except Exception:
+        return None
+
+
+def _dataset_shas(repo):
+    try:
+        return [entry.path.rstrip("/").rsplit("/", 1)[-1] for entry in _datasets_volume().listdir(repo)]
+    except Exception:
+        return []
+
+
 @app.function(image=web_image, volumes={SHELF_DIR: weights_volume}, timeout=FETCH_TIMEOUT_S, retries=0,
               max_containers=1, cpu=(1, 2), memory=(1024, 4096))
 def fetch_weights(repo: str, revision: str = "main", limits: Optional[dict] = None) -> dict:
@@ -645,22 +714,36 @@ def fetch_weights(repo: str, revision: str = "main", limits: Optional[dict] = No
 
 
 @app.function(image=image, timeout=JOB_TIMEOUT_S + 180, retries=0, max_containers=2, cpu=(1, 2), memory=(1024, 4096))
-def run_job(script: str, weights: Optional[dict] = None) -> dict:
+def run_job(script: str, weights: Optional[dict] = None, dataset: Optional[dict] = None) -> dict:
     """Run one job. Returns a result for every outcome; never raises for job failures.
 
     `weights` is {repo, sha?, licenses?} when the job names public weights
     from the shelf. Every result says what was mounted: "weights" is
     {repo, sha, license}, or None when the sandbox had no volume at all.
+
+    `dataset` is {repo, sha?, licenses?} when the job names a public dataset
+    from the dataset shelf. The result of such a job also carries "dataset":
+    {repo, sha, license}, or None when the sandbox did not have it. A job
+    that names no dataset has no such field and never touches that shelf.
     """
     t0 = time.time()
+    # What the result of a job that named a dataset reports. It stays None
+    # until the sandbox itself has read that entry's manifest (below).
+    data_mounted = None
+
+    def done(result):
+        if dataset is not None:
+            result["dataset"] = data_mounted
+        return result
+
     if not isinstance(script, str) or not script.strip() or len(script) > MAX_SCRIPT_CHARS:
-        return {"status": "error", "stage": "input", "error": "script missing or too long",
-                "exit_code": None, "log_tail": "", "wall_seconds": time.time() - t0, "gpu": None, "weights": None}
+        return done({"status": "error", "stage": "input", "error": "script missing or too long",
+                     "exit_code": None, "log_tail": "", "wall_seconds": time.time() - t0, "gpu": None, "weights": None})
     syntax_error = _check_script(script)
     if syntax_error is not None:
-        return {"status": "crash", "stage": "syntax",
-                "error": f"the script does not compile; no GPU was started. {syntax_error}",
-                "exit_code": None, "log_tail": syntax_error, "wall_seconds": time.time() - t0, "gpu": None, "weights": None}
+        return done({"status": "crash", "stage": "syntax",
+                     "error": f"the script does not compile; no GPU was started. {syntax_error}",
+                     "exit_code": None, "log_tail": syntax_error, "wall_seconds": time.time() - t0, "gpu": None, "weights": None})
 
     # Named weights: found on the shelf before any GPU starts, and then that
     # one entry (nothing else on the shelf) is mounted read-only. Without a
@@ -674,8 +757,16 @@ def run_job(script: str, weights: Optional[dict] = None) -> dict:
     if weights is not None:
         found = shelf_lookup(weights, _volume_manifest, _volume_shas)
         if not found["ok"]:
-            return {"status": "error", "stage": "weights", "error": f"no GPU was started. {found['error']}",
-                    "exit_code": None, "log_tail": "", "wall_seconds": time.time() - t0, "gpu": None, "weights": None}
+            return done({"status": "error", "stage": "weights", "error": f"no GPU was started. {found['error']}",
+                         "exit_code": None, "log_tail": "", "wall_seconds": time.time() - t0, "gpu": None, "weights": None})
+    # A named dataset, the same way: found on its shelf before any GPU starts.
+    data_found = None
+    if dataset is not None:
+        data_found = dataset_lookup(dataset, _dataset_manifest, _dataset_shas)
+        if not data_found["ok"]:
+            return done({"status": "error", "stage": "dataset", "error": f"no GPU was started. {data_found['error']}",
+                         "exit_code": None, "log_tail": "", "wall_seconds": time.time() - t0, "gpu": None, "weights": None})
+    if found is not None:
         sandbox_extra = {"volumes": {WEIGHTS_MOUNT: weights_volume.with_mount_options(
             read_only=True, sub_path=f"/{found['repo']}/{found['sha']}")}}
         sandbox_env["LAB_WEIGHTS_DIR"] = WEIGHTS_MOUNT
@@ -683,12 +774,21 @@ def run_job(script: str, weights: Optional[dict] = None) -> dict:
             weights_use[f"{found['repo']}@{found['sha']}"] = time.time()
         except Exception:
             pass  # only the shelf's least-recently-used order depends on it
+    if data_found is not None:
+        # That one entry of the dataset shelf, read-only, and nothing else of it.
+        sandbox_extra.setdefault("volumes", {})[DATASETS_MOUNT] = _datasets_volume().with_mount_options(
+            read_only=True, sub_path=f"/{data_found['repo']}/{data_found['sha']}")
+        sandbox_env["LAB_DATASETS_DIR"] = DATASETS_MOUNT
+        try:
+            _datasets_use()[f"{data_found['repo']}@{data_found['sha']}"] = time.time()
+        except Exception:
+            pass  # only the shelf's least-recently-used order depends on it
 
     sb = None
     run_seconds = None
     try:
         sb = modal.Sandbox.create(
-            app=app, image=image, gpu=GPU_KIND, timeout=JOB_TIMEOUT_S + 60,
+            app=app, image=image if data_found is None else data_image, gpu=GPU_KIND, timeout=JOB_TIMEOUT_S + 60,
             cpu=(2, 4), memory=(4096, 16384), block_network=True, secrets=[],
             env=sandbox_env, workdir="/tmp", **sandbox_extra,
         )
@@ -708,12 +808,31 @@ def run_job(script: str, weights: Optional[dict] = None) -> dict:
             except Exception:
                 seen = ""
             if not mount_matches(seen, found["repo"], found["sha"]):
-                return {"status": "error", "stage": "mount",
-                        "error": f"the script was not run. {found['repo']} could not be read at {WEIGHTS_MOUNT} "
-                                 "(it may have just been removed from the shelf); ask for it with the weights tool again",
-                        "exit_code": None, "log_tail": "", "run_seconds": None,
-                        "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": None}
+                return done({"status": "error", "stage": "mount",
+                             "error": f"the script was not run. {found['repo']} could not be read at {WEIGHTS_MOUNT} "
+                                      "(it may have just been removed from the shelf); ask for it with the weights tool again",
+                             "exit_code": None, "log_tail": "", "run_seconds": None,
+                             "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": None})
             mounted = {"repo": found["repo"], "sha": found["sha"], "license": found["license"]}
+        if data_found is not None:
+            # The same check for the dataset: its manifest, read inside the
+            # sandbox before the model's script is there.
+            seen = ""
+            try:
+                check = sb.exec("python", "-I", "-c", WEIGHTS_CHECK, f"{DATASETS_MOUNT}/{MANIFEST_NAME}", timeout=20)
+                seen = check.stdout.read()
+                check.wait()
+                if check.returncode != 0:
+                    seen = ""
+            except Exception:
+                seen = ""
+            if not mount_matches(seen, data_found["repo"], data_found["sha"]):
+                return done({"status": "error", "stage": "mount",
+                             "error": f"the script was not run. {data_found['repo']} could not be read at {DATASETS_MOUNT} "
+                                      "(it may have just been removed from the shelf); ask for it with the datasets tool again",
+                             "exit_code": None, "log_tail": "", "run_seconds": None,
+                             "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": mounted})
+            data_mounted = {"repo": data_found["repo"], "sha": data_found["sha"], "license": data_found["license"]}
         sb.filesystem.write_text(script, "/tmp/job.py")
         t_run = time.time()
         proc = sb.exec("python", "-c", SUPERVISOR, timeout=JOB_TIMEOUT_S)
@@ -727,17 +846,17 @@ def run_job(script: str, weights: Optional[dict] = None) -> dict:
         text = raw.decode("utf-8", errors="replace")
         log_tail = "\n".join(text.splitlines()[-60:])[-4000:]
         if run_seconds >= JOB_TIMEOUT_S - 1:
-            return {"status": "timeout", "stage": "run", "exit_code": proc.returncode,
-                    "error": f"stopped at the hard limit of {JOB_TIMEOUT_S} s",
-                    "log_tail": log_tail, "run_seconds": run_seconds,
-                    "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": mounted}
-        return {"status": "ok" if proc.returncode == 0 else "error", "stage": "run",
-                "exit_code": proc.returncode, "log_tail": log_tail, "run_seconds": run_seconds,
-                "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": mounted}
+            return done({"status": "timeout", "stage": "run", "exit_code": proc.returncode,
+                         "error": f"stopped at the hard limit of {JOB_TIMEOUT_S} s",
+                         "log_tail": log_tail, "run_seconds": run_seconds,
+                         "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": mounted})
+        return done({"status": "ok" if proc.returncode == 0 else "error", "stage": "run",
+                     "exit_code": proc.returncode, "log_tail": log_tail, "run_seconds": run_seconds,
+                     "wall_seconds": time.time() - t0, "gpu": GPU_KIND, "weights": mounted})
     except Exception as exc:
-        return {"status": "crash", "stage": "sandbox", "error": str(exc)[-1500:], "exit_code": None,
-                "log_tail": "", "run_seconds": run_seconds, "wall_seconds": time.time() - t0, "gpu": GPU_KIND,
-                "weights": mounted}
+        return done({"status": "crash", "stage": "sandbox", "error": str(exc)[-1500:], "exit_code": None,
+                     "log_tail": "", "run_seconds": run_seconds, "wall_seconds": time.time() - t0, "gpu": GPU_KIND,
+                     "weights": mounted})
     finally:
         if sb is not None:
             sb.terminate()
@@ -768,8 +887,22 @@ def start(body: dict, request: Request) -> dict:
     if not isinstance(script, str) or not script.strip() or len(script) > MAX_SCRIPT_CHARS:
         raise HTTPException(status_code=400, detail="script missing or too long")
     weights = body.get("weights")
+    # A dataset from the dataset shelf (modal/datasets.py), named the same way.
+    # A job that names none is spawned with exactly the arguments it always had.
+    dataset = body.get("dataset")
+    data_ref = None
+    if dataset is not None:
+        data_sha = dataset.get("sha") if isinstance(dataset, dict) else None
+        if (not isinstance(dataset, dict) or not valid_repo_id(dataset.get("repo"))
+                or (data_sha is not None and (not isinstance(data_sha, str) or re.fullmatch(SHA_PATTERN, data_sha) is None))):
+            raise HTTPException(status_code=400, detail="dataset needs a dataset id as org/name and, if given, a 40 character commit sha")
+        data_ref = {"repo": dataset["repo"]}
+        if data_sha is not None:
+            data_ref["sha"] = data_sha
+        if isinstance(dataset.get("licenses"), list):
+            data_ref["licenses"] = weights_limits({"licenses": dataset["licenses"]})["licenses"]
     if weights is None:
-        call = run_job.spawn(script)
+        call = run_job.spawn(script) if data_ref is None else run_job.spawn(script, None, data_ref)
         return {"call_id": call.object_id}
     sha = weights.get("sha") if isinstance(weights, dict) else None
     if (not isinstance(weights, dict) or not valid_repo_id(weights.get("repo"))
@@ -780,7 +913,7 @@ def start(body: dict, request: Request) -> dict:
         ref["sha"] = sha
     if isinstance(weights.get("licenses"), list):
         ref["licenses"] = weights_limits({"licenses": weights["licenses"]})["licenses"]
-    call = run_job.spawn(script, ref)
+    call = run_job.spawn(script, ref) if data_ref is None else run_job.spawn(script, ref, data_ref)
     return {"call_id": call.object_id}
 
 
