@@ -431,6 +431,8 @@ class KeepDb extends FakeDb {
   constructor() {
     super()
     this.keeps = []
+    // Rivals: each entry stands for another request that takes the slot a claim was about to take, at the same moment.
+    this.keepRaces = []
     this.failKeeps = false
     this.noKeepTables = false
   }
@@ -501,6 +503,12 @@ class KeepDb extends FakeDb {
         let slot = 0
         for (let s = 1; s <= max && !slot; s++) if (!this.keeps.some(k => k.slot === s)) slot = s
         if (!slot) return { rows: [] }
+        // Another request took that slot first: its row is there, and ON CONFLICT DO NOTHING gives this one no row.
+        if (this.keepRaces.length) {
+          const rival = this.keepRaces.shift()
+          this.keeps.push({ slot, status: 'pending', kept_by: 'owner', reason: 'rival', experiment_id: null, epoch: null, job_id: 'k-rival', call_id: null, requested_at: new Date().toISOString(), kept_at: null, detail: null, ...rival })
+          return { rows: [] }
+        }
         if (this.keeps.some(k => k.slug === slug)) return { rows: [] }
         if (epoch !== null && this.keeps.some(k => k.experiment_id === experiment_id && k.epoch === epoch)) return { rows: [] }
         const row = { slot, slug, status: 'pending', kept_by, reason, experiment_id, epoch, job_id, call_id: null, requested_at: new Date().toISOString(), kept_at: null, detail: null }
@@ -673,7 +681,8 @@ test('a name is read strictly: a small alphabet, 2 to 40 characters, no web addr
     'two spaces in a row': ['Brass  Finch'],
     'at least two letters': ['7-7', 'A1', '1.5'],
     'web address': ['example.com', 'www.Finch', 'finch.ai', 'http-finch', 'https finch', 'my.site.org', 'Finch.io'],
-    'lab id': ['e41-0a1b2c3d', 'E41 0A1B2C3D', 'lab e41-0a1b2c3d', 'lab-e7-deadbeef'],
+    // A lab id anywhere in the name, not only as the whole of it: "e41-0a1b2c3d v2" would be shown as another adapter's id.
+    'lab id': ['e41-0a1b2c3d', 'E41 0A1B2C3D', 'lab e41-0a1b2c3d', 'lab-e7-deadbeef', 'e41-0a1b2c3d v2', 'Finch e41-0a1b2c3d', 'E41 0A1B2C3D Finch', 'My e7deadbeef'],
   }
   for (const [reason, values] of Object.entries(refused)) {
     for (const value of values) {
@@ -689,6 +698,16 @@ test('a name is read strictly: a small alphabet, 2 to 40 characters, no web addr
     'gpt-6-astra', 'grok-4.7', 'deepseek-v4-pro-0813', 'north-mini-code',
     'GPT', 'gpt 7', 'G P T Five', 'ChatGPT', 'Claude', 'claude jr', 'C1aude', 'CIaude', 'Cl4ude', 'Gemini Two', 'Gernini', 'G3mini', 'Grok', 'Gr0k', 'DeepSeek', 'Deep Seek', 'D33pSeek',
     'Llama', 'L1ama', 'Qwen', 'Q-w-e-n', 'Qvven', 'Mistral', 'OpenAI Finch', 'Anthropic', 'Google Bird', 'Opus', 'Sonnet 9', 'Haiku', 'Fable', 'Astra', 'Kimi', 'Phi', 'Gemma', 'Codex', 'Tinker', 'o3 Mini',
+    // i, l and 1 pass for one another in either direction and in either case, in the name and in the real name alike.
+    'GEMlNI', 'Gemlni', 'Gem1ni', 'Gemin1', 'Gem1ni 4', 'OPENAl', 'OPENA1', '0penAl', 'MlSTRAL', 'NVlDlA', 'NV1DIA', 'Ciaude', 'C1AUDE', 'Anthropl c', 'Copi1ot', 'Kiml', 'Ph1', 'Halku',
+    // The maker of a panel model that has no family word of its own, as a word or as the provider id writes it.
+    'xAI', 'xAI Labs', 'x-ai', 'X AI Finch', 'XAl',
+    // A version written straight after the name, and a tier after that.
+    'Fable5.2', 'Sonnet5.5', 'Opus4.5', 'Haiku4', 'GLM5', 'GLM 6', 'Astra6', 'Gemma3', 'Phi4', 'Kimi2', 'Codex5', 'o3mini', 'o4-mini', 'Phi4mini', 'GLM4Plus', '0pus4',
+    // One of the lab's own models under another version, or under none.
+    'North 2', 'North7', 'N0rth', 'Claude Fable', 'claude-fable 6', 'Gemini 3.8 Flash 2', 'north-mini-code 3',
+    // A real name that begins after an r is not hidden by "rn" passing for m.
+    'Supernvidia',
   ]
   for (const value of real) {
     const read = names.readAdapterName(value)
@@ -697,14 +716,23 @@ test('a name is read strictly: a small alphabet, 2 to 40 characters, no web addr
   // Dots between letters are refused before that, as a web address would be.
   assert.ok('error' in names.readAdapterName('G.P.T. Five'))
   // A short model name is refused as a word, not as a few letters inside another word.
-  for (const fine of ['Octopus', 'Philosopher', 'Sophia', 'Bonnet', 'Stable Quill']) assert.ok('name' in names.readAdapterName(fine), fine)
+  for (const fine of ['Octopus', 'Philosopher', 'Sophia', 'Bonnet', 'Stable Quill', 'Fables', 'Tinkerbell', 'Northern Finch', 'North Star', 'Glow Worm', 'Max Allen', 'Hexalith']) {
+    assert.ok('name' in names.readAdapterName(fine), fine)
+  }
   // Two names are the same name whatever their case, separators or look-alike characters.
   assert.equal(names.adapterNameKey('Brass Finch'), names.adapterNameKey("brass-finch"))
   assert.equal(names.adapterNameKey('Bill'), names.adapterNameKey('B1ll'))
   assert.equal(names.adapterNameKey('QUIET LAMP'), names.adapterNameKey('Quiet Lamp'))
   assert.equal(names.adapterNameKey('Quiet Lamp'), names.adapterNameKey('Qulet Larnp'))
   // Ordinary names that only share letters with a model's name are fine.
-  for (const fine of ['William and Mary', 'Open Aloe', 'Quiet Lamp', 'Morning Glory']) assert.ok('name' in names.readAdapterName(fine), fine)
+  for (const fine of ['Quiet Lamp', 'Morning Glory', 'Little Owl', 'Mill Pond', 'Lily', 'Emil', 'Small Pilot', 'Aloe Vera', 'Apollo 11']) assert.ok('name' in names.readAdapterName(fine), fine)
+  // The comparison is wide on purpose, and words are not kept apart, so a few ordinary names are refused as well:
+  // "Open Al" is how "OpenAI" looks with a small l, and "liam a" is "llama" with an i for an l. The run goes on without a name.
+  for (const [wide, real] of [['Open Aloe', 'openai'], ['William and Mary', 'llama'], ['Liam Ashford', 'llama']]) {
+    assert.match(names.readAdapterName(wide).error ?? '', new RegExp(`reads like the real model or product name "${real}"`), wide)
+  }
+  // The key two names are compared by treats the same characters as one, so it is the old key for every name.
+  assert.equal(names.adapterNameKey("Qulet-Larnp 1.5"), 'quletlampls')
   assert.notEqual(names.adapterNameKey('Brass Finch'), names.adapterNameKey('Brass Finch 2'))
 })
 
@@ -998,7 +1026,33 @@ test('at most LAB_TINKER_KEEP_MAX adapters are kept, the database holds that cap
   const claims = await Promise.all(many.map((slug, i) => store.claimKeepSlot({ slug, keptBy: 'owner', reason: 'x', experimentId: null, epoch: null, jobId: `k-${slug}-0000000${i}`, max: 2 })))
   assert.equal(claims.filter(c => c.ok).length, 2)
   assert.equal(lab.keeps.length, 2)
-  assert.ok(claims.filter(c => !c.ok).every(c => /at most 2 may be|at the same moment/.test(c.reason)))
+  assert.ok(claims.filter(c => !c.ok).every(c => /at most 2 may be/.test(c.reason)))
+  // Two requests arriving together both aim at the lowest free slot. The one that gets no row back was not refused by
+  // the cap, so it looks again and takes the next free place.
+  lab.keeps.length = 0
+  const claim = (slug, extra = {}) => store.claimKeepSlot({ slug, keptBy: 'owner', reason: 'x', experimentId: null, epoch: null, jobId: `k-${slug}-00000000`, max: 3, ...extra })
+  lab.keepRaces.push({ slug: many[0] })
+  const second = await claim(many[1])
+  assert.deepEqual([second.ok, second.row?.slot], [true, 2])
+  assert.deepEqual(lab.keeps.map(k => [k.slot, k.slug]), [[1, many[0]], [2, many[1]]])
+  // The rival took the last place: full, said as full.
+  lab.keepRaces.push({ slug: many[2] })
+  assert.deepEqual(await claim(many[3]), { ok: false, reason: '3 adapters are kept and at most 3 may be; the owner has to unkeep one first' })
+  // The rival was this same adapter, or this same epoch: looking again finds that, and says which.
+  lab.keeps.length = 0
+  lab.keepRaces.push({ slug: many[4] })
+  assert.deepEqual(await claim(many[4]), { ok: false, reason: 'that adapter is already being kept' })
+  lab.keepRaces.push({ slug: many[5], kept_by: 'x-ai/grok-4.7', experiment_id: 'exp-1', epoch: 70 })
+  assert.deepEqual(await claim(many[0], { keptBy: 'x-ai/grok-4.7', experimentId: 'exp-1', epoch: 70 }), { ok: false, reason: 'this epoch already asked for one adapter to be kept' })
+  // It does not look for ever: beaten at every attempt, it stops, changes nothing and says why.
+  lab.keeps.length = 0
+  for (let i = 0; i < store.KEEP_CLAIM_ATTEMPTS; i++) lab.keepRaces.push({ slug: `e7${i}-0000000${i}` })
+  const beaten = await store.claimKeepSlot({ slug: many[0], keptBy: 'owner', reason: 'x', experimentId: null, epoch: null, jobId: 'k-x', max: 40 })
+  assert.deepEqual(beaten, { ok: false, reason: 'other requests took a place at the same moment, several times over; nothing was changed' })
+  assert.equal(lab.keeps.some(k => k.slug === many[0]), false)
+  assert.equal(lab.keeps.length, store.KEEP_CLAIM_ATTEMPTS)
+  lab.keeps.length = 0
+  many.slice(0, 2).forEach((slug, i) => lab.keeps.push({ slot: i + 1, slug, status: 'kept', kept_by: 'owner', reason: 'x', experiment_id: null, epoch: null, job_id: 'k-x', call_id: null, requested_at: new Date().toISOString(), kept_at: new Date().toISOString(), detail: null }))
   // Lowering the limit below what is kept keeps nothing new and removes nothing.
   assert.deepEqual(await store.claimKeepSlot({ slug: many[5], keptBy: 'owner', reason: 'x', experimentId: null, epoch: null, jobId: 'k-x', max: 1 }),
     { ok: false, reason: '2 adapters are kept and at most 1 may be; the owner has to unkeep one first' })
@@ -1092,6 +1146,21 @@ test('a keep still going when the wait ends is collected by a later tick, once; 
   assert.equal((await keepLib.unkeepAdapter(SLUG)).status, 'pending')
   // Still running at the next tick: nothing changes.
   assert.deepEqual(await keepLib.collectTinkerKeeps(), [])
+  // The status call fails at the tick after that, when the keep is most of an hour old (the tick is hourly, and a keep
+  // asked for during an epoch is 40 to 55 minutes old at the first one). The keeper may have finished long ago with
+  // the year set on Tinker, so one call that did not answer settles nothing: the place stays taken and nothing is stored.
+  const hour = 60 * 60 * 1000
+  for (const down of [async () => new Response('bad gateway', { status: 502 }), async () => { throw new Error('socket hang up') }]) {
+    globalThis.fetch = down
+    for (const age of [55 * 60 * 1000, hour + 55 * 60 * 1000, keepLib.KEEP_LOST_AFTER_MS - 60_000]) {
+      assert.deepEqual(await keepLib.collectTinkerKeeps(new Date(Date.now() + age)), [])
+    }
+    assert.deepEqual(lab.keeps.map(k => k.status), ['pending'])
+    assert.equal(keptRuns('keep_adapter').length, 0)
+  }
+  // The lab goes on asking for at least three ticks before it gives up, and the keeper's own time limit is far inside that.
+  assert.ok(keepLib.KEEP_LOST_AFTER_MS >= 3 * hour)
+  assert.ok(keepLib.KEEP_UNCONFIRMED_AFTER_MS > hour && keepLib.KEEP_UNCONFIRMED_AFTER_MS < keepLib.KEEP_LOST_AFTER_MS)
   // Done at the one after: closed once, with its record.
   globalThis.fetch = keeperRunner(sent)
   const collected = await keepLib.collectTinkerKeeps()
@@ -1124,6 +1193,8 @@ test('a keep still going when the wait ends is collected by a later tick, once; 
   assert.equal(lost.status, 'error')
   assert.equal(lab.keeps.length, 1)
   assert.deepEqual(await keepLib.collectTinkerKeeps(), [])
+  // Not at the first tick either, most of an hour on: "no call known" is also what one failed request looks like.
+  assert.deepEqual(await keepLib.collectTinkerKeeps(new Date(Date.now() + 55 * 60 * 1000)), [])
   assert.equal(lab.keeps.length, 1)
   const later = await keepLib.collectTinkerKeeps(new Date(Date.now() + keepLib.KEEP_UNCONFIRMED_AFTER_MS + 1000))
   assert.deepEqual(later.map(o => o.status), ['error'])
@@ -1132,6 +1203,24 @@ test('a keep still going when the wait ends is collected by a later tick, once; 
   // A lost runner cannot say whether it set the time to live on Tinker, so the record says that is not known.
   assert.match(keptRuns('owner_keep_adapter')[0].output_tail, /in the lab's record it still expires on \d{4}-\d\d-\d\d\. The runner may have set the long time to live on Tinker before it was lost/)
   assert.equal(keptRuns('owner_keep_adapter')[0].detail.tinker_time_to_live, 'unknown: the runner was lost')
+  // Started, and then the runner never answers again: after three hours of asking the lab gives up, with the same honest record.
+  lab.keeps.length = 0
+  lab.toolRuns.length = 0
+  globalThis.fetch = fakeRunner([], [{ status: 'running' }])
+  assert.equal((await keepLib.keepAdapter({ slug: SLUG, reason: 'x' }, { by: 'owner' }, { maxWaitMs: 20, pollMs: 5 })).status, 'started')
+  globalThis.fetch = async () => new Response('bad gateway', { status: 502 })
+  const gone = await keepLib.collectTinkerKeeps(new Date(Date.now() + keepLib.KEEP_LOST_AFTER_MS + 60_000))
+  assert.deepEqual(gone.map(o => o.status), ['error'])
+  assert.equal(lab.keeps.length, 0)
+  assert.match(keptRuns('owner_keep_adapter')[0].output_tail, /not kept: the runner was lost: no answer long after its time limit/)
+  assert.equal(keptRuns('owner_keep_adapter')[0].detail.tinker_time_to_live, 'unknown: the runner was lost')
+  // A runner that says the keep failed is believed at once, however young the keep is.
+  lab.toolRuns.length = 0
+  globalThis.fetch = fakeRunner([], [{ status: 'running' }])
+  assert.equal((await keepLib.keepAdapter({ slug: SLUG, reason: 'x' }, { by: 'owner' }, { maxWaitMs: 20, pollMs: 5 })).status, 'started')
+  globalThis.fetch = fakeRunner([], [{ status: 'failed', error: "the run's result expired before it was collected" }])
+  assert.deepEqual((await keepLib.collectTinkerKeeps()).map(o => o.status), ['error'])
+  assert.equal(lab.keeps.length, 0)
   // With the switch off the tick does not look at all.
   lab.statements.length = 0
   process.env.LAB_ENABLE_TINKER_KEEP = 'false'

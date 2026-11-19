@@ -661,6 +661,9 @@ export async function getKeep(slug: string, opts: { createTables?: boolean } = {
 
 export type KeepClaim = { ok: true; row: KeepRow } | { ok: false; reason: string }
 
+/** How many times a claim looks again after another request took the slot it was about to take. */
+export const KEEP_CLAIM_ATTEMPTS = 5
+
 /**
  * Takes a place among the kept adapters, or says why not. The cap is held by
  * the database: a place is a slot numbered 1 to `max`, the slot is the
@@ -669,6 +672,13 @@ export type KeepClaim = { ok: true; row: KeepRow } | { ok: false; reason: string
  * both take the last place: one of them finds the slot taken and gets no row
  * back. The same statement cannot keep one adapter twice (slug is unique) or
  * serve two keeps for one epoch (the index on experiment and epoch).
+ *
+ * Two requests arriving together both aim at the lowest free slot, so the
+ * one that gets no row back has not been refused by the cap: it looks again,
+ * and takes the next free slot, finds the adapter or the epoch taken, or
+ * finds the places full. Every round has a winner, so a request only runs
+ * out of attempts when that many others were served ahead of it at the same
+ * moment.
  */
 export async function claimKeepSlot(params: {
   slug: string
@@ -681,30 +691,31 @@ export async function claimKeepSlot(params: {
 }): Promise<KeepClaim> {
   await ensureTinkerExtras()
   if (!(params.max > 0)) return { ok: false, reason: 'no adapter may be kept (the limit is 0)' }
-  const existing = await getKeep(params.slug)
-  if (existing) return { ok: false, reason: existing.status === 'kept' ? 'that adapter is already kept' : 'that adapter is already being kept' }
-  if (params.experimentId !== null && params.epoch !== null) {
-    const same = await sql`SELECT slug FROM tinker_keeps WHERE experiment_id = ${params.experimentId} AND epoch = ${params.epoch} LIMIT 1`
-    if (same.rows[0]) return { ok: false, reason: 'this epoch already asked for one adapter to be kept' }
+  for (let attempt = 0; attempt < KEEP_CLAIM_ATTEMPTS; attempt++) {
+    const existing = await getKeep(params.slug, { createTables: false })
+    if (existing) return { ok: false, reason: existing.status === 'kept' ? 'that adapter is already kept' : 'that adapter is already being kept' }
+    if (params.experimentId !== null && params.epoch !== null) {
+      const same = await sql`SELECT slug FROM tinker_keeps WHERE experiment_id = ${params.experimentId} AND epoch = ${params.epoch} LIMIT 1`
+      if (same.rows[0]) return { ok: false, reason: 'this epoch already asked for one adapter to be kept' }
+    }
+    const r = await sql`
+      INSERT INTO tinker_keeps (slot, slug, status, kept_by, reason, experiment_id, epoch, job_id)
+      SELECT s.slot, ${params.slug}::text, 'pending', ${params.keptBy}::text, ${sanitizeOutput(params.reason).slice(0, 200)}::text,
+        ${params.experimentId}::text, ${params.epoch}::integer, ${params.jobId}::text
+      FROM generate_series(1, ${params.max}::integer) AS s(slot)
+      WHERE NOT EXISTS (SELECT 1 FROM tinker_keeps k WHERE k.slot = s.slot)
+        AND (SELECT COUNT(*) FROM tinker_keeps) < ${params.max}::integer
+      ORDER BY s.slot ASC
+      LIMIT 1
+      ON CONFLICT DO NOTHING
+      RETURNING *
+    `
+    if (r.rows[0]) return { ok: true, row: keepRow(r.rows[0] as Record<string, unknown>) }
+    const held = await sql`SELECT COUNT(*) AS n FROM tinker_keeps`
+    const n = Number(held.rows[0]?.n) || 0
+    if (n >= params.max) return { ok: false, reason: `${n} adapters are kept and at most ${params.max} may be; the owner has to unkeep one first` }
   }
-  const r = await sql`
-    INSERT INTO tinker_keeps (slot, slug, status, kept_by, reason, experiment_id, epoch, job_id)
-    SELECT s.slot, ${params.slug}::text, 'pending', ${params.keptBy}::text, ${sanitizeOutput(params.reason).slice(0, 200)}::text,
-      ${params.experimentId}::text, ${params.epoch}::integer, ${params.jobId}::text
-    FROM generate_series(1, ${params.max}::integer) AS s(slot)
-    WHERE NOT EXISTS (SELECT 1 FROM tinker_keeps k WHERE k.slot = s.slot)
-      AND (SELECT COUNT(*) FROM tinker_keeps) < ${params.max}::integer
-    ORDER BY s.slot ASC
-    LIMIT 1
-    ON CONFLICT DO NOTHING
-    RETURNING *
-  `
-  if (r.rows[0]) return { ok: true, row: keepRow(r.rows[0] as Record<string, unknown>) }
-  const held = await sql`SELECT COUNT(*) AS n FROM tinker_keeps`
-  const n = Number(held.rows[0]?.n) || 0
-  return n >= params.max
-    ? { ok: false, reason: `${n} adapters are kept and at most ${params.max} may be; the owner has to unkeep one first` }
-    : { ok: false, reason: 'another request took the place at the same moment; nothing was changed' }
+  return { ok: false, reason: 'other requests took a place at the same moment, several times over; nothing was changed' }
 }
 
 /**
