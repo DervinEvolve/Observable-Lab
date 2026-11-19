@@ -24,9 +24,9 @@ import { researchAlongside } from './experiment-modes.js'
 import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
 import { mayRetryPromotion, promoteResearchModel, researchModelKey, researchTalkStatus, type Promotion } from './research-talk.js'
 import {
-  collectRepeats, confirmColumns, confirmNewBest, confirmWaitDeadlineMs, loadRepeats, maybeStartControl, readDecision,
-  researchConfirmEnabled, researchMaxMargin, researchMinMargin, scoringPromptNote, scoringSnapshot, writeRepeatLedger,
-  type ConfirmDecision, type RepeatRow,
+  checkResearchGpuBudget, collectRepeats, confirmColumns, confirmNewBest, confirmWaitDeadlineMs, loadRepeats, maybeStartControl,
+  readDecision, RepeatDeferredError, repeatOpen, researchConfirmEnabled, researchMaxMargin, researchMinMargin, scoringPromptNote, scoringSnapshot,
+  writeRepeatLedger, type ConfirmDecision, type RepeatRow,
 } from './research-confirm.js'
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
@@ -115,13 +115,22 @@ function stabilityFromProgress(r: ResearchMeta): number {
   return Math.min(0.99, Math.max(0.12, 0.15 + 0.84 * progress))
 }
 
-export async function runResearchEpoch(experimentId: string): Promise<{
+/**
+ * `requestStartedAt` is when the request began (a Date.now() time, taken by
+ * the tick or the manual route before anything else they do): the waits and
+ * start deadlines of the lab's repeats are measured from it, so time the
+ * request spent before this epoch (collecting Tinker runs, say) counts.
+ * Left out, or not a time in the past, it is now.
+ */
+export async function runResearchEpoch(experimentId: string, opts: { requestStartedAt?: number } = {}): Promise<{
   success: boolean
   epochNumber: number
   newSpec: AgentSpecification
   commentatorOutput: CommentatorOutput
 }> {
-  const requestStartedAt = Date.now()
+  const now = Date.now()
+  const given = opts.requestStartedAt
+  const requestStartedAt = typeof given === 'number' && Number.isFinite(given) && given <= now ? given : now
   const experimentResult = await sql`SELECT * FROM experiments WHERE id = ${experimentId}`
   const experiment = experimentResult.rows[0]
   if (!experiment) throw new Error('Experiment not found')
@@ -162,6 +171,8 @@ export async function runResearchEpoch(experimentId: string): Promise<{
   // The epoch is already claimed (runEpoch). Everything from here on runs
   // inside the try, so any failure, including the repo reads, releases it.
   let totalCost = 0
+  // Which GPU run a budget pause inside the epoch held back, for the log.
+  let pausedBefore = 'lab repeat'
   const saveNote = async (role: string, modelId: string, output: unknown) => {
     const note = output && typeof output === 'object' ? String((output as Record<string, unknown>).notebook ?? '') : ''
     await addNotebookNote(experimentId, epochNumber, `${role} (${answeredModel(output, modelId).split('/').pop()})`, note)
@@ -213,7 +224,7 @@ export async function runResearchEpoch(experimentId: string): Promise<{
       // Only while the lab saves kept models for visitors (research-talk.ts).
       ...(researchTalkStatus().enabled ? { storyModel: true } : {}),
       // Only while the lab repeats a run before taking it as the best (research-confirm.ts).
-      ...(confirmOn ? { scoringNote: scoringPromptNote(labRepeats, researchMinMargin(), researchMaxMargin()) } : {}),
+      ...(confirmOn ? { scoringNote: scoringPromptNote(labRepeats, researchMinMargin(), researchMaxMargin(), { saveStep: researchTalkStatus().enabled }) } : {}),
     })
 
     const notebook = await getRecentNotebook(experimentId)
@@ -286,6 +297,16 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     if (!runResult) {
       let callId = existingEpoch?.research_run?.call_id
       if (!callId) {
+        // LAB_RESEARCH_CONFIRM: a repeat or control the lab started earlier and
+        // has not collected is not on the ledger yet. The cap the tick checked
+        // did not count it, so this run is checked again with it counted in.
+        if (confirmOn && labRepeats.some(r => repeatOpen(r.status))) {
+          const budget = await checkResearchGpuBudget(labRepeats, RESEARCH_BUDGET_S)
+          if (!budget.allowed) {
+            pausedBefore = 'GPU run'
+            throw new BudgetPausedError(budget)
+          }
+        }
         keepKey = (researchTalkStatus().enabled ? researchModelKey(experimentId, epochNumber) : null) ?? undefined
         callId = keepKey
           ? await startResearchRun(executorOutput.train_py, RESEARCH_BUDGET_S, keepKey)
@@ -376,6 +397,8 @@ export async function runResearchEpoch(experimentId: string): Promise<{
         confirm = await confirmNewBest({
           experimentId, epoch: epochNumber, trainPy: executorOutput.train_py, first, best: research.best_bpb, budgetS: RESEARCH_BUDGET_S,
           maxWaitMs: Math.min(runPollMaxMs(), confirmWaitDeadlineMs(completionTimeoutMs()) - (Date.now() - requestStartedAt)),
+          requestStartedAt,
+          ...(runResult.runner_flow ? { firstRunnerFlow: runResult.runner_flow } : {}),
         })
         await sql`
           UPDATE epochs SET research_run = COALESCE(research_run, '{}'::jsonb) || ${JSON.stringify({ confirm })}::jsonb
@@ -583,9 +606,15 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     return { success: true, epochNumber, newSpec, commentatorOutput }
   } catch (error) {
     await releaseEpoch(experimentId)
-    if (error instanceof ResearchRunPendingError && researchAlongside()) console.log(`[Research e${epochNumber}] ${error.message}`)
-    // Thrown inside an epoch only by the lab's repeat (research-confirm.ts): the day's cap was reached before it could start.
-    else if (error instanceof BudgetPausedError) console.log(`[Research e${epochNumber}] lab repeat not started: ${error.status.reason ?? 'daily budget reached'}; the epoch waits and repeats the run when the cap allows`)
+    // A repeat the lab did not start this time (research-confirm.ts) is not a failure either, beside run 2 or not.
+    if (error instanceof ResearchRunPendingError && (researchAlongside() || error instanceof RepeatDeferredError)) console.log(`[Research e${epochNumber}] ${error.message}`)
+    // Thrown inside an epoch only with LAB_RESEARCH_CONFIRM on (research-confirm.ts): the day's cap, with the
+    // lab's open repeats counted in, was reached before the lab's repeat, or this epoch's own run, could start.
+    else if (error instanceof BudgetPausedError) {
+      console.log(pausedBefore === 'lab repeat'
+        ? `[Research e${epochNumber}] lab repeat not started: ${error.status.reason ?? 'daily budget reached'}; the epoch waits and repeats the run when the cap allows`
+        : `[Research e${epochNumber}] GPU run not started: ${error.status.reason ?? 'daily budget reached'}, with the lab's open repeats counted; the epoch waits and starts it when the cap allows`)
+    }
     else console.error(`[Research e${epochNumber}] failed:`, error instanceof Error ? error.message : error)
     throw error
   }

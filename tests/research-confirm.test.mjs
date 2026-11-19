@@ -136,7 +136,7 @@ class FakeLab {
       assert.match(text, /ON CONFLICT \(experiment_id, epoch_number, kind\) DO NOTHING RETURNING \*$/)
       const [experiment_id, epoch_number, kind, train_sha256, reference_bpb, reference_epoch, call_id, status] = v
       if (this.repeats.some(r => r.experiment_id === experiment_id && r.epoch_number === epoch_number && r.kind === kind)) return { rows: [] }
-      const row = { id: this.repeats.length + 1, created_at: new Date(), experiment_id, epoch_number, kind, train_sha256, reference_bpb, reference_epoch, call_id, status, val_bpb: null, result: null, cost_usd: null, ledger_written: false, finished_at: null }
+      const row = { id: Math.max(0, ...this.repeats.map(r => Number(r.id))) + 1, created_at: new Date(), experiment_id, epoch_number, kind, train_sha256, reference_bpb, reference_epoch, call_id, status, val_bpb: null, result: null, cost_usd: null, ledger_written: false, finished_at: null }
       this.repeats.push(row)
       return { rows: [{ ...row }] }
     }
@@ -145,6 +145,16 @@ class FakeLab {
       if (!row) return { rows: [] }
       Object.assign(row, { status: v[0], val_bpb: v[1], result: v[2], cost_usd: v[3], finished_at: new Date() })
       return { rows: [{ ...row }] }
+    }
+    if (text === 'UPDATE research_repeats SET call_id = ?, status = ? WHERE id = ? AND status = ? RETURNING *') {
+      const row = this.repeats.find(r => String(r.id) === String(v[2]) && r.status === v[3])
+      if (!row) return { rows: [] }
+      Object.assign(row, { call_id: v[0], status: v[1] })
+      return { rows: [{ ...row }] }
+    }
+    if (text === 'DELETE FROM research_repeats WHERE id = ? AND status = ?') {
+      this.repeats = this.repeats.filter(r => !(String(r.id) === String(v[0]) && r.status === v[1]))
+      return { rows: [] }
     }
     if (text === 'UPDATE research_repeats SET ledger_written = TRUE WHERE id = ?') {
       this.repeats.find(r => String(r.id) === String(v[0])).ledger_written = true
@@ -375,18 +385,23 @@ test('both switches are off unless exactly "true", and the numbers have their do
   }
 })
 
-test('the noise is the median distance between runs of the same file, and is not measured until three repeated scores exist', () => {
+test('the noise is the median spread of each file\'s runs about their own middle, every run counted once, and is not measured until three repeated scores exist', () => {
   const K = confirm.PAIR_DISTANCE_TO_SD
   assert.equal(K, 1.0483)
+  // The factor that turns a file's median distance from its middle into a standard deviation, by how many runs it has.
+  assert.equal(confirm.madToSd(2), 2 * K) // a pair: half its distance, times 2 x 1.0483, as when the noise was a median of pair distances
+  assert.deepEqual([3, 4, 5, 10].map(confirm.madToSd), [2.77, 2.21, 1.99, 1.68])
+  close(confirm.madToSd(20), 1.4826 * 1.06)
+  for (const odd of [0, 1, 2.5, NaN]) assert.ok(Number.isNaN(confirm.madToSd(odd)), String(odd))
   // Nothing, one score, and one pair: not measured, with the count it has.
   assert.deepEqual(confirm.estimateNoise([]), { noise_bpb: null, samples: 0, groups: 0 })
   assert.deepEqual(confirm.estimateNoise([[0.7]]), { noise_bpb: null, samples: 0, groups: 0 })
   assert.deepEqual(confirm.estimateNoise([[0.7, 0.702]]), { noise_bpb: null, samples: 2, groups: 1 })
   // Single scores of different files say nothing about spread, however many there are.
   assert.deepEqual(confirm.estimateNoise([[0.7], [0.69], [0.68], [0.67]]), { noise_bpb: null, samples: 0, groups: 0 })
-  // Three runs of one file: three distances (0.002, 0.004, 0.002), and the middle one, scaled to a standard deviation.
+  // Three runs of one file: distances from its middle score 0.702 of 0.002, 0 and 0.002, whose median is 0.002, scaled for three runs.
   let n = confirm.estimateNoise([[0.700, 0.702, 0.704]])
-  close(n.noise_bpb, K * 0.002)
+  close(n.noise_bpb, 2.77 * 0.002)
   assert.deepEqual([n.samples, n.groups], [3, 1])
   // Two pairs of different files, far apart in level: only the distance inside each pair counts.
   n = confirm.estimateNoise([[0.700, 0.702], [0.600, 0.604], [0.9]])
@@ -400,9 +415,9 @@ test('the noise is the median distance between runs of the same file, and is not
   assert.deepEqual(confirm.noiseFromRepeats([row(1, 'control', 'a', 0.701, 0.7)]), { noise_bpb: null, samples: 0, groups: 0 })
   // A control's reference (the best on record) is not a repeated score; a confirmation's reference (its first run) is.
   n = confirm.noiseFromRepeats([row(1, 'control', 'a', 0.700, 0.9), row(2, 'control', 'a', 0.702, 0.9), row(3, 'control', 'a', 0.704, 0.9)])
-  close(n.noise_bpb, K * 0.002)
+  close(n.noise_bpb, 2.77 * 0.002)
   n = confirm.noiseFromRepeats([row(1, 'confirm', 'b', 0.702, 0.700), row(2, 'control', 'b', 0.704, 0.701)])
-  close(n.noise_bpb, K * 0.002)
+  close(n.noise_bpb, 2.77 * 0.002)
   assert.equal(n.samples, 3)
   // Runs that gave no score, are still running, or have no usable hash are left out.
   n = confirm.noiseFromRepeats([row(1, 'confirm', 'b', 0.702, 0.700), row(2, 'control', 'b', null, 0.7, 'crash'), row(3, 'control', 'b', null, 0.7, 'running'), { ...row(4, 'control', 'b', 0.9, 0.7), train_sha256: 'short' }])
@@ -415,15 +430,30 @@ test('the noise is the median distance between runs of the same file, and is not
 test('one wild pair of scores cannot move the noise among quiet runs, and can never lift the margin above the ceiling', () => {
   const K = confirm.PAIR_DISTANCE_TO_SD
   const row = (id, kind, sha, val, ref) => ({ id: String(id), kind, train_sha256: sha.repeat(64), val_bpb: val, reference_bpb: ref, status: 'ok', epoch_number: id })
-  // A train.py that printed 0.10 and then 4.90, beside three quiet controls of the best file:
-  // four distances (0.002, 0.002, 0.004 and 4.8), and the middle is still between the quiet ones.
+  // A train.py that printed 0.10 and then 4.90, beside three quiet controls of the best file: two spreads,
+  // the quiet file's counted three times and the wild pair's twice, and the middle is the quiet one.
   const quiet = [row(1, 'control', 'a', 0.700, 0.7), row(2, 'control', 'a', 0.702, 0.7), row(3, 'control', 'a', 0.704, 0.7)]
   const wild = row(4, 'confirm', 'b', 4.90, 0.10)
   let n = confirm.noiseFromRepeats([...quiet, wild])
-  close(n.noise_bpb, K * 0.003)
+  close(n.noise_bpb, 2.77 * 0.002)
   assert.equal(n.samples, 5)
   assert.deepEqual(confirm.marginFor(n, 0.002).basis, 'noise')
-  close(confirm.marginFor(n, 0.002).margin_bpb, 2 * K * 0.003)
+  close(confirm.marginFor(n, 0.002).margin_bpb, 2 * 2.77 * 0.002)
+
+  // One wild score inside the group of controls (one control diverged) does not set that file's spread:
+  // 0.7001, 0.7003 and 0.95 are 0.0002, 0 and 0.2497 from their middle, and the median of those is 0.0002.
+  const diverged = [row(1, 'control', 'a', 0.7001, 0.7001), row(2, 'control', 'a', 0.7003, 0.7001), row(3, 'control', 'a', 0.95, 0.7001)]
+  n = confirm.noiseFromRepeats(diverged)
+  close(n.noise_bpb, 2.77 * 0.0002)
+  assert.deepEqual(confirm.marginFor(n, 0.002), { margin_bpb: 0.002, basis: 'floor' })
+  // With a quiet confirmation pair beside it the margin is still the floor, and a real improvement repeats into a new best.
+  n = confirm.noiseFromRepeats([...diverged, row(4, 'confirm', 'd', 0.6905, 0.6900)])
+  assert.ok(n.noise_bpb < 0.001, String(n.noise_bpb))
+  assert.equal(confirm.marginFor(n, 0.002).basis, 'floor')
+  assert.equal(confirm.decideConfirmation({ first: 0.6900, repeat: 0.6902, repeatStatus: 'ok', best: 0.7001, noise: n, minMargin: 0.002 }).verdict, 'confirmed')
+  // Distances between every two scores, as the noise was taken before, would have put that margin at the ceiling.
+  const pairwise = [0.0002, 0.2499, 0.2497].sort((a, b) => a - b)[1] * K
+  assert.ok(2 * pairwise > 0.05)
   // With only one quiet pair beside it the middle is far out (2.4 before scaling), and the ceiling is what holds.
   n = confirm.noiseFromRepeats([row(1, 'control', 'a', 0.70, 0.7), row(2, 'control', 'a', 0.70, 0.7), wild])
   close(n.noise_bpb, K * 2.4)
@@ -644,8 +674,9 @@ test('a run that would be the best is repeated once, and a mean that beats the b
   const stored = lab.epochs[0].research_run.confirm
   assert.equal(stored.verdict, 'confirmed')
   close(stored.mean_bpb, 0.691)
-  assert.deepEqual([stored.first_bpb, stored.repeat_bpb, stored.best_bpb, stored.margin_bpb, stored.margin_basis, stored.noise_bpb, stored.noise_samples], [0.69, 0.692, 0.7, 0.002, 'floor', null, 2])
-  const line = 'confirmed: mean 0.6910 of two runs (0.6900 and 0.6920) beats 0.7000 by 0.0090, more than the 0.0020 margin; kept as the new best at 0.6910 (margin: the floor of 0.0020; noise not yet measured, 2 repeated scores so far)'
+  // The noise that judged it leaves its own pair out, so it had no repeated scores to go on.
+  assert.deepEqual([stored.first_bpb, stored.repeat_bpb, stored.best_bpb, stored.margin_bpb, stored.margin_basis, stored.noise_bpb, stored.noise_samples], [0.69, 0.692, 0.7, 0.002, 'floor', null, 0])
+  const line = 'confirmed: mean 0.6910 of two runs (0.6900 and 0.6920) beats 0.7000 by 0.0090, more than the 0.0020 margin; kept as the new best at 0.6910 (margin: the floor of 0.0020; noise not yet measured, 0 repeated scores so far, not counting this run\'s own two scores)'
   assert.equal(stored.line, line)
   assert.deepEqual(said(lab.epochs[0].reviewer_output), { verdict: 'keep', reason: 'the number decided' })
 
@@ -671,8 +702,8 @@ test('a run that would be the best is repeated once, and a mean that beats the b
   assert.ok(page.includes('- **Verdict:** KEEP (run: ok)'))
   // The repeat has its own row in the lab's ledger of repeats, committed by the owner (no model trailer).
   const repeats = world.files['lab-repeats.tsv'].trimEnd().split('\n')
-  assert.equal(repeats[0], 'kind\tepoch\ttrain_sha256\tval_bpb\tstatus\treference_bpb\treference_epoch\tmetrics_source\tdataset\tharness_sha256\ttrain_wall_seconds\tcall_id')
-  assert.equal(repeats[1], `confirm\t81\t${confirm.trainSha256(NEW_TRAIN_PY)}\t0.6920\tok\t0.6900\t81\texperiment_stdout_unverified\ttinystories_gpt4_clean\t-\t310.0\tcall-2`)
+  assert.equal(repeats[0], 'kind\tepoch\ttrain_sha256\tval_bpb\tstatus\treference_bpb\treference_epoch\tmetrics_source\tdataset\tharness_sha256\ttrain_wall_seconds\tcall_id\trunner_flow')
+  assert.equal(repeats[1], `confirm\t81\t${confirm.trainSha256(NEW_TRAIN_PY)}\t0.6920\tok\t0.6900\t81\texperiment_stdout_unverified\ttinystories_gpt4_clean\t-\t310.0\tcall-2\t-`)
   assert.equal(repeats.length, 2)
   assert.match(world.messages['lab-repeats.tsv'], /^lab repeat: repeat of epoch 81, ok \(val_bpb 0\.6920, unverified\)\n\nMetrics-Source: experiment_stdout_unverified\n/)
   assert.equal(/^Model:/m.test(world.messages['lab-repeats.tsv']), false)
@@ -705,7 +736,7 @@ test('a mean that does not clear the margin is recorded as within noise with bot
   const world = fakeWorld({ runs: [0.7058, 0.7064] })
   await runEpoch()
 
-  const line = 'within noise: mean 0.7061 of two runs (0.7058 and 0.7064) beats 0.7067 by 0.0006, not more than the 0.0020 margin; not kept (margin: the floor of 0.0020; noise not yet measured, 2 repeated scores so far)'
+  const line = 'within noise: mean 0.7061 of two runs (0.7058 and 0.7064) beats 0.7067 by 0.0006, not more than the 0.0020 margin; not kept (margin: the floor of 0.0020; noise not yet measured, 0 repeated scores so far, not counting this run\'s own two scores)'
   assert.equal(lab.epochs[0].research_run.confirm.verdict, 'within_noise')
   assert.equal(lab.epochs[0].research_run.confirm.line, line)
   // The Reviewer's keep is not taken, and its stored reason says why.
@@ -747,7 +778,7 @@ test('a repeat that crashes, or whose call is lost, is not confirmed, and nothin
     await runEpoch()
     const stored = lab.epochs[0].research_run.confirm
     assert.deepEqual([stored.verdict, stored.repeat_status, stored.repeat_bpb, stored.mean_bpb], ['not_confirmed', status, null, null], outcome)
-    assert.equal(stored.line, `not confirmed: the lab's repeat of the same train.py gave no score (${word}); the first run printed 0.6500 against a best of 0.7000; not kept (margin: the floor of 0.0020; noise not yet measured, 0 repeated scores so far)`)
+    assert.equal(stored.line, `not confirmed: the lab's repeat of the same train.py gave no score (${word}); the first run printed 0.6500 against a best of 0.7000; not kept (margin: the floor of 0.0020; noise not yet measured, 0 repeated scores so far, not counting this run's own two scores)`)
     assert.equal(lab.epochs[0].reviewer_output.verdict, 'revert')
     assert.deepEqual([researchMeta().best_bpb, researchMeta().best_epoch, researchMeta().last_run.confirm], [0.7, 40, 'not_confirmed'])
     assert.equal(world.puts.includes('train.py'), false)
@@ -856,11 +887,11 @@ test('controls follow the first three epochs and then every N, one per tick at m
 
   await runEpoch() // 84: three controls are in, the noise is measured; no control is due (the third was one epoch ago)
   assert.deepEqual(controls(), [[81, 'ok', 0.7], [82, 'ok', 0.702], [83, 'ok', 0.704]])
-  close(researchMeta().scoring.noise_bpb, confirm.PAIR_DISTANCE_TO_SD * 0.002)
-  close(researchMeta().scoring.margin_bpb, 2 * confirm.PAIR_DISTANCE_TO_SD * 0.002)
+  close(researchMeta().scoring.noise_bpb, confirm.madToSd(3) * 0.002)
+  close(researchMeta().scoring.margin_bpb, 2 * confirm.madToSd(3) * 0.002)
   assert.deepEqual([researchMeta().scoring.noise_samples, researchMeta().scoring.min_margin_bpb, researchMeta().scoring.updated_epoch], [3, 0.002, 84])
   assert.deepEqual([researchMeta().scoring.margin_basis, researchMeta().scoring.max_margin_bpb], ['noise', 0.05])
-  assert.equal(noteOf(world.chats.at(-5)), 'The margin now is 0.0042 val_bpb (margin: twice the measured noise of 0.0021, from 3 repeated scores); it is the larger')
+  assert.equal(noteOf(world.chats.at(-5)), 'The margin now is 0.0111 val_bpb (margin: twice the measured noise of 0.0055, from 3 repeated scores); it is the larger')
   assert.equal(world.starts.length, 7)
 
   await runEpoch() // 85: two epochs since the last control, so one is due
@@ -896,20 +927,22 @@ test('with the noise measured, a result the floor alone would have kept is withi
   for (const [i, val] of [0.700, 0.702, 0.704].entries()) {
     lab.repeats.push({ id: i + 1, created_at: new Date(), experiment_id: EXPERIMENT, epoch_number: 78 + i, kind: 'control', train_sha256: sha, reference_bpb: 0.7, reference_epoch: 40, call_id: `old-${i}`, status: 'ok', val_bpb: val, result: null, cost_usd: null, ledger_written: true, finished_at: new Date() })
   }
-  // 0.697 twice beats 0.700 by 0.003: more than the 0.002 floor, less than twice the measured noise of 0.002.
+  // 0.697 twice beats 0.700 by 0.003: more than the 0.002 floor, less than twice the measured noise of the three controls.
   const world = fakeWorld({ runs: [0.697, 0.697] })
   await runEpoch()
   const stored = lab.epochs[0].research_run.confirm
   assert.equal(stored.verdict, 'within_noise')
   assert.equal(stored.margin_basis, 'noise')
-  assert.equal(stored.noise_samples, 5) // the three controls and this pair
-  assert.match(stored.line, /^within noise: mean 0\.6970 of two runs \(0\.6970 and 0\.6970\) beats 0\.7000 by 0\.0030, not more than the 0\.00\d\d margin; not kept \(margin: twice the measured noise of 0\.00\d\d, from 5 repeated scores\)$/)
+  assert.equal(stored.noise_samples, 3) // the three controls; this pair is not in the noise that judges it
+  close(stored.noise_bpb, confirm.madToSd(3) * 0.002)
+  assert.match(stored.line, /^within noise: mean 0\.6970 of two runs \(0\.6970 and 0\.6970\) beats 0\.7000 by 0\.0030, not more than the 0\.0111 margin; not kept \(margin: twice the measured noise of 0\.0055, from 3 repeated scores, not counting this run's own two scores\)$/)
   assert.equal(researchMeta().best_bpb, 0.7)
   // The row carries the noise and the margin the verdict used.
   const cells = ledgerRows(world)[1].split('\t').slice(14)
   assert.deepEqual([cells[0], cells[1], cells[4]], ['0.6970', '0.6970', 'within_noise'])
   assert.equal(cells[2], stored.noise_bpb.toFixed(4))
   assert.equal(cells[3], stored.margin_bpb.toFixed(4))
+  // For later epochs the pair counts: the state after the epoch has all five scores (two spreads of zero and 0.0055 by three).
   close(researchMeta().scoring.noise_bpb, stored.noise_bpb)
   assert.equal(researchMeta().scoring.noise_samples, 5)
   // Three controls exist, the last two epochs ago of ten: none is started.
@@ -991,7 +1024,7 @@ test('a file that printed wild scores cannot block later results: the margin sto
   enable()
   researchExperiment()
   // On record: two earlier candidates whose repeats were far from their first scores (0.10 then 4.90, 0.20 then 3.00),
-  // and two controls of the best file that agreed at 0.70. With the new pair that is four distances, half of them wild.
+  // and two controls of the best file that agreed at 0.70: three spreads, two of them wild. The new pair is not counted.
   const stored = (id, epoch, kind, sha, val, ref) => ({ id, created_at: new Date(), experiment_id: EXPERIMENT, epoch_number: epoch, kind, train_sha256: sha, reference_bpb: ref, reference_epoch: epoch, call_id: `old-${id}`, status: 'ok', val_bpb: val, result: null, cost_usd: null, ledger_written: true, finished_at: new Date() })
   lab.repeats.push(stored(1, 69, 'confirm', 'c'.repeat(64), 3.00, 0.20), stored(2, 70, 'confirm', 'b'.repeat(64), 4.90, 0.10), stored(3, 71, 'control', confirm.trainSha256(TRAIN_PY), 0.70, 0.7), stored(4, 72, 'control', confirm.trainSha256(TRAIN_PY), 0.70, 0.7))
   // Twice the noise is 2.9 val_bpb. A run that repeats at 0.60 against a best of 0.70 is kept all the same.
@@ -999,7 +1032,7 @@ test('a file that printed wild scores cannot block later results: the margin sto
   await runEpoch()
   const d = lab.epochs[0].research_run.confirm
   assert.deepEqual([d.verdict, d.margin_bpb, d.margin_basis, d.mean_bpb], ['confirmed', 0.05, 'ceiling', 0.6])
-  assert.match(d.line, /more than the 0\.0500 margin; kept as the new best at 0\.6000 \(margin: the ceiling of 0\.0500, because twice the measured noise of \d+\.\d{4} from 8 repeated scores is above it\)$/)
+  assert.match(d.line, /more than the 0\.0500 margin; kept as the new best at 0\.6000 \(margin: the ceiling of 0\.0500, because twice the measured noise of \d+\.\d{4} from 6 repeated scores is above it, not counting this run's own two scores\)$/)
   assert.deepEqual([researchMeta().best_bpb, researchMeta().best_epoch], [0.6, 81])
   assert.deepEqual([researchMeta().scoring.margin_bpb, researchMeta().scoring.margin_basis, researchMeta().scoring.max_margin_bpb], [0.05, 'ceiling', 0.05])
   // The models are told the margin that applies, not the runaway one, and the row and the public state carry it.
@@ -1199,6 +1232,249 @@ test('the wait for a repeat leaves room for the rest of the epoch, the runner is
   assert.deepEqual(lab.repeats.map(r => [r.kind, r.epoch_number, r.status]), [['control', 82, 'running']])
 })
 
+// ===========================================================================
+// 4c. Starting a repeat, the cap with open repeats, and whose noise judges a run
+// ===========================================================================
+const storedRepeat = (over = {}) => ({ id: 1, created_at: new Date(), experiment_id: EXPERIMENT, epoch_number: 80, kind: 'control', train_sha256: 'a'.repeat(64), reference_bpb: 0.7, reference_epoch: 40, call_id: 'call-50', status: 'running', val_bpb: null, result: null, cost_usd: null, ledger_written: false, finished_at: null, ...over })
+const confirmArgs = { experimentId: EXPERIMENT, epoch: 81, trainPy: NEW_TRAIN_PY, first: 0.69, best: 0.7, budgetS: 300, maxWaitMs: 0 }
+
+test('a repeat is not started late in a request: the epoch defers it, the next tick starts it, and the time before the epoch counts', async () => {
+  const deferred = e => e instanceof research.ResearchRunPendingError && e.name === 'RepeatDeferredError'
+  assert.equal(confirm.REPEAT_START_DEADLINE_MS, 680_000)
+  assert.equal(confirm.CONTROL_START_DEADLINE_MS, confirm.REPEAT_START_DEADLINE_MS)
+  enable()
+  researchExperiment()
+  const world = fakeWorld({ runs: [0.69, 0.692] })
+  // The request began 700 s ago (the tick spent that long before this epoch): the epoch's run is kept, the repeat is not started.
+  await assert.rejects(researchEpoch.runResearchEpoch(EXPERIMENT, { requestStartedAt: Date.now() - 700_000 }), deferred)
+  assert.equal(world.starts.length, 1)
+  assert.deepEqual(lab.repeats, [])
+  assert.equal(lab.epochs[0].reviewer_output.verdict, 'keep')
+  assert.equal(lab.experiments[0].current_epoch, 80)
+  assert.ok(logs.some(l => l.includes('[Research e81] lab repeat not started: 700 s into the request, too late to start one safely; the next tick starts it')))
+  // The next tick, early in its request, starts it and decides.
+  await researchEpoch.runResearchEpoch(EXPERIMENT, { requestStartedAt: Date.now() - 5_000 })
+  assert.deepEqual(world.starts[1], { train_py: NEW_TRAIN_PY, budget_s: 300 })
+  assert.equal(lab.epochs[0].research_run.confirm.verdict, 'confirmed')
+  assert.equal(world.starts.length, 3) // and the control after it
+
+  // A start time in the future, or not a number, is taken as now.
+  freshLab()
+  enable()
+  researchExperiment()
+  const later = fakeWorld({ runs: [0.69, 0.692] })
+  await researchEpoch.runResearchEpoch(EXPERIMENT, { requestStartedAt: Date.now() + 3_600_000 })
+  assert.equal(later.starts.length, 3)
+
+  // No control is started when the request is late, counted from when it began, not from when the epoch began.
+  freshLab()
+  enable()
+  researchExperiment()
+  const reverted = fakeWorld({ verdict: 'revert', runs: [0.74] })
+  await researchEpoch.runResearchEpoch(EXPERIMENT, { requestStartedAt: Date.now() - 690_000 })
+  assert.equal(reverted.starts.length, 1)
+  assert.ok(logs.some(l => l.includes('[Research e81] no control run: 690 s into the request')))
+
+  // The handlers take the time before anything else and pass it down to the research epoch.
+  const tick = readFileSync(join(root, 'api/epoch/tick.ts'), 'utf8')
+  assert.ok(tick.indexOf('const requestStartedAt = Date.now()') < tick.indexOf('await collectTinkerRuns()'))
+  assert.ok(tick.includes('result = await runEpoch(experiment.id, { requestStartedAt })'))
+  const run = readFileSync(join(root, 'api/epoch/run.ts'), 'utf8')
+  assert.ok(run.includes('const requestStartedAt = Date.now()') && run.includes('result = await runEpoch(experiment.id, { requestStartedAt })'))
+  const runner = readFileSync(join(root, 'api/_lib/epoch-runner.ts'), 'utf8')
+  assert.ok(runner.includes('return runResearchEpoch(experimentId, opts)'))
+})
+
+test('the wait for a repeat is counted from before its start, so a slow start comes out of it', async () => {
+  enable()
+  const world = fakeWorld({ runs: ['running'] })
+  const inner = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if (String(url) === 'https://runner.example/start') await new Promise(r => setTimeout(r, 150))
+    return inner(url, options)
+  }
+  // 100 ms to wait, and the start alone takes 150 ms: the runner is asked once, and the request does not wait on.
+  await assert.rejects(confirm.confirmNewBest({ ...confirmArgs, maxWaitMs: 100 }), e => e.name === 'ResearchRunPendingError' && e.callId === 'call-1')
+  assert.deepEqual(world.polls, ['call-1'])
+})
+
+test('a repeat\'s row is written before the runner is asked: a start that is refused is removed, one that never answered is closed as lost and never started again', async () => {
+  enable({ LAB_RESEARCH_ALONGSIDE: 'true' })
+  let world = fakeWorld({ runs: [0.692] })
+  const inner = globalThis.fetch
+  let startAnswer = 'refuse'
+  globalThis.fetch = async (url, options) => {
+    if (String(url) === 'https://runner.example/start') {
+      if (startAnswer === 'refuse') return new Response('{"detail":"busy"}', { status: 503 })
+      if (startAnswer === 'silent') throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    }
+    return inner(url, options)
+  }
+  // The row is there, starting and without a call id, while the runner is asked.
+  const seen = []
+  const handler = db.handler
+  db.handler = (text, values) => {
+    if (text.startsWith('UPDATE research_repeats SET call_id')) seen.push(lab.repeats.map(r => [r.status, r.call_id]))
+    return handler(text, values)
+  }
+
+  // Refused: the runner answered and started nothing, so the row goes and the next attempt starts it.
+  await assert.rejects(confirm.confirmNewBest(confirmArgs), e => e.name === 'RunnerStartRefusedError' && /runner start failed: 503/.test(e.message))
+  assert.deepEqual(lab.repeats, [])
+  startAnswer = 'ok'
+  const decision = await confirm.confirmNewBest(confirmArgs)
+  assert.equal(decision.verdict, 'confirmed')
+  assert.deepEqual(seen, [[['starting', null]]])
+  assert.deepEqual(lab.repeats.map(r => [r.status, r.call_id]), [['ok', 'call-1']])
+
+  // No answer at all: the run may have started. The row stays starting, and nothing starts a second one.
+  freshLab()
+  enable({ LAB_RESEARCH_ALONGSIDE: 'true' })
+  world = fakeWorld({ runs: [0.692] })
+  let plain = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if (String(url) === 'https://runner.example/start') throw new DOMException('The operation was aborted due to timeout', 'TimeoutError')
+    return plain(url, options)
+  }
+  await assert.rejects(confirm.confirmNewBest(confirmArgs), e => e.name === 'TimeoutError')
+  assert.deepEqual(lab.repeats.map(r => [r.kind, r.status, r.call_id]), [['confirm', 'starting', null]])
+  // While the request that wrote it could still be running, the next attempt waits.
+  globalThis.fetch = plain
+  await assert.rejects(confirm.confirmNewBest(confirmArgs), e => e.name === 'RepeatDeferredError')
+  assert.equal(world.starts.length, 0)
+  // Once that request is certainly over: lost, charged at the full estimate, not confirmed, and not started again.
+  lab.repeats[0].created_at = new Date(Date.now() - confirm.REPEAT_START_LOST_AFTER_MS - 1_000)
+  const lost = await confirm.confirmNewBest(confirmArgs)
+  assert.deepEqual([lost.verdict, lost.repeat_status], ['not_confirmed', 'lost'])
+  assert.equal(world.starts.length, 0)
+  assert.equal(lab.repeats[0].status, 'lost')
+  assert.deepEqual(lab.modelCalls.filter(c => c.model_id === 'tool/research_gpu_repeat').map(c => Number(c.cost_usd.toFixed(6))), [Number(((300 + 180) * 0.000306).toFixed(6))])
+
+  // A control whose start never answered holds back the next control until it is closed as lost the same way.
+  freshLab()
+  enable({ LAB_RESEARCH_ALONGSIDE: 'true' })
+  world = fakeWorld({ runs: [] })
+  plain = globalThis.fetch
+  globalThis.fetch = async (url, options) => {
+    if (String(url) === 'https://runner.example/start') throw new TypeError('fetch failed')
+    return plain(url, options)
+  }
+  const control = { experimentId: EXPERIMENT, epoch: 81, trainPy: TRAIN_PY, bestBpb: 0.7, bestEpoch: 40, budgetS: 300 }
+  assert.equal(await confirm.maybeStartControl(control), null)
+  assert.deepEqual(lab.repeats.map(r => [r.kind, r.status]), [['control', 'starting']])
+  // The public state does not take a control that is still starting as the last one.
+  const starting = lab.repeats.map(r => ({ ...r, id: String(r.id), created_at: r.created_at.toISOString() }))
+  assert.equal('last_control' in confirm.scoringSnapshot({ epoch: 81, rows: starting, minMargin: 0.002 }), false)
+  globalThis.fetch = plain
+  assert.equal(await confirm.maybeStartControl({ ...control, epoch: 82 }), null)
+  await confirm.collectRepeats(EXPERIMENT, 82, 300)
+  assert.equal(lab.repeats[0].status, 'starting')
+  await confirm.collectRepeats(EXPERIMENT, 82, 300, new Date(Date.now() + confirm.REPEAT_START_LOST_AFTER_MS + 1_000))
+  assert.equal(lab.repeats[0].status, 'lost')
+  assert.equal(lab.modelCalls.filter(c => c.model_id === 'tool/research_gpu_control').length, 1)
+  assert.ok(logs.some(l => l.includes('control after epoch 81 collected: lost val_bpb=n/a (its start was never recorded)')))
+  // Only now is the next control started.
+  assert.equal(await confirm.maybeStartControl({ ...control, epoch: 82 }), 82)
+  assert.equal(world.starts.length, 1)
+})
+
+test('repeats that are still open count against the research cap at the full estimate before any more GPU time is started', async () => {
+  const estimate = (300 + 180) * 0.000306
+  enable({ LAB_RESEARCH_ALONGSIDE: 'true', LAB_RESEARCH_DAILY_BUDGET_USD: '1' })
+  // Spent 0.90 of 1.00, and a control is still training: one more run would take the day past the cap.
+  lab.spentToday = 0.9
+  lab.repeats.push(storedRepeat())
+  let world = fakeWorld({ runs: [0.692] })
+  const status = await confirm.checkResearchGpuBudget(lab.repeats.map(r => ({ ...r, id: String(r.id) })), 300)
+  assert.deepEqual([status.allowed, status.reason, Number(status.reserved_usd.toFixed(6))], [false, 'research daily budget reached', Number(estimate.toFixed(6))])
+  await assert.rejects(confirm.confirmNewBest({ ...confirmArgs, epoch: 81 }), e => e.name === 'BudgetPausedError' && e.status.reserved_usd > 0)
+  assert.equal(world.starts.length, 0)
+  assert.equal(await confirm.maybeStartControl({ experimentId: EXPERIMENT, epoch: 90, trainPy: TRAIN_PY, bestBpb: 0.7, bestEpoch: 40, budgetS: 300 }), null)
+  assert.equal(world.starts.length, 0)
+  // With room for both it is started, and the cap check says what it held back for the open one.
+  lab.spentToday = 0.8
+  assert.ok((await confirm.checkResearchGpuBudget(lab.repeats.map(r => ({ ...r, id: String(r.id) })), 300)).allowed)
+  assert.equal((await confirm.confirmNewBest({ ...confirmArgs, epoch: 81 })).verdict, 'confirmed')
+  assert.equal(world.starts.length, 1)
+
+  // The epoch's own run is held back the same way while one of the lab's repeats is open, and goes on when there is room.
+  freshLab()
+  enable({ LAB_RESEARCH_ALONGSIDE: 'true', LAB_RESEARCH_DAILY_BUDGET_USD: '1' })
+  researchExperiment()
+  lab.repeats.push(storedRepeat())
+  lab.spentToday = 0.9
+  world = fakeWorld({ verdict: 'revert', runs: [0.74] })
+  await assert.rejects(runEpoch(), e => e.name === 'BudgetPausedError')
+  assert.equal(world.starts.length, 0)
+  assert.ok(logs.some(l => l.includes('[Research e81] GPU run not started: research daily budget reached, with the lab\'s open repeats counted')))
+  lab.spentToday = 0.5
+  await runEpoch()
+  assert.equal(world.starts.length, 1)
+
+  // Not beside run 2, GPU time is not on the ledger at all, so nothing is held back for it.
+  freshLab()
+  process.env = { ...BASE_ENV }
+  enable({ LAB_DAILY_BUDGET_USD: '1' })
+  lab.spentToday = 0.99
+  const open = [storedRepeat({ id: '1' }), storedRepeat({ id: '2', kind: 'confirm', status: 'starting', call_id: null })]
+  const single = await confirm.checkResearchGpuBudget(open, 300)
+  assert.deepEqual([single.allowed, 'reserved_usd' in single], [true, false])
+  // Nothing open beside run 2: the plain check of research's own cap.
+  Object.assign(process.env, { LAB_RESEARCH_ALONGSIDE: 'true', LAB_RESEARCH_DAILY_BUDGET_USD: '1' })
+  lab.spentToday = 0.99
+  const plainCheck = await confirm.checkResearchGpuBudget([], 300)
+  assert.deepEqual(plainCheck, { allowed: true, spent_usd: 0.99, budget_usd: 1, resumes_at: plainCheck.resumes_at, scope: 'research' })
+})
+
+test('the run being judged is not in the noise that judges it: a file that prints one number twice does not lower its own bar', async () => {
+  enable()
+  researchExperiment({ best_bpb: 0.6905 })
+  const best = confirm.trainSha256(TRAIN_PY)
+  // Controls of the best file printed 0.700 and 0.708; an earlier candidate printed 0.690 and then 0.694.
+  lab.repeats.push(
+    storedRepeat({ id: 1, epoch_number: 70, train_sha256: best, status: 'ok', val_bpb: 0.700, call_id: 'old-1', ledger_written: true }),
+    storedRepeat({ id: 2, epoch_number: 71, train_sha256: best, status: 'ok', val_bpb: 0.708, call_id: 'old-2', ledger_written: true }),
+    storedRepeat({ id: 3, epoch_number: 72, kind: 'confirm', train_sha256: 'e'.repeat(64), status: 'ok', val_bpb: 0.694, reference_bpb: 0.690, call_id: 'old-3', ledger_written: true }),
+  )
+  // The candidate prints 0.6800 in both runs: 0.0105 below the best.
+  const world = fakeWorld({ runs: [0.68, 0.68] })
+  await runEpoch()
+  const d = lab.epochs[0].research_run.confirm
+  // The noise without the pair: spreads of 0.004 and 0.002 (by 2 x 1.0483), middle 0.0031; margin 0.0063 x 2.
+  close(d.noise_bpb, 2 * confirm.PAIR_DISTANCE_TO_SD * 0.003)
+  assert.equal(d.noise_samples, 4)
+  assert.equal(d.verdict, 'within_noise')
+  assert.match(d.line, /^within noise: mean 0\.6800 of two runs \(0\.6800 and 0\.6800\) beats 0\.6905 by 0\.0105, not more than the 0\.0126 margin; not kept \(margin: twice the measured noise of 0\.0063, from 4 repeated scores, not counting this run's own two scores\)$/)
+  assert.deepEqual([researchMeta().best_bpb, world.files['train.py']], [0.6905, TRAIN_PY])
+  // With its own pair counted (a spread of zero), the bar would have been 0.0084 and the same pair a new best.
+  const withPair = confirm.noiseFromRepeats(lab.repeats.map(r => ({ ...r, id: String(r.id) })))
+  close(withPair.noise_bpb, 2 * confirm.PAIR_DISTANCE_TO_SD * 0.002)
+  assert.equal(confirm.decideConfirmation({ first: 0.68, repeat: 0.68, repeatStatus: 'ok', best: 0.6905, noise: withPair, minMargin: 0.002 }).verdict, 'confirmed')
+  // For later epochs the pair does count: the public state after the epoch has it.
+  assert.equal(researchMeta().scoring.noise_samples, 6)
+})
+
+test('with stories on, the record and the models are told that the repeat has no save step', async () => {
+  enable()
+  fakeWorld({ runs: [0.692] })
+  const d = await confirm.confirmNewBest({ ...confirmArgs, firstRunnerFlow: 'keep-1' })
+  assert.match(d.line, /not counting this run's own two scores\); the first run had the runner's save step \(runner_flow keep-1\) and the lab's repeat did not$/)
+  // A first run without it, or a flow that is not a plain word, adds nothing.
+  freshLab()
+  enable()
+  fakeWorld({ runs: [0.692] })
+  assert.equal((await confirm.confirmNewBest({ ...confirmArgs, firstRunnerFlow: 'keep 1; rm -rf' })).line.includes('save step'), false)
+  // The note the models read says the same while stories are on, and what it always said otherwise.
+  const plain = confirm.scoringPromptNote([], 0.002)
+  assert.ok(plain.includes('the lab runs the same train.py once more, unchanged, through the same runner and harness.'))
+  const saving = confirm.scoringPromptNote([], 0.002, 0.05, { saveStep: true })
+  assert.ok(saving.includes('through the same runner, without the step that saves the trained model'))
+  assert.equal(/\b(you should|you must|try to|aim|make sure|please)\b/i.test(saving), false)
+  const epochSource = readFileSync(join(root, 'api/_lib/research-epoch.ts'), 'utf8')
+  assert.ok(epochSource.includes('{ saveStep: researchTalkStatus().enabled }'))
+  assert.ok(epochSource.includes('...(runResult.runner_flow ? { firstRunnerFlow: runResult.runner_flow } : {}),'))
+})
+
 test('the growth feed counts a confirmed best at the mean of its two runs, as the record does', () => {
   const epoch = (n, extra = {}) => ({ id: `e${n}`, epoch_number: n, completed_at: new Date(Date.parse('2026-11-01T00:00:00Z') + n * 3600_000).toISOString(), assigned_executor: 'openai/gpt-6-astra', decisions: [], review_verdict: 'keep', run_status: 'ok', ...extra })
   const breakthroughs = epochs => growth.buildGrowthEvents({ baselineBpb: 0.72, epochs, contributions: [], exhibits: [] }).filter(e => e.kind === 'breakthrough').map(e => [e.epoch, e.magnitude])
@@ -1301,13 +1577,23 @@ test('lab-repeats.tsv gets one row per repeat, once, and a file that is not the 
   assert.equal(await research.appendLabRepeatRow(fields), false)
   assert.equal(await research.appendLabRepeatRow({ ...fields, kind: 'confirm', epoch: 82, val_bpb: null, status: 'crash', reference_epoch: 82, provenance: research.provenanceOf(undefined), call_id: null }), true)
   assert.deepEqual(world.files['lab-repeats.tsv'].trimEnd().split('\n').slice(1), [
-    `control\t81\t${'a'.repeat(64)}\t0.7012\tok\t0.7000\t40\texperiment_stdout_unverified\ttinystories\t-\t310.0\tfc-01ABC`,
-    `confirm\t82\t${'a'.repeat(64)}\t-\tcrash\t0.7000\t82\t-\t-\t-\t-\t-`,
+    `control\t81\t${'a'.repeat(64)}\t0.7012\tok\t0.7000\t40\texperiment_stdout_unverified\ttinystories\t-\t310.0\tfc-01ABC\t-`,
+    `confirm\t82\t${'a'.repeat(64)}\t-\tcrash\t0.7000\t82\t-\t-\t-\t-\t-\t-`,
   ])
+  // A run with the runner's save step says so in the last column.
+  await research.appendLabRepeatRow({ ...fields, epoch: 83, provenance: research.provenanceOf({ status: 'ok', metrics: { val_bpb: 0.7 }, runner_flow: 'keep-1' }) })
+  assert.equal(world.files['lab-repeats.tsv'].trimEnd().split('\n')[3].split('\t')[12], 'keep-1')
+  // A file written with the twelve columns it had before gets the wider header; its rows stay as they were.
+  const OLD_REPEATS_HEADER = 'kind\tepoch\ttrain_sha256\tval_bpb\tstatus\treference_bpb\treference_epoch\tmetrics_source\tdataset\tharness_sha256\ttrain_wall_seconds\tcall_id'
+  const oldRow = `control\t80\t${'a'.repeat(64)}\t0.7000\tok\t0.7000\t40\t-\t-\t-\t-\tfc-0`
+  world = fakeWorld({ files: { 'lab-repeats.tsv': `${OLD_REPEATS_HEADER}\n${oldRow}\n` } })
+  assert.equal(await research.appendLabRepeatRow(fields), true)
+  assert.deepEqual(world.files['lab-repeats.tsv'].trimEnd().split('\n').map(l => l.split('\t').length), [13, 12, 13])
+  assert.equal(world.files['lab-repeats.tsv'].split('\n')[1], oldRow)
   // What is not a hash, a status word or a call id is written as "-", so no cell can add a column or a row.
   world = fakeWorld({})
   await research.appendLabRepeatRow({ ...fields, train_sha256: 'x\ty', status: 'ok\n81', call_id: 'a\tb' })
-  assert.equal(world.files['lab-repeats.tsv'].trimEnd().split('\n')[1].split('\t').length, 12)
+  assert.equal(world.files['lab-repeats.tsv'].trimEnd().split('\n')[1].split('\t').length, 13)
   assert.deepEqual(world.files['lab-repeats.tsv'].trimEnd().split('\n')[1].split('\t').filter((_, i) => [2, 4, 11].includes(i)), ['-', '-', '-'])
   world = fakeWorld({ files: { 'lab-repeats.tsv': 'someone else\'s file\n' } })
   await assert.rejects(research.appendLabRepeatRow(fields), /does not start with the lab's header/)
@@ -1510,7 +1796,12 @@ test('the documents state the switches, their defaults and the owner\'s steps as
   assert.ok(ops.includes(`never past ${confirm.confirmWaitDeadlineMs(240_000) / 1000} s into the request`))
   assert.ok(ops.includes(`less ${confirm.CONFIRM_TAIL_MS / 1000} s for the repository and database writes`))
   assert.ok(ops.includes(`not started later than ${confirm.CONTROL_START_DEADLINE_MS / 1000} s into a request`))
-  assert.ok(ops.includes(`The noise is the median of those distances over the newest ${confirm.NOISE_WINDOW} finished repeats, times ${confirm.PAIR_DISTANCE_TO_SD}`))
+  assert.ok(ops.includes(`over the newest ${confirm.NOISE_WINDOW} finished repeats`) && ops.includes(`(for a pair, 2 x ${confirm.PAIR_DISTANCE_TO_SD}`))
+  assert.ok(ops.includes('The noise is the median of those spreads, each counted once for every score in its group, so every run counts once.'))
+  assert.ok(ops.includes('leaves out the pair being judged') && ops.includes("not counting this run's own two scores"))
+  assert.ok(ops.includes(`once the request that wrote it is certainly over (${confirm.REPEAT_START_LOST_AFTER_MS / 1000} s)`))
+  assert.ok(ops.includes('it counts each open one at the full estimate'))
+  assert.equal(ops.includes('No run is started twice.'), false)
   assert.ok(ops.includes('never more than `LAB_RESEARCH_MAX_MARGIN`') && ops.includes('`margin_basis: "ceiling"`'))
   assert.equal(ops.split('still unanswered three hours after it started').length, 3) // said of a confirmation and of a control
   assert.equal(confirm.REPEAT_LOST_AFTER_MS, 3 * 60 * 60 * 1000)
@@ -1533,7 +1824,7 @@ test('the documents state the switches, their defaults and the owner\'s steps as
     '[MAI-Thinking-1: Building a Hill-Climbing Machine](https://microsoft.ai/pdf/mai-thinking-1.pdf)',
     '**Self-reported and unverified.**', '**Measured by the lab.**', '`LAB_RESEARCH_CONFIRM`, off by default', '`LAB_TINKER_ORIGIN_LABELS`, off by default',
     `\`LAB_RESEARCH_MIN_MARGIN\`, ${confirm.DEFAULT_MIN_MARGIN_BPB} val_bpb by default`, `\`LAB_RESEARCH_MAX_MARGIN\`, ${confirm.DEFAULT_MAX_MARGIN_BPB} by default`,
-    'uses the median of those distances', 'compared at four decimal places', 'the epoch waits with its candidate and repeats it when the budget resets', 'noise not yet measured', 'A repeat checks luck, not honesty.',
+    'uses the median of those spreads, with every run counted once', 'The run being judged is not part of the noise that judges it', 'compared at four decimal places', 'the epoch waits with its candidate and repeats it when the budget resets', 'noise not yet measured', 'A repeat checks luck, not honesty.',
     'a `train.py` that prints a false score would print it twice and pass', 'It is not built yet.', '"written by the models"', '"public dataset"',
   ]) assert.ok(section.includes(text), text)
   // The example line in the README is what the code writes for those numbers.
@@ -1548,9 +1839,10 @@ test('the documents state the switches, their defaults and the owner\'s steps as
 
   // The About card has one sentence about it, said as something that is switched on.
   const overlay = readFileSync(join(root, 'src/systems/UIOverlay.ts'), 'utf8')
-  const sentence = 'When the lab\'s repeat check is switched on, a research result only counts as the best after the lab repeats it and it beats the old best by more than chance.'
+  const sentence = 'When the lab\'s repeat check is switched on, a research result only counts as the best after the lab runs it again and the average of the two printed scores beats the old best by more than the run-to-run spread the lab has measured. Both scores are printed by the models\' own code, so a repeat checks luck, not honesty.'
   assert.ok(overlay.includes(`and every result goes to the Research-Lab repository. ${sentence}\n`))
   assert.equal(/[—–]/.test(sentence), false)
+  assert.equal(/chance|significan|verif/i.test(sentence), false)
   // What the models are told has no instruction in it: it states the rule and its limits.
   const note = confirm.scoringPromptNote([], 0.002)
   assert.ok(note.startsWith('\n\nHOW THE LAB SCORES A NEW BEST (a fact about the lab, not a goal;'))

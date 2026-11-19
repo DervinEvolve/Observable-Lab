@@ -13,6 +13,8 @@ import { ResearchRunPendingError } from '../_lib/research.js'
 // claim with the cron, so the two can never run an epoch at the same time,
 // and the same daily budget.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // The research epoch measures its deadlines from here (see tick.ts).
+  const requestStartedAt = Date.now()
   if (!requireBearer(req, res)) return
 
   if (req.method !== 'POST') {
@@ -73,7 +75,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
 
     let result: Awaited<ReturnType<typeof runEpoch>>
     try {
-      result = await runEpoch(experiment.id)
+      result = await runEpoch(experiment.id, { requestStartedAt })
     } catch (e) {
       if (e instanceof EpochBusyError) {
         return res.status(409).json({ error: 'An epoch is already in progress', experiment_id: experiment.id })

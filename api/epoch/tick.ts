@@ -26,6 +26,9 @@ const NO_EXPERIMENT: TickBody = { message: 'No active experiment', next_check: '
 // its own claim, stale limit, follow-ups, cadence and daily cap, so one that
 // fails, is busy or is over its cap never holds up the other.
 export default async function handler(req: VercelRequest, res: VercelResponse) {
+  // Before anything else: the research epoch measures how long it may still
+  // wait, and whether it may still start a GPU run, from this moment.
+  const requestStartedAt = Date.now()
   if (!requireBearer(req, res, 'CRON_SECRET')) return
 
   if (req.method !== 'GET') {
@@ -56,7 +59,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         console.log('[CRON] No active experiment')
         return res.status(200).json(NO_EXPERIMENT)
       }
-      return res.status(200).json(await advance(experiment, 'primary'))
+      return res.status(200).json(await advance(experiment, 'primary', requestStartedAt))
     } catch (error) {
       // Log full error server-side, return sanitized message to client
       console.error('[CRON] Error in epoch tick:', error)
@@ -73,7 +76,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         console.log('[CRON] No active experiment')
         return NO_EXPERIMENT
       }
-      return advance(experiment, 'classic')
+      return advance(experiment, 'classic', requestStartedAt)
     })(),
     (async (): Promise<TickBody> => {
       let experiment = await loadTickExperiment('research')
@@ -86,7 +89,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
         console.log(`[CRON research] No active research experiment: ${activation && !activation.activated ? activation.reason : 'none found'}`)
         return { message: 'No active research experiment', activation }
       }
-      return { ...(await advance(experiment, 'research')), ...(activation ? { activation } : {}) }
+      return { ...(await advance(experiment, 'research', requestStartedAt)), ...(activation ? { activation } : {}) }
     })(),
   ])
   if (classic.status === 'rejected') console.error('[CRON] Error in epoch tick:', classic.reason)
@@ -103,7 +106,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
  * waiting follow-up, or runs the next epoch when it is due. Returns what it
  * did; throws only for an error nobody expected.
  */
-async function advance(experiment: Record<string, any>, slot: TickSlot): Promise<TickBody> {
+async function advance(experiment: Record<string, any>, slot: TickSlot, requestStartedAt: number): Promise<TickBody> {
   const tag = slot === 'research' ? '[CRON research]' : '[CRON]'
   const staleMinutes = envEpochStaleMinutes()
 
@@ -155,7 +158,7 @@ async function advance(experiment: Record<string, any>, slot: TickSlot): Promise
   const tickStart = Date.now()
   let result: Awaited<ReturnType<typeof runEpoch>>
   try {
-    result = await runEpoch(experiment.id)
+    result = await runEpoch(experiment.id, { requestStartedAt })
   } catch (e) {
     if (e instanceof BudgetPausedError) {
       console.warn(`${tag} Skipping epoch ${experiment.current_epoch + 1}: ${describeBudget(e.status)}`)

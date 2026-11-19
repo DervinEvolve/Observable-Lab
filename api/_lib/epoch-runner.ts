@@ -225,7 +225,11 @@ export interface EpochRunResult {
  * Every model call inside is written to the spend ledger under this
  * experiment and epoch. The claim is released however the epoch ends.
  */
-export async function runEpoch(experimentId: string): Promise<EpochRunResult> {
+export async function runEpoch(
+  experimentId: string,
+  /** requestStartedAt: when the request began (Date.now() then); the research epoch measures its deadlines from it. */
+  opts: { requestStartedAt?: number } = {},
+): Promise<EpochRunResult> {
   // One cap for everything, or research's own cap when it runs alongside
   // (spend.ts). The rows this epoch writes carry the cap it started under.
   const budgetScope = await budgetScopeFor(experimentId)
@@ -237,7 +241,7 @@ export async function runEpoch(experimentId: string): Promise<EpochRunResult> {
   if (!(await claimEpoch(experimentId))) throw new EpochBusyError(experimentId)
   return withSpendContext({ experimentId, purpose: 'epoch', budgetScope }, async () => {
     try {
-      return await runClaimedEpoch(experimentId)
+      return await runClaimedEpoch(experimentId, opts)
     } catch (error) {
       await releaseEpoch(experimentId).catch(e =>
         console.error('[Epoch] could not release the epoch claim:', e instanceof Error ? e.message : e))
@@ -246,7 +250,7 @@ export async function runEpoch(experimentId: string): Promise<EpochRunResult> {
   })
 }
 
-async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
+async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: number }): Promise<EpochRunResult> {
   // 1. Get current experiment state
   const experimentResult = await sql`
     SELECT * FROM experiments WHERE id = ${experimentId}
@@ -263,7 +267,7 @@ async function runClaimedEpoch(experimentId: string): Promise<EpochRunResult> {
   // classic spec-growing pipeline.
   if (currentSpec.meta.research) {
     setSpendEpoch((experiment.current_epoch as number) + 1)
-    return runResearchEpoch(experimentId)
+    return runResearchEpoch(experimentId, opts)
   }
 
   const epochNumber = (experiment.current_epoch as number) + 1

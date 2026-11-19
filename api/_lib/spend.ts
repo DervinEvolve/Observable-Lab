@@ -218,6 +218,7 @@ export interface BudgetStatus {
   resumes_at: string        // next UTC midnight
   reason?: string
   scope?: ExperimentMode    // which cap this is, when there are two
+  reserved_usd?: number     // GPU runs started but not on the ledger yet, counted at their full estimate (research-confirm.ts)
 }
 
 export const BUDGET_PAUSED_STATE = 'paused: daily budget reached'

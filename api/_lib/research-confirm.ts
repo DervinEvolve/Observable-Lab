@@ -8,10 +8,13 @@
  *
  *  1. Confirm before best. A run the Reviewer kept, whose score is below the
  *     best, is run once more by the lab: the same train.py, unchanged,
- *     through the same runner and harness. It becomes the new best only if
- *     the mean of the two scores beats the best by more than the margin.
- *     Otherwise it is recorded as within noise, or as not confirmed when the
- *     repeat gives no score, and train.py stays as it was.
+ *     through the same runner. (While LAB_ENABLE_RESEARCH_TALK is on, the
+ *     epoch's own run has the runner's save step and the repeat does not:
+ *     the repeat is started without a key. The verdict line and
+ *     lab-repeats.tsv say so.) It becomes the new best only if the mean of
+ *     the two scores beats the best by more than the margin. Otherwise it is
+ *     recorded as within noise, or as not confirmed when the repeat gives no
+ *     score, and train.py stays as it was.
  *  2. A noise floor. The margin is max(2 x noise, LAB_RESEARCH_MIN_MARGIN),
  *     and never more than LAB_RESEARCH_MAX_MARGIN. The noise is the spread
  *     between runs of the same file, measured from every confirmation pair
@@ -19,12 +22,18 @@
  *     unchanged after an epoch, the first three times on consecutive epochs
  *     and then every LAB_RESEARCH_CONTROL_EVERY epochs. Until three repeated
  *     scores exist the margin is the floor alone. The scores the noise is
- *     taken from are printed by generated code, so the estimate is a median
- *     (one wild pair does not move it) and the margin has a ceiling (many
- *     wild pairs cannot lift it without limit).
- *  3. A record. Every repeat is a row in research_repeats, a row in
- *     lab-repeats.tsv in the research repository, and its GPU time goes on
- *     the spend ledger like an epoch's own run.
+ *     taken from are printed by generated code, so each file's spread is
+ *     taken about its own middle score, the estimate is the middle of those
+ *     spreads with every run counted once (one wild score, or one wild pair,
+ *     does not set it), and the margin has a ceiling (many wild scores
+ *     cannot lift it without limit). The run being judged is not in the
+ *     noise that judges it: its own pair counts only for later epochs.
+ *  3. A record. Every repeat is a row in research_repeats, written before
+ *     the runner is asked, so no GPU run the lab starts goes unrecorded; a
+ *     row in lab-repeats.tsv in the research repository; and its GPU time
+ *     goes on the spend ledger like an epoch's own run. Until it is
+ *     collected, an open repeat counts against the research cap at the full
+ *     estimate of a run.
  *
  * What this is not: a check on honesty. Both scores are printed by the
  * generated train.py. A repeat tells a lucky run from one that repeats; a
@@ -38,10 +47,12 @@
 import { createHash } from 'node:crypto'
 import { sql } from '@vercel/postgres'
 import { researchAlongside } from './experiment-modes.js'
-import { BudgetPausedError, checkDailyBudget, recordModelCall, withSpendContext } from './spend.js'
+import {
+  BudgetPausedError, checkDailyBudget, recordModelCall, RESEARCH_BUDGET_REACHED, withSpendContext, type BudgetStatus,
+} from './spend.js'
 import {
   appendLabRepeatRow, pollResearchRun, provenanceOf, researchGpuCostUsd, ResearchRunPendingError,
-  sanitizeRunResult, startResearchRun,
+  RunnerStartRefusedError, sanitizeRunResult, startResearchRun,
   type ResearchRunResult, type ResultConfirmColumns,
 } from './research.js'
 import type { ResearchConfirmVerdict, ResearchScoring } from './types.js'
@@ -112,12 +123,25 @@ export function confirmWaitDeadlineMs(completionTimeoutMs: number): number {
   return Math.max(0, FUNCTION_LIMIT_MS - call - CONFIRM_TAIL_MS)
 }
 /**
- * A control is not started later than this into a request: starting it may
- * take the runner's whole start timeout, and a function that is stopped
- * between the start and the row that records it would leave a GPU run nobody
- * collects. A control that is skipped is tried after the next epoch.
+ * No repeat, a confirmation or a control, is started later than this into a
+ * request, counted from when the request began (the tick or the manual
+ * route, before anything else it does): starting one may take the runner's
+ * whole start timeout, and the call id it hands back still has to be
+ * written. A confirmation that is not started for this is started early in
+ * the next tick's request; a control is tried after the next epoch.
  */
-export const CONTROL_START_DEADLINE_MS = FUNCTION_LIMIT_MS - 120_000
+export const REPEAT_START_DEADLINE_MS = FUNCTION_LIMIT_MS - 120_000
+/** The same deadline, under the name it had when it applied to controls only. */
+export const CONTROL_START_DEADLINE_MS = REPEAT_START_DEADLINE_MS
+/**
+ * A repeat's row is written before the runner is asked to start it (status
+ * starting, no call id), and the call id is written when the runner hands it
+ * back. A row still starting this long after it was written was left by a
+ * request that stopped in between, which is certainly over by now: the run
+ * may or may not have been started, and nothing can ask about it. It is
+ * closed as lost, charged at the full estimate, and never started again.
+ */
+export const REPEAT_START_LOST_AFTER_MS = FUNCTION_LIMIT_MS + 60_000
 
 // ---------------------------------------------------------------------------
 // The arithmetic (no I/O)
@@ -148,31 +172,63 @@ function median(values: number[]): number {
 export const PAIR_DISTANCE_TO_SD = 1.0483
 
 /**
+ * For a file run k times, what the median distance of its scores from their
+ * own middle score is multiplied by to estimate the standard deviation:
+ * chosen so that, for scores with a normal spread s, the middle of many such
+ * estimates is s. For a pair the median distance is half the pair's
+ * distance, so the factor is twice PAIR_DISTANCE_TO_SD and a pair counts
+ * exactly as it did when the noise was a median of pair distances. For 3 to
+ * 10 runs the factors come from a simulation of 1.5 million groups of
+ * normal scores each, rounded to two places; above 10 runs it is
+ * 1.4826 x (1 + 1.2 / k), within one per cent of the same simulation and
+ * tending to the large-sample 1.4826.
+ */
+const MAD_TO_SD = [NaN, NaN, 2 * PAIR_DISTANCE_TO_SD, 2.77, 2.21, 1.99, 1.87, 1.79, 1.75, 1.71, 1.68]
+export function madToSd(k: number): number {
+  if (!Number.isInteger(k) || k < 2) return NaN
+  return k < MAD_TO_SD.length ? MAD_TO_SD[k] : 1.4826 * (1 + 1.2 / k)
+}
+
+/** The middle of values that each count `weight` times. */
+function weightedMedian(items: Array<{ value: number; weight: number }>): number {
+  const sorted = [...items].sort((a, b) => a.value - b.value)
+  const half = sorted.reduce((sum, item) => sum + item.weight, 0) / 2
+  let seen = 0
+  for (let i = 0; i < sorted.length; i++) {
+    seen += sorted[i].weight
+    if (seen > half) return sorted[i].value
+    if (seen === half && i + 1 < sorted.length) return (sorted[i].value + sorted[i + 1].value) / 2
+  }
+  return sorted[sorted.length - 1].value
+}
+
+/**
  * The run-to-run spread from groups of scores, one group per train.py. A
- * group of one says nothing about spread and is left out. Inside each group
- * every two scores give one distance, |a - b|; the estimate is the median of
- * all those distances, scaled to a standard deviation. A median, not a
- * pooled variance, because the scores are printed by generated code: one
- * pair that is far apart (a file that prints a random number, a run that
- * diverged) is one distance among the others and does not move the middle,
- * where it would dominate a sum of squares. It is null ("not yet measured")
- * until NOISE_MIN_SAMPLES scores are in such groups.
+ * group of one says nothing about spread and is left out. Each group gives
+ * one spread: the median distance of its scores from the group's own middle
+ * score, times madToSd(k). The estimate is the middle of those spreads, each
+ * counted once for every run in its group, so every run counts once.
+ * Medians throughout, not a pooled variance, because the scores are printed
+ * by generated code. One wild score among three or more runs of a file (a
+ * control that diverged) is one distance from the middle among the others
+ * and does not set that file's spread, where with distances between every
+ * two runs it would have been in most of them. One pair that is far apart (a
+ * file that prints a random number) is one spread among the others and does
+ * not move the middle, where it would dominate a sum of squares. It is null
+ * ("not yet measured") until NOISE_MIN_SAMPLES scores are in such groups.
  */
 export function estimateNoise(groups: number[][]): NoiseEstimate {
   let samples = 0
-  let used = 0
-  const distances: number[] = []
+  const spreads: Array<{ value: number; weight: number }> = []
   for (const group of groups) {
     const values = group.filter(finite)
     if (values.length < 2) continue
-    for (let a = 0; a < values.length; a++) {
-      for (let b = a + 1; b < values.length; b++) distances.push(Math.abs(values[a] - values[b]))
-    }
+    const middle = median(values)
+    spreads.push({ value: madToSd(values.length) * median(values.map(v => Math.abs(v - middle))), weight: values.length })
     samples += values.length
-    used += 1
   }
-  if (samples < NOISE_MIN_SAMPLES || distances.length < 1) return { noise_bpb: null, samples, groups: used }
-  return { noise_bpb: PAIR_DISTANCE_TO_SD * median(distances), samples, groups: used }
+  if (samples < NOISE_MIN_SAMPLES || spreads.length < 1) return { noise_bpb: null, samples, groups: spreads.length }
+  return { noise_bpb: weightedMedian(spreads), samples, groups: spreads.length }
 }
 
 export type MarginBasis = 'noise' | 'floor' | 'ceiling'
@@ -249,9 +305,14 @@ export function decideConfirmation(args: {
   minMargin: number
   /** The ceiling, LAB_RESEARCH_MAX_MARGIN. Left out: the default. */
   maxMargin?: number
+  /** The noise was measured without this run's own two scores, and the line says so. */
+  ownPairLeftOut?: boolean
+  /** One more plain clause for the end of the line, such as how the two runs differed in the runner. */
+  note?: string
 }): ConfirmDecision {
   const margin = marginFor(args.noise, args.minMargin, args.maxMargin)
-  const how = describeMargin(args.noise, margin)
+  const how = describeMargin(args.noise, margin) + (args.ownPairLeftOut ? ', not counting this run\'s own two scores' : '')
+  const note = args.note ? `; ${args.note.replace(/[\r\n\t]+/g, ' ').slice(0, 200)}` : ''
   const common = {
     first_bpb: args.first, best_bpb: args.best, margin_bpb: margin.margin_bpb, margin_basis: margin.basis,
     noise_bpb: args.noise.noise_bpb, noise_samples: args.noise.samples,
@@ -260,7 +321,7 @@ export function decideConfirmation(args: {
   if (status !== 'ok' || !finite(args.repeat) || args.repeat < 0) {
     return {
       ...common, verdict: 'not_confirmed', repeat_bpb: null, repeat_status: status === 'ok' ? 'crash' : status, mean_bpb: null, improvement_bpb: null,
-      line: `not confirmed: the lab's repeat of the same train.py gave no score (${(status === 'ok' ? 'crash' : status).replace(/_/g, ' ')}); the first run printed ${f4(args.first)} against a best of ${f4(args.best)}; not kept (${how})`,
+      line: `not confirmed: the lab's repeat of the same train.py gave no score (${(status === 'ok' ? 'crash' : status).replace(/_/g, ' ')}); the first run printed ${f4(args.first)} against a best of ${f4(args.best)}; not kept (${how})${note}`,
     }
   }
   const mean = (args.first + args.repeat) / 2
@@ -270,14 +331,14 @@ export function decideConfirmation(args: {
   if (Number(f4(improvement)) > Number(f4(margin.margin_bpb))) {
     return {
       ...scored, verdict: 'confirmed',
-      line: `confirmed: ${runs} beats ${f4(args.best)} by ${f4(improvement)}, more than the ${f4(margin.margin_bpb)} margin; kept as the new best at ${f4(mean)} (${how})`,
+      line: `confirmed: ${runs} beats ${f4(args.best)} by ${f4(improvement)}, more than the ${f4(margin.margin_bpb)} margin; kept as the new best at ${f4(mean)} (${how})${note}`,
     }
   }
   return {
     ...scored, verdict: 'within_noise',
     line: improvement > 0
-      ? `within noise: ${runs} beats ${f4(args.best)} by ${f4(improvement)}, not more than the ${f4(margin.margin_bpb)} margin; not kept (${how})`
-      : `within noise: ${runs} does not beat ${f4(args.best)}; not kept (${how})`,
+      ? `within noise: ${runs} beats ${f4(args.best)} by ${f4(improvement)}, not more than the ${f4(margin.margin_bpb)} margin; not kept (${how})${note}`
+      : `within noise: ${runs} does not beat ${f4(args.best)}; not kept (${how})${note}`,
   }
 }
 
@@ -357,13 +418,22 @@ export interface RepeatRow {
   /** control: the epoch that best came from. */
   reference_epoch: number | null
   call_id: string | null
-  /** running, then ok, crash, infra_error or lost. */
+  /**
+   * starting (the row is written before the runner is asked, and has no call
+   * id yet), running (the call id is written), then ok, crash, infra_error
+   * or lost.
+   */
   status: string
   val_bpb: number | null
   result: ResearchRunResult | null
   cost_usd: number | null
   ledger_written: boolean
   created_at: string
+}
+
+/** A repeat that has not finished: being started, or training. Its GPU time is not on the ledger yet. */
+export function repeatOpen(status: string): boolean {
+  return status === 'starting' || status === 'running'
 }
 
 let tableReady: Promise<void> | null = null
@@ -444,38 +514,66 @@ export async function loadRepeats(experimentId: string, opts: { createTable?: bo
   return r.rows.map(row => repeatRow(row as Record<string, unknown>))
 }
 
-/**
- * Writes the row for a repeat that was just started. (experiment, epoch,
- * kind) is unique, so an epoch has one confirmation and is followed by one
- * control at most: null means there already is one.
- */
-async function openRepeat(params: {
+interface RepeatStart {
   experimentId: string
   epoch: number
   kind: RepeatKind
-  trainSha256: string
+  trainPy: string
   referenceBpb: number | null
   referenceEpoch: number | null
-  callId: string
-}): Promise<RepeatRow | null> {
+  budgetS: number
+}
+
+/**
+ * Starts a repeat so that no GPU run the lab starts can go unrecorded. The
+ * row is written first (starting, no call id), then the runner is asked,
+ * then the call id goes on the row. A request stopped in between leaves a
+ * row that says a run may have been started; it is closed as lost at the
+ * full estimate once REPEAT_START_LOST_AFTER_MS has passed (settleRepeat),
+ * and nothing starts it again. When the runner answers that it started
+ * nothing (RunnerStartRefusedError) the row is removed, so a later epoch
+ * can try again; any other failure leaves the row as it is, because the run
+ * may have started. (experiment, epoch, kind) is unique, so an epoch has
+ * one confirmation and is followed by one control at most: null means there
+ * already is one, and nothing was started.
+ */
+async function startRepeat(params: RepeatStart): Promise<RepeatRow | null> {
   await ensureRepeatsTable()
-  const r = await sql`
+  const inserted = await sql`
     INSERT INTO research_repeats (experiment_id, epoch_number, kind, train_sha256, reference_bpb, reference_epoch, call_id, status)
-    VALUES (${params.experimentId}, ${params.epoch}, ${params.kind}, ${params.trainSha256}, ${params.referenceBpb}, ${params.referenceEpoch}, ${params.callId}, ${'running'})
+    VALUES (${params.experimentId}, ${params.epoch}, ${params.kind}, ${trainSha256(params.trainPy)}, ${params.referenceBpb}, ${params.referenceEpoch}, ${null}, ${'starting'})
     ON CONFLICT (experiment_id, epoch_number, kind) DO NOTHING
     RETURNING *
   `
-  return r.rows[0] ? repeatRow(r.rows[0] as Record<string, unknown>) : null
+  if (!inserted.rows[0]) return null
+  const row = repeatRow(inserted.rows[0] as Record<string, unknown>)
+  let callId: string
+  try {
+    callId = await startResearchRun(params.trainPy, params.budgetS)
+  } catch (e) {
+    if (e instanceof RunnerStartRefusedError) {
+      await sql`DELETE FROM research_repeats WHERE id = ${row.id} AND status = ${'starting'}`.catch(() => undefined)
+    }
+    throw e
+  }
+  const started = await sql`
+    UPDATE research_repeats SET call_id = ${callId}, status = ${'running'}
+    WHERE id = ${row.id} AND status = ${'starting'}
+    RETURNING *
+  `
+  return started.rows[0] ? repeatRow(started.rows[0] as Record<string, unknown>) : { ...row, call_id: callId, status: 'running' }
 }
 
 /**
  * Closes a repeat with what the runner answered and puts its GPU time on the
- * spend ledger. Only a row that is still running is closed, and only the
- * request that closed it writes the cost. The cost is the same estimate as
+ * spend ledger. Only a row that is still open (starting or running) is
+ * closed, and only the request that closed it writes the cost. A row closed
+ * as lost has no measured time and is charged the full estimate. The cost is the same estimate as
  * for an epoch's own run (researchGpuCostUsd), written under the same
  * condition: only beside run 2, where research has a cap of its own.
  */
 async function closeRepeat(row: RepeatRow, outcome: ResearchRunResult | 'lost', budgetS: number): Promise<RepeatRow> {
+  if (!repeatOpen(row.status)) return row
   const result = outcome === 'lost' ? null : outcome
   const status = outcome === 'lost' ? 'lost' : outcome.status
   const score = result?.status === 'ok' && finite(result.metrics?.val_bpb) ? result.metrics.val_bpb : null
@@ -483,7 +581,7 @@ async function closeRepeat(row: RepeatRow, outcome: ResearchRunResult | 'lost', 
   const r = await sql`
     UPDATE research_repeats
     SET status = ${status}, val_bpb = ${score}, result = ${result ? JSON.stringify(result) : null}, cost_usd = ${cost}, finished_at = NOW()
-    WHERE id = ${row.id} AND status = ${'running'}
+    WHERE id = ${row.id} AND status = ${row.status}
     RETURNING *
   `
   if (!r.rows[0]) return { ...row, status, val_bpb: score, result }
@@ -536,7 +634,7 @@ export function scoringSnapshot(args: {
     ? { noise_bpb: args.previous.noise_bpb, samples: args.previous.noise_samples, groups: 0 }
     : noiseFromRepeats(args.rows)
   const margin = marginFor(noise, args.minMargin, args.maxMargin)
-  const control = args.rows.filter(r => r.kind === 'control' && r.status !== 'running').sort((a, b) => Number(b.id) - Number(a.id))[0]
+  const control = args.rows.filter(r => r.kind === 'control' && !repeatOpen(r.status)).sort((a, b) => Number(b.id) - Number(a.id))[0]
   const d = args.decision
   const lastVerdict = d
     ? {
@@ -563,12 +661,19 @@ export function scoringSnapshot(args: {
  * Told to the research models only while the switch is on. A fact about how
  * the lab scores, with its limits: nothing here asks for anything.
  */
-export function scoringPromptNote(rows: RepeatRow[], minMargin: number, maxMargin: number = DEFAULT_MAX_MARGIN_BPB): string {
+export function scoringPromptNote(
+  rows: RepeatRow[], minMargin: number, maxMargin: number = DEFAULT_MAX_MARGIN_BPB,
+  /** saveStep: the epoch's own run has the runner's save step (LAB_ENABLE_RESEARCH_TALK), and the repeat does not. */
+  opts: { saveStep?: boolean } = {},
+): string {
   const noise = noiseFromRepeats(rows)
   const margin = marginFor(noise, minMargin, maxMargin)
+  const runner = opts.saveStep
+    ? 'through the same runner, without the step that saves the trained model (the epoch\'s own run has that step while the lab keeps models for stories; the repeat is started without it)'
+    : 'through the same runner and harness'
   return `
 
-HOW THE LAB SCORES A NEW BEST (a fact about the lab, not a goal; val_bpb is still the only thing a run is judged on): when the Reviewer keeps a run whose val_bpb is below the current best, the lab runs the same train.py once more, unchanged, through the same runner and harness. The run becomes the new best only if the mean of the two scores beats the current best by more than the margin, and the new best is then recorded as that mean. Otherwise the result is recorded as within noise, or as not confirmed when the repeat gives no score, and train.py stays as it was. The margin now is ${f4(margin.margin_bpb)} val_bpb (${describeMargin(noise, margin)}); it is the larger of a fixed floor and twice the run-to-run noise the lab measures by running the same file more than once, which it also does now and then with the current best train.py, and it is never more than a fixed ceiling of ${f4(Math.max(minMargin, maxMargin))}. In results.tsv the columns repeat_val_bpb, mean_val_bpb, noise_bpb, margin_bpb and confirm hold this for a run that was repeated. Its limits: a repeat tells a lucky run from one that repeats, and nothing more. Both scores are printed by train.py itself, so the repeat does not make a score independently evaluated.`
+HOW THE LAB SCORES A NEW BEST (a fact about the lab, not a goal; val_bpb is still the only thing a run is judged on): when the Reviewer keeps a run whose val_bpb is below the current best, the lab runs the same train.py once more, unchanged, ${runner}. The run becomes the new best only if the mean of the two scores beats the current best by more than the margin, and the new best is then recorded as that mean. Otherwise the result is recorded as within noise, or as not confirmed when the repeat gives no score, and train.py stays as it was. The margin now is ${f4(margin.margin_bpb)} val_bpb (${describeMargin(noise, margin)}); it is the larger of a fixed floor and twice the run-to-run noise the lab measures by running the same file more than once, which it also does now and then with the current best train.py, and it is never more than a fixed ceiling of ${f4(Math.max(minMargin, maxMargin))}. In results.tsv the columns repeat_val_bpb, mean_val_bpb, noise_bpb, margin_bpb and confirm hold this for a run that was repeated. Its limits: a repeat tells a lucky run from one that repeats, and nothing more. Both scores are printed by train.py itself, so the repeat does not make a score independently evaluated.`
 }
 
 // ---------------------------------------------------------------------------
@@ -583,9 +688,13 @@ HOW THE LAB SCORES A NEW BEST (a fact about the lab, not a goal; val_bpb is stil
  * the lab knows. A status endpoint that could not be read (an HTTP error
  * from a gateway, a timeout, an answer that is not the runner's) is not an
  * outcome: the run may be training fine, so it counts as still training
- * until the runner answers or the age limit passes.
+ * until the runner answers or the age limit passes. A row still starting
+ * (no call id was ever written) is lost once REPEAT_START_LOST_AFTER_MS has
+ * passed, and until then belongs to the request that is starting it.
  */
 async function settleRepeat(row: RepeatRow, now: number = Date.now()): Promise<ResearchRunResult | 'lost' | null> {
+  const age = now - Date.parse(row.created_at || '')
+  if (row.status === 'starting') return !Number.isFinite(age) || age > REPEAT_START_LOST_AFTER_MS ? 'lost' : null
   if (!row.call_id) return 'lost'
   let poll: Awaited<ReturnType<typeof pollResearchRun>> | null
   try {
@@ -597,7 +706,6 @@ async function settleRepeat(row: RepeatRow, now: number = Date.now()): Promise<R
   if (poll?.status === 'failed' && poll.reported === true) {
     return row.kind === 'control' ? 'lost' : { status: 'infra_error', error: poll.error }
   }
-  const age = now - Date.parse(row.created_at || '')
   return Number.isFinite(age) && age > REPEAT_LOST_AFTER_MS ? 'lost' : null
 }
 
@@ -618,13 +726,13 @@ export async function collectRepeats(experimentId: string, epoch: number, budget
     const rows = await loadRepeats(experimentId)
     let changed = false
     for (const row of rows) {
-      if (row.status !== 'running') continue
+      if (!repeatOpen(row.status)) continue
       if (row.kind !== 'control' && !(row.epoch_number < epoch)) continue
       const outcome = await settleRepeat(row, now.getTime())
       if (!outcome) continue
       const closed = await closeRepeat(row, outcome, budgetS)
       changed = true
-      console.log(`[Research] ${row.kind === 'control' ? `control after epoch ${row.epoch_number}` : `repeat left open by epoch ${row.epoch_number}`} collected: ${closed.status} val_bpb=${closed.val_bpb ?? 'n/a'}`)
+      console.log(`[Research] ${row.kind === 'control' ? `control after epoch ${row.epoch_number}` : `repeat left open by epoch ${row.epoch_number}`} collected: ${closed.status} val_bpb=${closed.val_bpb ?? 'n/a'}${row.status === 'starting' ? ' (its start was never recorded)' : ''}`)
     }
     return changed ? await loadRepeats(experimentId) : rows
   } catch (e) {
@@ -634,29 +742,69 @@ export async function collectRepeats(experimentId: string, epoch: number, budget
 }
 
 /**
- * Waits for a repeat while the request has time, asking the runner at least
- * once however little time is left. null: still training at the deadline.
+ * Waits for a repeat until `waitUntil` (a Date.now() time), asking the
+ * runner at least once however little time is left. null: still training
+ * at the deadline.
  */
-async function awaitRepeat(row: RepeatRow, maxWaitMs: number, pollMs = 15_000): Promise<ResearchRunResult | 'lost' | null> {
-  const deadline = Date.now() + Math.max(0, maxWaitMs)
+async function awaitRepeat(row: RepeatRow, waitUntil: number, pollMs = 15_000): Promise<ResearchRunResult | 'lost' | null> {
   for (;;) {
     const outcome = await settleRepeat(row)
     if (outcome) return outcome
-    const left = deadline - Date.now()
+    const left = waitUntil - Date.now()
     if (left <= 0) return null
     await new Promise(r => setTimeout(r, Math.min(pollMs, left)))
   }
 }
 
 /**
+ * The day's cap for one more GPU run of the lab's own (a repeat, a control,
+ * or an epoch's own run while one of them is open), with the runs it has
+ * started and not yet collected counted in: their GPU time reaches the
+ * ledger only when they are collected. Beside run 2, where research has a
+ * cap of its own and GPU time is counted, each open repeat is counted at the
+ * full estimate of a run, the most it can be charged. Otherwise GPU time is
+ * not on the ledger at all and this is checkDailyBudget. Not allowed when
+ * the cap is reached or the ledger cannot be read.
+ */
+export async function checkResearchGpuBudget(rows: RepeatRow[], budgetS: number, now: Date = new Date()): Promise<BudgetStatus> {
+  const budget = await checkDailyBudget(now, 'research')
+  if (!budget.allowed || budget.spent_usd === null || !researchAlongside()) return budget
+  const open = rows.filter(r => repeatOpen(r.status)).length
+  if (open === 0) return budget
+  const reserved = open * researchGpuCostUsd(undefined, budgetS)
+  if (budget.spent_usd + reserved < budget.budget_usd) return { ...budget, reserved_usd: reserved }
+  return { ...budget, allowed: false, reserved_usd: reserved, reason: RESEARCH_BUDGET_REACHED }
+}
+
+/**
+ * The lab's repeat was not started in this request, or an earlier request's
+ * start of it is not recorded yet. Nothing failed: the next tick goes on
+ * from here. A kind of ResearchRunPendingError, so the tick and the manual
+ * route answer it as they answer a GPU run that is still training.
+ */
+export class RepeatDeferredError extends ResearchRunPendingError {
+  constructor(reason: string) {
+    super('none')
+    this.message = reason
+    this.name = 'RepeatDeferredError'
+  }
+}
+
+const RUNNER_FLOW = /^[a-z0-9-]{1,20}$/
+
+/**
  * The lab's repeat of a run that would become the best: starts it if this
  * epoch has none yet, waits for it while the request has time, and returns
- * the verdict. Throws ResearchRunPendingError when the repeat is still
- * training or the runner could not be asked about it (the next tick picks
- * the same call up again), BudgetPausedError when the day's cap is reached
- * before the repeat is started (the epoch waits as it is, with the
- * Reviewer's verdict stored, and is picked up when the cap resets), and any
- * error from starting the run, like the epoch's own run does.
+ * the verdict. The noise that sets the margin is the noise as it was before
+ * this pair: the run being judged does not help set its own bar. Throws
+ * ResearchRunPendingError when the repeat is still training or the runner
+ * could not be asked about it (the next tick picks the same call up again),
+ * RepeatDeferredError when it is too late in the request to start one, or an
+ * earlier request's start is not recorded yet, BudgetPausedError when the
+ * day's cap is reached before the repeat is started (the epoch waits as it
+ * is, with the Reviewer's verdict stored, and is picked up when the cap
+ * resets), and any error from starting the run, like the epoch's own run
+ * does.
  */
 export async function confirmNewBest(args: {
   experimentId: string
@@ -665,40 +813,73 @@ export async function confirmNewBest(args: {
   first: number
   best: number
   budgetS: number
-  /** How long this request may still wait, in ms. */
+  /**
+   * How long this request may still wait for the repeat, in ms, counted from
+   * this call: the budget check and the start come out of it.
+   */
   maxWaitMs: number
+  /** When the request began (a Date.now() time). Past REPEAT_START_DEADLINE_MS into it no repeat is started. */
+  requestStartedAt?: number
+  /** runner_flow of the epoch's own run, when it had one (keep-1): the line says the repeat did not. */
+  firstRunnerFlow?: string
 }): Promise<ConfirmDecision> {
+  const waitUntil = Date.now() + (finite(args.maxWaitMs) ? Math.max(0, args.maxWaitMs) : 0)
   const mine = (rows: RepeatRow[]) => rows.find(r => r.kind === 'confirm' && r.epoch_number === args.epoch)
-  let row = mine(await loadRepeats(args.experimentId))
+  const before = await loadRepeats(args.experimentId)
+  let row = mine(before)
   if (!row) {
+    // Starting a run late in a request risks the function being stopped
+    // before the call is recorded. The row is written first, so even then
+    // the run is not lost from the record, but it could not be collected or
+    // judged: the next tick, early in its request, starts it instead.
+    const elapsed = finite(args.requestStartedAt) ? Date.now() - args.requestStartedAt : 0
+    if (elapsed > REPEAT_START_DEADLINE_MS) {
+      throw new RepeatDeferredError(`lab repeat not started: ${Math.round(elapsed / 1000)} s into the request, too late to start one safely; the next tick starts it`)
+    }
     // A repeat is one more GPU run. The cap was checked when the tick began,
     // before the epoch's own run, which may have used up what was left: it
     // is checked again here (research's own cap beside run 2, the one cap
-    // otherwise), and nothing is started once it is reached or cannot be
-    // read. The candidate is not thrown away for that: the epoch stops here
-    // and repeats the run when the cap allows.
-    const budget = await checkDailyBudget(new Date(), 'research')
+    // otherwise), with the lab's repeats that are still open counted in, and
+    // nothing is started once it is reached or cannot be read. The candidate
+    // is not thrown away for that: the epoch stops here and repeats the run
+    // when the cap allows.
+    const budget = await checkResearchGpuBudget(before, args.budgetS)
     if (!budget.allowed) throw new BudgetPausedError(budget)
-    const callId = await startResearchRun(args.trainPy, args.budgetS)
-    row = await openRepeat({
-      experimentId: args.experimentId, epoch: args.epoch, kind: 'confirm', trainSha256: trainSha256(args.trainPy),
-      referenceBpb: args.first, referenceEpoch: args.epoch, callId,
+    row = await startRepeat({
+      experimentId: args.experimentId, epoch: args.epoch, kind: 'confirm', trainPy: args.trainPy,
+      referenceBpb: args.first, referenceEpoch: args.epoch, budgetS: args.budgetS,
     }) ?? mine(await loadRepeats(args.experimentId))
     if (!row) throw new Error('the lab could not store its repeat run')
-    console.log(`[Research e${args.epoch}] lab repeat started: ${callId}`)
+    console.log(`[Research e${args.epoch}] lab repeat started: ${row.call_id}`)
+  }
+  if (row.status === 'starting') {
+    // An earlier request wrote the row and stopped before the call id was
+    // written. Once that request is certainly over, the repeat is lost:
+    // charged at the full estimate, not confirmed, and never started again.
+    const outcome = await settleRepeat(row)
+    if (!outcome) throw new RepeatDeferredError('lab repeat: an earlier request\'s start of it is not recorded yet; the next tick looks again')
+    row = await closeRepeat(row, outcome, args.budgetS)
+    console.log(`[Research e${args.epoch}] lab repeat closed as ${row.status}: its start was never recorded`)
   }
   if (row.status === 'running') {
-    const outcome = await awaitRepeat(row, args.maxWaitMs)
+    const outcome = await awaitRepeat(row, waitUntil)
     if (outcome === null) throw new ResearchRunPendingError(row.call_id as string)
     row = await closeRepeat(row, outcome, args.budgetS)
     console.log(`[Research e${args.epoch}] lab repeat finished: ${row.status} val_bpb=${row.val_bpb ?? 'n/a'}`)
   }
-  // The noise as it is now, this pair included.
-  const noise = noiseFromRepeats(await loadRepeats(args.experimentId).catch(() => [row as RepeatRow]))
+  // The noise as it was before this pair. The pair stays in the table and
+  // counts for later epochs.
+  const ownId = row.id
+  const others = (await loadRepeats(args.experimentId).catch(() => before)).filter(r => r.id !== ownId)
+  const firstFlow = typeof args.firstRunnerFlow === 'string' && RUNNER_FLOW.test(args.firstRunnerFlow) ? args.firstRunnerFlow : undefined
+  const repeatFlow = row.result?.runner_flow
   return decideConfirmation({
     // The first score as it was stored when the repeat was started.
     first: finite(row.reference_bpb) ? row.reference_bpb : args.first,
-    repeat: row.val_bpb, repeatStatus: row.status, best: args.best, noise, minMargin: researchMinMargin(), maxMargin: researchMaxMargin(),
+    repeat: row.val_bpb, repeatStatus: row.status, best: args.best, noise: noiseFromRepeats(others),
+    minMargin: researchMinMargin(), maxMargin: researchMaxMargin(), ownPairLeftOut: true,
+    ...(firstFlow && repeatFlow !== firstFlow
+      ? { note: `the first run had the runner's save step (runner_flow ${firstFlow}) and the lab's repeat did not` } : {}),
   })
 }
 
@@ -716,35 +897,36 @@ export async function maybeStartControl(args: {
   bestBpb: number
   bestEpoch: number
   budgetS: number
-  /** How far into its request the caller is, in ms. Past CONTROL_START_DEADLINE_MS nothing is started. */
+  /** How far into its request the caller is, in ms. Past REPEAT_START_DEADLINE_MS nothing is started. */
   requestElapsedMs?: number
 }): Promise<number | null> {
   try {
-    if (finite(args.requestElapsedMs) && args.requestElapsedMs > CONTROL_START_DEADLINE_MS) {
+    if (finite(args.requestElapsedMs) && args.requestElapsedMs > REPEAT_START_DEADLINE_MS) {
       console.log(`[Research e${args.epoch}] no control run: ${Math.round(args.requestElapsedMs / 1000)} s into the request, too late to start one safely; tried again after the next epoch`)
       return null
     }
-    const controls = (await loadRepeats(args.experimentId)).filter(r => r.kind === 'control')
+    const rows = await loadRepeats(args.experimentId)
+    const controls = rows.filter(r => r.kind === 'control')
     const last = controls.length ? Math.max(...controls.map(r => r.epoch_number)) : null
     if (!controlDue({
       epoch: args.epoch, every: researchControlEvery(), lastControlEpoch: last, controls: controls.length,
-      open: controls.some(r => r.status === 'running'),
+      open: controls.some(r => repeatOpen(r.status)),
     })) return null
     // A control is extra spend the epoch did not have to make: none once the
     // day's cap is reached (research's own cap beside run 2, the one cap
-    // otherwise), or when the cap cannot be checked.
-    const budget = await checkDailyBudget(new Date(), 'research')
+    // otherwise), with the lab's open repeats counted in, or when the cap
+    // cannot be checked.
+    const budget = await checkResearchGpuBudget(rows, args.budgetS)
     if (!budget.allowed) {
       console.log(`[Research e${args.epoch}] no control run: ${budget.reason ?? 'daily budget reached'}`)
       return null
     }
-    const callId = await startResearchRun(args.trainPy, args.budgetS)
-    const row = await openRepeat({
-      experimentId: args.experimentId, epoch: args.epoch, kind: 'control', trainSha256: trainSha256(args.trainPy),
-      referenceBpb: args.bestBpb, referenceEpoch: args.bestEpoch, callId,
+    const row = await startRepeat({
+      experimentId: args.experimentId, epoch: args.epoch, kind: 'control', trainPy: args.trainPy,
+      referenceBpb: args.bestBpb, referenceEpoch: args.bestEpoch, budgetS: args.budgetS,
     })
     if (!row) return null
-    console.log(`[Research e${args.epoch}] control run of the best train.py started: ${callId}`)
+    console.log(`[Research e${args.epoch}] control run of the best train.py started: ${row.call_id}`)
     return args.epoch
   } catch (e) {
     console.warn(`[Research e${args.epoch}] could not start a control run (non-fatal):`, e instanceof Error ? e.message : e)
@@ -760,7 +942,7 @@ export async function maybeStartControl(args: {
 export async function writeRepeatLedger(experimentId: string): Promise<number> {
   let written = 0
   try {
-    const pending = (await loadRepeats(experimentId)).filter(r => r.status !== 'running' && !r.ledger_written)
+    const pending = (await loadRepeats(experimentId)).filter(r => !repeatOpen(r.status) && !r.ledger_written)
       .sort((a, b) => Number(a.id) - Number(b.id)).slice(0, 4)
     for (const row of pending) {
       await appendLabRepeatRow({

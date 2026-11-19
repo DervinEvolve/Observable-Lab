@@ -286,7 +286,13 @@ export async function appendResultsRow(fields: {
 // (the best train.py run again unchanged; reference is the best on record
 // and the epoch it came from). The file is made the first time a repeat is
 // written, so a research repository whose lab never repeats a run has none.
-const LAB_REPEATS_HEADER = 'kind\tepoch\ttrain_sha256\tval_bpb\tstatus\treference_bpb\treference_epoch\tmetrics_source\tdataset\tharness_sha256\ttrain_wall_seconds\tcall_id'
+// runner_flow is the repeat's own flow, as on results.tsv: a repeat is
+// started without a key, so it has no save step and the cell is "-" even
+// when the run it repeats (whose row in results.tsv says keep-1) had one.
+// A file written before the column existed gets the wider header the next
+// time a row is added; its earlier rows are left as they were.
+const LAB_REPEATS_HEADER_12 = 'kind\tepoch\ttrain_sha256\tval_bpb\tstatus\treference_bpb\treference_epoch\tmetrics_source\tdataset\tharness_sha256\ttrain_wall_seconds\tcall_id'
+const LAB_REPEATS_HEADER = `${LAB_REPEATS_HEADER_12}\trunner_flow`
 export const LAB_REPEATS_FILE = 'lab-repeats.tsv'
 
 /**
@@ -308,8 +314,10 @@ export async function appendLabRepeatRow(fields: {
 }): Promise<boolean> {
   if (!Number.isSafeInteger(fields.epoch) || fields.epoch < 0) throw new Error('appendLabRepeatRow: epoch is not a whole number')
   const existing = await getResearchFile(LAB_REPEATS_FILE)
-  const base = existing?.content?.trimEnd() || LAB_REPEATS_HEADER
-  if (base.split('\n')[0].replace(/\r$/, '') !== LAB_REPEATS_HEADER) throw new Error(`${LAB_REPEATS_FILE} does not start with the lab's header; not rewriting it`)
+  let base = existing?.content?.trimEnd() || LAB_REPEATS_HEADER
+  const [first, ...rest] = base.split('\n')
+  if (first.replace(/\r$/, '') === LAB_REPEATS_HEADER_12) base = [LAB_REPEATS_HEADER, ...rest].join('\n')
+  else if (first.replace(/\r$/, '') !== LAB_REPEATS_HEADER) throw new Error(`${LAB_REPEATS_FILE} does not start with the lab's header; not rewriting it`)
   const fmt = (v: unknown, digits = 4) => (typeof v === 'number' && Number.isFinite(v) ? v.toFixed(digits) : '-')
   const word = (v: unknown, pattern: RegExp) => (typeof v === 'string' && pattern.test(v) ? v : '-')
   const row = [
@@ -325,6 +333,7 @@ export async function appendLabRepeatRow(fields: {
     fields.provenance.harness_sha256 ?? '-',
     fmt(fields.provenance.train_wall_seconds, 1),
     word(fields.call_id, /^[A-Za-z0-9_-]{1,80}$/),
+    fields.provenance.runner_flow ?? '-',
   ].map(cell => String(cell).replace(/[\t\n\r]/g, ' ')).join('\t')
   if (base.split('\n').some(line => line.replace(/\r$/, '') === row)) return false
   const unverified = fields.provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
@@ -579,10 +588,24 @@ export async function startResearchRun(trainPy: string, budgetS: number, keepKey
     body: JSON.stringify({ train_py: trainPy, budget_s: budgetS, ...(keepKey ? { keep_key: keepKey } : {}) }),
     signal: AbortSignal.timeout(RUNNER_TIMEOUT_MS),
   })
-  if (!res.ok) throw new Error(`runner start failed: ${res.status}`)
+  if (!res.ok) throw new RunnerStartRefusedError(`runner start failed: ${res.status}`)
   const data = await res.json()
-  if (!data.call_id) throw new Error(`runner start rejected: ${JSON.stringify(data)}`)
+  if (!data.call_id) throw new RunnerStartRefusedError(`runner start rejected: ${JSON.stringify(data)}`)
   return data.call_id as string
+}
+
+/**
+ * The runner (or the gateway in front of it) answered a start with an HTTP
+ * error, or with no call id: no call was handed back, so the lab takes it
+ * that no run was started. Any other failure of startResearchRun (no answer
+ * in time, a connection that broke, an answer that cannot be read) says
+ * nothing either way: the run may have been started.
+ */
+export class RunnerStartRefusedError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'RunnerStartRefusedError'
+  }
 }
 
 /**
