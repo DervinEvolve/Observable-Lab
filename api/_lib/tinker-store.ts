@@ -752,6 +752,22 @@ export async function releaseKeep(slug: string, status: 'pending' | 'kept'): Pro
   return r.rows[0] ? keepRow(r.rows[0] as Record<string, unknown>) : null
 }
 
+/**
+ * Kept adapters whose time on Tinker has run out give their places back. A
+ * keep lasts as long as the life it set on Tinker; after that the adapter is
+ * gone like any other, and a place held by it would be a place nothing can
+ * use. Each row comes back only to the caller that removed it.
+ */
+export async function releaseExpiredKeeps(now: Date = new Date()): Promise<KeepRow[]> {
+  const r = await sql`
+    DELETE FROM tinker_keeps WHERE status = ${'kept'} AND slug IN (
+      SELECT slug FROM tinker_runs WHERE status <> ${'ok'} OR expires_at IS NULL OR expires_at <= ${now.toISOString()}
+    )
+    RETURNING *
+  `
+  return r.rows.map(row => keepRow(row as Record<string, unknown>))
+}
+
 /** Sets when the lab stops offering an adapter (after an unkeep). */
 export async function setAdapterExpiry(slug: string, expiresAt: string): Promise<void> {
   await sql`UPDATE tinker_runs SET expires_at = ${expiresAt} WHERE slug = ${slug} AND status = ${'ok'}`

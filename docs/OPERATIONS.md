@@ -106,6 +106,8 @@ The mark stays on the row. So if I turn the flag off in the middle of a day, wha
 
 - `/api/experiment/trained-chat` is public by design: it is the visitor chat with adapters the models trained ([Tinker training](#tinker-training)). While `LAB_ENABLE_TRAINED_CHAT` is off, which is the default, a GET says `{"enabled":false,"adapters":[]}` and a POST answers 503, and neither touches the database or the network. When it is on it is the one public route that spends money, so it has a rate limit per address, a tighter one per visitor (an address with a browser string), and its own small daily cap. The room's page calls it only after `GET /api/experiment` has said the chat is on, so with the chat off it gets no traffic from visitors' pages.
 
+- `/api/experiment/trained-adapters` is an operator route: `Authorization: Bearer <LAB_OPERATOR_SECRET>` on every call, 401 before anything is read otherwise, and `?confirm=true` on a POST as well. It is where I look at the trained adapters and keep or unkeep one, or take a display name away ([Naming and keeping trained adapters](#naming-and-keeping-trained-adapters)). Nothing a model writes reaches it.
+
 - `/api/live-model/v1/chat/completions` (and `/api/live-model/v1/models`, which `vercel.json` rewrites to it) is neither a public route nor an operator route. It takes a scoped key that the lab makes for one Sprite session. While `LAB_ENABLE_LIVE_MODEL` is off it answers 503 to everyone. When it is on it answers 401 to anything that is not a live scoped key, and that includes the operator secret.
 
 The anonymous viewer no longer calls operator routes: it does not persist the glass state or load Sprites status, and the `window.lab` and console debug helpers exist only in development builds. Use a separate trusted operator client; do not solve a 401 by embedding the operator secret in the browser. The browser's glass animation still plays locally without persisting its state.
@@ -382,6 +384,101 @@ I turn them on one at a time: `LAB_ENABLE_TINKER` first, and the two chat switch
 **Turning it off.** Set `LAB_ENABLE_TINKER` to anything but `true` and redeploy: the models are no longer told about it and requests are ignored, so nothing new starts. I leave `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL` and `TINKER_JOBS_TOKEN` in place for at least an hour after that. A run already training carries on at Modal, and while those three are set the tick keeps collecting it: it only asks the runner about runs that were already started and closes their rows, so the run's record is written, its estimated cost reaches `model_calls` and the daily budget, and a finished adapter is recorded. This also covers a run whose experiment has been archived or replaced in the meantime. `SELECT count(*) FROM tinker_runs WHERE status IN ('reserved', 'running')` says when nothing is open any more; after that the three values can go too. If I remove them while a run is open and the switch is off, that run stays open and its cost is in Tinker's billing only, so I do not do that. (With the switch still on and the runner's address gone, an open run is closed after about an hour at the whole amount set aside.)
 
 `LAB_ENABLE_TRAINED_CHAT` and `LAB_ENABLE_LIVE_TRAINED` turn off the same way: the panel's button disappears and pages stop calling the chat route, the chat route answers 503, and the lab model endpoint refuses `lab/` models like any unknown model. To stop everything at once, delete `TINKER_API_KEY` in Vercel and the `oblab-tinker-auth` secret in Modal, or revoke the key in the Tinker console. `modal app stop oblab-tinker` takes the runner down. Adapters expire by themselves; `tinker checkpoint list` and `tinker checkpoint delete` (or the console) remove them sooner.
+
+## Naming and keeping trained adapters
+
+Two more switches on top of [Tinker training](#tinker-training), both default false and independent of each other. `LAB_ENABLE_TINKER_NAMES` lets a training request carry a display name for its adapter. `LAB_ENABLE_TINKER_KEEP` lets an adapter be marked kept, by a model with the Reviewer's approval or by me, so that it stays on Tinker for a year instead of two weeks and a copy of its weights is written to my own Modal Volume. What each does, checks and records is in [TOOLS.md](TOOLS.md#naming-a-trained-adapter). With both off nothing changes: the prompts, the requests to the runner, the routes' answers and the tick are as before, and the database gets no new table or column.
+
+**Names need nothing but the switch.** Set `LAB_ENABLE_TINKER_NAMES=true` in Vercel and redeploy. No Modal deploy, no new secret. The first run that carries a name adds two columns to `tinker_runs` (`display_name`, `name_key`) and a unique index, by itself.
+
+**Keeping needs the runner redeployed first.** In this order:
+
+**1. Redeploy the runner.** The keeper is a new function in the same file, so it is the same command as before, from this repository:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py
+```
+
+The app `oblab-tinker` now has four functions: `train`, `keeper`, and the `start` and `status` endpoints. The deploy creates the Modal Volume `oblab-kept-models` by itself (`create_if_missing`), mounted in `keeper` only. `keeper` is given the same Modal secret as `train`, `oblab-tinker-auth`, because setting a checkpoint's time to live and downloading its weights both need the Tinker key; the two endpoints still have only `oblab-tinker-jobs-auth`. There is no new secret and the endpoint URLs do not change. The image is the same, so nothing is rebuilt.
+
+An old runner is safe with the new server and the other way round. An old runner ignores the request to save weights for download, so runs train as before and their adapters can be kept without a copy; it refuses a keep outright, and the lab gives the place back and stores why. But there would be no copies, so I deploy before I switch keeping on.
+
+**2. Smoke test of keeping, before any model can use it.** This calls the deployed `train` and `keeper` directly with my Modal login:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py keep
+```
+
+It trains the same 20 made-up examples as the first smoke test, this time with the weights also saved for download; asks `keeper` to keep the result under a made-up id with a time to live of two hours and a copy on the Volume; prints what the keeper answered; and then unkeeps it and removes the copy again. It costs about a tenth of a cent, like the first one, and the two checkpoints it leaves on Tinker expire within the hour.
+
+What I expect: seven lines that start with `ok`, among them "its weights were also saved for download", "the time to live was set", "a copy was written to the Volume" and "the copy is in PEFT format", then `keep: all as expected`. The keeper's answer names two files, `adapter_config.json` and `adapter_model.safetensors`, with sizes and SHA-256, and how many checkpoints my Tinker key holds. What a `FAIL` means:
+
+- on "its weights were also saved for download": Tinker did not save external weights for this account. An older line in Tinker's changelog says downloads of external weights need to be enabled for an organisation; if the reason printed says so, I ask Tinker. Keeping still works without it, as a longer life with no copy.
+- on "a copy was written to the Volume": the reason printed says which step failed (the list of files, a download, the size limit, the Volume).
+- on "the copy is in PEFT format" alone: the copy is there as Tinker exported it and the conversion failed; the reason says why. The files are usable later, so this does not block switching on, but I want to know.
+
+**3. Vercel.** Set these for Production and redeploy:
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LAB_ENABLE_TINKER_NAMES` | false | A training request may carry a display name. Only the exact value `true` turns it on. Needs nothing else. |
+| `LAB_ENABLE_TINKER_KEEP` | false | Adapters can be kept, by a model with the Reviewer's approval and by me through the operator route. Only the exact value `true`, and only with the three `TINKER_JOBS_*` settings. Training itself need not be on: adapters trained earlier can still be kept. While it is on, every training run also saves its weights for download. |
+| `LAB_TINKER_KEEP_MAX` | 10 | How many adapters may be kept at one time, mine and the models' together. 0 to 40; 0 turns keeping off. |
+| `LAB_TINKER_KEEPS_PER_DAY` | 2 | How many keep requests from models are carried out per UTC day, 0 to 10. An epoch may ask for one. Mine are not counted here. |
+| `LAB_TINKER_KEEP_DAYS` | 365 | How long a kept adapter stays on Tinker, counted from the day it is kept. 30 to 3650. |
+| `LAB_TINKER_KEEP_MAX_MB` | 1024 | The most one copy on the Volume may weigh. 1 to 4096. |
+
+There is no new secret in Vercel. Keeping does not use `TINKER_API_KEY` on the server; only the runner touches Tinker for it.
+
+**Vercel functions.** One new function, `api/experiment/trained-adapters.ts` (the project now has 20; `vercel.json` gives it 120 s, because a keep waits up to 45 seconds for the runner). Nothing calls it but me. The tick collects keeps that were still going, and gives back the places of kept adapters that have expired, inside the existing cron function.
+
+**4. Using the operator route.** The secret is the same `LAB_OPERATOR_SECRET` as for the other operator routes.
+
+```
+read -s LAB_OPERATOR_SECRET
+HOST='https://...my deployment...'
+# What is alive, what is kept, by whom, and how many places are taken. Changes nothing.
+curl -sS "$HOST/api/experiment/trained-adapters" -H "Authorization: Bearer $LAB_OPERATOR_SECRET"
+# Keep one. The reason is optional and public.
+curl -sS -X POST "$HOST/api/experiment/trained-adapters?confirm=true" -H "Authorization: Bearer $LAB_OPERATOR_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "keep", "adapter": "lab/e41-0a1b2c3d", "reason": "the lowest held-out loss so far"}'
+# Unkeep it again. The copy on the Volume stays unless remove_copy is true.
+curl -sS -X POST "$HOST/api/experiment/trained-adapters?confirm=true" -H "Authorization: Bearer $LAB_OPERATOR_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "unkeep", "adapter": "lab/e41-0a1b2c3d", "remove_copy": false}'
+# Take a display name away. The adapter itself is not touched.
+curl -sS -X POST "$HOST/api/experiment/trained-adapters?confirm=true" -H "Authorization: Bearer $LAB_OPERATOR_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "clear_name", "adapter": "lab/e41-0a1b2c3d"}'
+unset LAB_OPERATOR_SECRET
+```
+
+What a keep answers: 200 with `"status": "ok"` and a sentence saying until when it is kept and what happened to the copy; 202 with `"status": "started"` when the runner had not answered within 45 seconds (the next tick collects it, and the GET shows it as pending until then); 409 with `"status": "refused"` and the reason when nothing was changed (not alive, already kept, every place taken, keeping switched off); 502 when the runner failed, with the place given back. An unkeep answers 200, 404 when the adapter is not kept, 409 while a keep of it is still going, or 502 when the runner did not answer, in which case nothing was changed and I call again. Unkeeping and taking a name away work with the switches off, so I can always undo.
+
+**5. What I check after turning keeping on.**
+
+- `GET /api/experiment` lists `keep_adapter` in `tools_enabled`, and the GET above says `"enabled": true` with `"max"` as I set it.
+- The next training run's `tool_runs` row has `detail.external_path`, a path with `/external_weights/` in it. If it has `detail.export_error` instead, that adapter can be kept without a copy only, and the reason is there.
+- After the first keep, the `tool_runs` row (tool `keep_adapter`, or `owner_keep_adapter` for mine) has `detail.kept_until`, `detail.tinker.ttl_seconds`, `detail.tinker.checkpoints_in_account` and `detail.copy` with the folder, the format and each file's SHA-256. The visitor chat lists that adapter first with its "kept" mark.
+- The copy itself:
+
+  ```
+  modal volume ls oblab-kept-models
+  modal volume ls oblab-kept-models e41-0a1b2c3d
+  modal volume get oblab-kept-models e41-0a1b2c3d/lab_manifest.json -
+  ```
+
+  The folder holds `adapter_config.json`, `adapter_model.safetensors` and `lab_manifest.json`. To use a copy I download the folder (`modal volume get oblab-kept-models e41-0a1b2c3d ./e41-0a1b2c3d`) and load it on the base model the manifest names, for example with `peft` (`PeftModel.from_pretrained(base, "./e41-0a1b2c3d")`) or vLLM (`--enable-lora --lora-modules name=./e41-0a1b2c3d`). A manifest that says `"format": "tinker"` means the files are as Tinker exported them; `tinker_cookbook.weights.build_lora_adapter(base_model=..., adapter_path=..., output_path=...)` converts them.
+- `SELECT slot, slug, status, kept_by, reason, requested_at, kept_at FROM tinker_keeps ORDER BY slot` shows every place that is taken. A row that stays `pending` for more than about an hour means the tick is not collecting.
+- Tinker's side: `tinker checkpoint list` shows the kept adapter's sampler checkpoint with its new expiry, and `tinker billing checkpoint-storage` shows how much of the free 100 checkpoints and 100 GB is used (it can lag an hour or two). Each keep also stores the number of checkpoints my key held at that moment.
+
+**Checkpoint storage.** Tinker stores 100 checkpoints or 100 GB per organisation for free, and past either it stops a training session after one last save. While keeping is on, every run leaves two checkpoints instead of one until they expire (the adapter for sampling, and its weights for download), and each kept adapter holds one for a year. With my defaults that is at most 2 runs x 14 days x 2 = 56, plus up to 10 kept, plus the few from smoke tests. If I raise `LAB_TINKER_PER_DAY` I lower `LAB_TINKER_TTL_DAYS` so that runs a day x days x 2, plus `LAB_TINKER_KEEP_MAX`, stays well under 100. `tinker checkpoint delete tinker://<run>/external_weights/final` removes a downloadable checkpoint I no longer need; once a copy is on the Volume the downloadable one is not needed any more.
+
+**When a kept adapter runs out.** A keep lasts `LAB_TINKER_KEEP_DAYS` from the day it is kept. After that the adapter expires on Tinker like any other, the lab stops offering it, the next tick gives its place back and stores a `kept_adapter_expired` row. The copy on the Volume stays. To keep one longer I unkeep it and keep it again before that date. If I unkeep one that has already expired, the lab only frees the place; a copy I no longer want goes with `modal volume rm -r oblab-kept-models <lab id>`.
+
+**If a keep is recorded as lost.** A row that says "the runner was lost" also says the time to live on Tinker is unknown: the runner may have set the year before it stopped. I keep the adapter again (that sets it properly and reuses or makes the copy), or set it back by hand with `tinker checkpoint set-ttl tinker://<run>/sampler_weights/final --ttl 1209600`.
+
+**Things I know are not checked from the development machine.** It cannot reach Modal or Tinker, so no adapter has been kept for real. What was checked: the runner file compiles and imports on Python 3.9; the SDK calls the keeper makes (`set_checkpoint_ttl_from_tinker_path`, `get_external_weights_urls`, `list_user_checkpoints`, `save_weights_external`) match the signatures of the installed `tinker` 0.39.1 and Tinker's documentation as I read it on 18 November 2026; the reading of the base model's config and safetensors headers ran against the real Hugging Face repositories of all three base models (a second or two, about 100 KB on disk for the 4B model, instead of 9 GB); and the cookbook's real `build_lora_adapter` 0.6.1 converted an adapter I made up, with the weight names I believe Tinker uses, against those headers. What step 2 is the first real test of: that Tinker saves external weights for my account at all, what files that export really holds and how its weights are named, the signed download, the conversion of a real export, the Volume mount and its commit, and the time to live being changed on a sampler checkpoint. Not checked anywhere yet: that the stub files the conversion reads (the real length with only the header written) take no room in a Modal container the way they do on my machine. If they did take room the conversion would fail and the copy would be stored as Tinker exported it, with the reason. I have also not loaded a kept copy into `peft` or vLLM, and whether `list_user_checkpoints` counts the whole organisation or only my key's user is not something the documentation settles, so I read the stored number as "at least".
+
+**Turning it off.** Set `LAB_ENABLE_TINKER_KEEP` to anything but `true` and redeploy: the models are no longer told about it, `keep_adapter` is an unknown tool again, runs stop saving weights for download, and the operator route refuses a new keep. Adapters that are already kept stay kept and keep answering until their time runs out; they are listed in the chat in the ordinary order without the mark. A keep that was still going when I switched off keeps its place until the switch is on again, and so does a kept adapter that expires in the meantime; no money is tied to either. I can still unkeep through the operator route with the switch off. `LAB_ENABLE_TINKER_NAMES` turns off the same way: `name` is an unknown field again, and names already given are shown nowhere but stay in the database, so turning it back on shows them again. To empty the Volume: `modal volume rm -r oblab-kept-models <lab id>` for one adapter, or `modal volume delete oblab-kept-models` for all of it.
 
 ## Model proposals to this repository
 

@@ -68,6 +68,7 @@ const TOOL_LABEL: Record<string, string> = {
   owner_keep_adapter: 'kept a trained adapter',
   owner_unkeep_adapter: 'stopped keeping a trained adapter',
   owner_clear_adapter_name: 'took a display name off an adapter',
+  kept_adapter_expired: 'had a kept adapter reach the end of its time',
 }
 
 function esc(text: unknown): string {

@@ -522,6 +522,13 @@ class KeepDb extends FakeDb {
         const i = this.keeps.findIndex(k => k.slug === v[0] && k.status === v[1])
         return i < 0 ? { rows: [] } : copy(this.keeps.splice(i, 1))
       }
+      // Kept adapters whose run is gone or has expired give their places back.
+      if (text === 'DELETE FROM tinker_keeps WHERE status = ? AND slug IN ( SELECT slug FROM tinker_runs WHERE status <> ? OR expires_at IS NULL OR expires_at <= ? ) RETURNING *') {
+        const gone = k => this.tinkerRuns.some(r => r.slug === k.slug && (r.status !== v[1] || !r.expires_at || at(r.expires_at) <= at(v[2])))
+        const out = this.keeps.filter(k => k.status === v[0] && gone(k))
+        this.keeps = this.keeps.filter(k => !out.includes(k))
+        return copy(out)
+      }
       if (text === 'SELECT * FROM tinker_keeps WHERE status = ? ORDER BY requested_at ASC LIMIT 5') {
         return copy(this.keeps.filter(k => k.status === v[0]).slice(0, 5))
       }
@@ -863,7 +870,7 @@ test('an approved keep: the runner is sent the lab\'s own record, the adapter\'s
   const out = await deliver(keepPlan(), approve, ctx)
   assert.equal(out.length, 1)
   assert.deepEqual([out[0].tool, out[0].status], ['keep_adapter', 'ok'])
-  assert.match(out[0].summary, /^Grok 4\.7 kept lab\/e41-0a1b2c3d \("Brass Finch"\): kept until \d{4}-\d\d-\d\d \(its time to live on Tinker was set to 365 days\); a copy of its LoRA weights is on the lab's Volume oblab-kept-models under e41-0a1b2c3d\/ \(2 files, 18\.4 MB, PEFT format\)$/)
+  assert.match(out[0].summary, /^Grok 4\.7 kept lab\/e41-0a1b2c3d \("Brass Finch"\): kept until \d{4}-\d\d-\d\d \(its time to live on Tinker was set to 365 days\); a copy of its LoRA weights is on the lab's Volume oblab-kept-models under e41-0a1b2c3d\/ \(2 files, 18\.4 MB, PEFT format\); the lab's Tinker key now holds 41 checkpoints \(Tinker stores 100, or 100 GB, for free\)$/)
 
   // What went to the runner: the lab's token, the lab's record of the run, the limits. No Tinker key, nothing the model wrote but its reason.
   const start = sent.find(s => s.kind === 'start')
@@ -1006,6 +1013,7 @@ test('a keep that fails gives its place back and says why; a copy that fails doe
   assert.equal(lab.keeps.length, 0)
   assert.equal(row.expires_at, before)
   assert.match(keptRuns('keep_adapter')[0].output_tail, /^not kept: at ttl: 404 checkpoint not found; its place was given back and it still expires on \d{4}-\d\d-\d\d$/)
+  assert.equal('tinker_time_to_live' in keptRuns('keep_adapter')[0].detail, false)
   // An "ok" that does not say the time to live was set is not an ok.
   lab.toolRuns.length = 0
   globalThis.fetch = keeperRunner([], { status: 'ok', copy: { status: 'ok', dir: SLUG, files: FILES } })
@@ -1118,6 +1126,9 @@ test('a keep still going when the wait ends is collected by a later tick, once; 
   assert.deepEqual(later.map(o => o.status), ['error'])
   assert.equal(lab.keeps.length, 0)
   assert.match(keptRuns('owner_keep_adapter')[0].output_tail, /not kept: the runner was lost: its start was never confirmed/)
+  // A lost runner cannot say whether it set the time to live on Tinker, so the record says that is not known.
+  assert.match(keptRuns('owner_keep_adapter')[0].output_tail, /in the lab's record it still expires on \d{4}-\d\d-\d\d\. The runner may have set the long time to live on Tinker before it was lost/)
+  assert.equal(keptRuns('owner_keep_adapter')[0].detail.tinker_time_to_live, 'unknown: the runner was lost')
   // With the switch off the tick does not look at all.
   lab.statements.length = 0
   process.env.LAB_ENABLE_TINKER_KEEP = 'false'
@@ -1166,7 +1177,7 @@ test('the owner keeps and unkeeps through an operator route; unkeeping is the ow
   globalThis.fetch = keeperRunner(sent, { status: 'ok', ttl_seconds: 14 * 86400, checkpoints: null, copy: { status: 'none', reason: 'The copy on the Volume was left where it is.' } })
   const unkept = await operator({ action: 'unkeep', adapter: `lab/${SLUG}` })
   assert.deepEqual([unkept.code, unkept.body.status], [200, 'unkept'])
-  assert.match(unkept.body.message, /^lab\/e41-0a1b2c3d is no longer kept and expires on \d{4}-\d\d-\d\d\. Its time to live on Tinker was set to 14 days from now\. The copy on the Volume was left where it is\.$/)
+  assert.match(unkept.body.message, /^lab\/e41-0a1b2c3d is no longer kept; it now expires on \d{4}-\d\d-\d\d\. Its time to live on Tinker was set to 14 days from now\. The copy on the Volume was left where it is\.$/)
   assert.match(sent[0].body.run_id, /^u-e41-0a1b2c3d-[0-9a-f]{8}$/)
   assert.deepEqual(sent[0].body.unkeep, { slug: SLUG, sampler_path: SAMPLER, external_path: EXTERNAL, ttl_seconds: 14 * 86400, remove_copy: false })
   assert.equal(lab.keeps.length, 0)
@@ -1200,6 +1211,55 @@ test('the owner keeps and unkeeps through an operator route; unkeeping is the ow
   assert.ok(built.tools.every(t => t.model_name === 'The owner'))
   const html = activityPanel.renderEpochActivity(built)
   for (const words of ['kept a trained adapter', 'stopped keeping a trained adapter', 'took a display name off an adapter']) assert.ok(html.includes(words), words)
+})
+
+test('a keep lasts as long as the life it set on Tinker: an expired kept adapter gives its place back, with a record, and the owner can still unkeep one', async () => {
+  enableKeep({ LAB_TINKER_KEEP_MAX: '1' })
+  process.env.LAB_OPERATOR_SECRET = OPERATOR
+  const old = adapter({ name: 'Brass Finch' })
+  adapter({ slug: 'e42-11111111', epoch: 42 })
+  globalThis.fetch = keeperRunner([])
+  assert.equal((await keepLib.keepAdapter({ slug: SLUG, reason: 'x' }, { by: 'model', modelId: 'x-ai/grok-4.7', experimentId: 'exp-1', epoch: 45 })).status, 'ok')
+  // The one place is taken while the kept adapter is alive.
+  assert.match((await keepLib.keepAdapter({ slug: 'e42-11111111', reason: 'y' }, { by: 'owner' })).summary, /1 adapters are kept and at most 1 may be/)
+  assert.deepEqual(await keepLib.collectTinkerKeeps(), [])
+  assert.equal(lab.keeps.length, 1)
+
+  // Its year on Tinker runs out. The tick gives the place back, once, and stores that it did. Tinker is not asked anything.
+  old.expires_at = new Date(Date.now() - 1000).toISOString()
+  const sent = []
+  globalThis.fetch = keeperRunner(sent)
+  const released = await keepLib.collectTinkerKeeps()
+  assert.deepEqual(released.map(o => [o.tool, o.status]), [['kept_adapter_expired', 'ok']])
+  assert.deepEqual([lab.keeps.length, sent.length], [0, 0])
+  assert.deepEqual(await keepLib.collectTinkerKeeps(), [])
+  const record = keptRuns('kept_adapter_expired')
+  assert.deepEqual(record.map(r => [r.experiment_id, r.epoch, r.model, r.status]), [['exp-1', 41, 'x-ai/grok-4.7', 'ok']])
+  assert.equal(record[0].request_summary, 'kept adapter lab/e41-0a1b2c3d reached the end of its time on Tinker')
+  assert.match(record[0].output_tail, /^no longer kept: its time on Tinker ended on \d{4}-\d\d-\d\d, so it has expired like any other adapter and its place among the kept was given back\. The copy of its weights on the lab's Volume oblab-kept-models stays\.$/)
+  assert.deepEqual([record[0].detail.adapter, record[0].detail.was_kept_by, record[0].detail.copy_stays], ['lab/e41-0a1b2c3d', 'Grok 4.7', true])
+  // It does not count as a keep request of today, and the place can be taken again.
+  assert.equal((await keepLib.keepAdapter({ slug: 'e42-11111111', reason: 'y' }, { by: 'owner' })).status, 'ok')
+  assert.deepEqual(lab.keeps.map(k => k.slug), ['e42-11111111'])
+  const html = activityPanel.renderEpochActivity(activity.buildEpochActivity({ epoch: { epoch_number: 41, role_assignments: {} }, toolRuns: record.map(r => ({ ...r })), contributions: [], spend: [] }))
+  assert.ok(html.includes('<b>Grok 4.7</b> had a kept adapter reach the end of its time'))
+
+  // A keep asked for when every place is held by an expired adapter frees that place first, without waiting for a tick.
+  lab.tinkerRuns.find(r => r.slug === 'e42-11111111').expires_at = new Date(Date.now() - 1000).toISOString()
+  adapter({ slug: 'e43-22222222', epoch: 43 })
+  assert.equal((await keepLib.keepAdapter({ slug: 'e43-22222222', reason: 'z' }, { by: 'owner' })).status, 'ok')
+  assert.deepEqual(lab.keeps.map(k => k.slug), ['e43-22222222'])
+  assert.equal(keptRuns('kept_adapter_expired').length, 2)
+
+  // The owner unkeeps an adapter that expired before any tick noticed: nothing is asked of Tinker (the checkpoint is gone),
+  // the place is free, and the date it expired on is left as it is.
+  const gone = lab.tinkerRuns.find(r => r.slug === 'e43-22222222')
+  gone.expires_at = new Date(Date.now() - 5000).toISOString()
+  const expiredOn = gone.expires_at
+  sent.length = 0
+  const unkept = await operator({ action: 'unkeep', adapter: 'lab/e43-22222222', remove_copy: true })
+  assert.deepEqual([unkept.code, unkept.body.status, sent.length, lab.keeps.length, gone.expires_at], [200, 'unkept', 0, 0, expiredOn])
+  assert.match(unkept.body.message, /^lab\/e43-22222222 is no longer kept; it expired on \d{4}-\d\d-\d\d\. It had already expired, so Tinker was not asked to change anything\. Any copy on the Volume was left where it is; remove it with: modal volume rm -r oblab-kept-models e43-22222222$/)
 })
 
 test('a lab that never kept anything gets no new table from the owner looking, and the keeper has the training key while the web endpoints do not', async () => {
@@ -1264,4 +1324,53 @@ test('with keeping on, the models are told what it does and where its limits are
   for (const file of ['api/_lib/tinker-keep.ts', 'api/_lib/tinker-keep-request.ts', 'api/_lib/tinker-names.ts', 'api/experiment/trained-adapters.ts']) {
     assert.equal(/[—–]/.test(readFileSync(join(root, file), 'utf8')), false, file)
   }
+})
+
+test('the documents state the switches, the limits and the owner\'s steps as the code has them', () => {
+  const tools = readFileSync(join(root, 'docs/TOOLS.md'), 'utf8')
+  const ops = readFileSync(join(root, 'docs/OPERATIONS.md'), 'utf8')
+  const env = readFileSync(join(root, '.env.example'), 'utf8')
+  for (const name of ['LAB_ENABLE_TINKER_NAMES', 'LAB_ENABLE_TINKER_KEEP', 'LAB_TINKER_KEEP_MAX', 'LAB_TINKER_KEEPS_PER_DAY', 'LAB_TINKER_KEEP_DAYS', 'LAB_TINKER_KEEP_MAX_MB']) {
+    for (const [doc, text] of [['TOOLS.md', tools], ['OPERATIONS.md', ops], ['.env.example', env]]) assert.ok(text.includes(name), `${name} in ${doc}`)
+  }
+  // Off in the example file, with the defaults the code has.
+  for (const line of ['LAB_ENABLE_TINKER_NAMES=false', 'LAB_ENABLE_TINKER_KEEP=false', `LAB_TINKER_KEEP_MAX=${tinker.DEFAULT_TINKER_KEEP_MAX}`, 'LAB_TINKER_KEEPS_PER_DAY=2',
+    `LAB_TINKER_KEEP_DAYS=${tinker.DEFAULT_TINKER_KEEP_DAYS}`, `LAB_TINKER_KEEP_MAX_MB=${tinker.DEFAULT_TINKER_KEEP_MAX_MB}`]) {
+    assert.ok(env.split('\n').includes(line), `${line} in .env.example`)
+  }
+  for (const row of [
+    `| \`LAB_TINKER_KEEP_MAX\` | ${tinker.DEFAULT_TINKER_KEEP_MAX} |`, '| `LAB_TINKER_KEEPS_PER_DAY` | 2 |',
+    `| \`LAB_TINKER_KEEP_DAYS\` | ${tinker.DEFAULT_TINKER_KEEP_DAYS} |`, `| \`LAB_TINKER_KEEP_MAX_MB\` | ${tinker.DEFAULT_TINKER_KEEP_MAX_MB} |`,
+    '| `LAB_ENABLE_TINKER_NAMES` | false |', '| `LAB_ENABLE_TINKER_KEEP` | false |',
+  ]) assert.ok(ops.includes(row), `${row} in OPERATIONS.md`)
+  assert.ok(tools.includes(`\`LAB_TINKER_KEEP_MAX\` (default ${tinker.DEFAULT_TINKER_KEEP_MAX}, never more than ${tinker.TINKER_HARD_KEEP_MAX})`))
+  assert.ok(tools.includes(`\`LAB_TINKER_KEEP_DAYS\` (default ${tinker.DEFAULT_TINKER_KEEP_DAYS}, ${tinker.TINKER_MIN_KEEP_DAYS} to ${tinker.TINKER_MAX_KEEP_DAYS})`))
+  assert.ok(tools.includes(`${names.ADAPTER_NAME_MIN} to ${names.ADAPTER_NAME_MAX} characters`))
+  assert.ok(tools.includes(`at most ${keepRequest.KEEP_REASON_MAX} characters`))
+  assert.ok(tools.includes(`The request waits ${tinker.TINKER_KEEP_WAIT_MS / 1000} seconds for the runner`))
+  assert.ok(tools.includes(`within ${keepLib.KEEP_UNCONFIRMED_AFTER_MS / 60000} minutes, or gives no answer within ${keepLib.KEEP_LOST_AFTER_MS / 60000}`))
+  // The sections the code's comments point at exist, and so do the tool names the records are stored under.
+  for (const heading of ['## Naming a trained adapter', '## Keeping a trained adapter']) assert.ok(tools.includes(heading), heading)
+  assert.ok(ops.includes('## Naming and keeping trained adapters'))
+  for (const tool of [keepRequest.KEEP_TOOL, keepRequest.OWNER_KEEP_TOOL, keepRequest.OWNER_UNKEEP_TOOL, keepRequest.OWNER_NAME_TOOL, keepRequest.KEEP_EXPIRED_TOOL, keepRequest.TINKER_NAME_TOOL]) {
+    assert.ok(tools.includes(`\`${tool}\``), `${tool} in TOOLS.md`)
+  }
+  // The owner's steps: the exact deploy command, the smoke test, the Volume, the route, and the number of functions.
+  assert.ok(ops.includes('uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py'))
+  assert.ok(ops.includes('uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py keep'))
+  for (const text of [tools, ops, env]) assert.ok(text.includes(keepLib.KEPT_VOLUME))
+  assert.ok(ops.includes('/api/experiment/trained-adapters?confirm=true'))
+  const routes = []
+  const walk = directory => {
+    for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
+      if (entry.isDirectory()) { if (entry.name !== '_lib') walk(join(directory, entry.name)) } else if (entry.name.endsWith('.ts')) routes.push(entry.name)
+    }
+  }
+  walk('api')
+  assert.ok(ops.includes(`the project now has ${routes.length};`), `OPERATIONS.md should say the project has ${routes.length} functions`)
+  // The smoke test prints as many checks as the document says to expect.
+  const smoke = readFileSync(join(root, 'modal', 'tinker_smoke.py'), 'utf8')
+  const keepCheck = smoke.slice(smoke.indexOf('def keep() -> int:'), smoke.indexOf('if __name__ == "__main__":'))
+  assert.equal((keepCheck.match(/^    expect\(/gm) || []).length, 7)
+  assert.ok(ops.includes('seven lines that start with `ok`'))
 })

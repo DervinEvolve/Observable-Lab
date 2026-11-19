@@ -11,6 +11,8 @@ export const KEEP_TOOL = 'keep_adapter'
 /** The owner's keep and unkeep, done through the operator route, are stored under these. */
 export const OWNER_KEEP_TOOL = 'owner_keep_adapter'
 export const OWNER_UNKEEP_TOOL = 'owner_unkeep_adapter'
+/** A kept adapter reaching the end of its time on Tinker, and giving its place back, is stored under this. */
+export const KEEP_EXPIRED_TOOL = 'kept_adapter_expired'
 /** The owner taking a display name away is stored under this. */
 export const OWNER_NAME_TOOL = 'owner_clear_adapter_name'
 /**

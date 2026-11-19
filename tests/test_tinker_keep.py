@@ -35,6 +35,7 @@ MANIFEST = {
     "kept_by": "the owner", "kept_reason": "the best one so far", "kept_at": "2026-11-18T12:00:00.000Z",
 }
 WEIGHTS = {"adapter_config.json": b'{"r": 16}', "adapter_model.safetensors": b"\x00" * 2048}
+REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 
 def keep_job(**changes):
@@ -100,6 +101,7 @@ class FakeKeep:
         shutil.copy(os.path.join(source, "adapter_model.safetensors"), os.path.join(target, "adapter_model.safetensors"))
         with open(os.path.join(target, "adapter_config.json"), "w") as out:
             json.dump({"peft_type": "LORA", "base_model_name_or_path": base_model}, out)
+        return REVISION
 
     def commit(self):
         self.commits += 1
@@ -323,6 +325,153 @@ class KeepTests(Folder):
         self.assertEqual((result["status"], result["copy"]["status"]), ("ok", "error"))
         self.assertIn("connection reset", result["copy"]["reason"])
         self.assertEqual(self.tree(), [])
+
+
+    def test_a_peft_copy_names_the_base_model_revision_it_was_converted_against(self):
+        self.keep(keep_job())
+        with open(os.path.join(self.root, SLUG, M.MANIFEST_NAME)) as handle:
+            self.assertEqual(json.load(handle)["copy"]["base_model_revision"], REVISION)
+        shutil.rmtree(os.path.join(self.root, SLUG))
+        # Files kept as Tinker exported them were converted against nothing.
+        self.keep(keep_job(), peft=False)
+        with open(os.path.join(self.root, SLUG, M.MANIFEST_NAME)) as handle:
+            self.assertNotIn("base_model_revision", json.load(handle)["copy"])
+
+    def test_a_folder_left_half_written_by_a_stopped_runner_is_cleared_by_the_next_keep(self):
+        stale = os.path.join(self.root, ".incoming-e7-aaaaaaaa-1")
+        os.makedirs(stale)
+        with open(os.path.join(stale, "adapter_model.safetensors"), "wb") as out:
+            out.write(b"half")
+        result, _, _ = self.keep(keep_job())
+        self.assertEqual(result["copy"]["status"], "ok")
+        self.assertEqual(sorted(os.listdir(self.root)), [SLUG])
+
+
+class FakeHub:
+    """A base model repository on Hugging Face, as the runner reads it: a listing, a config and two safetensors files."""
+
+    def __init__(self):
+        self.asked = []
+        self.headers = {
+            "model-00001-of-00002.safetensors": json.dumps({"__metadata__": {"format": "pt"}, "model.a.weight": {"dtype": "F32", "shape": [4, 2], "data_offsets": [0, 32]}}).encode(),
+            "model-00002-of-00002.safetensors": json.dumps({"model.b.weight": {"dtype": "F32", "shape": [8], "data_offsets": [0, 32]}}).encode(),
+        }
+        self.sizes = {name: 8 + len(header) + 5_000_000_000 for name, header in self.headers.items()}
+        self.listing = {
+            "sha": REVISION,
+            "siblings": [{"rfilename": "config.json", "size": 30}, {"rfilename": "README.md", "size": 9}, {"rfilename": "onnx/model.safetensors", "size": 99}]
+            + [{"rfilename": name, "size": size} for name, size in self.sizes.items()],
+        }
+        self.config = b'{"model_type": "qwen3_5"}'
+
+    def read(self, url, max_bytes, first=None):
+        self.asked.append((url, max_bytes, first))
+        if url == "https://huggingface.co/api/models/Qwen/Qwen3.5-4B?blobs=true":
+            return json.dumps(self.listing).encode()
+        prefix = "https://huggingface.co/Qwen/Qwen3.5-4B/resolve/%s/" % REVISION
+        if not url.startswith(prefix):
+            raise AssertionError("an address outside the pinned revision was read: %s" % url)
+        name = url[len(prefix):]
+        if name == "config.json":
+            return self.config
+        header = self.headers[name]
+        whole = len(header).to_bytes(8, "little") + header
+        return whole[first:first + max_bytes]
+
+
+class BaseModelHeaderTests(unittest.TestCase):
+    """Converting to PEFT reads the base model's config and weight names, never its weights."""
+
+    def setUp(self):
+        self.folder = tempfile.mkdtemp(prefix="oblab-base-test-")
+        self.addCleanup(shutil.rmtree, self.folder, True)
+
+    def test_only_the_config_and_the_header_of_each_weights_file_are_read(self):
+        hub = FakeHub()
+        self.assertEqual(M.base_model_headers("Qwen/Qwen3.5-4B", self.folder, hub.read), REVISION)
+        self.assertEqual(sorted(os.listdir(self.folder)), ["config.json"] + sorted(hub.headers))
+        with open(os.path.join(self.folder, "config.json"), "rb") as handle:
+            self.assertEqual(handle.read(), hub.config)
+        for name, header in hub.headers.items():
+            path = os.path.join(self.folder, name)
+            # The same length as the real file, so the header's offsets hold; only the header was written.
+            self.assertEqual(os.path.getsize(path), hub.sizes[name])
+            with open(path, "rb") as handle:
+                self.assertEqual(int.from_bytes(handle.read(8), "little"), len(header))
+                self.assertEqual(handle.read(len(header)), header)
+                self.assertEqual(handle.read(64), b"\x00" * 64)
+        # Each weights file was asked for twice: its first 8 bytes, then exactly its header. Nothing past it.
+        ranges = [(url.split("/")[-1], size, first) for url, size, first in hub.asked if first is not None]
+        self.assertEqual(ranges, [r for name in sorted(hub.headers) for r in [(name, 8, 0), (name, len(hub.headers[name]), 8)]])
+        self.assertLess(sum(size for _, size, _ in hub.asked[2:]), 1000)
+        # A file in a subfolder is not one the conversion reads.
+        self.assertFalse(any("onnx" in url for url, _, _ in hub.asked))
+
+    def test_a_listing_or_a_header_the_lab_cannot_trust_stops_the_conversion(self):
+        def broken(change):
+            hub = FakeHub()
+            change(hub)
+            with self.assertRaises(ValueError) as caught:
+                M.base_model_headers("Qwen/Qwen3.5-4B", tempfile.mkdtemp(dir=self.folder), hub.read)
+            return str(caught.exception)
+
+        self.assertIn("no revision", broken(lambda hub: hub.listing.update(sha="main")))
+        self.assertIn("0 safetensors files", broken(lambda hub: hub.listing.update(siblings=[{"rfilename": "config.json", "size": 30}])))
+        self.assertIn("no size", broken(lambda hub: hub.listing["siblings"][-1].pop("size")))
+        self.assertIn("not an object", broken(lambda hub: setattr(hub, "config", b"[1]")))
+        # A header that says it is longer than its file, or longer than the lab reads in all, is not fetched.
+        name = "model-00001-of-00002.safetensors"
+        self.assertIn("more than the lab reads", broken(lambda hub: hub.sizes.update({name: 10}) or hub.listing["siblings"][3].update(size=10)))
+        with patch.dict(M.base_model_headers.__globals__, {"BASE_HEADERS_MAX_BYTES": 50}):
+            self.assertIn("more than the lab reads", broken(lambda hub: None))
+        with self.assertRaises(ValueError):
+            M.base_model_headers("someone/else", self.folder, FakeHub().read)
+
+    def test_a_range_must_be_answered_as_a_range_and_only_over_https(self):
+        body = bytes(range(200))
+
+        def opener(status=206, content_range=None, final="https://cdn.example/file", data=None):
+            def open_(request, timeout):
+                asked.append((request.full_url, request.get_header("Range"), timeout))
+                first = int(request.get_header("Range").split("=")[1].split("-")[0]) if request.get_header("Range") else 0
+                last = int(request.get_header("Range").split("-")[1]) if request.get_header("Range") else len(body) - 1
+                response = io.BytesIO(body[first:last + 1] if data is None else data)
+                response.status = status
+                response.headers = {"Content-Range": content_range if content_range is not None else "bytes %d-%d/200" % (first, last)}
+                response.geturl = lambda: final
+                return response
+            return open_
+
+        asked = []
+        self.assertEqual(M.read_https("https://huggingface.co/f", 8, first=0, opener=opener()), body[:8])
+        self.assertEqual(M.read_https("https://huggingface.co/f", 20, first=8, opener=opener()), body[8:28])
+        self.assertEqual(asked, [("https://huggingface.co/f", "bytes=0-7", M.HF_TIMEOUT_S), ("https://huggingface.co/f", "bytes=8-27", M.HF_TIMEOUT_S)])
+        # The whole file sent instead of the range (200), or a range starting elsewhere, is not read as the range.
+        for bad in (opener(status=200), opener(content_range="bytes 0-19/200"), opener(data=body[8:20])):
+            with self.assertRaises(ValueError):
+                M.read_https("https://huggingface.co/f", 20, first=8, opener=bad)
+        with self.assertRaises(ValueError):
+            M.read_https("https://huggingface.co/f", 8, first=0, opener=opener(final="http://cdn.example/file"))
+        with self.assertRaises(ValueError):
+            M.read_https("http://huggingface.co/f", 8, opener=opener())
+        # Without a range: the whole answer, up to the limit.
+        self.assertEqual(M.read_https("https://huggingface.co/f", 200, opener=opener(status=200)), body)
+        with self.assertRaises(ValueError):
+            M.read_https("https://huggingface.co/f", 199, opener=opener(status=200))
+
+    def test_a_converted_adapter_names_the_real_base_model_not_the_folder_it_was_read_from(self):
+        with open(os.path.join(self.folder, "adapter_config.json"), "w") as out:
+            json.dump({"peft_type": "LORA", "base_model_name_or_path": "/tmp/oblab-base-x", "r": 16}, out)
+        M.name_base_model(self.folder, "Qwen/Qwen3.5-4B")
+        with open(os.path.join(self.folder, "adapter_config.json")) as handle:
+            self.assertEqual(json.load(handle), {"peft_type": "LORA", "base_model_name_or_path": "Qwen/Qwen3.5-4B", "r": 16})
+
+    def test_the_conversion_is_never_given_a_repository_name_to_download(self):
+        keeper = SOURCE[SOURCE.index("class KeepDeps:"):SOURCE.index("kept_volume = modal.Volume.from_name")]
+        self.assertIn("revision = base_model_headers(base_model, stub)", keeper)
+        self.assertIn("weights.build_lora_adapter(base_model=stub, adapter_path=source, output_path=target, trust_remote_code=False)", keeper)
+        self.assertNotIn("build_lora_adapter(base_model=base_model", SOURCE)
+        self.assertNotIn("snapshot_download", SOURCE)
 
 
 class UnkeepTests(Folder):

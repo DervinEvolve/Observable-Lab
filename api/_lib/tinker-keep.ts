@@ -6,7 +6,10 @@
  * the owner asks through the operator route (api/experiment/trained-adapters.ts),
  * or a model asks with the "keep_adapter" tool and the Reviewer approves it.
  * At most LAB_TINKER_KEEP_MAX adapters are kept at one time, and one epoch
- * may ask for one. Only the owner can unkeep.
+ * may ask for one. Only the owner can unkeep. A keep lasts as long as the
+ * life it sets on Tinker (LAB_TINKER_KEEP_DAYS): when that has run out the
+ * adapter is gone like any other, its place is given back and the record
+ * says so. The copy on the Volume stays.
  *
  * Keeping does two things, both done by the lab's own runner on Modal
  * (modal/tinker_jobs.py), which is the only place the training key lives:
@@ -38,14 +41,14 @@ import {
   TINKER_KEEP_WAIT_MS, isSamplerPath, tinkerJobsConfigured, tinkerKeepDays, tinkerKeepFlag, tinkerKeepMax, tinkerKeepMaxMb, tinkerKeepStatus,
   tinkerTtlDays,
 } from './tinker.js'
-import { KEEP_TOOL, OWNER_KEEP_TOOL, OWNER_NAME_TOOL, OWNER_UNKEEP_TOOL, type KeepRequest } from './tinker-keep-request.js'
+import { KEEP_EXPIRED_TOOL, KEEP_TOOL, OWNER_KEEP_TOOL, OWNER_NAME_TOOL, OWNER_UNKEEP_TOOL, type KeepRequest } from './tinker-keep-request.js'
 import {
   findTinkerCall, keepJobId, pollTinkerJob, startTinkerJob, tinkerKeepBody, tinkerUnkeepBody, waitForTinkerJob, type TinkerPoll,
 } from './tinker-client.js'
 import { adapterExpiry } from './tinker-run.js'
 import {
   KEPT_BY_OWNER, claimKeepSlot, clearAdapterName, externalPathOf, finishKeep, getKeep, getRun, keptByName, listAdapters, listKeeps, markKeepStarted, openKeeps,
-  publicAdapter, releaseKeep, setAdapterExpiry, shownName,
+  publicAdapter, releaseExpiredKeeps, releaseKeep, setAdapterExpiry, shownName,
   type KeepRow, type TinkerRunRow, type TrainedAdapter,
 } from './tinker-store.js'
 
@@ -223,10 +226,22 @@ async function completeKeep(keep: KeepRow, run: TinkerRunRow, poll: Extract<Tink
     const released = await releaseKeep(keep.slug, 'pending')
     if (!released) return null
     const reason = `${result.stage ? `at ${result.stage}: ` : ''}${result.reason ?? 'unknown'}`
+    // A runner that answered says whether it set the time to live. One that
+    // was lost says nothing, and may have set it before it stopped: the lab's
+    // record then ends before Tinker's copy does. The record says so, since
+    // a checkpoint left on Tinker counts against the account's storage.
+    const lost = poll.state === 'failed'
+    const until = (run.expires_at ?? '').slice(0, 10)
+    const after = lost
+      ? `in the lab's record it still expires on ${until}. The runner may have set the long time to live on Tinker before it was lost; if it did, the checkpoint stays on Tinker after the lab stops offering it. Keeping it again settles it, or the owner can set its time to live by hand`
+      : `it still expires on ${until}`
     await recordToolRun({
       ...place, tool, requestSummary, status: 'error', durationMs,
-      outputTail: `not kept: ${reason}; its place was given back and it still expires on ${(run.expires_at ?? '').slice(0, 10)}`,
-      detail: { adapter: `lab/${run.slug}`, ...(shownName(run) ? { name: shownName(run) } : {}), kept_by: who(keep.kept_by), reason },
+      outputTail: `not kept: ${reason}; its place was given back and ${after}`,
+      detail: {
+        adapter: `lab/${run.slug}`, ...(shownName(run) ? { name: shownName(run) } : {}), kept_by: who(keep.kept_by), reason,
+        ...(lost ? { tinker_time_to_live: 'unknown: the runner was lost' } : {}),
+      },
     })
     return { tool, status: 'error', summary: `${label} was not kept: ${reason}` }
   }
@@ -250,7 +265,10 @@ async function completeKeep(keep: KeepRow, run: TinkerRunRow, poll: Extract<Tink
   }
   const closed = await finishKeep(keep.slug, detail, expiresAt)
   if (!closed) return null
-  const line = `kept until ${expiresAt.slice(0, 10)} (its time to live on Tinker was set to ${Math.round(result.ttl_seconds / 86400)} days); ${describeCopy(result.copy)}`
+  // How many checkpoints the lab's Tinker key holds, when the runner could count them: Tinker stores 100 (or 100 GB) for free,
+  // and past that a training session is stopped, so the number is part of the record of every keep.
+  const held = result.checkpoints === null ? '' : `; the lab's Tinker key now holds ${result.checkpoints} checkpoint${result.checkpoints === 1 ? '' : 's'} (Tinker stores 100, or 100 GB, for free)`
+  const line = `kept until ${expiresAt.slice(0, 10)} (its time to live on Tinker was set to ${Math.round(result.ttl_seconds / 86400)} days); ${describeCopy(result.copy)}${held}`
   await recordToolRun({ ...place, tool, requestSummary, status: 'ok', durationMs, outputTail: line, detail })
   return { tool, status: 'ok', summary: `${who(keep.kept_by)} kept ${label}: ${line}` }
 }
@@ -274,6 +292,9 @@ export async function keepAdapter(request: KeepRequest, asker: KeepWho, opts: { 
     return skipped('the lab could not read its adapters, so nothing was changed')
   }
   if (!isAlive(run, now)) return skipped(`no trained adapter lab/${request.slug} is alive (adapters expire)`)
+
+  // A place held by a kept adapter that has since expired is free again.
+  await releaseExpired(now)
 
   const jobId = keepJobId('k', run.slug, randomBytes(4).toString('hex'))
   let claim: Awaited<ReturnType<typeof claimKeepSlot>>
@@ -335,7 +356,36 @@ export const KEEP_UNCONFIRMED_AFTER_MS = 15 * 60 * 1000
 export const KEEP_COLLECT_BUDGET_MS = 30_000
 
 /**
- * Collects the keeps that were still going when their request ended. Called
+ * Gives back the places of kept adapters whose time on Tinker has run out,
+ * and stores that each one did. The copy on the Volume is not touched. Never
+ * throws.
+ */
+export async function releaseExpired(now: Date = new Date()): Promise<KeepOutcome[]> {
+  const out: KeepOutcome[] = []
+  try {
+    for (const keep of await releaseExpiredKeeps(now)) {
+      const run = await getRun(keep.slug).catch(() => null)
+      if (!run) continue
+      const label = adapterLabel(run)
+      const copied = plain(plain(keep.detail).copy).status === 'ok'
+      const line = `no longer kept: its time on Tinker ended on ${(run.expires_at ?? '').slice(0, 10)}, so it has expired like any other adapter and its place among the kept was given back. ${copied ? `The copy of its weights on the lab's Volume ${KEPT_VOLUME} stays.` : 'There was no copy of its weights.'}`
+      await recordToolRun({
+        experimentId: run.experiment_id, epoch: run.epoch, model: keep.kept_by, tool: KEEP_EXPIRED_TOOL,
+        requestSummary: `kept adapter ${label} reached the end of its time on Tinker`, status: 'ok', outputTail: line,
+        detail: { adapter: `lab/${run.slug}`, expired_at: run.expires_at, was_kept_by: who(keep.kept_by), was_kept_at: keep.kept_at, copy_stays: copied },
+      })
+      out.push({ tool: KEEP_EXPIRED_TOOL, status: 'ok', summary: `${label} is ${line}` })
+      console.log(`[tinker-keep] lab/${keep.slug} expired and gave its place back`)
+    }
+  } catch (e) {
+    console.warn('[tinker-keep] could not release expired keeps (non-fatal):', e instanceof Error ? e.message : e)
+  }
+  return out
+}
+
+/**
+ * Collects the keeps that were still going when their request ended, and
+ * gives back the places of kept adapters that have expired. Called
  * once on every tick. With LAB_ENABLE_TINKER_KEEP off it does nothing at
  * all: no query and no request. (A keep left pending when the switch was
  * turned off keeps its place until the switch is on again; no money is tied
@@ -346,7 +396,9 @@ export async function collectTinkerKeeps(now: Date = new Date()): Promise<KeepOu
   const out: KeepOutcome[] = []
   try {
     const giveUpAt = Date.now() + KEEP_COLLECT_BUDGET_MS
-    for (const keep of await openKeeps()) {
+    const open = await openKeeps()
+    out.push(...await releaseExpired(now))
+    for (const keep of open) {
       if (Date.now() > giveUpAt) break
       const run = await getRun(keep.slug)
       if (!run) {
@@ -419,9 +471,18 @@ export async function unkeepAdapter(slug: string, opts: { removeCopy?: boolean; 
 
   const startedAt = new Date()
   const ttlSeconds = tinkerTtlDays() * 24 * 60 * 60
+  // An adapter whose kept time has already run out is gone from Tinker: there
+  // is no time to live to set, and asking would fail. Its place is given back
+  // in the lab's record and nothing else is touched.
+  const alive = isAlive(run, startedAt)
   let told = 'Tinker was not told: no runner is configured, so set its time to live by hand (tinker checkpoint set-ttl).'
   let copyNote = 'The copy on the Volume was left where it is.'
-  if (tinkerJobsConfigured() && run && isSamplerPath(run.sampler_path)) {
+  if (!alive) {
+    told = 'It had already expired, so Tinker was not asked to change anything.'
+    copyNote = opts.removeCopy === true
+      ? `Any copy on the Volume was left where it is; remove it with: modal volume rm -r ${KEPT_VOLUME} ${slug}`
+      : 'Any copy on the Volume was left where it is.'
+  } else if (tinkerJobsConfigured() && run && isSamplerPath(run.sampler_path)) {
     const jobId = keepJobId('u', slug, randomBytes(4).toString('hex'))
     const started = await startTinkerJob(tinkerUnkeepBody({
       jobId, slug, samplerPath: run.sampler_path, externalPath: externalPathOf(run), ttlSeconds, removeCopy: opts.removeCopy === true,
@@ -441,18 +502,22 @@ export async function unkeepAdapter(slug: string, opts: { removeCopy?: boolean; 
 
   const released = await releaseKeep(slug, 'kept').catch(() => null)
   if (!released) return { ok: false, status: 'not_kept', message: `lab/${slug} is not kept any more.` }
-  const expiresAt = adapterExpiry(startedAt.toISOString(), ttlSeconds, startedAt)
-  await setAdapterExpiry(slug, expiresAt).catch(e =>
-    console.warn('[tinker-keep] could not set the expiry after an unkeep:', e instanceof Error ? e.message : e))
+  // An adapter that is alive gets the usual life from now. One that had expired keeps the date it expired on.
+  const expiresAt = alive ? adapterExpiry(startedAt.toISOString(), ttlSeconds, startedAt) : run?.expires_at ?? startedAt.toISOString()
+  if (alive) {
+    await setAdapterExpiry(slug, expiresAt).catch(e =>
+      console.warn('[tinker-keep] could not set the expiry after an unkeep:', e instanceof Error ? e.message : e))
+  }
+  const when = alive ? `it now expires on ${expiresAt.slice(0, 10)}` : `it expired on ${expiresAt.slice(0, 10)}`
   if (run) {
     await recordToolRun({
       experimentId: run.experiment_id, epoch: run.epoch, model: KEPT_BY_OWNER, tool: OWNER_UNKEEP_TOOL,
       requestSummary: `unkeep ${adapterLabel(run)}`, status: 'ok',
-      outputTail: `no longer kept; it now expires on ${expiresAt.slice(0, 10)}. ${told} ${copyNote}`,
+      outputTail: `no longer kept; ${when}. ${told} ${copyNote}`,
       detail: { adapter: `lab/${slug}`, expires_at: expiresAt, was_kept_by: who(released.kept_by), was_kept_at: released.kept_at },
     })
   }
-  return { ok: true, status: 'unkept', message: `lab/${slug} is no longer kept and expires on ${expiresAt.slice(0, 10)}. ${told} ${copyNote}`, expires_at: expiresAt }
+  return { ok: true, status: 'unkept', message: `lab/${slug} is no longer kept; ${when}. ${told} ${copyNote}`, expires_at: expiresAt }
 }
 
 /**
