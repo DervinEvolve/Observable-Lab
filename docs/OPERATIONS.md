@@ -513,6 +513,34 @@ I turn them on one at a time: `LAB_ENABLE_TINKER` first, then the two chat switc
 
 `LAB_ENABLE_TRAINED_CHAT` and `LAB_ENABLE_LIVE_TRAINED` turn off the same way: the panel's button disappears and pages stop calling the chat route, the chat route answers 503, and the lab model endpoint refuses `lab/` models like any unknown model. To stop everything at once, delete `TINKER_API_KEY` in Vercel and the `oblab-tinker-auth` secret in Modal, or revoke the key in the Tinker console. `modal app stop oblab-tinker` takes the runner down. Adapters expire by themselves; `tinker checkpoint list` and `tinker checkpoint delete` (or the console) remove them sooner.
 
+## Tinker RL
+
+Tinker RL is on by default. `LAB_ENABLE_TINKER_RL` is on unless it is `false`, `0`, `off` or `no` (any capitals). It needs the same things Tinker training needs, apart from that switch: `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL` and `TINKER_JOBS_TOKEN`, a base model on `LAB_TINKER_BASE_MODELS`, and non-zero `LAB_TINKER_RUN_USD` and `LAB_TINKER_DAILY_USD`. It uses those two caps, so training and RL share one daily amount. If one of them is missing the tool is off and says which one: the server logs a line starting `[Tools] Tinker RL is on by default and is off here:` once, and `GET /api/experiment` has `rl_practice.off_reason`. What it does, checks and records is in [TOOLS.md](TOOLS.md#tinker-rl).
+
+What it adds to the environment, besides the switch:
+
+- `LAB_TINKER_RL_PER_DAY` (default 2, 0 to 10): RL runs opened per UTC day. It counts apart from `LAB_TINKER_PER_DAY`, though both draw on the same dollars.
+
+**Redeploy the runner.** RL is a new function in `modal/tinker_jobs.py` (`train_rl`), the start endpoint now accepts an `rl` job, and the status endpoint can say how far a run has got. So the file has to be deployed again before an RL run can work. From this repository:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py
+```
+
+The two endpoint URLs do not change, and the two Modal secrets are the ones already there (`oblab-tinker-auth` goes to `train`, `train_rl` and `keeper`, and nothing else). The first deploy rebuilds nothing big: `train_rl` uses the training image that is already built. It also keeps a second small Modal Dict, `oblab-tinker-progress`, of each run's latest progress record. It creates it the first time it is used; there is nothing to set up. If the Dict cannot be read or written, runs go on and the room just has no live view of them. Until the runner is redeployed, an RL request is refused by the runner with a reason, costs nothing, and the room shows the stored refusal.
+
+**Smoke test, before any model relies on it.** This calls the deployed `train_rl` directly with my Modal login on a toy task set (16 tasks that ask for the name of a fruit, a rubric that rewards an answer written in capital letters only and short), 4 steps of 2 tasks with 4 answers each, at most 40 tokens an answer. Its budget is 5 cents and the runner cannot pass it; at the published prices it should cost well under a cent, and it costs cents at the very most. The adapter it saves expires after an hour.
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py rl
+```
+
+What I expect: `"status": "ok"`, `n_train` 14 and `n_holdout` 2 (16 tasks, about 15% held out, at least 2), `steps_done` 4, one line per step with the mean reward and the share of answers at the best score, a line with the held-out score before and after (the runner measured both, with the rubric, on tasks it held out), the last progress record read back from the Dict, and a `sampler_path` that starts with `tinker://`. Whether the reward goes up in four steps is not promised, and a run where it does not is still a pass: what I am checking is that every part ran and was measured. If it says `"status": "error"` with `"stage": "client"`, the Modal secret or the Tinker balance is the first thing to check. The result never contains the key. If the progress line says the record could not be read, the Dict is the thing to look at (`modal dict list`), and the room will not draw a run live until it works.
+
+**Looking at it in the room.** The practice bench is between the crates and the Executor's desk. With no RL run on record it is dark and its plate says that nothing has been practised yet. After a run it shows the record: click it for the panel. While a run is going it follows the progress record and rests again when the lab has not heard from the runner for six minutes. In the simulation (no experiment connected) it stays dark.
+
+**Turning it off.** Set `LAB_ENABLE_TINKER_RL=false` in Vercel (Production) and redeploy. The tool then disappears from what the models are told, and a request for it is stored as not enabled. A run that is already going is still collected, settled and recorded, and its adapter stays until it expires. To stop all Tinker use, also unset `TINKER_JOBS_TOKEN`; the hourly collection only asks the runner and closes rows, and it keeps doing that while the address and token are set.
+
 ## Naming and keeping trained adapters
 
 Two more switches on top of [Tinker training](#tinker-training), both default false and independent of each other. `LAB_ENABLE_TINKER_NAMES` lets a training request carry a display name for its adapter. `LAB_ENABLE_TINKER_KEEP` lets an adapter be marked kept, by a model with the Reviewer's approval or by me, so that it stays on Tinker for a year instead of two weeks and a copy of its weights is written to my own Modal Volume. What each does, checks and records is in [TOOLS.md](TOOLS.md#naming-a-trained-adapter). With both off nothing changes: the prompts, the requests to the runner, the routes' answers and the tick are as before, and the database gets no new table or column.
