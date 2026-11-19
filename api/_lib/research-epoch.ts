@@ -22,7 +22,7 @@ import { releaseEpoch } from './epoch-claim.js'
 import { epochSpend, recordModelCall } from './spend.js'
 import { researchAlongside } from './experiment-modes.js'
 import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
-import { promoteResearchModel, researchModelKey, researchTalkStatus, type Promotion } from './research-talk.js'
+import { mayRetryPromotion, promoteResearchModel, researchModelKey, researchTalkStatus, type Promotion } from './research-talk.js'
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
   provenanceOf, provenanceTrailers, putResearchFile, researchGpuCostUsd, ResearchRunPendingError,
@@ -41,6 +41,48 @@ const RESEARCH_BUDGET_S = Number(process.env.RESEARCH_BUDGET_S || 300)
 // repo writes after the run; a run still going at the deadline is picked up
 // again from its persisted call_id on the next tick.
 const runPollMaxMs = () => Number(process.env.RESEARCH_RUN_POLL_MAX_MS || 400_000)
+
+/** Asks the runner to keep a saved model for visitors and writes the answer on that epoch's row. */
+async function askPromotion(epochId: string, key: string, earlier: Promotion | undefined): Promise<Promotion> {
+  const asked = await promoteResearchModel(key)
+  const before = earlier ? (typeof earlier.attempts === 'number' && earlier.attempts > 0 ? earlier.attempts : 1) : 0
+  const promotion: Promotion = before > 0 ? { ...asked, attempts: before + 1 } : asked
+  await sql`
+    UPDATE epochs SET research_run = COALESCE(research_run, '{}'::jsonb) || ${JSON.stringify({ promotion })}::jsonb
+    WHERE id = ${epochId}
+  `
+  return promotion
+}
+
+/**
+ * A promotion whose answer never arrived (the runner was slow or away when
+ * its epoch ended) would otherwise be lost for good: the epoch is complete
+ * and nothing looks at it again, so the loop's new best would never be the
+ * model visitors can ask. While stories are on, each later attempt at a
+ * research epoch therefore looks at the epoch that holds the current best
+ * and asks again, a few times at most, and never after the runner answered
+ * no. Promoting twice is the same as promoting once. Never throws.
+ */
+async function retryLostPromotion(experimentId: string, bestEpoch: unknown, currentEpoch: number): Promise<void> {
+  if (!researchTalkStatus().enabled) return
+  if (typeof bestEpoch !== 'number' || !Number.isSafeInteger(bestEpoch) || bestEpoch < 1 || bestEpoch >= currentEpoch) return
+  try {
+    const r = await sql`
+      SELECT id, research_run FROM epochs
+      WHERE experiment_id = ${experimentId} AND epoch_number = ${bestEpoch} AND completed_at IS NOT NULL LIMIT 1
+    `
+    const row = r.rows[0] as { id: string; research_run?: { result?: ResearchRunResult; keep_key?: string; promotion?: Promotion } } | undefined
+    const run = row?.research_run
+    const key = run?.keep_key
+    if (!row || !run || !key || !mayRetryPromotion(run.promotion)) return
+    const checkpoint = run.result ? sanitizeRunResult(run.result).checkpoint : undefined
+    if (!checkpoint?.saved || checkpoint.key !== key) return
+    const promotion = await askPromotion(row.id, key, run.promotion)
+    console.log(`[Research e${currentEpoch}] asked again for model ${key} of epoch ${bestEpoch}: ${promotion.ok ? 'kept for visitors' : `not kept: ${promotion.error}`}`)
+  } catch (e) {
+    console.warn(`[Research e${currentEpoch}] could not ask again for a promotion (non-fatal):`, e instanceof Error ? e.message : e)
+  }
+}
 
 function getGrowthStage(spec: AgentSpecification): AgentSpecification['meta']['growth_stage'] {
   const caps = spec.capabilities.filter(c => c.status === 'active').length
@@ -120,6 +162,9 @@ export async function runResearchEpoch(experimentId: string): Promise<{
       await sql`ALTER TABLE epochs ADD COLUMN IF NOT EXISTS resumed_at TIMESTAMP WITH TIME ZONE`
       await sql`UPDATE epochs SET resumed_at = NOW() WHERE id = ${existingEpoch.id as string}`
     }
+
+    // Stories on: a promotion that was lost when an earlier epoch ended is asked for again.
+    await retryLostPromotion(experimentId, research.best_epoch, epochNumber)
 
     // --- Assemble research context from the repo (the org's real memory) ---
     const [trainPyFile, resultsFile, wikiIndexFile] = await Promise.all([
@@ -297,25 +342,25 @@ export async function runResearchEpoch(experimentId: string): Promise<{
     // it is kept as the new best and the runner saved its model, ask the
     // runner to keep that model for visitors. What happened is written on
     // the epoch's row and on the finding page. A failure here changes
-    // nothing else about the epoch; a later attempt at the epoch asks again.
+    // nothing else about the epoch. When the runner could not be asked, a
+    // later attempt at this epoch, or the start of a later epoch, asks again
+    // (retryLostPromotion), so the page can say "not kept" for a model that
+    // was kept afterwards; the epoch's row has the last answer.
     let checkpointNote: string | undefined
     if (keepKey) {
       const checkpoint = runResult.checkpoint
       let promotion: Promotion | undefined = existingEpoch?.research_run?.promotion
       const newBest = verdict === 'keep' && measuredBpb !== null && measuredBpb < research.best_bpb
-      if (newBest && checkpoint?.saved && checkpoint.key === keepKey && !promotion?.ok && researchTalkStatus().enabled) {
-        promotion = await promoteResearchModel(keepKey)
-        await sql`
-          UPDATE epochs SET research_run = COALESCE(research_run, '{}'::jsonb) || ${JSON.stringify({ promotion })}::jsonb
-          WHERE id = ${epochId}
-        `
+      if (newBest && checkpoint?.saved && checkpoint.key === keepKey && (!promotion || mayRetryPromotion(promotion)) && researchTalkStatus().enabled) {
+        promotion = await askPromotion(epochId, keepKey, promotion)
         console.log(`[Research e${epochNumber}] model ${keepKey} ${promotion.ok ? 'kept for visitors' : `not kept: ${promotion.error}`}`)
       }
       const saved = checkpoint?.saved
         ? `saved by the runner as ${keepKey} (${checkpoint.bytes} bytes, SHA-256 \`${checkpoint.sha256}\`); the file was written in the same process as the generated code and is not independently checked`
         : `not saved (${checkpoint?.reason || (runResult.status === 'ok' ? 'the runner said nothing about a saved model; it may not have been redeployed' : 'the run did not finish with a score')})`
       const kept = !checkpoint?.saved ? '' : !newBest ? '. Not kept for visitors: the run was not a new best'
-        : promotion?.ok ? '. Kept for visitors to ask for a story' : `. Not kept for visitors: ${promotion?.error ?? 'unknown'}`
+        : promotion?.ok ? '. Kept for visitors to ask for a story'
+          : `. Not kept for visitors when this page was written: ${promotion?.error ?? 'unknown'}${mayRetryPromotion(promotion) ? ' (the lab asks again at later epochs)' : ''}`
       checkpointNote = saved + kept
     }
 

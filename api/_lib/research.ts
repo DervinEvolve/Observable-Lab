@@ -129,18 +129,34 @@ export interface ResultProvenance {
   dataset: string | null
   harness_sha256: string | null
   train_wall_seconds: number | null
+  /**
+   * Set only for a run the runner made with its save step in place (a run
+   * started with a key while LAB_ENABLE_RESEARCH_TALK was on): the runner's
+   * own name for that way of running, "keep-1". Such a run used a copy of
+   * the harness with the save block appended, and its wall time includes the
+   * save. The field is absent for every other run, so their records are
+   * what they always were.
+   */
+  runner_flow?: string
+}
+
+/** The runner's name for a way of running other than the plain one, or undefined. */
+export function runnerFlowOf(v: unknown): string | undefined {
+  return typeof v === 'string' && /^[a-z][a-z0-9-]{0,23}$/.test(v) ? v : undefined
 }
 
 export function provenanceOf(run: Partial<ResearchRunResult> | undefined): ResultProvenance {
   const text = (v: unknown) => (typeof v === 'string' && /^[A-Za-z0-9_.:-]{1,80}$/.test(v) ? v : null)
   const sha = typeof run?.harness_sha256 === 'string' && /^[0-9a-f]{64}$/.test(run.harness_sha256) ? run.harness_sha256 : null
   const wall = typeof run?.train_wall_seconds === 'number' && Number.isFinite(run.train_wall_seconds) ? run.train_wall_seconds : null
+  const flow = runnerFlowOf(run?.runner_flow)
   return {
     // A score with no recorded source is treated as unverified too.
     metrics_source: text(run?.metrics_source) ?? (run?.metrics ? 'experiment_stdout_unverified' : null),
     dataset: text(run?.dataset),
     harness_sha256: sha,
     train_wall_seconds: wall,
+    ...(flow ? { runner_flow: flow } : {}),
   }
 }
 
@@ -151,11 +167,19 @@ export function provenanceTrailers(p: ResultProvenance): string {
     `Dataset: ${p.dataset ?? 'unknown'}`,
     `Harness-SHA256: ${p.harness_sha256 ?? 'unknown'}`,
     `Train-Wall-Seconds: ${p.train_wall_seconds === null ? 'unknown' : p.train_wall_seconds.toFixed(1)}`,
+    // Only for a run made with the runner's save step in place.
+    ...(p.runner_flow ? [`Runner-Flow: ${p.runner_flow}`] : []),
   ].join('\n')
 }
 
 const RESULTS_HEADER_V1 = 'epoch\tcommit\tval_bpb\ttrain_steps\ttrain_seconds\tpeak_vram_mb\tparams_m\tstatus\thypothesis'
 const RESULTS_HEADER = `${RESULTS_HEADER_V1}\tmetrics_source\tdataset\tharness_sha256\ttrain_wall_seconds`
+// With one more column, runner_flow. A ledger gets it the first time a run
+// made with the runner's save step is written (the boundary such a run is),
+// and from then on every row has the column: "keep-1" or the like for such a
+// run, "-" for a plain one. A ledger that never sees such a run keeps the
+// header above and its rows keep thirteen columns.
+const RESULTS_HEADER_FLOW = `${RESULTS_HEADER}\trunner_flow`
 
 // Append one row to results.tsv (read-modify-write; single writer per epoch).
 // Older ledgers get the provenance columns added to their header; their
@@ -182,8 +206,14 @@ export async function appendResultsRow(fields: {
   let base = existing?.content?.trimEnd() || RESULTS_HEADER
   const newline = base.indexOf('\n')
   const header = (newline === -1 ? base : base.slice(0, newline)).replace(/\r$/, '')
-  if (header === RESULTS_HEADER_V1) base = RESULTS_HEADER + (newline === -1 ? '' : base.slice(newline))
-  else if (header !== RESULTS_HEADER) throw new Error('results.tsv does not start with a known header; not rewriting it')
+  const rest = newline === -1 ? '' : base.slice(newline)
+  const flow = fields.provenance.runner_flow
+  let withFlow = header === RESULTS_HEADER_FLOW
+  if (!withFlow && header !== RESULTS_HEADER_V1 && header !== RESULTS_HEADER) throw new Error('results.tsv does not start with a known header; not rewriting it')
+  if (!withFlow && flow) {
+    base = RESULTS_HEADER_FLOW + rest
+    withFlow = true
+  } else if (header === RESULTS_HEADER_V1) base = RESULTS_HEADER + rest
   // The metrics are whatever the generated train.py printed. Only a real
   // number is written; anything else becomes "-", and no cell can carry a tab
   // or a line break, so one epoch can never write a second row.
@@ -204,6 +234,7 @@ export async function appendResultsRow(fields: {
     fields.provenance.dataset ?? '-',
     fields.provenance.harness_sha256 ?? '-',
     fmt(fields.provenance.train_wall_seconds, 1),
+    ...(withFlow ? [flow ?? '-'] : []),
   ].map(cell => String(cell).replace(/[\t\n\r]/g, ' ')).join('\t')
   if (base.split('\n').some(line => line.replace(/\r$/, '') === row)) return false
   const unverified = fields.provenance.metrics_source === 'experiment_stdout_unverified' ? ', unverified' : ''
@@ -257,7 +288,10 @@ export async function writeFindingPage(args: {
     : ''}
 - **Dataset:** ${args.provenance.dataset ?? 'unknown'}
 - **Harness SHA-256:** ${args.provenance.harness_sha256 ? '`' + args.provenance.harness_sha256 + '`' : 'unknown'}
-- **Training wall time (measured by the runner):** ${args.provenance.train_wall_seconds !== null ? args.provenance.train_wall_seconds.toFixed(1) + ' s' : 'unknown'}
+- **Training wall time (measured by the runner):** ${args.provenance.train_wall_seconds !== null ? args.provenance.train_wall_seconds.toFixed(1) + ' s' : 'unknown'}${
+  args.provenance.runner_flow
+    ? `\n- **Runner flow:** ${args.provenance.runner_flow} (run with the runner's save step in place: a copy of the harness with the save block appended, and the wall time above includes the save. A boundary for comparing with runs that have no such line)`
+    : ''}
 ${args.checkpointNote ? `- **Saved model:** ${args.checkpointNote.replace(/[\r\n]+/g, ' ').slice(0, 400)}\n` : ''}
 ## Hypothesis
 ${args.hypothesis}
@@ -318,6 +352,7 @@ export interface ResearchCheckpoint {
   seq_len?: number
   /** What the harness's evaluate_bpb returned for the saved model, seen inside the training process. */
   eval_bpb?: number
+  /** How long the save step says it took, timed by itself inside the sandbox. Information only. */
   save_seconds?: number
   collect_seconds?: number
 }
@@ -352,8 +387,9 @@ export interface ResearchRunResult {
   dataset?: string
   harness_sha256?: string
   budget_s?: number
-  train_wall_seconds?: number // measured by the runner around train.py
+  train_wall_seconds?: number // measured by the runner around train.py's whole process
   checkpoint?: ResearchCheckpoint // only when the run was started with a key
+  runner_flow?: string // only when the runner made the run with its save step in place ("keep-1")
 }
 
 /**
@@ -400,6 +436,8 @@ export function sanitizeRunResult(raw: unknown): ResearchRunResult {
   // Present only on a run that was started with a key (research-talk.ts).
   const checkpoint = status === 'ok' ? cleanCheckpoint(r.checkpoint) : undefined
   if (checkpoint) out.checkpoint = checkpoint
+  const flow = runnerFlowOf(r.runner_flow)
+  if (flow) out.runner_flow = flow
   return out
 }
 

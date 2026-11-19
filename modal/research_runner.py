@@ -40,8 +40,14 @@
 #     disposable copy of prepare.py gets a fixed block appended (KEEP_HOOK): it
 #     remembers the last model evaluate_bpb scored and, when the interpreter
 #     exits, writes torch.save(model) next to the log in 4 MiB parts. The
-#     reviewed harness file, its hash, the image, the way train.py is started,
-#     its limits and the hard stop are the same as without it.
+#     reviewed harness file, its hash, the image, the supervisor that starts
+#     train.py, its limits and the hard stop are the same as without it.
+#   * Nothing the training sandbox writes can relax the budget. The save step
+#     runs before the process ends, so it is inside the same hard stop, and
+#     the wall time the runner measures includes it. A process still running
+#     at the hard stop is a crash at stage "budget" whether it was training
+#     or saving. Every result of such a run carries runner_flow "keep-1", so
+#     the record shows which runs had the save step.
 #   * That save runs in the same process as the generated code, so the saved
 #     file is as self-reported as the score. The controller copies it out
 #     through a bounded reader and stores it, with the train.py that made it
@@ -100,7 +106,10 @@ KEEP_PART_BYTES = 4 * 1024 * 1024  # under the 8 MiB file limit train.py runs wi
 KEEP_MAX_BYTES = 256 * 1024 * 1024 # a saved model larger than this is not kept
 KEEP_READ_PARTS = 8                # parts copied out per reader call (32 MiB)
 KEEP_COLLECT_S = 240               # extra sandbox lifetime for copying the parts out
-KEEP_CUT_BEFORE_LIMIT_S = 2        # the save step is cut this long before train.py's hard stop
+# Written on every result of a run that had the save step, and from there
+# into results.tsv and the commit trailers. Change the name when the save
+# step or the way such a run is started changes.
+RUNNER_FLOW_KEEP = "keep-1"
 KEPT_MAX = 3                       # promoted models kept on the Volume
 CANDIDATES_MAX = 3                 # unpromoted saves kept on the Volume
 CANDIDATE_TTL_S = 3 * 24 * 3600
@@ -113,6 +122,9 @@ SAMPLE_CHECK_NEW = 64
 SAMPLE_GENERATE_S = 40             # the sampler stops writing after this long
 SAMPLE_EXEC_S = 60                 # loading and writing together, inside the sandbox
 SAMPLE_SANDBOX_S = 120
+# What a sampling sandbox may print in all. One OBLAB_SAMPLE line with 500
+# bytes in base64 is under 1 KiB; past this the sandbox is ended.
+SAMPLE_OUTPUT_MAX_BYTES = 64 * 1024
 SAMPLE_FN_TIMEOUT_S = 180
 SAMPLE_TEMPERATURE = 0.8
 SAMPLE_TOP_K = 40
@@ -181,7 +193,7 @@ def _check_train_py(source: str):
 
 
 # ---------------------------------------------------------------------------
-# Keeping a model. The four scripts below are fixed text written by the
+# Keeping a model. The three scripts below are fixed text written by the
 # controller into a sandbox; none of them takes anything from generated code.
 # The plain functions after them have the sandbox and the Volume passed in, so
 # tests/test_research_talk.py runs all of them without Modal.
@@ -231,16 +243,13 @@ def _oblab_keep_install():
     def save():
         # Only the process that runs train.py saves. A worker process (a data
         # loader's, say) that was forked from it, or that imported this module
-        # again, must not write the marker or anything else.
+        # again, must not write anything.
         if os.getpid() != owner or multiprocessing.parent_process() is not None:
             return
         status = {"saved": False}
         started = time.time()
         try:
             os.makedirs(keep_dir, exist_ok=True)
-            # Tells the supervisor that train.py itself is over and what
-            # follows is the save step.
-            write("train-done", b"")
             model = seen["model"]
             if model is None:
                 status["reason"] = "prepare.evaluate_bpb was never called, so there was no model to save"
@@ -289,39 +298,6 @@ def _oblab_keep_install():
 _oblab_keep_install()
 del _oblab_keep_install
 '''.replace("__KEEP_DIR__", KEEP_DIR).replace("__PART_BYTES__", str(KEEP_PART_BYTES)).replace("__MAX_BYTES__", str(KEEP_MAX_BYTES))
-
-# The supervisor of a run that may be kept. It starts train.py exactly as the
-# other one does (same command, same file limit, same log). The difference is
-# that it knows when train.py is over and the save step has begun (the marker
-# file), so it can cut a save that is still writing shortly before the hard
-# stop and still let the run count. It never stops train.py itself: a train.py
-# that runs to the hard stop is stopped by the same timeout as before.
-KEEP_SUPERVISOR = """import json, os, resource, subprocess, sys, time
-cut_at = float(sys.argv[1])
-mark = '%s/train-done'
-resource.setrlimit(resource.RLIMIT_FSIZE, (8 * 1024 * 1024, 8 * 1024 * 1024))
-t0 = time.monotonic()
-done = None
-cut = False
-with open('/tmp/train.log', 'wb') as out:
-    p = subprocess.Popen([sys.executable, '/tmp/train.py'] + sys.argv[2:], stdout=out, stderr=out)
-    while True:
-        rc = p.poll()
-        now = time.monotonic() - t0
-        if done is None and os.path.lexists(mark):
-            done = now
-        if rc is not None:
-            break
-        if done is not None and now >= cut_at:
-            p.kill()
-            p.wait()
-            cut = True
-            break
-        time.sleep(0.05)
-total = time.monotonic() - t0
-print('OBLAB_KEEP ' + json.dumps({'train_done_s': done, 'total_s': total, 'cut': cut, 'rc': p.returncode}))
-sys.exit(0 if cut else p.returncode)
-""" % KEEP_DIR
 
 # Copies what the save step wrote out of the training sandbox. Like the log
 # reader: no symlinks, regular files only, and never more than the size named.
@@ -482,20 +458,18 @@ def clean_story(raw, limit) -> str:
     return "".join(chr(b) for b in bytes(raw)[:max(0, int(limit))] if b == 10 or 32 <= b <= 126)
 
 
-def keep_report(output):
-    """What the keeping supervisor printed, or None when it printed nothing usable."""
-    text = output.decode("utf-8", errors="replace") if isinstance(output, (bytes, bytearray)) else str(output or "")
-    for line in reversed(text.splitlines()):
-        if line.startswith("OBLAB_KEEP "):
-            try:
-                r = json.loads(line[len("OBLAB_KEEP "):])
-            except ValueError:
-                return None
-            if not isinstance(r, dict):
-                return None
-            num = lambda v: float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v) and v >= 0 else None
-            return {"train_done_s": num(r.get("train_done_s")), "total_s": num(r.get("total_s")), "cut": r.get("cut") is True}
-    return None
+def read_bounded(stream, limit) -> tuple:
+    """Reads what a sandbox process prints, piece by piece, and stops once it
+    is more than `limit` bytes. Returns (the first `limit` bytes at most,
+    whether that was all of it). For output that model-written code can reach."""
+    data = bytearray()
+    for chunk in stream:
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", "replace")
+        data += bytes(chunk)[:limit + 1 - len(data)]
+        if len(data) > limit:
+            return bytes(data[:limit]), False
+    return bytes(data), True
 
 
 def keep_status(raw) -> dict:
@@ -517,8 +491,13 @@ def keep_status(raw) -> dict:
             or parts != -(-size // KEEP_PART_BYTES):
         return {"saved": False, "reason": "the save step's report does not add up"}
     bpb = s.get("eval_bpb")
+    took = s.get("save_seconds")
     return {
         "saved": True, "bytes": size, "parts": parts, "sha256": sha,
+        # As the save step timed itself, inside the sandbox. Shown for
+        # information only: it is never taken off any time the runner measured.
+        "save_seconds": round(float(took), 3) if isinstance(took, (int, float)) and not isinstance(took, bool)
+                        and math.isfinite(took) and 0 <= took <= 3600 else None,
         "params": count(s.get("params"), 10 ** 12), "seq_len": count(s.get("seq_len"), 10 ** 6),
         "eval_calls": count(s.get("eval_calls"), 10 ** 9),
         "eval_bpb": float(bpb) if isinstance(bpb, (int, float)) and not isinstance(bpb, bool) and math.isfinite(bpb) and bpb >= 0 else None,
@@ -749,10 +728,17 @@ def sample_in_sandbox(create_sandbox, key, prompt, max_new, seed) -> dict:
         sb.filesystem.write_text(SAMPLER, "/tmp/oblab_sample.py")
         t_exec = time.time()
         proc = sb.exec("python", "-I", "/tmp/oblab_sample.py", timeout=SAMPLE_EXEC_S, text=False)
-        output = proc.stdout.read()
-        proc.wait()
-        result = sample_result(output, prompt, max_new)
-        if result.get("stage") == "sandbox" and time.time() - t_exec >= SAMPLE_EXEC_S - 1:
+        # The process in there runs model-written code, which can find the
+        # real output and write to it. Never hold more than a little of it.
+        output, whole = read_bounded(proc.stdout, SAMPLE_OUTPUT_MAX_BYTES)
+        if not whole:
+            # Not waited for: the sandbox is ended below, and the process with it.
+            result = {"status": "error", "stage": "sandbox",
+                      "error": f"the sampling sandbox printed more than the {SAMPLE_OUTPUT_MAX_BYTES} bytes allowed and was ended"}
+        else:
+            proc.wait()
+            result = sample_result(output, prompt, max_new)
+        if whole and result.get("stage") == "sandbox" and time.time() - t_exec >= SAMPLE_EXEC_S - 1:
             result = {"status": "error", "stage": "timeout",
                       "error": f"loading and writing took more than the {SAMPLE_EXEC_S} s allowed"}
     except Exception as exc:
@@ -784,7 +770,12 @@ def run_experiment(train_py: str, budget_s: float = DEFAULT_BUDGET_S, smoke: boo
     model" at the top of this file). Without it nothing below differs from a
     runner that has no such thing. With it, an ok result also carries
     "checkpoint": {"key", "saved", ...} saying whether a model was saved as a
-    candidate and, if not, why. Keeping never changes the run's own outcome.
+    candidate and, if not, why, and every result from the sandbox onwards
+    carries "runner_flow". Nothing the sandbox writes changes the run's status
+    or the time measured here. The one way keeping can change an outcome: the
+    save step runs before the process ends, inside the same hard stop, so a
+    run still saving at the hard stop is the same crash at stage "budget" as
+    one still training.
     """
     t0 = time.time()
     keep = None
@@ -794,6 +785,8 @@ def run_experiment(train_py: str, budget_s: float = DEFAULT_BUDGET_S, smoke: boo
             keep["reason"] = "the key the lab sent is not a model key"
     keeping = keep is not None and keep["key"] is not None
     kept_blob = None
+    # Marks a result as coming from a run that had the save step.
+    tag = (lambda r: dict(r, runner_flow=RUNNER_FLOW_KEEP)) if keeping else (lambda r: r)
     syntax_error = _check_train_py(train_py)
     if syntax_error is not None:
         return {"status": "crash", "stage": "syntax",
@@ -854,25 +847,15 @@ with open('/tmp/train.log', 'wb') as out:
 sys.exit(p.returncode)
 """
         t_train = time.time()
-        if keeping:
-            # Same command, limits and hard stop for train.py. This supervisor
-            # also knows when train.py is over and the save step has begun.
-            proc = sb.exec("python", "-c", KEEP_SUPERVISOR, str(train_timeout - KEEP_CUT_BEFORE_LIMIT_S),
-                           *(["--smoke"] if smoke else []), timeout=train_timeout)
-        else:
-            proc = sb.exec("python", "-c", supervisor, *(["--smoke"] if smoke else []),
-                           timeout=train_timeout)
+        # The same supervisor, command, limits and hard stop whether or not the
+        # model may be kept. The save step of a kept run happens as train.py's
+        # process ends, so it is inside this hard stop and inside the wall time
+        # measured here. Nothing that process writes is asked when it "really"
+        # finished: it could write that itself.
+        proc = sb.exec("python", "-c", supervisor, *(["--smoke"] if smoke else []),
+                       timeout=train_timeout)
         proc.wait()
         train_seconds_wall = time.time() - t_train
-        if keeping:
-            # The time the save step took is not training time. It is taken off
-            # the measured wall time, so that number means what it meant before.
-            phases = keep_report(proc.stdout.read())
-            if phases is not None and phases["train_done_s"] is not None and phases["total_s"] is not None:
-                keep["save_seconds"] = round(max(0.0, phases["total_s"] - phases["train_done_s"]), 3)
-                train_seconds_wall = max(0.0, train_seconds_wall - keep["save_seconds"])
-                if phases["cut"]:
-                    keep["reason"] = "the save step was cut short at the hard limit for the run"
         # Generated code can replace the log path. Refuse symlinks/devices and
         # read at most 64 KiB from one verified file descriptor inside the sandbox.
         log_reader = """import os, stat, sys
@@ -894,15 +877,15 @@ finally:
         stdout = raw_log.decode("utf-8", errors="replace")[-65536:]
         log_tail = "\n".join(stdout.splitlines()[-40:])[-4000:]
         if train_seconds_wall >= train_timeout - 1:
-            return {"status": "crash", "stage": "budget",
-                    "error": f"train.py was stopped at the hard limit of {train_timeout} s "
-                             f"(budget {budget_s:g} s + {TRAIN_GRACE_S} s grace)",
-                    "log_tail": log_tail, "train_wall_seconds": train_seconds_wall,
-                    "wall_seconds": time.time() - t0}
+            return tag({"status": "crash", "stage": "budget",
+                        "error": f"train.py was stopped at the hard limit of {train_timeout} s "
+                                 f"(budget {budget_s:g} s + {TRAIN_GRACE_S} s grace)",
+                        "log_tail": log_tail, "train_wall_seconds": train_seconds_wall,
+                        "wall_seconds": time.time() - t0})
         if proc.returncode != 0:
-            return {"status": "crash", "stage": "train", "error": log_tail[-2500:],
-                    "log_tail": log_tail, "wall_seconds": time.time() - t0}
-        if keeping and "reason" not in keep and any(line.startswith("RESULT ") for line in stdout.splitlines()):
+            return tag({"status": "crash", "stage": "train", "error": log_tail[-2500:],
+                        "log_tail": log_tail, "wall_seconds": time.time() - t0})
+        if keeping and any(line.startswith("RESULT ") for line in stdout.splitlines()):
             # Copy the saved model out while the sandbox is still there. It is
             # stored only if the run turns out ok below. A failure here is a
             # missing checkpoint, never a failed run.
@@ -915,8 +898,8 @@ finally:
                 kept_blob = None
                 keep["reason"] = "the saved model could not be copied out: " + plain(str(exc), 200)
     except Exception as exc:
-        return {"status": "crash", "stage": "sandbox", "error": str(exc)[-1500:],
-                "wall_seconds": time.time() - t0}
+        return tag({"status": "crash", "stage": "sandbox", "error": str(exc)[-1500:],
+                    "wall_seconds": time.time() - t0})
     finally:
         if sb is not None:
             sb.terminate()
@@ -928,12 +911,12 @@ finally:
             result_line = line[len("RESULT "):]
             break
     if result_line is None:
-        return {
+        return tag({
             "status": "crash", "stage": "parse",
             "error": "no RESULT line in output — train.py broke the output contract",
             "log_tail": log_tail,
             "wall_seconds": time.time() - t0,
-        }
+        })
     try:
         metrics = json.loads(result_line)
         val_bpb = float(metrics["val_bpb"])
@@ -941,24 +924,24 @@ finally:
             raise ValueError(f"non-finite val_bpb: {val_bpb}")
         reported_train_s = metrics.get("train_seconds")
     except Exception as e:
-        return {
+        return tag({
             "status": "crash", "stage": "parse",
             "error": f"RESULT line invalid: {e}",
             "log_tail": log_tail,
             "wall_seconds": time.time() - t0,
-        }
+        })
 
     # The score is self-reported; at least refuse runs that say they trained
     # longer than the budget allowed (one optimiser step of overshoot is fine).
     limit_s = (20 if smoke else budget_s) + REPORTED_TRAIN_TOLERANCE_S
     if isinstance(reported_train_s, (int, float)) and not isinstance(reported_train_s, bool) \
             and (not math.isfinite(reported_train_s) or reported_train_s > limit_s):
-        return {
+        return tag({
             "status": "crash", "stage": "budget",
             "error": f"reported train_seconds {reported_train_s} exceeds the {budget_s:g} s budget",
             "log_tail": log_tail, "train_wall_seconds": train_seconds_wall,
             "wall_seconds": time.time() - t0,
-        }
+        })
 
     result = {
         "status": "ok",
@@ -989,7 +972,7 @@ finally:
             keep["reason"] = "no model was saved"
         result["checkpoint"] = keep
         result["wall_seconds"] = time.time() - t0
-    return result
+    return tag(result)
 
 
 # ---------------------------------------------------------------------------
@@ -1057,15 +1040,22 @@ def status(request: Request, call_id: str = "") -> dict:
 # Kept models: the store, and asking one for a story
 # ---------------------------------------------------------------------------
 
+@app.function(image=web_image, volumes={MODELS_ROOT: model_store}, timeout=60, retries=0, max_containers=1)
+def kept_info() -> dict:
+    """Lists the kept models. It only reads, and it is a function of its own
+    so that questions about the list never wait in front of a promotion (or
+    make one wait): store_op below runs one call at a time."""
+    model_store.reload()
+    return {"models": models_info(MODELS_ROOT)}
+
+
 @app.function(image=web_image, volumes={MODELS_ROOT: model_store}, timeout=120, retries=0, max_containers=1)
 def store_op(action: str, key: str = "", check: bool = True) -> dict:
-    """The two things done to the store outside a run: list the kept models,
-    and promote a candidate. One container at a time, so two promotions
-    cannot clear each other's files away. `check` False leaves the sample of
-    a newly kept model to the caller (the owner's command waits for it)."""
+    """The one change made to the store outside a run: promote a candidate.
+    One container at a time, so two promotions cannot clear each other's
+    files away. `check` False leaves the sample of a newly kept model to the
+    caller (the owner's command waits for it)."""
     model_store.reload()
-    if action == "info":
-        return {"models": models_info(MODELS_ROOT)}
     if action == "promote":
         result = promote(MODELS_ROOT, key, time.time())
         model_store.commit()
@@ -1132,7 +1122,7 @@ def models(body: dict, request: Request) -> dict:
         raise HTTPException(status_code=401, detail="Unauthorized")
     action = body.get("action")
     if action == "info":
-        return store_op.remote("info")
+        return kept_info.remote()
     key = body.get("key")
     if not valid_key(key):
         raise HTTPException(status_code=400, detail="Invalid key")
@@ -1186,5 +1176,5 @@ def keep_current(train_py: str, smoke: bool = False, budget_s: float = DEFAULT_B
 @app.local_entrypoint()
 def list_kept():
     """Print the kept models and their sample checks."""
-    print(json.dumps(store_op.remote("info"), indent=2))
+    print(json.dumps(kept_info.remote(), indent=2))
 

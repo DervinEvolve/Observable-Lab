@@ -28,8 +28,15 @@
  * line of at most 200 plain characters, a fixed number of new bytes, a few
  * stories per visitor in ten minutes and in a day, and a number of stories
  * for all visitors in a day (LAB_RESEARCH_TALK_DAILY). Each story is written
- * to the spend ledger as a small flat estimate, so it counts inside the
- * lab's daily budget.
+ * to the spend ledger as a small flat estimate, before its sandbox is asked
+ * for, so it counts inside the lab's daily budget even if this function is
+ * stopped while it waits.
+ *
+ * GET costs the runner nothing a visitor can multiply. The list of kept
+ * models is held in one database row: one server instance at a time asks
+ * the runner for it, at most once a minute for all of them together, and a
+ * failed read is not tried again for half a minute. Every other request is
+ * answered from that row or from this instance's memory.
  *
  * A visitor is counted the way the trained chat counts one: by keyed hashes
  * of the address, and of the address with the browser string, new every day.
@@ -66,9 +73,25 @@ export const RESEARCH_TALK_ADDRESS_PER_DAY = 20
 export const RESEARCH_TALK_MAX_BODY_BYTES = 4 * 1024
 /** A story waits for a sandbox to start, load the model and write. */
 export const RESEARCH_TALK_TIMEOUT_MS = 105_000
+/**
+ * The route's function may run for 120 s (vercel.json). The wait for a story
+ * is cut so that the whole request ends inside this, leaving time to write
+ * the call's record; with less than the minimum left, no sandbox is asked for.
+ */
+export const RESEARCH_TALK_FUNCTION_BUDGET_MS = 112_000
+export const RESEARCH_TALK_MIN_WAIT_MS = 20_000
 export const RESEARCH_TALK_PROMOTE_TIMEOUT_MS = 45_000
+/** How often the lab asks again for a promotion the runner could not be asked for (once per later attempt or epoch). */
+export const RESEARCH_TALK_PROMOTE_MAX_ATTEMPTS = 6
 const INFO_TIMEOUT_MS = 20_000
-const INFO_TTL_MS = 60_000
+/** The runner is asked for its list at most this often, by all server instances together. */
+export const RESEARCH_TALK_INFO_TTL_MS = 60_000
+/** After a read that failed (or while one is under way) the runner is not asked again for this long. */
+export const RESEARCH_TALK_INFO_RETRY_MS = 30_000
+/** One instance answers from its own memory for this long before it looks at the database row again. */
+export const RESEARCH_TALK_INFO_MEMORY_MS = 30_000
+/** A stored list older than this is not served when the runner cannot be asked. */
+export const RESEARCH_TALK_INFO_STALE_MS = 15 * 60_000
 
 /** Shown beside the story box. Plain, and no dashes. */
 export const RESEARCH_TALK_NOTICE = 'It does not answer questions. It carries on from the line you give it, and nobody reviews what it writes.'
@@ -220,24 +243,40 @@ export async function listStoryModels(): Promise<StoryModel[]> {
   return list.slice(0, 10).map(readStoryModel).filter((m): m is StoryModel => m !== null)
 }
 
-export interface Promotion { ok: boolean; at: string; error?: string }
+export interface Promotion {
+  ok: boolean
+  at: string
+  error?: string
+  /** The runner answered and said no (nothing saved under that key, say). Asking again would change nothing. */
+  refused?: true
+  /** How many times the lab has asked, when more than once. */
+  attempts?: number
+}
 
 /**
  * Asks the runner to keep the model saved under `key`: called when the
  * Reviewer keeps that run as the new best. Never throws. Asking twice is the
- * same as asking once.
+ * same as asking once, so a promotion whose answer never arrived (a slow or
+ * unreachable runner) is asked for again later: mayRetryPromotion below.
  */
 export async function promoteResearchModel(key: string): Promise<Promotion> {
   const at = new Date().toISOString()
-  if (!EPOCH_KEY.test(key)) return { ok: false, at, error: 'not a model key' }
+  if (!EPOCH_KEY.test(key)) return { ok: false, at, error: 'not a model key', refused: true }
   try {
     const data = await callRunner({ action: 'promote', key }, RESEARCH_TALK_PROMOTE_TIMEOUT_MS) as Record<string, unknown>
-    infoCache = null
+    await forgetStoryView()
     if (data?.ok === true) return { ok: true, at }
-    return { ok: false, at, error: plain(data?.error, 200) || 'the runner did not keep it' }
+    return { ok: false, at, error: plain(data?.error, 200) || 'the runner did not keep it', refused: true }
   } catch (e) {
     return { ok: false, at, error: plain(e instanceof Error ? e.message : String(e), 200) || 'the runner could not be asked' }
   }
+}
+
+/** Should a promotion that did not succeed be asked for again? Only when the runner never answered, and only a few times. */
+export function mayRetryPromotion(p: Promotion | undefined): boolean {
+  if (!p || p.ok || p.refused) return false
+  const attempts = typeof p.attempts === 'number' && Number.isSafeInteger(p.attempts) && p.attempts > 0 ? p.attempts : 1
+  return attempts < RESEARCH_TALK_PROMOTE_MAX_ATTEMPTS
 }
 
 export interface StoryView {
@@ -254,9 +293,27 @@ export interface StoryView {
 }
 
 let infoCache: { at: number; view: StoryView } | null = null
-/** Forgets what was last read from the runner. For tests, and after a promotion. */
+let infoFailure: { at: number; error: unknown; forMs: number } | null = null
+let infoInFlight: Promise<StoryView> | null = null
+/** Forgets what this instance last read. For tests, and after a story that failed. */
 export function resetResearchTalkCache(): void {
   infoCache = null
+  infoFailure = null
+  infoInFlight = null
+}
+/** After a promotion: this instance forgets, and the shared row is marked old so the next request asks the runner. */
+async function forgetStoryView(): Promise<void> {
+  resetResearchTalkCache()
+  try {
+    await ensureResearchTalkTables()
+    // Old enough to be read again at once, and still there for the instances that only read the row meanwhile.
+    await sql`
+      UPDATE research_talk_state SET asked_at = NULL, read_at = NOW() - make_interval(secs => ${RESEARCH_TALK_INFO_TTL_MS / 1000 + 1})
+      WHERE id = 'models' AND read_at IS NOT NULL
+    `
+  } catch {
+    // The row grows old by itself within a minute.
+  }
 }
 
 async function currentBest(): Promise<{ hex: string; epoch: number } | null> {
@@ -275,10 +332,61 @@ async function currentBest(): Promise<{ hex: string; epoch: number } | null> {
   }
 }
 
-/** What the room is told about the story model. Read from the runner at most once a minute per server instance. */
-export async function storyView(now: number = Date.now()): Promise<StoryView> {
-  if (infoCache && now - infoCache.at < INFO_TTL_MS) return infoCache.view
-  const models = await listStoryModels()
+/** Nothing is stored yet and another request holds the right to ask the runner: worth looking again in a moment. */
+class StoryListPending extends Error {}
+/** How long one instance waits before it looks again in that case. */
+const INFO_PENDING_MS = 3_000
+
+/** The list the database row holds, strictly read again, or null when there is none young enough to use. */
+async function storedStoryModels(): Promise<StoryModel[] | null> {
+  const r = await sql`
+    SELECT models FROM research_talk_state
+    WHERE id = 'models' AND read_at IS NOT NULL AND read_at > NOW() - make_interval(secs => ${RESEARCH_TALK_INFO_STALE_MS / 1000})
+  `
+  const list = r.rows[0]?.models
+  return Array.isArray(list) ? list.slice(0, 10).map(readStoryModel).filter((m): m is StoryModel => m !== null) : null
+}
+
+/**
+ * The kept models, for every server instance together. Anyone can call GET,
+ * and a visitor must not be able to turn requests into calls to the runner:
+ * each call starts a container on Modal that nobody is billed for here, and
+ * could keep a promotion waiting. So the list lives in one database row and
+ * the right to refresh it is taken with one statement: only when the row is
+ * older than a minute, and only when nobody took that right in the last half
+ * minute (which also spaces out the tries while the runner is away).
+ * Everyone else reads the row.
+ */
+async function sharedStoryModels(): Promise<StoryModel[]> {
+  await ensureResearchTalkTables()
+  const claim = await sql`
+    INSERT INTO research_talk_state (id, asked_at) VALUES ('models', NOW())
+    ON CONFLICT (id) DO UPDATE SET asked_at = NOW()
+    WHERE (research_talk_state.read_at IS NULL OR research_talk_state.read_at < NOW() - make_interval(secs => ${RESEARCH_TALK_INFO_TTL_MS / 1000}))
+      AND (research_talk_state.asked_at IS NULL OR research_talk_state.asked_at < NOW() - make_interval(secs => ${RESEARCH_TALK_INFO_RETRY_MS / 1000}))
+    RETURNING id
+  `
+  if (claim.rows[0]) {
+    let fresh: StoryModel[]
+    try {
+      fresh = await listStoryModels()
+    } catch (e) {
+      // The runner is away. An older list is better than none; it is not
+      // asked again for half a minute either way.
+      const stored = await storedStoryModels()
+      if (stored) return stored
+      throw e
+    }
+    await sql`UPDATE research_talk_state SET models = ${JSON.stringify(fresh)}::jsonb, read_at = NOW() WHERE id = 'models'`
+    return fresh
+  }
+  const stored = await storedStoryModels()
+  if (stored) return stored
+  throw new StoryListPending('the kept models have not been read yet (another request is asking the runner, or it could not be asked)')
+}
+
+async function readStoryView(): Promise<StoryView> {
+  const models = await sharedStoryModels()
   const talk = models.find(m => m.check?.ok === true) ?? null
   const newest = models[0] && models[0].key !== talk?.key ? models[0] : null
   let best_epoch: number | null = null
@@ -287,9 +395,34 @@ export async function storyView(now: number = Date.now()): Promise<StoryView> {
     const best = await currentBest()
     if (best && best.hex === epochKey[2] && best.epoch > Number(epochKey[1])) best_epoch = best.epoch
   }
-  const view = { talk, newest, best_epoch }
-  infoCache = { at: now, view }
-  return view
+  return { talk, newest, best_epoch }
+}
+
+/**
+ * What the room is told about the story model. One instance answers from
+ * memory for half a minute, remembers a failure for as long (three seconds
+ * when the list is only still being fetched by someone else), and lets
+ * requests that arrive together share one read.
+ */
+export async function storyView(now: number = Date.now()): Promise<StoryView> {
+  if (infoCache && now - infoCache.at < RESEARCH_TALK_INFO_MEMORY_MS) return infoCache.view
+  if (infoFailure && now - infoFailure.at < infoFailure.forMs) throw infoFailure.error
+  if (!infoInFlight) {
+    const read: Promise<StoryView> = readStoryView().then(
+      view => {
+        if (infoInFlight === read) { infoCache = { at: now, view }; infoFailure = null }
+        return view
+      },
+      error => {
+        if (infoInFlight === read) infoFailure = { at: now, error, forMs: error instanceof StoryListPending ? INFO_PENDING_MS : RESEARCH_TALK_INFO_RETRY_MS }
+        throw error
+      },
+    ).finally(() => {
+      if (infoInFlight === read) infoInFlight = null
+    })
+    infoInFlight = read
+  }
+  return infoInFlight
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +454,15 @@ export function ensureResearchTalkTables(): Promise<void> {
           stopped TEXT,
           cost_usd NUMERIC(12,6) NOT NULL DEFAULT 0,
           duration_ms INTEGER
+        )
+      `
+      // The runner's list of kept models, read for all server instances (sharedStoryModels).
+      await sql`
+        CREATE TABLE IF NOT EXISTS research_talk_state (
+          id TEXT PRIMARY KEY,
+          models JSONB,
+          read_at TIMESTAMP WITH TIME ZONE,
+          asked_at TIMESTAMP WITH TIME ZONE
         )
       `
     })().catch(e => {
@@ -482,6 +624,7 @@ export async function handleResearchTalk(req: VercelRequest, res: VercelResponse
   }
 
   if (!status.enabled) return say(res, 503, 'off', researchTalkFlag() ? MESSAGES.unavailable : MESSAGES.off)
+  const arrived = Date.now()
 
   // ---- the request ----
   if (!sentAsJson(req)) return say(res, 415, 'unsupported_media_type', 'Send the request as JSON.')
@@ -543,22 +686,30 @@ export async function handleResearchTalk(req: VercelRequest, res: VercelResponse
 
   // ---- the call ----
   const maxNew = researchTalkMaxNew()
-  const started = Date.now()
-  let answer: StoryAnswer
-  try {
-    answer = readStoryAnswer(await callRunner({ action: 'sample', key: model.key, prompt: story.prompt, max_new: maxNew }, RESEARCH_TALK_TIMEOUT_MS), maxNew)
-  } catch (e) {
-    // The kind of failure only: an error line could repeat what the visitor wrote.
-    answer = { ok: false, stage: e instanceof Error && e.name === 'TimeoutError' ? 'timeout' : 'unreachable' }
-  }
-  // A sandbox ran, or may have: the story is counted at its flat estimate
-  // either way, so the ledger fills from estimates that err high.
+  // The wait for the story ends inside this function's own time, whatever
+  // the steps above took. With too little left, no sandbox is asked for.
+  const waitMs = Math.min(RESEARCH_TALK_TIMEOUT_MS, RESEARCH_TALK_FUNCTION_BUDGET_MS - (Date.now() - arrived))
+  if (waitMs < RESEARCH_TALK_MIN_WAIT_MS) return say(res, 503, 'busy', MESSAGES.busy)
+  // The story goes on the ledger at its flat estimate before the sandbox is
+  // asked for. Written afterwards, it would be missing whenever this function
+  // is stopped while it waits, and the sandbox would have run for nothing the
+  // daily budget ever saw. It is counted whether or not a story comes back,
+  // so the ledger fills from estimates that err high. The ledger row has the
+  // length of the line; the length of the story is in the call's own record.
   const costUsd = researchTalkUsdPerStory()
   if (costUsd > 0) {
     await withSpendContext({ purpose: RESEARCH_TALK_PURPOSE }, () => recordModelCall({
       model: 'tool/research_talk', assigned: `research:${model.key}`, cost_usd: costUsd, cost_source: 'estimate',
-      prompt_tokens: story.chars, completion_tokens: answer.ok ? answer.continuation.length : 0, reasoning_tokens: 0,
+      prompt_tokens: story.chars, completion_tokens: 0, reasoning_tokens: 0,
     }))
+  }
+  const started = Date.now()
+  let answer: StoryAnswer
+  try {
+    answer = readStoryAnswer(await callRunner({ action: 'sample', key: model.key, prompt: story.prompt, max_new: maxNew }, waitMs), maxNew)
+  } catch (e) {
+    // The kind of failure only: an error line could repeat what the visitor wrote.
+    answer = { ok: false, stage: e instanceof Error && e.name === 'TimeoutError' ? 'timeout' : 'unreachable' }
   }
   await recordStoryCall({
     modelKey: model.key, status: answer.ok ? 'ok' : 'error', stage: answer.ok ? null : answer.stage, promptChars: story.chars,
@@ -566,8 +717,8 @@ export async function handleResearchTalk(req: VercelRequest, res: VercelResponse
   })
   if (!answer.ok) {
     console.warn(`[research-talk] no story (${answer.stage})`)
-    // A model that can no longer be sampled should not be offered for another minute on the strength of an old check.
-    if (answer.stage !== 'timeout' && answer.stage !== 'unreachable') infoCache = null
+    // A model that can no longer be sampled: this instance looks at the shared list again before it offers it once more.
+    if (answer.stage !== 'timeout' && answer.stage !== 'unreachable') resetResearchTalkCache()
     return say(res, answer.stage === 'timeout' ? 504 : 502, 'busy', MESSAGES.busy)
   }
   return res.status(200).json({
