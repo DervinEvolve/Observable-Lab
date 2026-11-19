@@ -143,20 +143,25 @@ export async function startTinkerJob(body: Record<string, unknown>): Promise<Tin
 }
 
 export type TinkerPoll =
-  | { state: 'running' }
+  /** `progress` is whatever a run that reports as it goes (Tinker RL) has written; the caller reads it strictly (tinker-rl.ts). */
+  | { state: 'running'; progress?: unknown }
   | { state: 'done'; result: unknown }
   | { state: 'failed'; error: string }
   | { state: 'unknown' } // the status call itself did not answer; ask again later
 
-/** Asks once whether a run has finished. Never throws. */
-export async function pollTinkerJob(callId: string): Promise<TinkerPoll> {
+/**
+ * Asks once whether a run has finished. Never throws. `runId` is the run's
+ * own name: with it, a run that is still going also says how far it has got.
+ */
+export async function pollTinkerJob(callId: string, runId?: string, timeoutMs: number = REQUEST_TIMEOUT_MS): Promise<TinkerPoll> {
   try {
     const url = new URL(requireHttpsUrl('TINKER_JOBS_STATUS_URL', 'Tinker training'))
     url.searchParams.set('call_id', callId)
-    const res = await fetch(url, { headers: authHeaders(), signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS) })
+    if (runId && /^e[0-9]{1,6}-[0-9a-f]{8}$/.test(runId)) url.searchParams.set('run_id', runId)
+    const res = await fetch(url, { headers: authHeaders(), signal: AbortSignal.timeout(timeoutMs) })
     if (!res.ok) return { state: 'unknown' }
-    const data = await res.json() as { status?: unknown; result?: unknown; error?: unknown }
-    if (data.status === 'running') return { state: 'running' }
+    const data = await res.json() as { status?: unknown; result?: unknown; error?: unknown; progress?: unknown }
+    if (data.status === 'running') return data.progress === undefined ? { state: 'running' } : { state: 'running', progress: data.progress }
     if (data.status === 'done') return { state: 'done', result: data.result }
     return { state: 'failed', error: typeof data.error === 'string' ? data.error.slice(0, 300) : 'unknown status' }
   } catch {
@@ -182,13 +187,21 @@ export async function findTinkerCall(runId: string): Promise<string | null> {
   }
 }
 
-/** Polls until the run finishes or the wait ends. `running` means it is still going and can be collected later. */
-export async function waitForTinkerJob(callId: string, maxWaitMs: number, pollMs = 10_000): Promise<TinkerPoll> {
+/**
+ * Polls until the run finishes or the wait ends. `running` means it is still
+ * going and can be collected later. With `runId`, every answer that says
+ * where a run has got to is handed to `onProgress` (which must not throw).
+ */
+export async function waitForTinkerJob(
+  callId: string, maxWaitMs: number, pollMs = 10_000,
+  opts: { runId?: string; onProgress?: (progress: unknown) => Promise<void> } = {},
+): Promise<TinkerPoll> {
   const deadline = Date.now() + maxWaitMs
   for (let first = true; first || Date.now() < deadline; first = false) {
     if (!first) await new Promise(r => setTimeout(r, Math.min(pollMs, Math.max(0, deadline - Date.now()))))
-    const poll = await pollTinkerJob(callId)
+    const poll = await pollTinkerJob(callId, opts.runId)
     if (poll.state === 'done' || poll.state === 'failed') return poll
+    if (poll.state === 'running' && poll.progress !== undefined && opts.onProgress) await opts.onProgress(poll.progress)
   }
   return { state: 'running' }
 }

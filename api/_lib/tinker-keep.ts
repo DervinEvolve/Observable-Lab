@@ -107,11 +107,17 @@ export function keepManifest(run: TinkerRunRow, keep: Pick<KeepRow, 'kept_by' | 
     // `source` is there only for a run whose examples the lab read from a public dataset.
     dataset: { sha256: run.dataset_sha256, examples: run.dataset_examples, bytes: run.dataset_bytes, ...(run.dataset_source ? { source: run.dataset_source } : {}) },
     settings: run.settings,
-    measured_by_the_lab: {
-      what: 'mean cross-entropy per trained token on examples the lab held out; lower is better',
-      holdout_examples: num(result.n_holdout), train_examples: num(result.n_train),
-      holdout_loss_before: num(result.holdout_loss_before), holdout_loss_after: num(result.holdout_loss_after),
-    },
+    measured_by_the_lab: run.kind === 'rl'
+      ? {
+        what: 'mean rubric score on tasks the lab held out, with the rubric in the run record; higher is better',
+        holdout_tasks: num(result.n_holdout), train_tasks: num(result.n_train), max_reward: num(result.max_reward),
+        score_before: num(result.score_before), score_after: num(result.score_after),
+      }
+      : {
+        what: 'mean cross-entropy per trained token on examples the lab held out; lower is better',
+        holdout_examples: num(result.n_holdout), train_examples: num(result.n_train),
+        holdout_loss_before: num(result.holdout_loss_before), holdout_loss_after: num(result.holdout_loss_after),
+      },
     trained_at: run.created_at,
     kept_by: who(keep.kept_by),
     kept_reason: keep.reason,
@@ -599,6 +605,12 @@ export async function keepOverview(now: Date = new Date()): Promise<KeepOverview
 // ---------------------------------------------------------------------------
 
 function adapterFacts(a: TrainedAdapter): string {
+  if (a.kind === 'rl') {
+    const score = a.rl_score_before != null && a.rl_score_after != null
+      ? `LAB-MEASURED held-out rubric score ${a.rl_score_before.toFixed(3)} before training, ${a.rl_score_after.toFixed(3)} after${a.holdout_examples ? `, on ${a.holdout_examples} held-out tasks` : ''}`
+      : 'no held-out score recorded'
+    return `${a.model_id}${a.name ? ` "${a.name}"` : ''}: reinforcement learning in epoch ${a.epoch} by ${a.author_name} on ${a.examples} tasks, base model ${a.base_model}; ${score}; ${a.expires_at ? `alive until ${a.expires_at.slice(0, 10)}` : 'no expiry recorded'}${a.kept ? `, KEPT by ${a.kept_by ?? 'someone'}` : ''}`
+  }
   const loss = a.holdout_loss_before !== null && a.holdout_loss_after !== null
     ? `LAB-MEASURED held-out loss ${a.holdout_loss_before.toFixed(4)} before training, ${a.holdout_loss_after.toFixed(4)} after${a.holdout_examples ? `, on ${a.holdout_examples} held-out examples` : ''}`
     : 'no held-out score recorded'

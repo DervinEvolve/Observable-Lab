@@ -18,8 +18,9 @@
 import { spritesConfigured } from './sprites.js'
 import { liveModelStatus, type LiveModelStatus } from './live-model.js'
 import { liveTrainedStatus, tinkerKeepStatus, tinkerStatus } from './tinker.js'
+import { tinkerRlPerDay, tinkerRlStatus } from './tinker-rl.js'
 
-export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'keep_adapter', 'datasets'] as const
+export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'tinker_rl', 'keep_adapter', 'datasets'] as const
 export type ToolName = (typeof TOOL_NAMES)[number]
 
 /** Per-epoch limits. Not tunable: one of each kind per epoch at most. */
@@ -32,6 +33,7 @@ export const PER_EPOCH = {
   exhibits: 1,
   lab_proposals: 1,
   tinker_runs: 1,         // LoRA fine-tuning runs on Tinker
+  tinker_rl_runs: 1,      // reinforcement-learning runs on Tinker (an epoch has one run of either kind)
   adapter_keeps: 1,       // requests to keep a trained adapter
   datasets: 1,            // public datasets fetched onto the lab's shelf
 } as const
@@ -146,6 +148,15 @@ function warnAboutLicenses(found: WeightsLicenses): void {
     : `[Tools] LAB_WEIGHTS_LICENSES: ${found.dropped} entr${found.dropped === 1 ? 'y is not a license id and was' : 'ies are not license ids and were'} left out; ${found.licenses.length} license${found.licenses.length === 1 ? '' : 's'} allowed`)
 }
 
+// Tinker RL is on unless it is switched off, so when it is on and something it needs is missing the logs
+// say why, once per reason. Switched off on purpose is not worth a line.
+let rlWarnedFor: string | null = null
+function warnAboutRl(status: { enabled: boolean; off_reason?: string }): void {
+  if (status.enabled || !status.off_reason || status.off_reason.startsWith('LAB_ENABLE_TINKER_RL') || rlWarnedFor === status.off_reason) return
+  rlWarnedFor = status.off_reason
+  console.warn(`[Tools] Tinker RL is on by default and is off here: ${status.off_reason}`)
+}
+
 export function modalGpuUsdPerSecond(): number {
   return rateEnv('LAB_MODAL_GPU_USD_PER_SECOND', DEFAULT_MODAL_GPU_USD_PER_SECOND)
 }
@@ -178,6 +189,8 @@ export function toolConfig(): ToolConfig {
   const licenses = weightsLicenses()
   if (flag('LAB_ENABLE_WEIGHTS')) warnAboutLicenses(licenses)
   const tinker = tinkerStatus()
+  const rl = tinkerRlStatus()
+  warnAboutRl(rl)
   const keep = tinkerKeepStatus()
   // Public datasets (datasets.ts). A dataset on the shelf is read by a GPU job
   // or by a Tinker training run, so with neither on there is nothing to use
@@ -221,6 +234,8 @@ export function toolConfig(): ToolConfig {
     // Tinker training (tinker.ts): a fine-tuning run by the lab's own runner
     // on Modal. Its dollar caps are separate settings; this is the count.
     tinker_train: status(tinker.enabled, tinker.off_reason ?? '', intEnv('LAB_TINKER_PER_DAY', 2, 0, 10)),
+    // Tinker RL (tinker-rl.ts): on by default, through the same runner. The count is its own.
+    tinker_rl: status(rl.enabled, rl.off_reason ?? '', tinkerRlPerDay()),
     // Keeping a trained adapter (tinker-keep.ts). How many may be kept at one
     // time is LAB_TINKER_KEEP_MAX; this is how many requests a day may be run.
     keep_adapter: status(keep.enabled, keep.off_reason ?? '', intEnv('LAB_TINKER_KEEPS_PER_DAY', 2, 0, 10)),

@@ -37,6 +37,8 @@ import {
   type TinkerRunRow,
 } from './tinker-store.js'
 import { datasetRecordLine, readDatasetRecord, type TinkerDatasetRecord } from './datasets.js'
+import { tinkerRlStatus } from './tinker-rl.js'
+import { completeRlRun, storeRlProgress } from './tinker-rl-run.js'
 
 export interface TinkerRunContext {
   experimentId: string
@@ -46,7 +48,8 @@ export interface TinkerRunContext {
 }
 
 export interface TinkerOutcome {
-  tool: typeof TINKER_TOOL
+  /** 'tinker_train', or 'tinker_rl' for a run of tinker-rl-run.ts. */
+  tool: string
   status: ToolRunStatus | 'started'
   summary: string
 }
@@ -318,7 +321,9 @@ export const TINKER_COLLECT_BUDGET_MS = 90_000
  * nothing at all, no query and no request. Never throws.
  */
 export async function collectTinkerRuns(now: Date = new Date()): Promise<TinkerOutcome[]> {
-  const on = tinkerFlag()
+  // Tinker RL runs are collected here too. Its switch is on by default, so it counts only
+  // when it is really on (the runner is configured): a lab with no runner does nothing here.
+  const on = tinkerFlag() || tinkerRlStatus().enabled
   if (!on && !tinkerJobsConfigured()) return []
   const out: TinkerOutcome[] = []
   try {
@@ -339,12 +344,17 @@ export async function collectTinkerRuns(now: Date = new Date()): Promise<TinkerO
       if (!callId) {
         settled = age < TINKER_UNCONFIRMED_AFTER_MS ? null : { state: 'failed', error: 'its start was never confirmed' }
       } else {
-        const poll = await pollTinkerJob(callId)
+        const rl = row.kind === 'rl'
+        const poll = await pollTinkerJob(callId, rl ? row.slug : undefined)
+        // A run that is still going says how far it has got; the lab keeps the last record it was told.
+        if (rl && poll.state === 'running' && poll.progress !== undefined) await storeRlProgress(row, poll.progress)
         settled = poll.state === 'done' || poll.state === 'failed' ? poll
           : age > TINKER_LOST_AFTER_MS ? { state: 'failed', error: 'no result long after its time limit' } : null
       }
       if (!settled) continue
-      const outcome = await completeRun({ ...row, call_id: callId }, settled)
+      const outcome = row.kind === 'rl'
+        ? await completeRlRun({ ...row, call_id: callId }, settled)
+        : await completeRun({ ...row, call_id: callId }, settled)
       if (outcome) {
         out.push(outcome)
         console.log(`[tinker] collected the run of epoch ${row.epoch}: ${outcome.status}`)

@@ -1,0 +1,830 @@
+// Tinker RL (LAB_ENABLE_TINKER_RL, on by default): what a model may ask for, the
+// rubric engine, the cost estimate and the caps, the progress the room is
+// drawn from, the reward-hacking flag, the public record, and the whole run
+// against a fake runner. The rubric engine is checked against the same file of
+// cases as its Python twin (tests/test_tinker_rl.py).
+//
+// No network, no database, no secrets: fetch answers like the lab's runner on
+// Modal, and `@vercel/postgres` is an in-memory fake that understands the
+// queries these paths make, including the conditional UPDATE that holds the
+// daily caps.
+import assert from 'node:assert/strict'
+import { after, beforeEach, test } from 'node:test'
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { dirname, join, resolve } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import ts from 'typescript'
+
+const root = resolve(import.meta.dirname, '..')
+const build = mkdtempSync(join(tmpdir(), 'observable-tinker-rl-test-'))
+symlinkSync(join(root, 'node_modules'), join(build, 'node_modules'))
+writeFileSync(join(build, 'package.json'), '{"type":"module"}')
+
+const FAKE_PG = join(build, 'fake-postgres.js')
+writeFileSync(FAKE_PG, `
+export const db = { handler: null }
+export function sql(strings, ...values) {
+  const text = (Array.isArray(strings) ? strings.join('?') : String(strings)).replace(/\\s+/g, ' ').trim()
+  return (async () => (db.handler ? await db.handler(text, values) : undefined) ?? { rows: [] })()
+}
+`)
+const fakePgUrl = pathToFileURL(FAKE_PG).href
+function compile(directory) {
+  for (const entry of readdirSync(join(root, directory), { withFileTypes: true })) {
+    const path = join(directory, entry.name)
+    if (entry.isDirectory()) compile(path)
+    else if (path.endsWith('.ts')) {
+      const output = ts.transpileModule(readFileSync(join(root, path), 'utf8'), {
+        compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+      }).outputText.replaceAll(`from '@vercel/postgres'`, `from '${fakePgUrl}'`)
+      const destination = join(build, path.replace(/\.ts$/, '.js'))
+      mkdirSync(dirname(destination), { recursive: true })
+      writeFileSync(destination, output)
+    }
+  }
+}
+compile('api')
+for (const path of ['src/systems/TrainedChatPanel.ts', 'src/systems/toolRuns.ts', 'src/shared/types.ts']) {
+  const output = ts.transpileModule(readFileSync(join(root, path), 'utf8'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  }).outputText.replace(/from '([^']+)'/g, (whole, specifier) => specifier.startsWith('.') ? `from '${specifier}.js'` : whole)
+  mkdirSync(dirname(join(build, path)), { recursive: true })
+  writeFileSync(join(build, path.replace(/\.ts$/, '.js')), output)
+}
+
+const originalEnv = { ...process.env }
+const originalFetch = globalThis.fetch
+const quiet = { warn: console.warn, log: console.log, error: console.error }
+after(() => {
+  process.env = originalEnv
+  globalThis.fetch = originalFetch
+  Object.assign(console, quiet)
+  rmSync(build, { recursive: true, force: true })
+})
+
+for (const name of Object.keys(process.env)) {
+  if (/^(OPENROUTER|POSTGRES|LAB_|AI_AGENT|RESEARCH_|SPRITES|MODAL|EPOCH_|NORTH_|GPU_JOBS|VERCEL|TINKER|CRON_)/.test(name)) delete process.env[name]
+}
+process.env.OPENROUTER_API_KEY = 'test-only-openrouter-placeholder-0000'
+const JOBS_TOKEN = 'test-only-tinker-jobs-token-000000000000'
+const BASE_ENV = { ...process.env }
+
+let logs = []
+const capture = (...args) => logs.push(args.map(a => (a instanceof Error ? a.message : typeof a === 'string' ? a : JSON.stringify(a))).join(' '))
+console.warn = capture
+console.log = capture
+console.error = capture
+
+const load = path => import(pathToFileURL(join(build, path)).href)
+const { db } = await load('fake-postgres.js')
+const tinker = await load('api/_lib/tinker.js')
+const rl = await load('api/_lib/tinker-rl.js')
+const rlRun = await load('api/_lib/tinker-rl-run.js')
+const rlPublic = await load('api/_lib/tinker-rl-public.js')
+const rubric = await load('api/_lib/rubric.js')
+const store = await load('api/_lib/tinker-store.js')
+const runs = await load('api/_lib/tinker-run.js')
+const toolsConfig = await load('api/_lib/tools-config.js')
+const toolRequests = await load('api/_lib/tool-requests.js')
+const epochTools = await load('api/_lib/epoch-tools.js')
+const prompts = await load('api/_lib/prompts.js')
+const panel = await load('src/systems/TrainedChatPanel.js')
+const roomRuns = await load('src/systems/toolRuns.js')
+
+const cases = JSON.parse(readFileSync(join(root, 'tests', 'fixtures', 'rubric-cases.json'), 'utf8'))
+
+// ===========================================================================
+// The rubric engine: the same cases as the Python twin
+// ===========================================================================
+test('the rubric engine gives the answers in the shared file of cases', () => {
+  for (const c of cases.normalise) assert.equal(rubric.normaliseText(c.input), c.expected, JSON.stringify(c.input))
+  for (const c of cases.numbers) assert.deepEqual(rubric.numbersIn(c.input), c.expected, c.input)
+  for (const c of cases.regex) {
+    const x = rubric.compileRegex(c.pattern, c.ignore_case === true)
+    assert.ok('regex' in x, `${c.pattern}: ${x.error}`)
+    assert.equal(rubric.regexSearch(x.regex, c.text), c.match, c.pattern)
+  }
+  for (const pattern of cases.regex_refused) {
+    const x = rubric.compileRegex(pattern)
+    assert.ok('error' in x && x.error, `refused: ${pattern.slice(0, 30)}`)
+  }
+  for (const c of cases.scores) {
+    const n = rubric.normalizeRubric(c.rubric)
+    assert.ok('rubric' in n, `${c.name}: ${n.error}`)
+    assert.ok(Math.abs(rubric.scoreCompletion(n.rubric, c.task, c.completion) - c.score) < 1e-9, c.name)
+  }
+  for (const r of cases.rubric_ok) assert.ok('rubric' in rubric.normalizeRubric(r), JSON.stringify(r).slice(0, 80))
+  for (const c of cases.rubric_refused) {
+    const n = rubric.normalizeRubric(c.rubric)
+    assert.ok('error' in n && n.error, c.why)
+  }
+})
+
+test('a pattern that makes a backtracking engine run for ever is harmless or refused, never slow', () => {
+  for (const pattern of ['^(a+)+$', '^(a*)*b$', '^(a|a)*c$', '^(.*)*x$', '^(a+){2,}$']) {
+    const x = rubric.compileRegex(pattern)
+    if (!('regex' in x)) continue
+    const started = Date.now()
+    assert.equal(rubric.regexSearch(x.regex, 'a'.repeat(3000) + '!'), false, pattern)
+    assert.ok(Date.now() - started < 3000, pattern)
+  }
+  for (const pattern of ['(?=a)b', '(a)\\1', 'a+?', '\\bword', '(?<=a)b', 'a*+']) assert.ok('error' in rubric.compileRegex(pattern), pattern)
+  assert.ok('error' in rubric.compileRegex('a'.repeat(rubric.RUBRIC_REGEX_MAX_LEN + 1)))
+})
+
+// ===========================================================================
+// The switch
+// ===========================================================================
+const START_URL = 'https://lab--oblab-tinker-start.modal.example/'
+const STATUS_URL = 'https://lab--oblab-tinker-status.modal.example/'
+function configure(extra = {}) {
+  Object.assign(process.env, { TINKER_JOBS_START_URL: START_URL, TINKER_JOBS_STATUS_URL: STATUS_URL, TINKER_JOBS_TOKEN: JOBS_TOKEN, ...extra })
+}
+
+let lab
+beforeEach(() => {
+  process.env = { ...BASE_ENV }
+  logs = []
+  lab = new FakeDb()
+  db.handler = (text, values) => lab.handle(text, values)
+  globalThis.fetch = async url => { throw new Error(`Unexpected outbound request to ${url}`) }
+  rlPublic.resetRlPracticeCache()
+})
+
+test('the switch is on unless it is explicitly false-like, and says why when something it needs is missing', () => {
+  // unset, empty, or anything that is not a false-like word: on
+  for (const value of [undefined, '', 'true', 'TRUE', ' yes ', '1', 'on', 'enabled', 'maybe']) {
+    if (value === undefined) delete process.env.LAB_ENABLE_TINKER_RL
+    else process.env.LAB_ENABLE_TINKER_RL = value
+    assert.equal(rl.tinkerRlFlag(), true, `value ${JSON.stringify(value)}`)
+  }
+  for (const value of ['false', 'FALSE', ' False ', '0', 'off', 'OFF', 'no', ' No ']) {
+    process.env.LAB_ENABLE_TINKER_RL = value
+    assert.equal(rl.tinkerRlFlag(), false, `value ${JSON.stringify(value)}`)
+    configure()
+    assert.deepEqual(rl.tinkerRlStatus(), { enabled: false, off_reason: 'LAB_ENABLE_TINKER_RL is switched off' })
+  }
+  process.env = { ...BASE_ENV }
+  // on by default, but it needs the training runner: without it, it says what is missing
+  const missing = rl.tinkerRlStatus()
+  assert.equal(missing.enabled, false)
+  assert.match(missing.off_reason, /TINKER_JOBS_START_URL/)
+  configure()
+  assert.deepEqual(rl.tinkerRlStatus(), { enabled: true })
+  // it does not need Tinker training's own switch
+  assert.equal(tinker.tinkerStatus().enabled, false)
+  assert.equal(toolsConfig.toolConfig().tinker_rl.enabled, true)
+  assert.ok(toolsConfig.enabledTools().includes('tinker_rl'))
+  // and its own dollar settings are Tinker training's
+  configure({ LAB_TINKER_RUN_USD: '0' })
+  assert.match(rl.tinkerRlStatus().off_reason, /LAB_TINKER_RUN_USD or LAB_TINKER_DAILY_USD is 0/)
+  process.env.LAB_ENABLE_TINKER_RL = 'false'
+  assert.equal(toolsConfig.toolConfig().tinker_rl.enabled, false)
+  assert.ok(!toolsConfig.enabledTools().includes('tinker_rl'))
+})
+
+test('the runs per day have a limit of their own', () => {
+  assert.equal(rl.tinkerRlPerDay(), 2)
+  for (const [value, expected] of [['5', 5], ['0', 0], ['99', 10], ['-3', 0], ['x', 2], ['1.5', 2]]) {
+    process.env.LAB_TINKER_RL_PER_DAY = value
+    assert.equal(rl.tinkerRlPerDay(), expected, value)
+  }
+})
+
+// ===========================================================================
+// What a model may ask for
+// ===========================================================================
+const BASE = tinker.tinkerBaseModels().models[0]
+const task = i => ({ prompt: `What is ${i} plus ${i}? Give the number on the last line.`, expected: String(2 * i) })
+const tasks = (n = 20) => Array.from({ length: n }, (_, i) => task(i))
+const RUBRIC = { rules: [{ type: 'exact_match', weight: 0.7, from: 'expected', scope: 'last_line' }, { type: 'length_between', weight: 0.3, min: 1, max: 400 }] }
+const ask = (extra = {}) => ({ purpose: 'practise adding', task_set: 'Short sums', tasks: tasks(), rubric: RUBRIC, ...extra })
+const ok = raw => {
+  const checked = rl.normalizeTinkerRlRequest(raw)
+  assert.ok('request' in checked, checked.error)
+  return checked.request
+}
+const refused = raw => {
+  const checked = rl.normalizeTinkerRlRequest(raw)
+  assert.ok('error' in checked, 'it should have been refused')
+  return checked.error
+}
+
+test('a good request is read with the defaults filled in, and the data and the rubric are fingerprinted', () => {
+  const request = ok(ask())
+  assert.equal(request.base_model, BASE)
+  assert.deepEqual(request.settings, { rank: 16, learning_rate: 4e-5, group_size: 8, steps: 10, tasks_per_step: 4, max_completion_tokens: 256, loss: 'importance_sampling' })
+  assert.equal(request.tasks.length, 20)
+  assert.equal(request.task_set, 'Short sums')
+  assert.match(request.dataset_sha256, /^[0-9a-f]{64}$/)
+  assert.equal(ok(ask()).dataset_sha256, request.dataset_sha256)
+  assert.notEqual(ok(ask({ rubric: { rules: [{ type: 'contains', weight: 1, any: ['x'] }] } })).dataset_sha256, request.dataset_sha256)
+  const wide = ok(ask({ settings: { group_size: 16, steps: 30, tasks_per_step: 16, max_completion_tokens: 512, learning_rate: 5e-4, rank: 32, loss: 'ppo' } }))
+  assert.deepEqual([wide.settings.group_size, wide.settings.steps, wide.settings.loss], [16, 30, 'ppo'])
+})
+
+test('every way a request can be wrong is refused whole, with a reason', () => {
+  const reason = (extra, pattern) => assert.match(refused(ask(extra)), pattern)
+  assert.match(rl.normalizeTinkerRlRequest(null).error, /not an object/)
+  assert.match(rl.normalizeTinkerRlRequest([]).error, /not an object/)
+  reason({ unknown: 1 }, /unknown field: unknown/)
+  reason({ base_model: 'nobody/model' }, /base_model must be one of/)
+  reason({ tasks: tasks(7) }, /tasks must hold 8 to 400/)
+  reason({ tasks: tasks(401) }, /tasks must hold 8 to 400/)
+  reason({ tasks: 'x' }, /tasks is not a list/)
+  reason({ tasks: [...tasks(8).slice(0, 7), { prompt: '' }] }, /tasks\[7\]/)
+  reason({ tasks: [...tasks(8).slice(0, 7), { prompt: 'x', extra: 1 }] }, /tasks\[7\]/)
+  reason({ tasks: [...tasks(8).slice(0, 7), task(0)] }, /same prompt/)
+  reason({ tasks: tasks(8).map(t => ({ ...t, prompt: t.prompt + 'x'.repeat(1600) })) }, /1500 bytes|bytes/)
+  reason({ rubric: null }, /rubric/)
+  reason({ rubric: { rules: [] } }, /1 to 8 rules/)
+  reason({ rubric: { rules: [{ type: 'run_code', weight: 1 }] } }, /run_code|type/)
+  reason({ rubric: { rules: [{ type: 'contains', weight: 0.7, any: ['a'] }, { type: 'contains', weight: 0.7, any: ['b'] }] } }, /add up to/)
+  reason({ rubric: { rules: [{ type: 'regex_match', weight: 1, pattern: '(?=a)b' }] } }, /regex_match|pattern|lookaround/i)
+  reason({ rubric: { rules: [{ type: 'exact_match', weight: 1, from: 'data.answer' }] } }, /data\.answer/)
+  reason({ settings: { group_size: 1 } }, /group_size/)
+  reason({ settings: { group_size: 17 } }, /group_size/)
+  reason({ settings: { group_size: 2.5 } }, /group_size/)
+  reason({ settings: { steps: 0 } }, /steps/)
+  reason({ settings: { steps: 31 } }, /steps/)
+  reason({ settings: { tasks_per_step: 17 } }, /tasks_per_step/)
+  reason({ settings: { max_completion_tokens: 513 } }, /max_completion_tokens/)
+  reason({ settings: { max_completion_tokens: 15 } }, /max_completion_tokens/)
+  reason({ settings: { learning_rate: 1 } }, /learning_rate/)
+  reason({ settings: { learning_rate: 0 } }, /learning_rate/)
+  reason({ settings: { rank: 7 } }, /rank/)
+  reason({ settings: { loss: 'mse' } }, /loss must be one of importance_sampling, ppo, cispo/)
+  reason({ settings: { code: 'x' } }, /unknown field/)
+  reason({ settings: 'fast' }, /settings is not an object/)
+  reason({ task_set: '<b>sums</b>' }, /task_set/)
+  reason({ task_set: 'x'.repeat(49) }, /task_set/)
+  // the text of all the tasks together is bounded
+  reason({ tasks: Array.from({ length: 100 }, (_, i) => ({ prompt: `${i} ` + 'p'.repeat(1400), expected: 'e'.repeat(300) })) }, /bytes of text/)
+})
+
+test('the display name follows the names rules, and only while names are on', () => {
+  assert.match(refused(ask({ name: 'Adder' })), /unknown field: name/)
+  process.env.LAB_ENABLE_TINKER_NAMES = 'true'
+  assert.equal(ok(ask({ name: 'Adder' })).name, 'Adder')
+  const bad = ok(ask({ name: '<script>' }))
+  assert.equal(bad.name, undefined)
+  assert.ok(bad.name_refused)
+})
+
+test('a model that asks for a rule it has no data for, or for code, gets no run', () => {
+  assert.match(refused(ask({ rubric: { rules: [{ type: 'number_close', weight: 1, from: 'data.target', tolerance: 1 }] } })), /data\.target/)
+  assert.match(refused(ask({ rubric: { rules: [{ type: 'exact_match', weight: 1, value: 'x', code: 'os.system("x")' }] } })), /code|unknown|field/i)
+  assert.match(refused(ask({ rubric: 'def reward(x): return 1' })), /rubric/)
+})
+
+// ===========================================================================
+// The cost before starting, and the caps
+// ===========================================================================
+test('the estimate is the most the run could cost, grows with every setting, and stays under the per-run cap at its smallest and largest sensible sizes', () => {
+  const small = rl.estimateTinkerRl(ok(ask({ settings: { steps: 2, group_size: 2, tasks_per_step: 1, max_completion_tokens: 32 } })))
+  const normal = rl.estimateTinkerRl(ok(ask()))
+  assert.ok(small.max_cost_usd > 0 && small.max_cost_usd < normal.max_cost_usd)
+  assert.equal(normal.holdout, 3)
+  assert.equal(normal.train_tasks, 17)
+  assert.equal(normal.attempts, 10 * 4 * 8)
+  for (const [key, value] of [['steps', 20], ['group_size', 16], ['tasks_per_step', 8], ['max_completion_tokens', 512]]) {
+    const more = rl.estimateTinkerRl(ok(ask({ settings: { [key]: value } })))
+    assert.ok(more.max_cost_usd > normal.max_cost_usd, key)
+  }
+  // it counts the sampled answers at their longest, plus what the prompts take, plus training, plus both held-out scorings, with a margin
+  const request = ok(ask())
+  const s = request.settings
+  const longest = Math.max(...request.tasks.map(rl.estimateTaskTokens))
+  assert.ok(normal.max_cost_usd >= tinker.tinkerCostUsd(request.base_model, {
+    train: 0, eval: 0, sample_prompt: s.steps * s.tasks_per_step * longest * 0.5, sample_completion: s.steps * s.tasks_per_step * s.group_size * s.max_completion_tokens,
+  }))
+  assert.equal(rl.tinkerRlJobBody(request, { splitSalt: 'ab'.repeat(16), budgetUsd: 1, label: 'x', runId: 'e41-0a1b2c3d' }).run_id, 'e41-0a1b2c3d')
+  // the biggest run a model may ask for is over the default per-run cap, so it is refused before anything is set aside
+  const biggest = ok(ask({ tasks: tasks(400), settings: { steps: 30, group_size: 16, tasks_per_step: 16, max_completion_tokens: 512 } }))
+  assert.ok(rl.estimateTinkerRl(biggest).max_cost_usd > tinker.tinkerRunUsd())
+})
+
+test('money is set aside atomically and settled to the measured tokens, in the same table as a training run', async () => {
+  const a = await store.reserveTinkerSpend('all', 4, 10)
+  assert.deepEqual([a.ok, a.usd], [true, 4])
+  assert.equal((await store.reserveTinkerSpend('all', 4, 10)).ok, true)
+  assert.deepEqual(await store.reserveTinkerSpend('all', 4, 10), { ok: false, reason: "it would pass today's cap of $10.00 (UTC)" })
+  await store.settleTinkerSpend(a, 0.5)
+  assert.deepEqual(await store.tinkerSpendToday('all'), { spent_usd: 0.5, reserved_usd: 4 })
+  assert.ok(lab.statements.some(s => s.text.startsWith('UPDATE tinker_spend_days SET reserved_usd = reserved_usd + ?')))
+})
+
+const CTX = { experimentId: 'exp-1', epochNumber: 41, executorModelId: 'anthropic/claude-fable-5.2', assignedExecutorId: 'anthropic/claude-fable-5.2', reviewerModelId: 'openai/gpt-6-astra' }
+const planFor = raw => toolRequests.planTools({ tinker_rl: raw }, toolsConfig.toolConfig())
+const deliver = (plan, verdicts = { tinker_rl: 'approve' }, ctx = CTX) => epochTools.runDeliverables(ctx, plan, verdicts, new Set())
+
+const SAMPLER = 'tinker://0a1b2c3d-1111-2222-3333-444455556666:train:0/sampler_weights/final'
+const runnerOk = (extra = {}) => ({
+  status: 'ok', kind: 'rl', n_tasks: 20, n_train: 17, n_holdout: 3, steps_planned: 10, steps_done: 10, stopped_early: null, max_reward: 1,
+  score_before: 0.25, score_after: 0.75, train_score_first: 0.2, train_score_last: 0.7,
+  step_means: [0.2, 0.25, 0.3, 0.35, 0.4, 0.5, 0.55, 0.6, 0.65, 0.7], step_frac_max: [0, 0, 0.1, 0.1, 0.2, 0.3, 0.3, 0.4, 0.5, 0.6],
+  tokens: { train: 40000, eval: 0, sample_prompt: 9000, sample_completion: 30000 }, sampler_path: SAMPLER, ttl_seconds: 14 * 86400,
+  samples: [{ prompt: 'What is 3 plus 3?', completion: '6', reward: 1 }], wall_seconds: 300.5, ...extra,
+})
+const progressRecord = (extra = {}) => ({
+  v: 1, phase: 'scored', step: 3, steps_planned: 10, group_size: 8, tasks_per_step: 4, max_reward: 1, means: [0.2, 0.25, 0.3], frac_max: [0, 0, 0.1],
+  attempts: [0, 0, 1, 0.3, 0.7, 0, 1, 0.5], samples: [{ prompt: 'What is 3 plus 3?', completion: '6', reward: 1 }], score_before: 0.25, score_after: null, wall_seconds: 61, ...extra,
+})
+
+/** fetch that answers like the runner's two endpoints; `statuses` are served in order and the last repeats. */
+function fakeRunner(sent, statuses = [{ status: 'done', result: runnerOk() }], start = { call_id: 'fc-rl-1' }) {
+  let polls = 0
+  return async (url, options = {}) => {
+    const u = String(url)
+    if (u === START_URL) {
+      const body = JSON.parse(options.body)
+      sent.push({ kind: 'start', raw: options.body, body })
+      return new Response(JSON.stringify(start), { headers: { 'content-type': 'application/json' } })
+    }
+    if (u.startsWith(STATUS_URL) && new URL(u).searchParams.has('call_id')) {
+      sent.push({ kind: 'status', url: u })
+      return new Response(JSON.stringify(statuses[Math.min(polls++, statuses.length - 1)]), { headers: { 'content-type': 'application/json' } })
+    }
+    throw new Error(`Unexpected outbound request to ${u}`)
+  }
+}
+
+test('a request over the per-run cap, or over the daily cap, is refused before anything is started, and nothing is left set aside', async () => {
+  configure({ LAB_TINKER_RUN_USD: '0.0001' })
+  const plan = planFor(ask())
+  assert.ok(plan.tinker_rl)
+  let sent = []
+  globalThis.fetch = fakeRunner(sent)
+  let out = await deliver(plan)
+  assert.equal(out[0].status, 'skipped')
+  assert.match(out[0].summary, /over the \$0\.00 a run may cost|a run may cost/)
+  assert.deepEqual(sent, [])
+  assert.equal(lab.tinkerRuns.length, 0)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+  // under the run cap but not under the day's
+  const estimate = rl.estimateTinkerRl(plan.tinker_rl).max_cost_usd
+  configure({ LAB_TINKER_RUN_USD: '2', LAB_TINKER_DAILY_USD: String(estimate * 1.5) })
+  lab.spendDays.set(`${store.utcDay()}|all`, { day: store.utcDay(), scope: 'all', reserved_usd: estimate, spent_usd: 0 })
+  out = await deliver(plan)
+  assert.equal(out[0].status, 'skipped')
+  assert.match(out[0].summary, /was not set aside: it would pass today's cap/)
+  assert.deepEqual(sent, [])
+  assert.equal(lab.tinkerRuns.length, 0)
+})
+
+// ===========================================================================
+// What the models see
+// ===========================================================================
+test('the request is planned only while the tool is on, and an epoch has one Tinker run of either kind', () => {
+  configure()
+  const plan = planFor(ask())
+  assert.ok(plan.tinker_rl)
+  assert.equal(plan.tinker_rl.tasks.length, 20)
+  // both kinds in one answer: the training run keeps its place (when training is on; with it off, the RL request stands)
+  assert.ok(toolRequests.planTools({ tinker_rl: ask(), tinker_train: { purpose: 'x', examples: [] } }, toolsConfig.toolConfig()).tinker_rl)
+  process.env.LAB_ENABLE_TINKER = 'true'
+  const both = toolRequests.planTools({ tinker_rl: ask(), tinker_train: { purpose: 'x', examples: [] } }, toolsConfig.toolConfig())
+  assert.ok(!both.tinker_rl)
+  assert.ok(both.ignored.some(i => i.tool === 'tinker_rl' && /one Tinker run/.test(i.reason)))
+  delete process.env.LAB_ENABLE_TINKER
+  // a bad request is a stored refusal and no run
+  const bad = planFor(ask({ settings: { steps: 99 } }))
+  assert.ok(!bad.tinker_rl)
+  assert.ok(bad.ignored.some(i => i.tool === 'tinker_rl' && /steps/.test(i.reason)))
+  // off: an unknown tool, as it always was
+  process.env.LAB_ENABLE_TINKER_RL = 'off'
+  const off = planFor(ask())
+  assert.ok(!off.tinker_rl)
+  assert.ok(off.ignored.some(i => i.tool === 'tinker_rl'))
+})
+
+test('the models are told what the tool does and where its limits are, and nothing about what to build', () => {
+  configure()
+  const config = toolsConfig.toolConfig()
+  const lines = prompts.toolLines(config)
+  const line = lines.split('\n').find(l => l.includes('Tinker RL'))
+  assert.ok(line, 'the tool line')
+  for (const part of ['exact_match', 'contains', 'not_contains', 'number_close', 'regex_match', 'json_valid', 'length_between', 'group_size', 'holds out', 'measured by the lab', '0.95', 'a flag blocks nothing', 'no code', 'weighted sum']) {
+    assert.ok(line.includes(part), `the note says ${part}`)
+  }
+  assert.ok(line.includes(`$${tinker.tinkerRunUsd().toFixed(2)} a run`) && line.includes('estimates'))
+  for (const forbidden of [/you should (?:build|train|make)/i, /we want you to/i, /try to (?:build|make|train)/i, /\bgoal\b/i, /cool/i]) assert.ok(!forbidden.test(line), String(forbidden))
+  assert.ok(!line.includes('—'), 'no em dash')
+  const section = prompts.executorToolsSection(config)
+  assert.match(section, /"tinker_rl": \{/)
+  assert.match(section, /A Tinker RL request takes exactly the fields shown/)
+  assert.ok(!section.includes('—'))
+  assert.ok(!prompts.toolLines({ ...config, tinker_rl: { ...config.tinker_rl, enabled: false } }).includes('Tinker RL'))
+  const facts = prompts.tinkerRlReviewFacts(ok(ask())).line
+  assert.match(facts, /rubric/)
+  assert.match(facts, /the most it could cost/)
+  assert.match(prompts.reviewerToolSection({ tinker_rl: { line: facts } }), /"tinker_rl": "approve" \| "reject"/)
+})
+
+test('a verdict other than an explicit approve is a no, and the tool is a named verdict key', () => {
+  assert.deepEqual(epochTools.readToolVerdicts({ tool_verdicts: { tinker_rl: 'APPROVE' } }), { tinker_rl: 'approve' })
+  assert.deepEqual(epochTools.readToolVerdicts({ tool_verdicts: { tinker_rl: 'yes' } }), {})
+})
+
+// ===========================================================================
+// Progress and the flag
+// ===========================================================================
+test('the progress the runner writes is read strictly and bounded', () => {
+  const p = rl.readRlProgress(progressRecord(), new Date('2026-11-19T10:00:00Z'))
+  assert.equal(p.step, 3)
+  assert.deepEqual(p.means, [0.2, 0.25, 0.3])
+  assert.equal(p.updated_at, '2026-11-19T10:00:00.000Z')
+  assert.ok(Buffer.byteLength(JSON.stringify(p)) <= rl.RL_PROGRESS_MAX_BYTES)
+  // a field out of range drops the whole record: the bench shows nothing rather than a guess
+  for (const bad of [
+    { v: 2 }, { phase: 'dreaming' }, { step: 11 }, { step: -1 }, { group_size: 17 }, { group_size: 1 }, { means: [1.5] }, { means: [NaN] },
+    { means: Array(31).fill(0.5) }, { attempts: Array(17).fill(0.5) }, { max_reward: 'x' }, { steps_planned: 0 }, { score_before: 2 }, { samples: 'x' },
+    { samples: [{ prompt: 'p', completion: 'c', reward: 5 }] }, { means: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.9, 0.9], steps_planned: 10 },
+  ]) assert.equal(rl.readRlProgress(progressRecord(bad)), null, JSON.stringify(bad).slice(0, 60))
+  assert.equal(rl.readRlProgress('x'), null)
+  assert.equal(rl.readRlProgress(null), null)
+  // samples are cleaned and cut, and go first when the record is too large
+  const wild = rl.readRlProgress(progressRecord({ samples: [1, 2, 3, 4].map(() => ({ prompt: 'p\u0000'.repeat(300), completion: '<img src=x onerror=1>'.repeat(50), reward: 0.5 })) }))
+  assert.equal(wild.samples.length, 3)
+  assert.ok(wild.samples.every(s => s.prompt.length <= 100 && s.completion.length <= 160 && !s.prompt.includes('\u0000')))
+  assert.ok(Buffer.byteLength(JSON.stringify(wild)) <= rl.RL_PROGRESS_MAX_BYTES)
+  // a stored record comes back the same way
+  assert.deepEqual(rl.storedRlProgress(JSON.stringify(p)), p)
+  assert.deepEqual(rl.storedRlProgress(p), p)
+  assert.equal(rl.storedRlProgress('not json'), null)
+  assert.equal(rl.storedRlProgress({ ...p, step: 99 }), null)
+})
+
+test('a run is live only while the lab has heard from the runner recently', () => {
+  const now = new Date('2026-11-19T10:10:00Z')
+  const fresh = rl.readRlProgress(progressRecord(), new Date('2026-11-19T10:08:00Z'))
+  assert.equal(rl.progressIsLive(fresh, 'running', now), true)
+  assert.equal(rl.progressIsLive(fresh, 'reserved', now), true)
+  assert.equal(rl.progressIsLive(fresh, 'ok', now), false)
+  assert.equal(rl.progressIsLive(fresh, 'failed', now), false)
+  assert.equal(rl.progressIsLive(fresh, 'running', new Date('2026-11-19T10:30:00Z')), false)
+  assert.equal(rl.progressIsLive(null, 'running', now), false)
+  assert.equal(rl.progressIsLive({ ...fresh, phase: 'done' }, 'running', now), false)
+})
+
+test('the reward-hacking flag: a mean at 95% of the best within 3 steps, or a held-out gain far short of the training gain; it blocks nothing', () => {
+  const flag = input => rl.rlHackingFlag({ maxReward: 1, scoreBefore: null, scoreAfter: null, ...input })
+  assert.equal(flag({ means: [0.2, 0.3, 0.4, 0.5] }).flag, false)
+  assert.equal(flag({ means: [0.96] }).flag, true)
+  assert.equal(flag({ means: [0.5, 0.95] }).flag, true)
+  assert.equal(flag({ means: [0.2, 0.3, 0.949] }).flag, false)
+  assert.equal(flag({ means: [0.2, 0.3, 0.95] }).flag, true)
+  assert.equal(flag({ means: [0.2, 0.3, 0.4, 0.97] }).flag, false, 'the early window is the first 3 steps')
+  // relative to the best the rubric allows
+  assert.equal(flag({ means: [0.48], maxReward: 0.5 }).flag, true)
+  assert.equal(flag({ means: [0.4], maxReward: 0.5 }).flag, false)
+  // the gap rule: from 6 steps, a training gain of 0.15 or more and a held-out gain under 40% of it
+  const rising = [0.1, 0.1, 0.1, 0.3, 0.4, 0.5]
+  assert.equal(flag({ means: rising, scoreBefore: 0.3, scoreAfter: 0.31 }).flag, true)
+  assert.equal(flag({ means: rising, scoreBefore: 0.3, scoreAfter: 0.5 }).flag, false)
+  assert.equal(flag({ means: rising, scoreBefore: 0.3, scoreAfter: 0.2 }).flag, true)
+  assert.equal(flag({ means: rising.slice(0, 5), scoreBefore: 0.3, scoreAfter: 0.3 }).flag, false, 'needs 6 steps')
+  assert.equal(flag({ means: [0.5, 0.5, 0.5, 0.5, 0.5, 0.55], scoreBefore: 0.3, scoreAfter: 0.3 }).flag, false, 'a small training gain is not a gap')
+  assert.equal(flag({ means: rising }).flag, false, 'no held-out score, no gap rule')
+  assert.ok(flag({ means: [0.99] }).reasons[0].length > 20)
+})
+
+// ===========================================================================
+// The whole run, and the public record
+// ===========================================================================
+class FakeDb {
+  constructor() {
+    this.spendDays = new Map()
+    this.tinkerRuns = []
+    this.toolRuns = []
+    this.modelCalls = []
+    this.statements = []
+    this.nextId = 1
+  }
+
+  uuid() { return `00000000-0000-4000-8000-${String(this.nextId++).padStart(12, '0')}` }
+
+  spend(scope, day = store.utcDay()) { return this.spendDays.get(`${day}|${scope}`) ?? { reserved_usd: 0, spent_usd: 0 } }
+
+  handle(text, v) {
+    this.statements.push({ text, values: v })
+    if (/^(CREATE|ALTER|DROP)\b/.test(text)) return { rows: [] }
+    if (text.startsWith('INSERT INTO model_calls')) {
+      const [experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source] = v
+      this.modelCalls.push({ experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, created_at: new Date() })
+      return { rows: [] }
+    }
+    if (text.includes('FROM model_calls WHERE experiment_id = ? AND epoch_number = ?')) return { rows: [{ cost_usd: 0, prompt_tokens: 0, completion_tokens: 0 }] }
+    if (text.startsWith('UPDATE epochs SET cost_usd')) return { rows: [] }
+    if (text.includes('FROM model_calls WHERE purpose = ? AND created_at >= ?')) return { rows: [{ total: 0 }] }
+    if (text.includes('FROM model_calls WHERE created_at >= ?')) return { rows: [{ total: 0 }] }
+    if (text.startsWith('INSERT INTO tool_runs')) {
+      const [experiment_id, epoch, model, tool, request_summary, status, exit_code, duration_ms, cost_usd, output_tail, detail] = v
+      this.toolRuns.push({ id: this.uuid(), experiment_id, epoch, model, tool, request_summary, status, exit_code, duration_ms, cost_usd, output_tail, detail: detail ? JSON.parse(detail) : null })
+      return { rows: [] }
+    }
+    if (text.startsWith('SELECT COUNT(*) AS n FROM tool_runs WHERE tool = ?')) return { rows: [{ n: 0 }] }
+    if (text.startsWith('SELECT DISTINCT tool FROM tool_runs')) return { rows: [] }
+    if (text.startsWith('SELECT jsonb_typeof')) return { rows: [] }
+    if (text.startsWith('INSERT INTO tinker_spend_days (day, scope) VALUES (?, ?) ON CONFLICT')) {
+      const key = `${v[0]}|${v[1]}`
+      if (!this.spendDays.has(key)) this.spendDays.set(key, { day: v[0], scope: v[1], reserved_usd: 0, spent_usd: 0 })
+      return { rows: [] }
+    }
+    if (text.startsWith('UPDATE tinker_spend_days SET reserved_usd = reserved_usd + ?')) {
+      assert.ok(text.includes('WHERE day = ? AND scope = ? AND spent_usd + reserved_usd + ? <= ?'), 'the reserve statement lost its cap condition')
+      const [amount, day, scope, again, cap] = v
+      const row = this.spendDays.get(`${day}|${scope}`)
+      if (!row || !(row.spent_usd + row.reserved_usd + amount <= cap + 1e-12)) return { rows: [] }
+      row.reserved_usd += amount
+      return { rows: [{ spent_usd: row.spent_usd, reserved_usd: row.reserved_usd }] }
+    }
+    if (text.startsWith('UPDATE tinker_spend_days SET reserved_usd = GREATEST(0, reserved_usd - ?), spent_usd = spent_usd + ?')) {
+      const [reserved, actual, day, scope] = v
+      const row = this.spendDays.get(`${day}|${scope}`)
+      if (row) { row.reserved_usd = Math.max(0, row.reserved_usd - reserved); row.spent_usd += actual }
+      return { rows: [] }
+    }
+    if (text.startsWith('SELECT spent_usd, reserved_usd FROM tinker_spend_days')) {
+      const row = this.spendDays.get(`${v[0]}|${v[1]}`)
+      return { rows: row ? [{ ...row }] : [] }
+    }
+    if (text.startsWith('INSERT INTO tinker_runs')) {
+      assert.ok(text.includes('ON CONFLICT (experiment_id, epoch) DO NOTHING'), 'a run must be unique per epoch')
+      assert.ok(text.includes('kind, rl'), 'an RL run is stored with its kind and record')
+      const [experiment_id, epoch, model, assigned_model, slug, base_model, purpose, dataset_sha256, dataset_examples, dataset_bytes, settings, split_salt, status, spend_day, reserved_usd, kind, rlRecord] = v
+      if (this.tinkerRuns.some(r => r.experiment_id === experiment_id && r.epoch === epoch)) return { rows: [] }
+      const row = {
+        id: this.uuid(), created_at: new Date().toISOString(), experiment_id, epoch, model, assigned_model, slug, base_model, purpose, dataset_sha256,
+        dataset_examples, dataset_bytes, settings, split_salt, status, reason: null, call_id: null, spend_day, reserved_usd, cost_usd: null,
+        result: null, sampler_path: null, expires_at: null, finished_at: null, kind, rl: rlRecord, progress: null, display_name: null,
+      }
+      this.tinkerRuns.push(row)
+      return { rows: [{ ...row }] }
+    }
+    if (text.startsWith('UPDATE tinker_runs SET status = ?, call_id = ? WHERE id = ? AND status = ?')) {
+      const row = this.tinkerRuns.find(r => r.id === v[2] && r.status === v[3])
+      if (row) Object.assign(row, { status: v[0], call_id: v[1] })
+      return { rows: [] }
+    }
+    if (text.startsWith('UPDATE tinker_runs SET progress = ? WHERE id = ? AND status IN')) {
+      const row = this.tinkerRuns.find(r => r.id === v[1] && (r.status === 'reserved' || r.status === 'running'))
+      if (row) row.progress = v[0]
+      return { rows: [] }
+    }
+    if (text.startsWith('UPDATE tinker_runs SET status = ?, reason = ?, cost_usd = ?, result = ?, progress = COALESCE(')) {
+      assert.ok(text.includes("AND status IN ('reserved', 'running')"), 'a run may be closed only once')
+      const [status, reason, cost_usd, result, progress, sampler_path, expires_at, id] = v
+      const row = this.tinkerRuns.find(r => r.id === id && (r.status === 'reserved' || r.status === 'running'))
+      if (!row) return { rows: [] }
+      Object.assign(row, { status, reason, cost_usd, result, sampler_path, expires_at, finished_at: new Date().toISOString(), progress: progress ?? row.progress })
+      return { rows: [{ ...row }] }
+    }
+    if (text.startsWith("SELECT * FROM tinker_runs WHERE status IN ('reserved', 'running') ORDER BY created_at ASC LIMIT 5")) {
+      return { rows: this.tinkerRuns.filter(r => r.status === 'reserved' || r.status === 'running').slice(0, 5).map(r => ({ ...r })) }
+    }
+    if (text.startsWith("SELECT * FROM tinker_runs WHERE kind = 'rl' ORDER BY created_at DESC LIMIT 1")) {
+      const rows = this.tinkerRuns.filter(r => r.kind === 'rl')
+      return { rows: rows.length ? [{ ...rows[rows.length - 1] }] : [] }
+    }
+    if (text.startsWith('SELECT COUNT(*) AS n FROM tinker_runs WHERE spend_day = ?')) {
+      const rlOnly = text.includes("AND kind = 'rl'")
+      assert.ok(rlOnly || text.includes("kind IS DISTINCT FROM 'rl'"), 'the count must say which kind it counts')
+      const counted = this.tinkerRuns.filter(r => r.spend_day === v[0] && (['reserved', 'running', 'ok'].includes(r.status) || Number(r.cost_usd) > 0) && (rlOnly ? r.kind === 'rl' : r.kind !== 'rl'))
+      return { rows: [{ n: counted.length }] }
+    }
+    if (text.startsWith('UPDATE tinker_runs SET name_key = NULL')) return { rows: [] }
+    if (text.startsWith('UPDATE tinker_runs SET display_name = ?')) {
+      const row = this.tinkerRuns.find(r => r.id === v[2])
+      if (row) Object.assign(row, { display_name: v[0], name_key: v[1] })
+      return { rows: row ? [{ id: row.id }] : [] }
+    }
+    throw new Error(`unexpected query: ${text.slice(0, 160)}`)
+  }
+}
+
+test('a run is reserved, started, followed step by step, and settled at the tokens the runner counted', async () => {
+  configure({ LAB_TINKER_RL_PER_DAY: '3', LAB_TINKER_POLL_MAX_MS: '5000' })
+  const plan = planFor(ask())
+  const estimate = rl.estimateTinkerRl(plan.tinker_rl).max_cost_usd
+  const measured = tinker.tinkerCostUsd(plan.tinker_rl.base_model, runnerOk().tokens)
+  assert.ok(measured < estimate, 'the estimate is a ceiling')
+  const sent = []
+  const midway = { status: 'running', call_id: 'fc-rl-1', progress: progressRecord() }
+  globalThis.fetch = fakeRunner(sent, [midway, midway, { status: 'done', result: runnerOk() }])
+  const out = await rlRun.runTinkerRl(CTX, plan.tinker_rl, { maxWaitMs: 20_000, pollMs: 1 })
+  assert.equal(out.status, 'ok', out.summary)
+  assert.match(out.summary, /LAB-MEASURED held-out rubric score 0\.250 before training, 0\.750 after/)
+  assert.match(out.summary, /estimated cost/)
+  // what was sent: the run's own name, the tasks and rubric as data, the settings, a salt the model did not choose
+  const start = sent.find(s => s.kind === 'start').body
+  assert.equal(start.run_id, lab.tinkerRuns[0].slug)
+  assert.deepEqual(Object.keys(start.rl).sort(), ['base_model', 'budget_usd', 'label', 'prices', 'rubric', 'samples', 'settings', 'split_salt', 'tasks', 'ttl_seconds'])
+  assert.match(start.rl.split_salt, /^[0-9a-f]{32,64}$/)
+  assert.ok(Math.abs(start.rl.budget_usd - estimate) < 1e-9)
+  assert.ok(!JSON.stringify(start).includes(JOBS_TOKEN))
+  // the progress was stored while it went, and the row ends as a finished RL run
+  const row = lab.tinkerRuns[0]
+  assert.equal(row.kind, 'rl')
+  assert.equal(row.status, 'ok')
+  assert.equal(row.sampler_path, SAMPLER)
+  assert.ok(row.expires_at && Date.parse(row.expires_at) > Date.now() + 13 * 86400_000)
+  const stored = rl.storedRlProgress(row.progress)
+  assert.equal(stored.phase, 'done')
+  assert.equal(stored.step, 10)
+  assert.deepEqual(stored.means, runnerOk().step_means)
+  assert.ok(sent.filter(s => s.kind === 'status').length >= 3)
+  assert.ok(sent.filter(s => s.kind === 'status').every(s => new URL(s.url).searchParams.get('run_id') === row.slug || new URL(s.url).searchParams.get('call_id') === 'fc-rl-1'))
+  // money: the estimate was set aside, then replaced by the measured tokens
+  assert.equal(lab.spend('all').reserved_usd, 0)
+  assert.ok(Math.abs(lab.spend('all').spent_usd - measured) < 1e-9)
+  assert.equal(row.cost_usd, measured)
+  assert.equal(lab.modelCalls.length, 1)
+  assert.equal(lab.modelCalls[0].cost_source, 'estimate')
+  // the evidence: a tool run that says what was measured, by whom, and that cost is an estimate
+  const evidence = lab.toolRuns.find(t => t.tool === 'tinker_rl')
+  assert.equal(evidence.status, 'ok')
+  assert.equal(evidence.detail.kind, 'rl')
+  assert.equal(evidence.detail.measured.score_before, 0.25)
+  assert.equal(evidence.detail.measured.score_after, 0.75)
+  assert.match(evidence.detail.measured.by, /the lab/)
+  assert.match(evidence.detail.cost.basis, /estimate, not a billed amount/)
+  assert.equal(evidence.detail.reward_hacking.flag, false)
+  // the room plays it as a line on the ticket by the training rig
+  const parsed = roomRuns.parseToolRuns([{ id: 'a', tool: 'tinker_rl', model: CTX.executorModelId, status: 'ok', created_at: new Date().toISOString(), request_summary: 'x', output_tail: evidence.output_tail, detail: evidence.detail }])
+  assert.equal(parsed.length, 1)
+  assert.equal(parsed[0].kind, 'tinker_rl')
+  assert.equal(parsed[0].resultLine, 'held-out score 0.25 to 0.75, measured by the lab')
+  // a second run in the same epoch is refused, whatever its kind
+  const again = await rlRun.runTinkerRl(CTX, plan.tinker_rl, { maxWaitMs: 1, pollMs: 1 })
+  assert.equal(again.status, 'skipped')
+  assert.match(again.summary, /already has a Tinker run/)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+})
+
+test('a run still going when the wait ends is collected by a later tick, and an unreadable progress record is dropped without harm', async () => {
+  configure({ LAB_TINKER_POLL_MAX_MS: '1' })
+  const plan = planFor(ask())
+  const sent = []
+  const garbled = { status: 'running', call_id: 'fc-rl-1', progress: { v: 1, phase: 'sampling', step: 99 } }
+  globalThis.fetch = fakeRunner(sent, [garbled])
+  const out = await rlRun.runTinkerRl(CTX, plan.tinker_rl, { maxWaitMs: 1, pollMs: 1 })
+  assert.equal(out.status, 'started')
+  const row = lab.tinkerRuns[0]
+  assert.equal(row.status, 'running')
+  assert.equal(row.progress, null)
+  assert.ok(lab.spend('all').reserved_usd > 0)
+  // the hourly tick asks again, stores the progress the runner gives now, and closes the run when it is done
+  globalThis.fetch = fakeRunner(sent, [{ status: 'running', call_id: 'fc-rl-1', progress: progressRecord() }])
+  assert.deepEqual(await runs.collectTinkerRuns(), [])
+  assert.equal(rl.storedRlProgress(row.progress).step, 3)
+  globalThis.fetch = fakeRunner(sent, [{ status: 'done', result: runnerOk() }])
+  const closed = await runs.collectTinkerRuns()
+  assert.deepEqual(closed.map(o => [o.tool, o.status]), [['tinker_rl', 'ok']])
+  assert.equal(row.status, 'ok')
+  assert.equal(lab.spend('all').reserved_usd, 0)
+})
+
+test('a run the runner refuses or loses settles correctly: a refusal costs what it measured, a lost run counts what was set aside', async () => {
+  configure({ LAB_TINKER_POLL_MAX_MS: '1' })
+  let plan = planFor(ask())
+  globalThis.fetch = fakeRunner([], [{ status: 'done', result: { status: 'refused', reason: 'tasks[3] is too long', stage: 'tokens', tokens: { train: 0, eval: 0, sample_prompt: 0, sample_completion: 0 } } }])
+  let out = await rlRun.runTinkerRl(CTX, plan.tinker_rl, { maxWaitMs: 1000, pollMs: 1 })
+  assert.equal(out.status, 'failed')
+  assert.match(out.summary, /refused by the runner/)
+  assert.equal(lab.tinkerRuns[0].status, 'refused')
+  assert.equal(lab.tinkerRuns[0].sampler_path, null)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+  assert.equal(lab.spend('all').spent_usd, 0)
+  // a result that says ok but has no saved adapter or no held-out scores is not an ok
+  plan = planFor(ask())
+  globalThis.fetch = fakeRunner([], [{ status: 'done', result: runnerOk({ sampler_path: 'tinker://x' }) }])
+  out = await rlRun.runTinkerRl({ ...CTX, epochNumber: 42 }, plan.tinker_rl, { maxWaitMs: 1000, pollMs: 1 })
+  assert.notEqual(out.status, 'ok')
+  assert.equal(lab.tinkerRuns[1].sampler_path, null)
+  // the runner is gone: what was set aside is what it cost
+  globalThis.fetch = fakeRunner([], [{ status: 'failed', error: 'the run expired' }])
+  const spentBefore = lab.spend('all').spent_usd
+  out = await rlRun.runTinkerRl({ ...CTX, epochNumber: 43 }, plan.tinker_rl, { maxWaitMs: 1000, pollMs: 1 })
+  assert.equal(out.status, 'error')
+  assert.equal(lab.tinkerRuns[2].cost_usd, lab.tinkerRuns[2].reserved_usd)
+  assert.ok(lab.spend('all').spent_usd > spentBefore)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+})
+
+test('the Reviewer must approve, and a run past the runs per day is refused with its reason stored', async () => {
+  configure({ LAB_TINKER_RL_PER_DAY: '1' })
+  const plan = planFor(ask())
+  globalThis.fetch = fakeRunner([])
+  let out = await deliver(plan, {})
+  assert.equal(out[0].status, 'skipped')
+  assert.match(out[0].summary, /Reviewer did not approve/)
+  assert.equal(lab.tinkerRuns.length, 0)
+  out = await deliver(plan, { tinker_rl: 'reject' })
+  assert.equal(out[0].status, 'skipped')
+  out = await deliver(plan)
+  assert.notEqual(out[0].status, 'skipped')
+  out = await deliver(plan, undefined, { ...CTX, epochNumber: 42 })
+  assert.equal(out[0].status, 'skipped')
+  assert.match(out[0].summary, /daily limit of 1 reached/)
+  assert.equal(lab.tinkerRuns.length, 1)
+})
+
+test('the public record has the run and its progress, and no secret: no checkpoint, salt or call id', async () => {
+  configure({ LAB_ENABLE_TINKER_NAMES: 'true' })
+  const sent = []
+  globalThis.fetch = fakeRunner(sent, [{ status: 'running', call_id: 'fc-rl-1', progress: progressRecord({ samples: [{ prompt: '<b>hi</b>', completion: 'x'.repeat(900), reward: 0.5 }] }) }])
+  await rlRun.runTinkerRl(CTX, planFor(ask({ name: 'Adder' })).tinker_rl, { maxWaitMs: 1, pollMs: 1 })
+  rlPublic.resetRlPracticeCache()
+  let state = await rlPublic.rlPractice()
+  assert.equal(state.enabled, true)
+  const run = state.run
+  assert.deepEqual(Object.keys(run).sort(), [
+    'adapter', 'author_model', 'author_name', 'base_model', 'cost', 'created_at', 'epoch', 'finished_at', 'hacking', 'held_out', 'kind', 'live', 'max_reward',
+    'name', 'origin', 'progress', 'purpose', 'reason', 'rubric', 'settings', 'slug', 'status', 'task_set', 'tasks',
+  ].sort())
+  assert.equal(run.kind, 'rl')
+  assert.equal(run.status, 'running')
+  assert.equal(run.live, true)
+  assert.equal(run.author_name, 'Claude Fable 5.2')
+  assert.equal(run.task_set, 'Short sums')
+  assert.deepEqual(run.tasks, { total: 20, held_out: 3, training: 17 })
+  assert.equal(run.origin, 'written by the models')
+  assert.ok(run.rubric.length === 2 && run.rubric.every(l => typeof l === 'string' && l.length <= 200))
+  assert.equal(run.progress.step, 3)
+  assert.ok(run.progress.samples[0].completion.length <= 160)
+  assert.deepEqual(run.held_out, { before: 0.25, after: null, measured_by: 'the lab', tasks: 3 })
+  assert.equal(run.hacking.flag, false)
+  assert.match(run.cost.basis, /estimate/)
+  assert.equal(run.talk, undefined, 'a run that is not finished has no adapter to talk to')
+  const text = JSON.stringify(state)
+  assert.ok(!text.includes('tinker://') && !text.includes(lab.tinkerRuns[0].split_salt) && !text.includes('fc-rl-1') && !text.includes(JOBS_TOKEN))
+  assert.ok(!text.includes('—'))
+  // finished: the held-out scores are the lab's, the adapter can be talked to while the visitor chat is on
+  const row = lab.tinkerRuns[0]
+  globalThis.fetch = fakeRunner(sent, [{ status: 'done', result: runnerOk() }])
+  await runs.collectTinkerRuns()
+  process.env.LAB_ENABLE_TRAINED_CHAT = 'true'
+  process.env.LAB_ENABLE_LIVE_TRAINED = 'true'
+  rlPublic.resetRlPracticeCache()
+  state = await rlPublic.rlPractice()
+  assert.equal(state.run.status, 'ok')
+  assert.equal(state.run.live, false)
+  assert.deepEqual(state.run.held_out, { before: 0.25, after: 0.75, measured_by: 'the lab', tasks: 3 })
+  assert.equal(state.run.name, 'Adder')
+  assert.equal(state.run.hacking.flag, false)
+  const talkable = rlPublic.publicRlRun(row, new Date(), true)
+  assert.equal(talkable.talk, `lab/${row.slug}`)
+  assert.equal(rlPublic.publicRlRun(row, new Date(Date.now() + 30 * 86400_000), true).talk, undefined, 'an expired adapter cannot be talked to')
+  assert.equal(rlPublic.publicRlRun(row, new Date(), false).talk, undefined)
+  assert.ok(!JSON.stringify(state).includes('tinker://'))
+})
+
+test('with no run, or Tinker RL off, the public state says so and carries no run', async () => {
+  configure()
+  assert.deepEqual(await rlPublic.rlPractice(), { enabled: true, run: null })
+  rlPublic.resetRlPracticeCache()
+  process.env.LAB_ENABLE_TINKER_RL = 'false'
+  assert.deepEqual(await rlPublic.rlPractice(), { enabled: false, off_reason: 'LAB_ENABLE_TINKER_RL is switched off', run: null })
+  rlPublic.resetRlPracticeCache()
+  delete process.env.LAB_ENABLE_TINKER_RL
+  delete process.env.TINKER_JOBS_TOKEN
+  const state = await rlPublic.rlPractice()
+  assert.equal(state.enabled, false)
+  assert.match(state.off_reason, /TINKER_JOBS_START_URL, TINKER_JOBS_STATUS_URL or TINKER_JOBS_TOKEN/)
+  // a database that fails knows no run, and the state still answers
+  rlPublic.resetRlPracticeCache()
+  db.handler = () => { throw new Error('database down') }
+  assert.deepEqual((await rlPublic.rlPractice()).run, null)
+})
+
+test('a run flagged for reward hacking says so in its record, and nothing stops', async () => {
+  configure()
+  const flagged = runnerOk({ step_means: [0.97, 0.98, 0.99, 0.99, 1, 1, 1, 1, 1, 1], step_frac_max: Array(10).fill(0.9), score_before: 0.5, score_after: 0.5 })
+  globalThis.fetch = fakeRunner([], [{ status: 'done', result: flagged }])
+  const out = await rlRun.runTinkerRl(CTX, planFor(ask()).tinker_rl, { maxWaitMs: 1000, pollMs: 1 })
+  assert.equal(out.status, 'ok')
+  assert.match(out.summary, /FLAG: the reward may be gamed/)
+  const evidence = lab.toolRuns.find(t => t.tool === 'tinker_rl')
+  assert.equal(evidence.detail.reward_hacking.flag, true)
+  assert.ok(evidence.detail.reward_hacking.reasons.length >= 1)
+  assert.equal(lab.tinkerRuns[0].status, 'ok', 'the adapter is kept and can be talked to')
+  rlPublic.resetRlPracticeCache()
+  assert.equal((await rlPublic.rlPractice()).run.hacking.flag, true)
+})
+
+// ===========================================================================
+// The visitor chat
+// ===========================================================================
+test('the visitor chat lists an RL adapter with its rubric scores, higher is better', () => {
+  const [adapter] = panel.parseAdapters({ adapters: [{
+    slug: 'e41-0a1b2c3d', base_model: 'Qwen/Qwen3.5-4B', epoch: 41, author_name: 'Claude Fable 5.2', examples: 20, holdout_examples: 3,
+    kind: 'rl', rl_score_before: 0.25, rl_score_after: 0.75, expires_at: '2026-12-01T00:00:00.000Z',
+  }] })
+  assert.equal(adapter.kind, 'rl')
+  const d = panel.describeAdapter(adapter)
+  assert.match(d.score, /Held-out rubric score 0\.25 before training, 0\.75 after, on 3 tasks the lab held out\. Measured by the lab\. Higher is better\./)
+  assert.match(d.origin, /Reinforcement learning on 20 tasks and a rubric written by Claude Fable 5\.2/)
+  assert.ok(!d.score.includes('loss'))
+})

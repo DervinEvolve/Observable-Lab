@@ -12,6 +12,7 @@ import { normalizeWeightsRef, normalizeWeightsRequest, type WeightsRef, type Wei
 import { isValidSlug } from './exhibits.js'
 import { normalizeProposal, type ProposalRequest } from './lab-proposals.js'
 import { normalizeTinkerRequest, type TinkerRequest } from './tinker.js'
+import { normalizeTinkerRlRequest, type TinkerRlRequest } from './tinker-rl.js'
 import { KEEP_TOOL, TINKER_NAME_TOOL, normalizeKeepRequest, type KeepRequest } from './tinker-keep-request.js'
 import {
   DATASETS_TOOL, namesDataset, normalizeDatasetRef, normalizeDatasetRequest, normalizeTinkerDatasetRequest,
@@ -31,6 +32,8 @@ export interface ToolPlan {
   exhibit?: { slug: string; exhibit: unknown }
   lab_proposal?: ProposalRequest
   tinker_train?: TinkerRequest
+  /** A Tinker RL request (tinker-rl.ts). An epoch has one Tinker run, so it never stands beside tinker_train. */
+  tinker_rl?: TinkerRlRequest
   /**
    * A Tinker training request that names a shelf dataset instead of writing
    * its examples (datasets.ts). Only while public datasets are on, and never
@@ -157,6 +160,25 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
       // it would read as the epoch's run having been dealt with.)
       if (checked.request.name_refused) {
         plan.ignored.push({ tool: TINKER_NAME_TOOL, reason: `name refused: ${checked.request.name_refused}; the run stands and the adapter gets no name` })
+      }
+    }
+  }
+
+  // Tinker RL (tinker-rl.ts). An epoch has one Tinker run of either kind: when
+  // the answer asks for both, the training run keeps its place and the RL
+  // request is refused with that reason.
+  const rlOff = off('tinker_rl')
+  if (!rlOff) {
+    if (plan.tinker_train || plan.tinker_train_dataset || (req.tinker_train !== undefined && req.tinker_train !== null && req.tinker_train !== false && config.tinker_train.enabled && config.tinker_train.per_day > 0)) {
+      plan.ignored.push({ tool: 'tinker_rl', reason: 'an epoch has one Tinker run and this answer also asks for tinker_train' })
+    } else {
+      const checked = normalizeTinkerRlRequest(req.tinker_rl)
+      if ('error' in checked) plan.ignored.push({ tool: 'tinker_rl', reason: checked.error })
+      else {
+        plan.tinker_rl = checked.request
+        if (checked.request.name_refused) {
+          plan.ignored.push({ tool: TINKER_NAME_TOOL, reason: `name refused: ${checked.request.name_refused}; the run stands and the adapter gets no name` })
+        }
       }
     }
   }

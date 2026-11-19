@@ -506,15 +506,15 @@ class DeployShapeTests(unittest.TestCase):
                 top.update(alias.name.split(".")[0] for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 top.add((node.module or "").split(".")[0])
-        self.assertEqual(top, {"hashlib", "hmac", "json", "math", "os", "re", "shutil", "tempfile", "time", "typing", "urllib", "modal", "fastapi"})
-        # The Tinker SDK needs Python 3.11, so it is imported only inside the two classes that talk to Tinker.
+        self.assertEqual(top, {"hashlib", "hmac", "json", "math", "os", "re", "shutil", "tempfile", "time", "typing", "unicodedata", "urllib", "modal", "fastapi"})
+        # The Tinker SDK needs Python 3.11, so it is imported only inside the three classes that talk to Tinker.
         inside = [n for n in ast.walk(TREE) if isinstance(n, (ast.Import, ast.ImportFrom)) and n not in TREE.body]
         names = set()
         for node in inside:
             names.update([(node.module or "").split(".")[0]] if isinstance(node, ast.ImportFrom) else [a.name.split(".")[0] for a in node.names])
-        self.assertEqual(names, {"tinker", "tinker_cookbook"})
-        classes = [n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name in ("TinkerDeps", "KeepDeps")]
-        self.assertEqual(len(classes), 2)
+        self.assertEqual(names, {"tinker", "tinker_cookbook", "torch"})  # torch only in the RL class, on the training image
+        classes = [n for n in TREE.body if isinstance(n, ast.ClassDef) and n.name in ("TinkerDeps", "TinkerRlDeps", "KeepDeps")]
+        self.assertEqual(len(classes), 3)
         within = [n for c in classes for n in ast.walk(c)]
         self.assertTrue(all(any(node is n for n in within) for node in inside))
 
@@ -527,20 +527,20 @@ class DeployShapeTests(unittest.TestCase):
             self.assertIn(pin, train_image)
         self.assertNotIn("tinker", web_image)
 
-    def test_only_the_two_functions_that_talk_to_tinker_are_given_the_tinker_key(self):
+    def test_only_the_three_functions_that_talk_to_tinker_are_given_the_tinker_key(self):
         functions = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.decorator_list]
         secrets = {}
         for node in functions:
             text = " ".join(ast.unparse(d) for d in node.decorator_list)
             secrets[node.name] = sorted(set(re.findall(r"from_name\('([^']+)'\)", text)))
-        # `train` trains; `keeper` sets a checkpoint's time to live and copies its weights. The two web endpoints never have the key.
+        # `train` and `train_rl` train; `keeper` sets a checkpoint's time to live and copies its weights. The two web endpoints never have the key.
         self.assertEqual(secrets, {
-            "train": ["oblab-tinker-auth"], "keeper": ["oblab-tinker-auth"],
+            "train": ["oblab-tinker-auth"], "train_rl": ["oblab-tinker-auth"], "keeper": ["oblab-tinker-auth"],
             "start": ["oblab-tinker-jobs-auth"], "status": ["oblab-tinker-jobs-auth"],
         })
         # The key is named only where error text is scrubbed of it; it is never put in a result or printed.
         reads = [line.strip() for line in SOURCE.splitlines() if "TINKER_API_KEY" in line and "os.environ" in line]
-        self.assertEqual(reads, ['return [os.environ.get("TINKER_API_KEY", "")]'] * 2)
+        self.assertEqual(reads, ['return [os.environ.get("TINKER_API_KEY", "")]'] * 3)
         # No "X | None" in a signature: the deploying Mac's Python 3.9 cannot evaluate it.
         annotations = [a for n in ast.walk(TREE) if isinstance(n, (ast.FunctionDef, ast.arg)) for a in [getattr(n, "returns", None), getattr(n, "annotation", None)] if a is not None]
         self.assertFalse(any(isinstance(n, ast.BinOp) for a in annotations for n in ast.walk(a)))

@@ -1,6 +1,6 @@
 import { sql } from '@vercel/postgres'
 import { getRoleAssignments } from './role-rotation.js'
-import { getSharedContext, reviewerToolSection, tinkerDatasetReviewFacts, tinkerReviewFacts, ROLE_PROMPTS } from './prompts.js'
+import { getSharedContext, reviewerToolSection, tinkerDatasetReviewFacts, tinkerReviewFacts, tinkerRlReviewFacts, ROLE_PROMPTS } from './prompts.js'
 import { runResearchEpoch } from './research-epoch.js'
 import { getExperimentStatus, getGrowthStage } from './seed-spec.js'
 import { generatePlantFromSpec } from './plant-generator.js'
@@ -541,6 +541,7 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
           // A training request names a shelf dataset only while public datasets are on (tool-requests.ts).
           tinker_train: toolPlan?.tinker_train ? tinkerReviewFacts(toolPlan.tinker_train)
             : toolPlan?.tinker_train_dataset ? tinkerDatasetReviewFacts(toolPlan.tinker_train_dataset) : undefined,
+          tinker_rl: toolPlan?.tinker_rl ? tinkerRlReviewFacts(toolPlan.tinker_rl) : undefined,
           keep_adapter: toolPlan?.keep_adapter ? await keepReviewFacts(toolPlan.keep_adapter, { modelId: executorModel }) : undefined,
         })),
         'Make final decisions on each proposed mutation.'
@@ -570,7 +571,7 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
     // so doing both in one request overran it. It is queued on the epoch row
     // and runs in its own request on the next tick (epoch-followup.ts).
     const candidate = pickContributionCandidate(mutations, decisions, challengerOutput.challenges)
-    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal || toolPlan.tinker_train || toolPlan.tinker_train_dataset || toolPlan.keep_adapter))
+    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal || toolPlan.tinker_train || toolPlan.tinker_train_dataset || toolPlan.tinker_rl || toolPlan.keep_adapter))
     const followup: EpochFollowUp = {
       status: candidate || hasDeliverables ? 'pending' : 'none',
       contribution_mutation_index: candidate ? candidate.decision.mutation_index : null,
@@ -594,8 +595,8 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
     if (hasDeliverables) {
       toolOutcomes.push({
         tool: 'deliverables', status: 'queued',
-        summary: (toolPlan?.tinker_train || toolPlan?.tinker_train_dataset
-          ? 'any exhibit or lab proposal the Reviewer approved is opened after this epoch, and an approved Tinker training run is started then'
+        summary: (toolPlan?.tinker_train || toolPlan?.tinker_train_dataset || toolPlan?.tinker_rl
+          ? `any exhibit or lab proposal the Reviewer approved is opened after this epoch, and an approved Tinker ${toolPlan?.tinker_rl ? "RL" : "training"} run is started then`
           : 'any exhibit or lab proposal the Reviewer approved is opened after this epoch')
           + (toolPlan?.keep_adapter ? '; an approved request to keep a trained adapter is carried out then too' : ''),
       })

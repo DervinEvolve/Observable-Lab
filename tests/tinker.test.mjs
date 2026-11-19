@@ -71,6 +71,8 @@ const TINKER_KEY = 'tml-test-only-tinker-placeholder-0000'
 const JOBS_TOKEN = 'test-only-tinker-jobs-token-000000000000'
 const SPRITES_TOKEN = 'test-org/test-id/test-only-sprites-secret'
 process.env.OPENROUTER_API_KEY = OPENROUTER_KEY
+// Tinker RL (tests/tinker-rl.test.mjs) is on by default; these tests are about the training run, so it is switched off here.
+process.env.LAB_ENABLE_TINKER_RL = 'false'
 const BASE_ENV = { ...process.env }
 
 let logs = []
@@ -627,10 +629,10 @@ test('the price table and the limits are the same on the lab server and in the r
   assert.equal(constant('EPOCHS'), `(${tinker.TINKER_EPOCHS.min}, ${tinker.TINKER_EPOCHS.max})`)
   assert.equal(constant('BATCH_SIZE'), `(${tinker.TINKER_BATCH_SIZE.min}, ${tinker.TINKER_BATCH_SIZE.max})`)
   assert.equal(Number(constant('MAX_TTL_S').split('*').reduce((a, b) => a * Number(b), 1)), tinker.TINKER_MAX_TTL_DAYS * 86400)
-  // The runner has the Tinker key as a Modal secret, on the two functions that talk to Tinker: the one that trains and the one
+  // The runner has the Tinker key as a Modal secret, on the three functions that talk to Tinker: the two that train (a fine-tune and an RL run) and the one
   // that keeps an adapter (tests/tinker-keep.test.mjs). Both are lab code on the training image; the web endpoints never have it.
-  assert.equal((source.match(/Secret\.from_name\("oblab-tinker-auth"\)/g) || []).length, 2)
-  assert.equal((source.match(/@app\.function\(image=train_image, secrets=\[modal\.Secret\.from_name\("oblab-tinker-auth"\)\]/g) || []).length, 2)
+  assert.equal((source.match(/Secret\.from_name\("oblab-tinker-auth"\)/g) || []).length, 3)
+  assert.equal((source.match(/@app\.function\(image=train_image, secrets=\[modal\.Secret\.from_name\("oblab-tinker-auth"\)\]/g) || []).length, 3)
   assert.equal((source.match(/secrets=\[modal\.Secret\.from_name\("oblab-tinker-jobs-auth"\)\]/g) || []).length, 2)
 })
 

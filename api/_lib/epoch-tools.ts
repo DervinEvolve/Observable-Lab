@@ -38,7 +38,9 @@ import { contributeExhibit } from './exhibit-contribution.js'
 import { openLabProposal } from './lab-proposals.js'
 import { TINKER_TOOL } from './tinker.js'
 import { runTinkerTrain, tinkerRequestSummary, tinkerWorstCaseUsd } from './tinker-run.js'
-import { pendingModelKeepsToday, tinkerRunsToday } from './tinker-store.js'
+import { TINKER_RL_TOOL } from './tinker-rl.js'
+import { rlSummary, runTinkerRl, tinkerRlWorstCaseUsd } from './tinker-rl-run.js'
+import { pendingModelKeepsToday, tinkerRlRunsToday, tinkerRunsToday } from './tinker-store.js'
 import { KEEP_TOOL } from './tinker-keep-request.js'
 import { keepAdapter } from './tinker-keep.js'
 import {
@@ -357,14 +359,14 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
   return out
 }
 
-export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal' | 'tinker_train' | 'keep_adapter', 'approve' | 'reject'>>
+export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal' | 'tinker_train' | 'tinker_rl' | 'keep_adapter', 'approve' | 'reject'>>
 
 /** The Reviewer's verdicts on tool deliverables; anything but an explicit "approve" is a no. */
 export function readToolVerdicts(reviewerOutput: unknown): ToolVerdicts {
   const raw = reviewerOutput && typeof reviewerOutput === 'object' ? (reviewerOutput as Record<string, unknown>).tool_verdicts : undefined
   const out: ToolVerdicts = {}
   if (!raw || typeof raw !== 'object') return out
-  for (const key of ['exhibit', 'lab_proposal', 'tinker_train', 'keep_adapter'] as const) {
+  for (const key of ['exhibit', 'lab_proposal', 'tinker_train', 'tinker_rl', 'keep_adapter'] as const) {
     const v = String((raw as Record<string, unknown>)[key] ?? '').toLowerCase()
     if (v === 'approve' || v === 'reject') out[key] = v
   }
@@ -476,6 +478,25 @@ export async function runDeliverables(
       if (!ok.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, ok.reason))
       const outcome = await runTinkerTrain(ctx, resolved.request, { dataset: resolved.record, maxWaitMs: Math.max(0, wait - (Date.now() - startedAt)) })
       if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_TOOL, summary, outcome.summary))
+      out.push(outcome)
+    })())
+  }
+
+  // A Tinker RL run (tinker-rl-run.ts). The same order as a training run: the
+  // Reviewer must have approved it, then its own runs-per-day limit and the
+  // lab's budget are checked against the most it could cost, and the Tinker
+  // caps in runTinkerRl. The epoch's one row in tinker_runs stops a second run
+  // of either kind. A run still going when the wait ends writes its record
+  // when a later tick collects it.
+  if (plan.tinker_rl && !done(TINKER_RL_TOOL)) {
+    const request = plan.tinker_rl
+    const summary = rlSummary(request)
+    tasks.push((async () => {
+      if (verdicts.tinker_rl !== 'approve') return void out.push(await skip(ctx, TINKER_RL_TOOL, summary, 'the Reviewer did not approve it'))
+      const ok = await allowed(TINKER_RL_TOOL, config, tinkerRlWorstCaseUsd(request), () => tinkerRlRunsToday())
+      if (!ok.ok) return void out.push(await skip(ctx, TINKER_RL_TOOL, summary, ok.reason))
+      const outcome = await runTinkerRl(ctx, request)
+      if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_RL_TOOL, summary, outcome.summary))
       out.push(outcome)
     })())
   }

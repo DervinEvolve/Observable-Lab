@@ -97,6 +97,7 @@ import re
 import shutil
 import tempfile
 import time
+import unicodedata
 import urllib.request
 from typing import Optional  # the deploying Mac may run Python 3.9, which has no "X | None"
 
@@ -419,6 +420,1165 @@ def _short(text, limit: int) -> str:
     return " ".join(str(text).split())[:limit]
 
 
+# ---------------------------------------------------------------------------
+# The rubric engine for RL runs (the twin of api/_lib/rubric.ts)
+#
+# A rubric is a short list of rules from a fixed menu, each with a weight. A
+# rule gives 0 or 1; the score is the weighted sum clamped to [0, 1]. The two
+# languages are checked against one file of cases (tests/fixtures/rubric-cases.json).
+# regex_match uses a small automaton the lab compiles itself and steps once per
+# character, so no pattern can make it run long. Nothing a model wrote is run.
+# These are functions and constants only, so the tests can load them alone.
+# ---------------------------------------------------------------------------
+
+RUBRIC_TYPES = ("exact_match", "contains", "not_contains", "number_close", "regex_match", "json_valid", "length_between")
+RUBRIC_MAX_RULES = 8
+RUBRIC_STRING_MAX = 200
+RUBRIC_LIST_MAX = 20
+RUBRIC_REGEX_MAX_LEN = 120
+RUBRIC_REGEX_MAX_STATES = 120
+RUBRIC_REPEAT_MAX = 16
+RUBRIC_TEXT_MAX = 4000
+RUBRIC_LENGTH_MAX = 4000
+RUBRIC_TOLERANCE_MAX = 1e9
+RUBRIC_JSON_TYPES = ("object", "array", "string", "number", "integer", "boolean", "null")
+RUBRIC_WS = (32, 9, 10, 11, 12, 13)
+DATA_KEY_PATTERN = r"[A-Za-z0-9_]{1,24}"
+_RX_DIGIT = ((48, 57),)
+_RX_WORD = ((48, 57), (65, 90), (95, 95), (97, 122))
+_RX_SPACE = ((9, 13), (32, 32))
+_RX_PUNCT_ESCAPES = "\\/.-()[]{}*+?|^$"
+
+
+def rubric_strip(text: str) -> str:
+    """Strips space, tab, newline, vertical tab, form feed and carriage return from both ends, and nothing else."""
+    a = 0
+    b = len(text)
+    while a < b and ord(text[a]) in RUBRIC_WS:
+        a += 1
+    while b > a and ord(text[b - 1]) in RUBRIC_WS:
+        b -= 1
+    return text[a:b]
+
+
+def ascii_lower(text: str) -> str:
+    return "".join(chr(ord(c) + 32) if "A" <= c <= "Z" else c for c in text)
+
+
+def _nfkc(text: str) -> str:
+    return unicodedata.normalize("NFKC", text)
+
+
+def normalise_text(text: str) -> str:
+    """Whitespace runs to one space, quotes and ending punctuation off both ends, ASCII letters lower case."""
+    flat = []
+    space = False
+    for c in _nfkc(text):
+        if ord(c) in RUBRIC_WS:
+            space = True
+            continue
+        if space and flat:
+            flat.append(" ")
+        space = False
+        flat.append(c)
+    a = 0
+    b = len(flat)
+    while a < b and flat[a] in "\"'`":
+        a += 1
+    while b > a and flat[b - 1] in "\"'`.,;:!?":
+        b -= 1
+    return rubric_strip(ascii_lower("".join(flat[a:b])))
+
+
+def scope_text(text: str, scope) -> str:
+    whole = rubric_strip(text)
+    if not scope or scope == "whole":
+        return whole
+    lines = [rubric_strip(line) for line in whole.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    lines = [line for line in lines if line]
+    if not lines:
+        return ""
+    return lines[0] if scope == "first_line" else lines[-1]
+
+
+def _is_digit(text: str, i: int) -> bool:
+    return 0 <= i < len(text) and "0" <= text[i] <= "9"
+
+
+def numbers_in(text: str) -> list:
+    """The numbers in a text, in order. Same reading as numbersIn in api/_lib/rubric.ts."""
+    out = []
+    n = len(text)
+    i = 0
+    while i < n:
+        c = text[i]
+        start = i
+        signed = False
+        if c in "+-" and (_is_digit(text, i + 1) or (i + 1 < n and text[i + 1] == "." and _is_digit(text, i + 2))):
+            before = text[i - 1] if i > 0 else ""
+            glued = before != "" and (("0" <= before <= "9") or before == "." or ("A" <= before <= "Z") or ("a" <= before <= "z"))
+            if glued:
+                i += 1
+                continue
+            signed = True
+            i += 1
+        elif not _is_digit(text, i) and not (c == "." and _is_digit(text, i + 1)):
+            i += 1
+            continue
+        digits = ""
+        run = 0
+        grouped = False
+        while True:
+            if _is_digit(text, i):
+                digits += text[i]
+                run += 1
+                i += 1
+                continue
+            if (i < n and text[i] == "," and run >= 1 and (run == 3 if grouped else run <= 3)
+                    and _is_digit(text, i + 1) and _is_digit(text, i + 2) and _is_digit(text, i + 3) and not _is_digit(text, i + 4)):
+                digits += text[i + 1:i + 4]
+                i += 4
+                grouped = True
+                run = 3
+                continue
+            break
+        fraction = ""
+        if i < n and text[i] == "." and _is_digit(text, i + 1):
+            i += 1
+            while _is_digit(text, i):
+                fraction += text[i]
+                i += 1
+        value = float("%s%s" % (digits or "0", "." + fraction if fraction else ""))
+        if math.isfinite(value):
+            out.append(-value if signed and text[start] == "-" else value)
+    return out
+
+
+def compile_regex(pattern: str, ignore_case: bool = False):
+    """(program, None) for a pattern in the safe subset, or (None, reason). The program is a list of tuples."""
+    if not isinstance(pattern, str) or not pattern:
+        return None, "the pattern is empty"
+    p = [ord(c) for c in pattern]
+    if len(p) > RUBRIC_REGEX_MAX_LEN:
+        return None, "the pattern is longer than %d characters" % RUBRIC_REGEX_MAX_LEN
+    state = {"pos": 0}
+
+    class _Bad(Exception):
+        pass
+
+    def fail(reason):
+        raise _Bad(reason)
+
+    def fold(c):
+        return c + 32 if ignore_case and 65 <= c <= 90 else c
+
+    def peek(offset=0):
+        k = state["pos"] + offset
+        return p[k] if 0 <= k < len(p) else None
+
+    def escape_in(in_class):
+        state["pos"] += 1
+        c = peek()
+        if c is None:
+            fail("the pattern ends with a backslash")
+        state["pos"] += 1
+        ch = chr(c)
+        if ch == "d":
+            return ("ranges", _RX_DIGIT, False)
+        if ch == "w":
+            return ("ranges", _RX_WORD, False)
+        if ch == "s":
+            return ("ranges", _RX_SPACE, False)
+        if ch in "DWS":
+            if in_class:
+                fail("\\%s is not allowed inside [ ]" % ch)
+            return ("ranges", _RX_DIGIT if ch == "D" else _RX_WORD if ch == "W" else _RX_SPACE, True)
+        if ch == "n":
+            return ("char", 10)
+        if ch == "t":
+            return ("char", 9)
+        if ch == "r":
+            return ("char", 13)
+        if ch in _RX_PUNCT_ESCAPES:
+            return ("char", c)
+        return fail("\\%s is not supported (use \\d \\w \\s, \\n \\t \\r, or a backslash before a punctuation mark)" % ch)
+
+    def parse_class():
+        state["pos"] += 1
+        negate = False
+        if peek() == 94:
+            negate = True
+            state["pos"] += 1
+        ranges = []
+        first = True
+        while True:
+            c = peek()
+            if c is None:
+                fail("a [ has no closing ]")
+            if c == 93 and not first:
+                state["pos"] += 1
+                break
+            first = False
+            if c == 92:
+                e = escape_in(True)
+                if e[0] == "ranges":
+                    ranges.extend(e[1])
+                    continue
+                lo = e[1]
+            else:
+                lo = c
+                state["pos"] += 1
+            if peek() == 45 and peek(1) is not None and peek(1) != 93:
+                state["pos"] += 1
+                if peek() == 92:
+                    e = escape_in(True)
+                    if e[0] == "ranges":
+                        fail("a range cannot end in \\d, \\w or \\s")
+                    hi = e[1]
+                else:
+                    hi = peek()
+                    state["pos"] += 1
+                if hi < lo:
+                    fail("a range in [ ] runs backwards")
+                ranges.append((fold(lo), fold(hi)))
+            else:
+                ranges.append((fold(lo), fold(lo)))
+        return ("class", tuple(ranges), negate)
+
+    def parse_atom():
+        c = peek()
+        if c == 40:
+            state["pos"] += 1
+            if peek() == 63:
+                if peek(1) == 58:
+                    state["pos"] += 2
+                else:
+                    fail("(? groups other than (?: are not supported (no lookarounds, no named groups)")
+            inner = parse_alt()
+            if peek() != 41:
+                fail("a ( has no closing )")
+            state["pos"] += 1
+            return inner
+        if c == 91:
+            return parse_class()
+        if c == 46:
+            state["pos"] += 1
+            return ("any",)
+        if c == 94:
+            state["pos"] += 1
+            return ("bol",)
+        if c == 36:
+            state["pos"] += 1
+            return ("eol",)
+        if c == 92:
+            e = escape_in(False)
+            return ("class", tuple(e[1]), e[2]) if e[0] == "ranges" else ("char", fold(e[1]))
+        if c in (42, 43, 63):
+            fail("a quantifier has nothing before it")
+        if c == 123:
+            fail("{ must be written \\{ unless it starts a repeat after something")
+        state["pos"] += 1
+        return ("char", fold(c))
+
+    def parse_number():
+        s = ""
+        while peek() is not None and 48 <= peek() <= 57:
+            s += chr(peek())
+            state["pos"] += 1
+        return int(s) if s else None
+
+    def parse_seq():
+        parts = []
+        while peek() is not None and peek() != 124 and peek() != 41:
+            atom = parse_atom()
+            q = peek()
+            quantified = False
+            lo = hi = None
+            if q == 42:
+                lo, hi = 0, None
+                state["pos"] += 1
+                quantified = True
+            elif q == 43:
+                lo, hi = 1, None
+                state["pos"] += 1
+                quantified = True
+            elif q == 63:
+                lo, hi = 0, 1
+                state["pos"] += 1
+                quantified = True
+            elif q == 123:
+                state["pos"] += 1
+                lo = parse_number()
+                if lo is None:
+                    fail("a repeat needs a number: {3}, {2,5} or {2,}")
+                if peek() == 44:
+                    state["pos"] += 1
+                    hi = parse_number()
+                else:
+                    hi = lo
+                if peek() != 125:
+                    fail("a repeat is not closed with }")
+                state["pos"] += 1
+                quantified = True
+                if lo > RUBRIC_REPEAT_MAX or (hi is not None and hi > RUBRIC_REPEAT_MAX):
+                    fail("a repeat may count to at most %d" % RUBRIC_REPEAT_MAX)
+                if hi is not None and hi < lo:
+                    fail("a repeat runs backwards")
+            if quantified:
+                if atom[0] in ("bol", "eol"):
+                    fail("a quantifier cannot follow ^ or $")
+                if peek() in (63, 43, 42):
+                    fail("lazy and possessive quantifiers are not supported")
+                atom = ("rep", atom, lo, hi)
+            parts.append(atom)
+        return ("cat", tuple(parts))
+
+    def parse_alt():
+        options = [parse_seq()]
+        while peek() == 124:
+            state["pos"] += 1
+            options.append(parse_seq())
+        return options[0] if len(options) == 1 else ("alt", tuple(options))
+
+    try:
+        ast = parse_alt()
+        if state["pos"] < len(p):
+            fail("a ) has no opening (" if p[state["pos"]] == 41 else "the pattern could not be read")
+        program = []
+        too_big = "the pattern needs more than %d steps once its repeats are counted out" % RUBRIC_REGEX_MAX_STATES
+
+        def emit(n):
+            if len(program) > RUBRIC_REGEX_MAX_STATES:
+                fail(too_big)
+            kind = n[0]
+            if kind == "char":
+                program.append(["char", n[1]])
+            elif kind == "any":
+                program.append(["any"])
+            elif kind == "class":
+                program.append(["class", n[1], n[2]])
+            elif kind == "bol":
+                program.append(["bol"])
+            elif kind == "eol":
+                program.append(["eol"])
+            elif kind == "cat":
+                for part in n[1]:
+                    emit(part)
+            elif kind == "alt":
+                jumps = []
+                options = n[1]
+                for k, option in enumerate(options):
+                    if k < len(options) - 1:
+                        split = len(program)
+                        program.append(["split", split + 1, -1])
+                        emit(option)
+                        jumps.append(len(program))
+                        program.append(["jmp", -1])
+                        program[split][2] = len(program)
+                    else:
+                        emit(option)
+                for j in jumps:
+                    program[j][1] = len(program)
+            else:  # rep
+                node, lo, hi = n[1], n[2], n[3]
+                for _ in range(lo):
+                    emit(node)
+                if hi is None:
+                    split = len(program)
+                    program.append(["split", split + 1, -1])
+                    emit(node)
+                    program.append(["jmp", split])
+                    program[split][2] = len(program)
+                else:
+                    splits = []
+                    for _ in range(lo, hi):
+                        splits.append(len(program))
+                        program.append(["split", len(program) + 1, -1])
+                        emit(node)
+                    for s in splits:
+                        program[s][2] = len(program)
+
+        emit(ast)
+        program.append(["match"])
+        if len(program) > RUBRIC_REGEX_MAX_STATES:
+            fail(too_big)
+        return {"program": program, "ignore_case": bool(ignore_case)}, None
+    except _Bad as exc:
+        return None, str(exc)
+
+
+def regex_search(regex, text: str) -> bool:
+    """Does the pattern match anywhere in the text? The automaton is stepped once per character."""
+    prog = regex["program"]
+    chars = [ord(c) for c in (ascii_lower(text) if regex["ignore_case"] else text)]
+    n = len(chars)
+
+    def add(target, start, at):
+        stack = [start]
+        seen = set()
+        while stack:
+            pc = stack.pop()
+            if pc in seen:
+                continue
+            seen.add(pc)
+            op = prog[pc]
+            kind = op[0]
+            if kind == "jmp":
+                stack.append(op[1])
+            elif kind == "split":
+                stack.append(op[2])
+                stack.append(op[1])
+            elif kind == "bol":
+                if at == 0:
+                    stack.append(pc + 1)
+            elif kind == "eol":
+                if at == n:
+                    stack.append(pc + 1)
+            elif kind == "match":
+                return True
+            else:
+                target.add(pc)
+        return False
+
+    current = set()
+    for at in range(n + 1):
+        if add(current, 0, at):
+            return True
+        if at == n:
+            break
+        c = chars[at]
+        nxt = set()
+        for pc in current:
+            op = prog[pc]
+            kind = op[0]
+            if kind == "char":
+                ok = op[1] == c
+            elif kind == "any":
+                ok = c != 10
+            else:  # class
+                inside = any(lo <= c <= hi for lo, hi in op[1])
+                ok = inside != op[2]
+            if ok and add(nxt, pc + 1, at + 1):
+                return True
+        current = nxt
+    return False
+
+
+def json_text(text: str) -> str:
+    t = rubric_strip(text)
+    if not t.startswith("```"):
+        return t
+    lines = t.split("\n")
+    lines.pop(0)
+    body = rubric_strip("\n".join(lines))
+    if body.endswith("```"):
+        body = rubric_strip(body[:-3])
+    return body
+
+
+def _reject_constant(name):
+    raise ValueError("not JSON: %s" % name)
+
+
+def parse_json(text: str):
+    """(True, value) or (False, None). No NaN, no Infinity, nothing but one value."""
+    try:
+        return True, json.loads(text, parse_constant=_reject_constant)
+    except (ValueError, RecursionError):
+        return False, None
+
+
+def _is_json_integer(value) -> bool:
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return True
+    return isinstance(value, float) and math.isfinite(value) and math.floor(value) == value
+
+
+def schema_accepts(value, schema) -> bool:
+    kind = schema.get("type")
+    if kind is not None:
+        if kind == "object":
+            ok = isinstance(value, dict)
+        elif kind == "array":
+            ok = isinstance(value, list)
+        elif kind == "string":
+            ok = isinstance(value, str)
+        elif kind == "number":
+            ok = isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+        elif kind == "integer":
+            ok = _is_json_integer(value)
+        elif kind == "boolean":
+            ok = isinstance(value, bool)
+        else:
+            ok = value is None
+        if not ok:
+            return False
+    if isinstance(value, dict):
+        for key in schema.get("required", []):
+            if key not in value:
+                return False
+        for key, sub in (schema.get("properties") or {}).items():
+            if key in value and not schema_accepts(value[key], sub):
+                return False
+    elif schema.get("required"):
+        return False
+    if isinstance(value, list) and schema.get("items"):
+        for item in value:
+            if not schema_accepts(item, schema["items"]):
+                return False
+    return True
+
+
+def _plain_string(value, maximum=RUBRIC_STRING_MAX) -> bool:
+    if not isinstance(value, str) or not value or len(value) > maximum:
+        return False
+    for c in value:
+        o = ord(c)
+        if o < 32 and o not in (9, 10, 13) or o == 127 or 0xD800 <= o <= 0xDFFF:
+            return False
+    return True
+
+
+def _check_schema(raw, depth, nodes):
+    """None when the schema is in the subset, else a reason."""
+    if not isinstance(raw, dict):
+        return "a schema must be an object"
+    if depth > 4:
+        return "a schema may nest at most 4 deep"
+    nodes[0] += 1
+    if nodes[0] > 30:
+        return "a schema may hold at most 30 parts"
+    if any(k not in ("type", "required", "properties", "items") for k in raw):
+        return "a schema may only use type, required, properties and items"
+    if "type" in raw and raw["type"] not in RUBRIC_JSON_TYPES:
+        return "schema type is not one of the allowed types"
+    if "required" in raw:
+        req = raw["required"]
+        if not isinstance(req, list) or len(req) > RUBRIC_LIST_MAX or any(not isinstance(k, str) or re.fullmatch(DATA_KEY_PATTERN, k) is None for k in req):
+            return "schema required must be a list of names"
+    if "properties" in raw:
+        props = raw["properties"]
+        if not isinstance(props, dict) or len(props) > RUBRIC_LIST_MAX:
+            return "schema properties must be an object"
+        for k, v in props.items():
+            if re.fullmatch(DATA_KEY_PATTERN, k) is None:
+                return "a property name may hold only letters, digits and underscores"
+            problem = _check_schema(v, depth + 1, nodes)
+            if problem:
+                return problem
+    if "items" in raw:
+        problem = _check_schema(raw["items"], depth + 1, nodes)
+        if problem:
+            return problem
+    return None
+
+
+def _rule_problem(rule, where):
+    """None when one rule is well formed, else why not. Rules arrive already shaped by the lab server; this holds whatever it sends."""
+    if not isinstance(rule, dict):
+        return "%s is not an object" % where
+    kind = rule.get("type")
+    if kind not in RUBRIC_TYPES:
+        return "%s: type is not one of the rubric types" % where
+    weight = rule.get("weight")
+    if not _is_number(weight) or weight <= 0 or weight > 1:
+        return "%s: weight must be above 0 and at most 1" % where
+    allowed = {
+        "exact_match": ("value", "from", "scope"),
+        "contains": ("any", "all", "from", "value", "ignore_case", "scope"),
+        "not_contains": ("any", "all", "from", "value", "ignore_case", "scope"),
+        "number_close": ("value", "from", "tolerance", "relative", "pick", "scope"),
+        "regex_match": ("pattern", "ignore_case", "scope"),
+        "json_valid": ("schema",),
+        "length_between": ("min", "max", "scope"),
+    }[kind]
+    for key in rule:
+        if key not in ("type", "weight") and key not in allowed:
+            return "%s: %s has no field %s" % (where, kind, _short(key, 30))
+    if "scope" in rule and rule["scope"] not in ("whole", "first_line", "last_line"):
+        return "%s: scope must be whole, first_line or last_line" % where
+    if "from" in rule:
+        source = rule["from"]
+        if source != "expected" and not (isinstance(source, str) and source.startswith("data.") and re.fullmatch(DATA_KEY_PATTERN, source[5:]) is not None):
+            return "%s: from must be expected or data.<name>" % where
+    if kind in ("exact_match", "number_close"):
+        if ("value" in rule) == ("from" in rule):
+            return "%s: give either value or from" % where
+        if "value" in rule:
+            if kind == "number_close" and not _is_number(rule["value"]):
+                return "%s: value must be a number" % where
+            if kind == "exact_match" and not _plain_string(rule["value"]):
+                return "%s: value must be text" % where
+    if kind in ("contains", "not_contains"):
+        given = [k for k in ("any", "all", "from", "value") if k in rule]
+        if len(given) != 1:
+            return "%s: give exactly one of any, all, value or from" % where
+        if kind == "not_contains" and given[0] == "all":
+            return "%s: not_contains takes any, value or from" % where
+        if given[0] in ("any", "all"):
+            items = rule[given[0]]
+            if not isinstance(items, list) or not (1 <= len(items) <= RUBRIC_LIST_MAX) or any(not _plain_string(s) for s in items):
+                return "%s: %s must be a list of 1 to %d strings" % (where, given[0], RUBRIC_LIST_MAX)
+        elif given[0] == "value" and not _plain_string(rule["value"]):
+            return "%s: value must be text" % where
+        if "ignore_case" in rule and not isinstance(rule["ignore_case"], bool):
+            return "%s: ignore_case must be true or false" % where
+    if kind == "number_close":
+        if "tolerance" in rule and (not _is_number(rule["tolerance"]) or rule["tolerance"] < 0 or rule["tolerance"] > RUBRIC_TOLERANCE_MAX):
+            return "%s: tolerance is out of range" % where
+        if "relative" in rule and not isinstance(rule["relative"], bool):
+            return "%s: relative must be true or false" % where
+        if "pick" in rule and rule["pick"] not in ("first", "last"):
+            return "%s: pick must be first or last" % where
+    if kind == "regex_match":
+        if "ignore_case" in rule and not isinstance(rule["ignore_case"], bool):
+            return "%s: ignore_case must be true or false" % where
+        compiled, reason = compile_regex(rule.get("pattern"), rule.get("ignore_case") is True)
+        if compiled is None:
+            return "%s: %s" % (where, reason)
+    if kind == "json_valid" and "schema" in rule:
+        problem = _check_schema(rule["schema"], 1, [0])
+        if problem:
+            return "%s: %s" % (where, problem)
+    if kind == "length_between":
+        for key in ("min", "max"):
+            if key in rule and (not _is_int(rule[key]) or rule[key] < 0 or rule[key] > RUBRIC_LENGTH_MAX):
+                return "%s: %s must be a whole number from 0 to %d" % (where, key, RUBRIC_LENGTH_MAX)
+        if "min" not in rule and "max" not in rule:
+            return "%s: give min, max or both" % where
+        if "min" in rule and "max" in rule and rule["min"] > rule["max"]:
+            return "%s: min is above max" % where
+    return None
+
+
+def check_rubric(rubric):
+    """None when the rubric is one this runner scores, else a short reason."""
+    if not isinstance(rubric, dict) or set(rubric.keys()) != {"rules"}:
+        return "the rubric must be an object with only rules"
+    rules = rubric["rules"]
+    if not isinstance(rules, list) or not (1 <= len(rules) <= RUBRIC_MAX_RULES):
+        return "the rubric must hold 1 to %d rules" % RUBRIC_MAX_RULES
+    total = 0.0
+    for i, rule in enumerate(rules):
+        problem = _rule_problem(rule, "rubric.rules[%d]" % i)
+        if problem:
+            return problem
+        total += rule["weight"]
+    if total > 1 + 1e-9:
+        return "the rubric weights add up to more than 1"
+    return None
+
+
+def rubric_max(rubric) -> float:
+    total = sum(rule["weight"] for rule in rubric["rules"])
+    return math.floor(min(1.0, total) * 1e6 + 0.5) / 1e6
+
+
+def _rule_target(rule, task):
+    if rule.get("from") == "expected":
+        return task.get("expected")
+    if "from" in rule:
+        return (task.get("data") or {}).get(rule["from"][5:])
+    return rule.get("value")
+
+
+def _rule_fold(rule, text: str) -> str:
+    return _nfkc(text) if rule.get("ignore_case") is False else ascii_lower(_nfkc(text))
+
+
+def score_rule(rule, task, completion: str, cache=None) -> int:
+    """One rule on one completion: 0 or 1. `cache` holds compiled patterns."""
+    clipped = completion[:RUBRIC_TEXT_MAX]
+    text = scope_text(clipped, rule.get("scope"))
+    kind = rule["type"]
+    if kind == "exact_match":
+        target = _rule_target(rule, task)
+        return 1 if target is not None and normalise_text(text) == normalise_text(str(target)) else 0
+    if kind in ("contains", "not_contains"):
+        hay = _rule_fold(rule, text)
+        if "any" in rule:
+            wanted = rule["any"]
+        elif "all" in rule:
+            wanted = rule["all"]
+        else:
+            target = _rule_target(rule, task)
+            if target is None:
+                return 0
+            wanted = [str(target)]
+        found = [_rule_fold(rule, s) in hay for s in wanted]
+        if kind == "not_contains":
+            return 0 if any(found) else 1
+        return 1 if (all(found) if "all" in rule else any(found)) else 0
+    if kind == "number_close":
+        target = _rule_target(rule, task)
+        if target is None:
+            return 0
+        if isinstance(target, (int, float)) and not isinstance(target, bool):
+            want = float(target)
+        else:
+            found_target = numbers_in(str(target))
+            if not found_target:
+                return 0
+            want = found_target[0]
+        got = numbers_in(text)
+        if not got:
+            return 0
+        x = got[0] if rule.get("pick") == "first" else got[-1]
+        tolerance = rule.get("tolerance", 1e-6) * (abs(want) if rule.get("relative") else 1)
+        return 1 if abs(x - want) <= tolerance else 0
+    if kind == "regex_match":
+        key = (rule["pattern"], rule.get("ignore_case") is True)
+        store = cache if cache is not None else {}
+        if key not in store:
+            store[key] = compile_regex(rule["pattern"], rule.get("ignore_case") is True)[0]
+        return 1 if store[key] is not None and regex_search(store[key], text) else 0
+    if kind == "json_valid":
+        ok, value = parse_json(json_text(clipped))
+        if not ok:
+            return 0
+        return 1 if "schema" not in rule or schema_accepts(value, rule["schema"]) else 0
+    n = len(text)
+    return 1 if ("min" not in rule or n >= rule["min"]) and ("max" not in rule or n <= rule["max"]) else 0
+
+
+def score_completion(rubric, task, completion: str, cache=None) -> float:
+    """The weighted sum of the rules, clamped to [0, 1], to six places."""
+    total = 0.0
+    for rule in rubric["rules"]:
+        total += rule["weight"] * score_rule(rule, task, completion, cache)
+    clamped = min(1.0, max(0.0, total))
+    return math.floor(clamped * 1e6 + 0.5) / 1e6
+
+
+# ---------------------------------------------------------------------------
+# Reinforcement learning with a rubric (Tinker RL, docs/TOOLS.md)
+#
+# A model writes a set of tasks and a rubric as data. This file's own code:
+# holds out about 15% of the tasks by a hash of the run's salt; samples the base
+# model on them and scores the answers with the rubric engine above (the lab's
+# measurement of the base); then, for each step, samples `group_size` answers to
+# each of a few training tasks, scores them, centres the scores inside each
+# group (GRPO, as in Tinker's own tutorial), and takes one gradient step with one
+# of Tinker's built-in RL losses; then saves the adapter for sampling and scores
+# the held-out tasks again on the adapter as it was saved.
+#
+# The score of an attempt is the rubric's, computed here. A model's code never
+# runs. Every dollar figure is tokens counted here times Tinker's published
+# prices: an estimate. After each step the runner writes a small progress record
+# (the room's practice bench draws from it and from nothing else).
+# ---------------------------------------------------------------------------
+
+RL_MIN_TASKS = 8
+RL_MAX_TASKS = 400
+RL_TASK_PROMPT_MAX_BYTES = 1500
+RL_TASK_VALUE_MAX = 400
+RL_MAX_TASK_BYTES = 120000
+RL_GROUP_SIZE = (2, 16)
+RL_STEPS = (1, 30)
+RL_TASKS_PER_STEP = (1, 16)
+RL_COMPLETION_TOKENS = (16, 512)
+RL_LEARNING_RATE = (5e-6, 5e-4)
+RL_LOSSES = ("importance_sampling", "ppo", "cispo")
+RL_HOLDOUT_FRACTION = 0.15
+RL_HOLDOUT_MIN = 2
+RL_HOLDOUT_MAX = 60
+RL_EVAL_SAMPLES = 2
+RL_EVAL_TEMPERATURE = 0.3
+RL_TRAIN_TEMPERATURE = 1.0
+RL_TRAIN_WALL_S = 1500
+RL_MAX_PROMPT_TOKENS = 1024
+RL_PROGRESS_MAX_BYTES = 6000
+RL_SAMPLE_KEEP = 3
+RL_SETTINGS_KEYS = ("rank", "learning_rate", "group_size", "steps", "tasks_per_step", "max_completion_tokens", "loss")
+PROGRESS_DICT = "oblab-tinker-progress"
+
+
+def rl_holdout_count(n: int) -> int:
+    """How many of n tasks are held out: about 15%, at least 2, at most 60."""
+    return min(RL_HOLDOUT_MAX, max(RL_HOLDOUT_MIN, int(math.ceil(n * RL_HOLDOUT_FRACTION))))
+
+
+def rl_split(n: int, salt: str):
+    """(training indexes, held-out indexes). Fixed by the salt, which the lab makes up after the request was written."""
+    order = _order(n, salt, "rl-split")
+    k = rl_holdout_count(n)
+    return sorted(order[k:]), sorted(order[:k])
+
+
+def rl_step_tasks(train: list, step: int, per_step: int, salt: str) -> list:
+    """The training tasks of one step: a walk through the training tasks in an order fixed by the salt, round and round."""
+    order = [train[i] for i in _order(len(train), salt, "rl-steps")]
+    count = min(per_step, len(order))
+    return [order[(step * count + j) % len(order)] for j in range(count)]
+
+
+def rubric_fits_tasks(rubric, tasks):
+    """None when every task carries what the rubric reads from it, else why not."""
+    for r, rule in enumerate(rubric["rules"]):
+        source = rule.get("from")
+        if not source:
+            continue
+        for i, task in enumerate(tasks):
+            have = task.get("expected") if source == "expected" else (task.get("data") or {}).get(source[5:])
+            if have is None:
+                return "rubric.rules[%d] reads %s and tasks[%d] has none" % (r, source, i)
+    return None
+
+
+def check_rl_task(task, where):
+    if not isinstance(task, dict) or "prompt" not in task or any(k not in ("prompt", "expected", "data") for k in task):
+        return "%s must be an object with prompt, and optionally expected and data" % where
+    prompt = task["prompt"]
+    if not isinstance(prompt, str) or not prompt.strip():
+        return "%s: prompt must be non-empty text" % where
+    if len(prompt.encode("utf-8")) > RL_TASK_PROMPT_MAX_BYTES:
+        return "%s: prompt holds more than %d bytes" % (where, RL_TASK_PROMPT_MAX_BYTES)
+    if "expected" in task and (not _plain_string(task["expected"], RL_TASK_VALUE_MAX) or not task["expected"].strip()):
+        return "%s: expected must be text" % where
+    if "data" in task:
+        data = task["data"]
+        if not isinstance(data, dict) or not (1 <= len(data) <= 8):
+            return "%s: data must be an object of 1 to 8 entries" % where
+        for k, v in data.items():
+            if re.fullmatch(DATA_KEY_PATTERN, k) is None:
+                return "%s: a data name is not allowed" % where
+            if not (_is_int(v) or _plain_string(v, RL_TASK_VALUE_MAX)):
+                return "%s: data.%s must be a whole number or text" % (where, _short(k, 24))
+    return None
+
+
+def check_rl_job(job):
+    """None when the job is one this runner accepts, else a short reason. Runs nothing."""
+    if not isinstance(job, dict):
+        return "the job is not an object"
+    if job.get("base_model") not in RENDERERS:
+        return "base_model is not one this runner trains"
+    tasks = job.get("tasks")
+    if not isinstance(tasks, list) or not (RL_MIN_TASKS <= len(tasks) <= RL_MAX_TASKS):
+        return "tasks must hold %d to %d tasks" % (RL_MIN_TASKS, RL_MAX_TASKS)
+    seen = set()
+    total = 0
+    for i, task in enumerate(tasks):
+        problem = check_rl_task(task, "tasks[%d]" % i)
+        if problem:
+            return problem
+        if task["prompt"] in seen:
+            return "tasks[%d] has the same prompt as an earlier task" % i
+        seen.add(task["prompt"])
+        total += len(task["prompt"].encode("utf-8")) + len(str(task.get("expected", "")).encode("utf-8"))
+    if total > RL_MAX_TASK_BYTES:
+        return "the tasks hold more than %d bytes of text" % RL_MAX_TASK_BYTES
+    problem = check_rubric(job.get("rubric"))
+    if problem:
+        return problem
+    problem = rubric_fits_tasks(job["rubric"], tasks)
+    if problem:
+        return problem
+    settings = job.get("settings")
+    if not isinstance(settings, dict) or set(settings.keys()) != set(RL_SETTINGS_KEYS):
+        return "settings must hold %s" % ", ".join(RL_SETTINGS_KEYS)
+    if not _is_int(settings["rank"]) or settings["rank"] not in RANKS:
+        return "rank must be one of %s" % ", ".join(str(r) for r in RANKS)
+    if not _is_number(settings["learning_rate"]) or not (RL_LEARNING_RATE[0] <= settings["learning_rate"] <= RL_LEARNING_RATE[1]):
+        return "learning_rate is out of range"
+    for key, bounds in (("group_size", RL_GROUP_SIZE), ("steps", RL_STEPS), ("tasks_per_step", RL_TASKS_PER_STEP), ("max_completion_tokens", RL_COMPLETION_TOKENS)):
+        if not _is_int(settings[key]) or not (bounds[0] <= settings[key] <= bounds[1]):
+            return "%s must be a whole number from %d to %d" % (key, bounds[0], bounds[1])
+    if settings["loss"] not in RL_LOSSES:
+        return "loss must be one of %s" % ", ".join(RL_LOSSES)
+    salt = job.get("split_salt")
+    if not isinstance(salt, str) or re.fullmatch(SALT_PATTERN, salt) is None:
+        return "split_salt must be 16 to 64 hex characters"
+    budget = job.get("budget_usd")
+    if not _is_number(budget) or budget <= 0 or budget > HARD_RUN_USD:
+        return "budget_usd must be above 0 and at most %s" % HARD_RUN_USD
+    prices = job.get("prices")
+    if not isinstance(prices, dict) or any(not _is_number(prices.get(k)) or prices.get(k) <= 0 for k in ("train", "sample", "prefill")):
+        return "prices must hold train, sample and prefill, each above 0"
+    ttl = job.get("ttl_seconds")
+    if not _is_int(ttl) or ttl < MIN_TTL_S or ttl > MAX_TTL_S:
+        return "ttl_seconds must be from %d to %d" % (MIN_TTL_S, MAX_TTL_S)
+    if not _is_int(job.get("samples")) or not (0 <= job["samples"] <= MAX_SAMPLES):
+        return "samples must be from 0 to %d" % MAX_SAMPLES
+    if "export" in job and not isinstance(job["export"], bool):
+        return "export must be true or false"
+    run_id = job.get("run_id")
+    if run_id is not None and (not isinstance(run_id, str) or re.fullmatch(RUN_ID_PATTERN, run_id) is None):
+        return "run_id is not a run name"
+    return None
+
+
+def rl_plan_tokens(train_lengths: list, held_lengths: list, settings: dict) -> dict:
+    """The most tokens a whole run could use: every step at its longest, and two scorings of the held-out tasks."""
+    per_step = min(settings["tasks_per_step"], len(train_lengths))
+    top = sum(sorted(train_lengths, reverse=True)[:per_step])
+    group = settings["group_size"]
+    ceiling = settings["max_completion_tokens"]
+    steps = settings["steps"]
+    closing = rl_closing_tokens(held_lengths, settings)
+    return {
+        "train": steps * (group * top + per_step * group * ceiling),
+        "eval": 0,
+        "sample_prompt": steps * top + 2 * closing["sample_prompt"],
+        "sample_completion": steps * per_step * group * ceiling + 2 * closing["sample_completion"],
+    }
+
+
+def rl_closing_tokens(held_lengths: list, settings: dict) -> dict:
+    """Tokens one scoring of the held-out tasks takes at the most."""
+    return {
+        "train": 0,
+        "eval": 0,
+        "sample_prompt": sum(held_lengths),
+        "sample_completion": len(held_lengths) * RL_EVAL_SAMPLES * settings["max_completion_tokens"],
+    }
+
+
+def rl_step_tokens(train_lengths: list, settings: dict) -> dict:
+    """Tokens one step takes at the most."""
+    per_step = min(settings["tasks_per_step"], len(train_lengths))
+    top = sum(sorted(train_lengths, reverse=True)[:per_step])
+    group = settings["group_size"]
+    ceiling = settings["max_completion_tokens"]
+    return {
+        "train": group * top + per_step * group * ceiling,
+        "eval": 0,
+        "sample_prompt": top,
+        "sample_completion": per_step * group * ceiling,
+    }
+
+
+def _add_tokens(a: dict, b: dict) -> dict:
+    return dict((k, a.get(k, 0) + b.get(k, 0)) for k in ("train", "eval", "sample_prompt", "sample_completion"))
+
+
+def rl_progress_payload(job, live: dict, wall: float) -> dict:
+    """What the lab polls while a run goes: small, and nothing in it but what was measured. Cut to fit RL_PROGRESS_MAX_BYTES."""
+    settings = job["settings"]
+    payload = {
+        "v": 1,
+        "phase": live.get("phase", "starting"),
+        "step": int(live.get("step", 0)),
+        "steps_planned": int(live.get("steps_planned", settings["steps"])),
+        "group_size": settings["group_size"],
+        "tasks_per_step": int(live.get("tasks_per_step", settings["tasks_per_step"])),
+        "max_reward": live.get("max_reward"),
+        "means": [round(float(x), 4) for x in live.get("means", [])][:RL_STEPS[1]],
+        "frac_max": [round(float(x), 4) for x in live.get("frac_max", [])][:RL_STEPS[1]],
+        "attempts": [round(float(x), 4) for x in live.get("attempts", [])][:RL_GROUP_SIZE[1]],
+        "samples": [
+            {"prompt": _short(s.get("prompt", ""), 100), "completion": _short(s.get("completion", ""), 160), "reward": round(float(s.get("reward", 0)), 4)}
+            for s in live.get("samples", [])[:RL_SAMPLE_KEEP]
+        ],
+        "score_before": live.get("score_before"),
+        "score_after": live.get("score_after"),
+        "wall_seconds": round(wall, 1),
+    }
+    while len(json.dumps(payload).encode("utf-8")) > RL_PROGRESS_MAX_BYTES and payload["samples"]:
+        payload["samples"].pop()
+    return payload
+
+
+def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) -> dict:
+    """The whole RL run, with the training service behind `make_deps`. Never raises: a failure is returned as {"status": "error"}.
+
+    `make_deps(job)` is called only after the job has been checked. It returns an
+    object with: prompt_length(text) -> tokens; new_sampler() -> a sampler of the
+    weights as they are now; sampler_from_path(path); sample_batch(sampler,
+    prompts, n, max_tokens, temperature) -> per prompt {prompt, prompt_tokens,
+    completions: [{text, tokens, logprobs}]}; train(groups, learning_rate, loss)
+    with groups [{prompt, completions, advantages}]; save(ttl_seconds) -> sampler
+    path; secrets(); and, only when the job says "export": true, save_external(ttl_seconds).
+    """
+    started = clock()
+    tokens = {"train": 0, "eval": 0, "sample_prompt": 0, "sample_completion": 0}
+    state = {"stage": "input"}
+    progress = {}
+    secrets = []
+    live = {"phase": "starting", "step": 0, "means": [], "frac_max": [], "attempts": [], "samples": [], "score_before": None, "score_after": None}
+
+    def done(result: dict) -> dict:
+        out = dict(progress)
+        out.update(result)
+        out["tokens"] = dict(tokens)
+        out["wall_seconds"] = round(clock() - started, 1)
+        return out
+
+    def refused(reason: str) -> dict:
+        return done({"status": "refused", "stage": state["stage"], "reason": reason})
+
+    def emit(**changes) -> None:
+        live.update(changes)
+        if on_progress is not None:
+            try:
+                on_progress(rl_progress_payload(job, live, clock() - started))
+            except Exception as exc:  # noqa: BLE001
+                log("progress could not be written: %s" % type(exc).__name__)
+
+    try:
+        problem = check_rl_job(job)
+        if problem:
+            return refused(problem)
+        tasks = job["tasks"]
+        rubric = job["rubric"]
+        settings = job["settings"]
+        prices = job["prices"]
+        budget = float(job["budget_usd"])
+        salt = job["split_salt"]
+        ceiling = settings["max_completion_tokens"]
+        group = settings["group_size"]
+        max_reward = rubric_max(rubric)
+        patterns = {}
+        train, holdout = rl_split(len(tasks), salt)
+        progress.update({"kind": "rl", "n_tasks": len(tasks), "n_train": len(train), "n_holdout": len(holdout), "max_reward": max_reward})
+        live["max_reward"] = max_reward
+        live["tasks_per_step"] = min(settings["tasks_per_step"], len(train))
+
+        state["stage"] = "client"
+        deps = make_deps(job)
+        secrets = list(deps.secrets())
+
+        state["stage"] = "tokens"
+        lengths = [deps.prompt_length(t["prompt"]) for t in tasks]
+        for i, length in enumerate(lengths):
+            if length > RL_MAX_PROMPT_TOKENS:
+                return refused("tasks[%d] is %d tokens and a task may be %d" % (i, length, RL_MAX_PROMPT_TOKENS))
+        train_lengths = [lengths[i] for i in train]
+        held_lengths = [lengths[i] for i in holdout]
+
+        state["stage"] = "budget"
+        steps_planned = settings["steps"]
+        progress["steps_planned"] = steps_planned
+        live["steps_planned"] = steps_planned
+        plan = rl_plan_tokens(train_lengths, held_lengths, settings)
+        plan_cost = cost_usd(plan, prices)
+        if plan_cost > budget:
+            return refused("the tokenized plan costs $%.4f at the published prices, more than the $%.4f set aside" % (plan_cost, budget))
+        closing = rl_closing_tokens(held_lengths, settings)
+        one_step = rl_step_tokens(train_lengths, settings)
+
+        def attempts_of(sampler, indexes, count, temperature):
+            """Samples `count` answers to each task and scores them. Returns (rewards per task, results)."""
+            results = deps.sample_batch(sampler, [tasks[i]["prompt"] for i in indexes], count, ceiling, temperature)
+            rewards = []
+            for i, result in zip(indexes, results):
+                tokens["sample_prompt"] += int(result["prompt_tokens"])
+                tokens["sample_completion"] += sum(len(c["tokens"]) for c in result["completions"])
+                rewards.append([score_completion(rubric, tasks[i], c["text"], patterns) for c in result["completions"]])
+            return rewards, results
+
+        def measure(sampler):
+            rewards, results = attempts_of(sampler, holdout, RL_EVAL_SAMPLES, RL_EVAL_TEMPERATURE)
+            flat = [r for per_task in rewards for r in per_task]
+            if not flat:
+                return None, []
+            shown = []
+            for i, per_task, result in zip(holdout, rewards, results):
+                if per_task and len(shown) < max(job["samples"], 0):
+                    shown.append({"prompt": _short(tasks[i]["prompt"], 300), "completion": _short(result["completions"][0]["text"], 600), "reward": per_task[0]})
+            return sum(flat) / len(flat), shown
+
+        state["stage"] = "baseline"
+        emit(phase="baseline")
+        sampler = deps.new_sampler()
+        before, _ = measure(sampler)
+        if before is None:
+            return done({"status": "error", "stage": state["stage"], "error": "the held-out score could not be measured"})
+        progress["score_before"] = round(before, 6)
+        emit(score_before=round(before, 6))
+        log("held-out score before training: %.4f on %d tasks (best possible %.2f)" % (before, len(holdout), max_reward))
+
+        state["stage"] = "train"
+        steps = 0
+        stopped = None
+        progress["steps_done"] = 0
+        first_mean = None
+        last_mean = None
+        for step in range(steps_planned):
+            if clock() - started > RL_TRAIN_WALL_S:
+                stopped = "the time limit of %d s for training" % RL_TRAIN_WALL_S
+                break
+            ahead = _add_tokens(_add_tokens(tokens, one_step), closing)
+            if cost_usd(ahead, prices) > budget:
+                stopped = "the budget: one more step would pass the $%.4f set aside" % budget
+                break
+            indexes = rl_step_tasks(train, step, settings["tasks_per_step"], salt)
+            emit(phase="sampling", attempts=[])
+            if step > 0:
+                sampler = deps.new_sampler()
+            rewards, results = attempts_of(sampler, indexes, group, RL_TRAIN_TEMPERATURE)
+            flat = [r for per_task in rewards for r in per_task]
+            mean = sum(flat) / len(flat)
+            at_max = sum(1 for r in flat if r >= max_reward - 1e-9) / float(len(flat))
+            kept = []
+            for per_task, result in zip(rewards, results):
+                centre = sum(per_task) / len(per_task)
+                advantages = [r - centre for r in per_task]
+                if all(abs(a) < 1e-12 for a in advantages):
+                    continue  # every answer scored the same: nothing to learn from
+                kept.append({"prompt": result["prompt"], "prompt_tokens": result["prompt_tokens"], "completions": result["completions"], "advantages": advantages})
+            seen = []
+            for i, per_task, result in zip(indexes, rewards, results):
+                seen.append({"prompt": _short(tasks[i]["prompt"], 100), "completion": _short(result["completions"][0]["text"], 160), "reward": per_task[0]})
+            emit(phase="scored", step=steps, attempts=list(rewards[0]), samples=seen,
+                 means=live["means"] + [mean], frac_max=live["frac_max"] + [at_max])
+            if kept:
+                for g in kept:
+                    tokens["train"] += int(g["prompt_tokens"]) * len(g["completions"]) + sum(len(c["tokens"]) for c in g["completions"])
+                deps.train(kept, settings["learning_rate"], settings["loss"])
+            steps += 1
+            progress["steps_done"] = steps
+            if first_mean is None:
+                first_mean = mean
+            last_mean = mean
+            emit(step=steps)
+            log("step %d of %d: mean reward %.4f, %d%% at the best score, %d of %d groups taught something" % (
+                steps, steps_planned, mean, round(100 * at_max), len(kept), len(rewards)))
+        progress["stopped_early"] = stopped
+        progress["step_means"] = [round(x, 4) for x in live["means"]]
+        progress["step_frac_max"] = [round(x, 4) for x in live["frac_max"]]
+        if steps == 0:
+            return done({"status": "error", "stage": state["stage"], "error": "no training step was done (%s)" % (stopped or "nothing to train")})
+        progress["train_score_first"] = round(first_mean, 6)
+        progress["train_score_last"] = round(last_mean, 6)
+
+        state["stage"] = "save"
+        emit(phase="saving")
+        path = deps.save(job["ttl_seconds"])
+        if not isinstance(path, str) or not path.startswith("tinker://"):
+            return done({"status": "error", "stage": state["stage"], "error": "the adapter was not saved"})
+        progress["sampler_path"] = path
+        progress["ttl_seconds"] = job["ttl_seconds"]
+
+        if job.get("export") is True:
+            state["stage"] = "export"
+            try:
+                external = deps.save_external(job["ttl_seconds"])
+                if isinstance(external, str) and re.fullmatch(EXTERNAL_PATH_PATTERN, external) is not None:
+                    progress["external_path"] = external
+                else:
+                    progress["export_error"] = "the weights were not saved for download"
+            except Exception as exc:  # noqa: BLE001
+                progress["export_error"] = scrub(exc, secrets)
+                log("saving the weights for download failed: %s" % progress["export_error"])
+
+        # The held-out tasks again, on the adapter as it was saved: what a visitor will talk to.
+        state["stage"] = "measure"
+        emit(phase="measuring")
+        saved = deps.sampler_from_path(path)
+        after, shown = measure(saved)
+        if after is None:
+            return done({"status": "error", "stage": state["stage"], "error": "the held-out score could not be measured after training"})
+        progress["score_after"] = round(after, 6)
+        log("held-out score after training: %.4f" % after)
+        emit(phase="done", score_after=round(after, 6), attempts=[], samples=shown if shown else live["samples"])
+        return done({"status": "ok", "samples": shown})
+    except Exception as exc:  # noqa: BLE001
+        return done({"status": "error", "stage": state["stage"], "error": scrub(exc, secrets)})
+
+
 def run_core(job, make_deps, clock=time.time, log=print) -> dict:
     """The whole run, with the training service behind `make_deps`.
 
@@ -663,6 +1823,134 @@ class TinkerDeps:
 def train(job: dict) -> dict:
     """One fine-tuning run. Lab code only; the job is data. The result never carries the Tinker key."""
     return run_core(job, TinkerDeps)
+
+
+class TinkerRlDeps:
+    """Tinker behind the calls run_rl_core makes. The SDK reads TINKER_API_KEY from the environment itself."""
+
+    def __init__(self, job: dict):
+        import tinker
+        import torch
+        from tinker_cookbook.renderers import get_renderer, get_text_content
+
+        self._tinker = tinker
+        self._torch = torch
+        self._text = get_text_content
+        service = tinker.ServiceClient()
+        self._client = service.create_lora_training_client(
+            base_model=job["base_model"], rank=job["settings"]["rank"],
+            user_metadata={"source": "observable-lab", "kind": "rl", "label": _short(job.get("label", ""), 80)},
+        ).result(timeout=CALL_TIMEOUT_S)
+        self._renderer = get_renderer(RENDERERS[job["base_model"]], self._client.get_tokenizer())
+        self._stop = self._renderer.get_stop_sequences()
+
+    def secrets(self) -> list:
+        return [os.environ.get("TINKER_API_KEY", "")]
+
+    def _prompt(self, text: str):
+        return self._renderer.build_generation_prompt([{"role": "user", "content": text}])
+
+    def prompt_length(self, text: str) -> int:
+        return int(self._prompt(text).length)
+
+    def new_sampler(self):
+        # A sampler of the weights as they are now, as Tinker's own RL tutorial makes one for every step.
+        return self._client.save_weights_and_get_sampling_client().result(timeout=CALL_TIMEOUT_S)
+
+    def sampler_from_path(self, path: str):
+        return self._client.create_sampling_client(path).result(timeout=CALL_TIMEOUT_S)
+
+    def sample_batch(self, sampler, prompts: list, n: int, max_tokens: int, temperature: float) -> list:
+        params = self._tinker.SamplingParams(max_tokens=max_tokens, temperature=temperature, stop=self._stop)
+        # Every request is sent before any is waited for.
+        pending = []
+        for text in prompts:
+            prompt = self._prompt(text)
+            pending.append((prompt, sampler.sample(prompt=prompt, num_samples=n, sampling_params=params)))
+        out = []
+        for prompt, future in pending:
+            result = future.result(timeout=CALL_TIMEOUT_S)
+            completions = []
+            for sequence in result.sequences:
+                sampled = [int(t) for t in sequence.tokens]
+                message, _ = self._renderer.parse_response(sampled)
+                completions.append({"text": self._text(message), "tokens": sampled, "logprobs": [float(x) for x in sequence.logprobs]})
+            out.append({"prompt": prompt, "prompt_tokens": int(prompt.length), "completions": completions})
+        return out
+
+    def train(self, groups: list, learning_rate: float, loss: str) -> None:
+        tinker = self._tinker
+        datums = []
+        for g in groups:
+            prompt = g["prompt"]
+            ob_len = int(prompt.length) - 1
+            for completion, advantage in zip(g["completions"], g["advantages"]):
+                sampled = completion["tokens"]
+                if not sampled:
+                    continue
+                model_input = prompt.append(tinker.EncodedTextChunk(tokens=sampled[:-1]))
+                datums.append(tinker.Datum(
+                    model_input=model_input,
+                    loss_fn_inputs={
+                        "target_tokens": tinker.TensorData.from_torch(self._torch.tensor([0] * ob_len + sampled)),
+                        "logprobs": tinker.TensorData.from_torch(self._torch.tensor([0.0] * ob_len + completion["logprobs"])),
+                        "advantages": tinker.TensorData.from_torch(self._torch.tensor([0.0] * ob_len + [advantage] * (int(model_input.length) - ob_len))),
+                    },
+                ))
+        if not datums:
+            return
+        # Both are submitted before either is waited for, as Tinker's own loop does.
+        gradients = self._client.forward_backward(datums, loss_fn=loss)
+        update = self._client.optim_step(tinker.AdamParams(learning_rate=learning_rate, beta1=0.9, beta2=0.95))
+        gradients.result(timeout=CALL_TIMEOUT_S)
+        update.result(timeout=CALL_TIMEOUT_S)
+
+    def save(self, ttl_seconds: int) -> str:
+        return self._client.save_weights_for_sampler("final", ttl_seconds=ttl_seconds).result(timeout=CALL_TIMEOUT_S).path
+
+    def save_external(self, ttl_seconds: int) -> str:
+        return self._client.save_weights_external("final", ttl_seconds=ttl_seconds).result(timeout=CALL_TIMEOUT_S).path
+
+
+def progress_store():
+    """The Modal Dict of run name -> the run's latest progress record. None if it cannot even be named; reads and writes are guarded where it is used."""
+    try:
+        return modal.Dict.from_name(PROGRESS_DICT, create_if_missing=True)
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def write_progress(store, run_id, payload: dict) -> None:
+    """Stores a progress record under a run's name. Never a gate: a store that fails costs the room its live view, not the run."""
+    if store is None or not isinstance(run_id, str) or re.fullmatch(RUN_ID_PATTERN, run_id) is None:
+        return
+    try:
+        text = json.dumps(payload)
+        if len(text.encode("utf-8")) <= RL_PROGRESS_MAX_BYTES + 1000:
+            store.put(run_id, text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def read_progress(store, run_id):
+    """The latest progress record of a run, or None. A store that fails knows nothing."""
+    if store is None or not isinstance(run_id, str) or re.fullmatch(RUN_ID_PATTERN, run_id) is None:
+        return None
+    try:
+        value = store.get(run_id)
+        record = json.loads(value) if isinstance(value, str) else None
+    except Exception:  # noqa: BLE001
+        return None
+    return record if isinstance(record, dict) else None
+
+
+@app.function(image=train_image, secrets=[modal.Secret.from_name("oblab-tinker-auth")], timeout=RUN_TIMEOUT_S, retries=0,
+              max_containers=2, cpu=(1, 2), memory=(2048, 8192))
+def train_rl(job: dict) -> dict:
+    """One RL run. Lab code only; the job is data. The result never carries the Tinker key."""
+    store = progress_store()
+    run_id = job.get("run_id") if isinstance(job, dict) else None
+    return run_rl_core(job, TinkerRlDeps, on_progress=lambda payload: write_progress(store, run_id, payload))
 
 
 # ---------------------------------------------------------------------------
@@ -1162,16 +2450,16 @@ def read_start(body) -> dict:
     """
     if not isinstance(body, dict):
         return {"problem": "the body is not an object"}
-    kinds = [k for k in ("train", "keep", "unkeep") if k in body]
+    kinds = [k for k in ("train", "rl", "keep", "unkeep") if k in body]
     if len(kinds) != 1:
-        return {"problem": "the job is not an object" if not kinds else "a start holds one of train, keep and unkeep"}
+        return {"problem": "the job is not an object" if not kinds else "a start holds one of train, rl, keep and unkeep"}
     kind = kinds[0]
     job = body[kind]
-    problem = check_job(job) if kind == "train" else check_keep(job) if kind == "keep" else check_unkeep(job)
+    problem = check_job(job) if kind == "train" else check_rl_job(job) if kind == "rl" else check_keep(job) if kind == "keep" else check_unkeep(job)
     if problem:
         return {"problem": problem}
     run_id = body.get("run_id")
-    if kind == "train":
+    if kind in ("train", "rl"):
         if run_id is not None and (not isinstance(run_id, str) or re.fullmatch(RUN_ID_PATTERN, run_id) is None):
             return {"problem": "run_id is not a run name"}
     elif not isinstance(run_id, str) or re.fullmatch(KEEP_ID_PATTERN, run_id) is None \
@@ -1196,6 +2484,9 @@ def start(body: dict, request: Request) -> dict:
     run_id = work["run_id"]
     if work["kind"] == "train":
         return {"call_id": start_once(run_id, _run_names(), lambda: train.spawn(work["job"]).object_id)}
+    if work["kind"] == "rl":
+        # The run's name goes into the job too, so the runner can write its progress under it.
+        return {"call_id": start_once(run_id, _run_names(), lambda: train_rl.spawn(dict(work["job"], run_id=run_id)).object_id)}
     # A keep or an unkeep: the same remembered start, on the function that holds the Volume.
     return {"call_id": start_once(run_id, _run_names(), lambda: keeper.spawn({"action": work["kind"], work["kind"]: work["job"]}).object_id)}
 
@@ -1220,6 +2511,8 @@ def status(request: Request, call_id: str = "", run_id: str = "") -> dict:
     except OutputExpiredError:
         return {"status": "failed", "call_id": call_id, "error": "the run's result expired before it was collected"}
     except TimeoutError:
-        return {"status": "running", "call_id": call_id}
+        # A run that reports as it goes (RL) is asked for by its name too, and says how far it has got.
+        record = read_progress(progress_store(), run_id) if run_id else None
+        return {"status": "running", "call_id": call_id, **({"progress": record} if record else {})}
     except Exception as e:  # noqa: BLE001
         return {"status": "failed", "call_id": call_id, "error": str(e)[-300:]}

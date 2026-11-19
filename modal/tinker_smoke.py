@@ -22,6 +22,19 @@
 # waits for the result. The token is sent in the Authorization header and is
 # never printed.
 #
+# A check of Tinker RL (docs/TOOLS.md, "Tinker RL"), before it is relied on:
+#   uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py rl
+# It calls the deployed `train_rl` function with a toy task set of 16 tasks
+# ("name a fruit") and a rubric of two rules chosen from the lab's menu (the
+# answer is written in capital letters only, and is short), for 4 steps of 2
+# tasks with 4 answers each, at most 40 tokens an answer. It prints the mean
+# reward of every step, the held-out score before and after (measured with the
+# same rubric on tasks the runner held out), and the last progress record the
+# room would have drawn the bench from. It costs a few cents at the most and
+# can never cost more than the 5 cents it sets as the budget; the adapter it
+# saves expires after one hour. Whether the reward moves in so few steps is
+# not promised: the check is that every part ran and was measured.
+#
 # A third check, of keeping an adapter (docs/TOOLS.md, "Keeping a trained
 # adapter"), before LAB_ENABLE_TINKER_KEEP is switched on:
 #   uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py keep
@@ -76,6 +89,53 @@ def report(result: dict) -> None:
         print("held-out loss %.4f -> %.4f on %d examples the runner chose" % (
             result["holdout_loss_before"], result["holdout_loss_after"], result["n_holdout"]))
         print("adapter for the chat check: %s" % result["sampler_path"])
+
+
+FRUITS = ["apple", "pear", "plum", "fig", "lime", "kiwi", "peach", "grape", "mango", "melon", "lemon", "cherry", "banana", "orange", "papaya", "guava"]
+
+rl_job = {
+    "base_model": "Qwen/Qwen3.5-4B",
+    "tasks": [{"prompt": "Name one fruit that starts with the same letter as the word '%s'. Answer with the name only." % fruit} for fruit in FRUITS],
+    "rubric": {"rules": [
+        {"type": "regex_match", "weight": 0.7, "pattern": "^[A-Z][A-Z ]{2,15}$", "scope": "last_line"},
+        {"type": "length_between", "weight": 0.3, "min": 1, "max": 30},
+    ]},
+    "settings": {"rank": 8, "learning_rate": 1e-4, "group_size": 4, "steps": 4, "tasks_per_step": 2, "max_completion_tokens": 40, "loss": "importance_sampling"},
+    "split_salt": secrets.token_hex(16),
+    "budget_usd": 0.05,
+    "prices": {"train": 0.737, "sample": 1.005, "prefill": 0.33},
+    "ttl_seconds": 3600,
+    "samples": 2,
+    "label": "smoke test rl",
+}
+
+
+def rl() -> int:
+    """Runs a tiny RL run on the deployed runner and prints what was measured. 0 when every part ran."""
+    run_id = "e0-%s" % secrets.token_hex(4)
+    result = modal.Function.from_name("oblab-tinker", "train_rl").remote(dict(rl_job, run_id=run_id))
+    print(json.dumps(result, indent=2))
+    tokens = result.get("tokens", {})
+    cost = (tokens.get("train", 0) * 0.737 + tokens.get("sample_prompt", 0) * 0.33 + tokens.get("sample_completion", 0) * 1.005) / 1e6
+    print("estimated cost at the published prices: $%.6f (an estimate, not a billed amount)" % cost)
+    if result.get("status") != "ok":
+        print("rl: the run did not finish: %s %s" % (result.get("status"), result.get("reason") or result.get("error")))
+        return 1
+    for number, mean in enumerate(result.get("step_means", []), 1):
+        print("step %d: mean reward %.3f (share at the best score %.2f)" % (number, mean, result["step_frac_max"][number - 1]))
+    print("held-out score, measured by the runner with the rubric: %.3f before, %.3f after (best possible %.2f, %d tasks held out)" % (
+        result["score_before"], result["score_after"], result["max_reward"], result["n_holdout"]))
+    record = None
+    try:
+        record = json.loads(modal.Dict.from_name("oblab-tinker-progress").get(run_id))
+    except Exception as error:  # noqa: BLE001
+        print("the progress record could not be read: %s" % type(error).__name__)
+    if record:
+        print("the last progress record the room would draw from: phase %s, step %s of %s, %d means" % (
+            record.get("phase"), record.get("step"), record.get("steps_planned"), len(record.get("means", []))))
+    print("adapter for the chat check: %s" % result["sampler_path"])
+    print("rl: all parts ran")
+    return 0
 
 
 def call(method: str, url: str, token: str, body=None) -> dict:
@@ -182,4 +242,6 @@ if __name__ == "__main__":
         sys.exit(endpoints())
     if sys.argv[1:] == ["keep"]:
         sys.exit(keep())
+    if sys.argv[1:] == ["rl"]:
+        sys.exit(rl())
     report(modal.Function.from_name("oblab-tinker", "train").remote(job))
