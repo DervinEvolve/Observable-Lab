@@ -104,7 +104,7 @@ The mark stays on the row. So if I turn the flag off in the middle of a day, wha
 - The guard covers manual epochs, clearing stuck epochs, seeding/resetting/patching experiments, the persisted glass state, debug views, North runs, and all Sprites routes. `?confirm=true` remains an extra action check; it is not authentication.
 - Ordinary experiment state (now including recent `tool_runs`, cleaned of anything that looks like a credential), merged exhibits (`GET /api/experiment?view=exhibits`), contribution records, and wildcard transcripts remain public observer endpoints. Review their contents before using private research or code in a connected deployment. Only put material intended for viewers in that experiment.
 
-- `/api/experiment/trained-chat` is public by design: it is the visitor chat with adapters the models trained ([Tinker training](#tinker-training)). While `LAB_ENABLE_TRAINED_CHAT` is off, which is the default, a GET says `{"enabled":false,"adapters":[]}` and a POST answers 503, and neither touches the database or the network. When it is on it is the one public route that spends money, so it has a rate limit per address, a tighter one per visitor (an address with a browser string), and its own small daily cap. The room's page calls it only after `GET /api/experiment` has said the chat is on, so with the chat off it gets no traffic from visitors' pages.
+- `/api/experiment/trained-chat` is public by design: it is the visitor chat with adapters the models trained ([Tinker training](#tinker-training)). While `LAB_ENABLE_TRAINED_CHAT` is off, which is the default, a GET says `{"enabled":false,"adapters":[]}` and a POST answers 503, and neither touches the database or the network. When it is on it is the one public route that spends money, so it has a rate limit per address, a tighter one per visitor (an address with a browser string), and its own small daily cap. The room's page calls it only after `GET /api/experiment` has said the chat is on, so with the chat off it gets no traffic from visitors' pages. While the chat is on, `GET /api/experiment` also carries `trained_chat_activity` (when someone last got an answer, and how many today), read from the existing `trained_chat_calls` rows with two small queries at most every 4 seconds per server instance and never written to.
 
 - `/api/experiment/trained-adapters` is an operator route: `Authorization: Bearer <LAB_OPERATOR_SECRET>` on every call, 401 before anything is read otherwise, and `?confirm=true` on a POST as well. It is where I look at the trained adapters and keep or unkeep one, or take a display name away ([Naming and keeping trained adapters](#naming-and-keeping-trained-adapters)). Nothing a model writes reaches it.
 
@@ -447,6 +447,18 @@ unset TINKER_API_KEY
 
 What I expect: a `chat.completion` whose `choices[0].message.content` is a short direct answer (the trained code for teal is OL-184, if teal was not one of the two held-out examples the adapter should know it), no `reasoning_content` to speak of, and a `usage` with `prompt_tokens` and `completion_tokens`. This is the call the server makes for both chat switches, so if it fails here they stay off.
 
+**Compare with untrained: run this once first.** The chat's comparison asks the base model by its own id instead of the adapter's path. I have not been able to confirm that Tinker's endpoint accepts a base model id here, so I check it before leaving the switch on:
+
+```
+read -s TINKER_API_KEY
+curl -sS https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1/chat/completions \
+  -H "Authorization: Bearer $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "Qwen/Qwen3.5-4B", "messages": [{"role": "user", "content": "Say hello."}], "max_completion_tokens": 20, "reasoning_effort": false}'
+unset TINKER_API_KEY
+```
+
+If it answers with a `chat.completion`, `LAB_ENABLE_TRAINED_CHAT_COMPARE` can stay as it is (on). If Tinker refuses the base id (a 4xx), I set `LAB_ENABLE_TRAINED_CHAT_COMPARE=false` in Vercel and redeploy: `GET /api/experiment/trained-chat` then says `compare_enabled: false` and the page hides the switch. Nothing else changes, and there is no other server to redeploy. If the switch is left on and Tinker refuses at call time, the untrained side shows a plain error, costs nothing (an error status is a call that was not served), and the trained answer still shows. A comparison uses the chat's daily cap twice as fast: it counts as two messages and sets aside both calls' worst case.
+
 Last, the endpoints. These are shell variables on my Mac for this check only; the same three values go into Vercel in step 5. The two URLs are the ones Modal printed in step 3, and the token is the one from step 2.
 
 ```
@@ -491,6 +503,7 @@ It starts a run under a made-up name, sends the same start a second time, asks f
 | `LAB_ENABLE_LIVE_TRAINED` | false | Kept adapters answer on the lab model endpoint as `lab/<name>`. Needs `LAB_ENABLE_LIVE_MODEL=true` and `TINKER_API_KEY`. |
 | `LAB_ENABLE_TRAINED_CHAT` | false | The visitor chat in the room. Needs `TINKER_API_KEY`. |
 | `LAB_TRAINED_CHAT_DATASET_ADAPTERS` | false | Whether that chat also offers adapters trained on rows of a public dataset ([Public datasets](#public-datasets)). Nobody has read those rows, so it is off unless I say so. |
+| `LAB_ENABLE_TRAINED_CHAT_COMPARE` | on | "Compare With Untrained" in that chat. On unless `false`, `0`, `off` or `no`. Run the probe below once; if it fails, set this to `false`. |
 | `LAB_TINKER_CHAT_DAILY_USD` | 1 | The most all visitor chat may cost per UTC day, by the estimate, inside the $10. Never more than 10. |
 
 I turn them on one at a time: `LAB_ENABLE_TINKER` first, then the two chat switches whenever I choose. Nobody reviews an adapter before it can be talked to; every finished adapter is listed until it expires (or for good once kept), and the chat says beside every reply that replies are not reviewed.
