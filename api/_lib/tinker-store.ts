@@ -1214,3 +1214,24 @@ export async function recordTrainedChatCall(call: TrainedChatCall): Promise<void
     console.warn('[trained-chat] could not store a call record:', e instanceof Error ? e.message : e)
   }
 }
+
+/**
+ * The newest visitor chat call that was answered (status 'ok'): which adapter
+ * and when. Reads the counts row only; no text is kept anywhere. An error, a
+ * refusal and an untrained comparison row (status 'base_...') are not 'ok'.
+ */
+export async function latestChatCall(): Promise<{ slug: string; at: Date } | null> {
+  await ensureTinkerTables()
+  const r = await sql`SELECT slug, created_at FROM trained_chat_calls WHERE status = 'ok' ORDER BY created_at DESC LIMIT 1`
+  const row = r.rows[0] as { slug?: unknown; created_at?: unknown } | undefined
+  if (!row || typeof row.slug !== 'string') return null
+  const at = new Date(row.created_at as string | number | Date)
+  return Number.isFinite(at.getTime()) ? { slug: row.slug, at } : null
+}
+
+/** How many visitor chat calls were answered (status 'ok') since 00:00 UTC of `now`'s day. */
+export async function chatCallsToday(now: Date = new Date()): Promise<number> {
+  await ensureTinkerTables()
+  const r = await sql`SELECT COUNT(*) AS n FROM trained_chat_calls WHERE status = 'ok' AND created_at >= ${`${utcDay(now)}T00:00:00.000Z`}`
+  return Math.max(0, Math.floor(Number(r.rows[0]?.n) || 0))
+}

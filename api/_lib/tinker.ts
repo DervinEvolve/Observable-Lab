@@ -158,6 +158,16 @@ export function trainedChatFlag(): boolean {
   return flag('LAB_ENABLE_TRAINED_CHAT')
 }
 /**
+ * May a visitor ask the untrained base model the same question beside the
+ * adapter's answer (trained-chat.ts, "compare")? On unless the owner says
+ * false, 0, off or no, so a Tinker endpoint that does not serve a base model
+ * can be switched off without a deploy of code. Only meaningful while the
+ * chat itself is on (trainedChatStatus).
+ */
+export function trainedChatCompareFlag(): boolean {
+  return !['false', '0', 'off', 'no'].includes((process.env.LAB_ENABLE_TRAINED_CHAT_COMPARE || '').trim().toLowerCase())
+}
+/**
  * May the visitor chat also answer with an adapter trained on rows of a
  * public dataset (datasets.ts)? Off unless the owner says so: nobody has
  * read those rows, not a model, not the Reviewer and not the owner, so such

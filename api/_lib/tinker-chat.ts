@@ -12,19 +12,28 @@
  * answered travels back unread.
  *
  * The model named in the request is the adapter's checkpoint path. Tinker
- * runs it on the base model it was trained on. "reasoning_effort": false
+ * runs it on the base model it was trained on. For the visitor chat's
+ * comparison it is instead the base model's own id (a priced one), asking for
+ * the same model without the adapter. "reasoning_effort": false
  * asks that base model to answer directly, which is how the adapter was
  * trained (the runner trains without the thinking block).
  */
 import { sanitizeOutput } from './sprites.js'
-import { isSamplerPath } from './tinker.js'
+import { isSamplerPath, TINKER_PRICES } from './tinker.js'
 
 export const TINKER_CHAT_URL = 'https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1/chat/completions'
 
 export interface TinkerChatMessage { role: 'system' | 'user' | 'assistant'; content: string }
 
 export interface TinkerChatInput {
-  samplerPath: string
+  /** An adapter's checkpoint path. Exactly one of samplerPath and baseModel is set. */
+  samplerPath?: string
+  /**
+   * The untrained base model, for the visitor chat's comparison. Always the
+   * adapter's own base_model from the lab's record, never text a visitor sent.
+   * Only a model with a price in TINKER_PRICES is sent.
+   */
+  baseModel?: string
   messages: TinkerChatMessage[]
   maxTokens: number
   temperature?: number
@@ -83,7 +92,7 @@ function neverConnected(e: unknown): boolean {
 /** The body sent to Tinker for one call. Exported so a test can see exactly what leaves. */
 export function tinkerChatBody(input: TinkerChatInput): Record<string, unknown> {
   return {
-    model: input.samplerPath,
+    model: input.baseModel ?? input.samplerPath,
     messages: input.messages.map(m => ({ role: m.role, content: m.content })),
     max_completion_tokens: Math.max(1, Math.floor(input.maxTokens)),
     ...(typeof input.temperature === 'number' ? { temperature: input.temperature } : {}),
@@ -112,7 +121,13 @@ export function tinkerChatCharge(answer: TinkerChatResult, measuredUsd: (promptT
 export async function callTinkerChat(input: TinkerChatInput): Promise<TinkerChatResult> {
   const key = (process.env.TINKER_API_KEY || '').trim()
   if (!key) return { ok: false, kind: 'not_configured', maybeServed: false, httpStatus: null, detail: 'no Tinker key on this server' }
-  if (!isSamplerPath(input.samplerPath)) return { ok: false, kind: 'not_configured', maybeServed: false, httpStatus: null, detail: 'not a saved adapter' }
+  const hasPath = input.samplerPath !== undefined
+  const hasBase = input.baseModel !== undefined
+  if (hasPath === hasBase) return { ok: false, kind: 'not_configured', maybeServed: false, httpStatus: null, detail: 'name an adapter or a base model, not both' }
+  if (hasPath && !isSamplerPath(input.samplerPath)) return { ok: false, kind: 'not_configured', maybeServed: false, httpStatus: null, detail: 'not a saved adapter' }
+  if (hasBase && !(typeof input.baseModel === 'string' && Object.hasOwn(TINKER_PRICES, input.baseModel))) {
+    return { ok: false, kind: 'not_configured', maybeServed: false, httpStatus: null, detail: 'not a base model the lab prices' }
+  }
 
   let response: Response
   try {

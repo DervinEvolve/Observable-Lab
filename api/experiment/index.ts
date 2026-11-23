@@ -12,6 +12,7 @@ import { getRecentToolRuns } from '../_lib/tool-runs-store.js'
 import { enabledTools } from '../_lib/tools-config.js'
 import { trainedChatStatus } from '../_lib/tinker.js'
 import { rlPractice } from '../_lib/tinker-rl-public.js'
+import { chatActivity } from '../_lib/trained-chat-activity.js'
 import { researchStoryStatus } from '../_lib/research-talk.js'
 import { exhibitsHandler } from '../_lib/exhibits-reader.js'
 import { researchAlongside } from '../_lib/experiment-modes.js'
@@ -175,12 +176,16 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
     const research = researchAlongside() && !currentSpec.meta.research ? await researchSummary() : null
     // Tinker RL, for the practice bench: whether it is on and the newest run, from the stored record only.
     const practice = await rlPractice().catch(() => null)
+    // When a visitor last got a reply from a trained model, for the room's speaking tube. Read from rows the chat already writes.
+    const activity = trainedChatStatus().enabled ? await chatActivity().catch(() => null) : null
 
     return res.status(200).json({
       ...response, growth_events: growthEvents, tool_runs: toolRuns, tools_enabled: enabledTools(),
       // Present only while the visitor chat with trained adapters is switched
       // on. The room's chat panel calls its own route only after seeing this.
       ...(trainedChatStatus().enabled ? { trained_chat_enabled: true } : {}),
+      // Present only while the chat is on and a reply was given in the last 24 hours: counts and times, never text.
+      ...(activity ? { trained_chat_activity: activity } : {}),
       // Present only while stories from the research loop's kept model are
       // switched on. The story box calls its own route only after seeing this.
       ...(researchStoryStatus().enabled ? { research_talk_enabled: true } : {}),

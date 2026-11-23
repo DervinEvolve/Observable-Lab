@@ -1294,6 +1294,7 @@ test('the chat lists kept adapters with the lab-measured scores, and answers a m
   assert.equal(list.body.enabled, true)
   assert.equal(list.body.notice, "A small model fine-tuned by the lab's AI models on data they wrote. Replies are not reviewed.")
   assert.deepEqual(list.body.limits, { max_message_chars: 500, max_turns: 8, max_reply_tokens: 200 })
+  assert.equal(list.body.compare_enabled, true)
   assert.equal(list.body.adapters.length, 1)
   const a = list.body.adapters[0]
   assert.deepEqual([a.slug, a.model_id, a.base_model, a.epoch, a.author_model, a.author_name, a.examples, a.holdout_examples, a.holdout_loss_before, a.holdout_loss_after],
