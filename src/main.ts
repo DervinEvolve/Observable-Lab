@@ -33,6 +33,8 @@ import { TranscriptPanel } from './systems/TranscriptPanel'
 import { ActivityPanel } from './systems/ActivityPanel'
 import { KnowledgeGraphPanel } from './systems/KnowledgeGraphPanel'
 import { TrainedChatPanel } from './systems/TrainedChatPanel'
+import { SpeakingTubeGlow } from './entities/SpeakingTubeGlow'
+import { parseChatActivity } from './systems/speakingTube'
 import { PracticeBenchPanel } from './systems/PracticeBenchPanel'
 import { benchCameraView, parsePractice } from './systems/practiceBench'
 import { ResearchStoryBox } from './systems/ResearchStoryBox'
@@ -66,6 +68,7 @@ class ObservableLab {
   private exhibitHall: ExhibitHall | null = null
   private toolRuns: ToolRunsService | null = null
   private trainedChat: TrainedChatPanel | null = null
+  private speakingTube: SpeakingTubeGlow | null = null
   private practiceBench: PracticeBench | null = null
   private practicePanel: PracticeBenchPanel | null = null
   private growthSeen = false // a growth record (or the dev preview) has arrived
@@ -291,6 +294,18 @@ class ObservableLab {
       }
     }
     this.scene.add(this.practiceBench.group)
+
+    // The Commentator's speaking tube glows while a real trained-model reply is recent. One additive
+    // sprite, outside the merged room groups; hidden (and free) when there is nothing real to show.
+    this.speakingTube = new SpeakingTubeGlow()
+    {
+      const mq = window.matchMedia?.('(prefers-reduced-motion: reduce)')
+      if (mq) {
+        this.speakingTube.setReducedMotion(mq.matches)
+        mq.addEventListener?.('change', e => this.speakingTube?.setReducedMotion(e.matches))
+      }
+    }
+    this.scene.add(this.speakingTube.sprite)
 
     // J-space lens: toggled per-scientist from their hover card
     // (callback wired after UIOverlay exists — see init)
@@ -567,6 +582,8 @@ class ObservableLab {
     })
     // The story box of the research loop's kept model lives in the same panel, with its own switch
     this.trainedChat.attachStory(onChange => new ResearchStoryBox(onChange))
+    // A real reply to this visitor lights the tube at once; nothing else here does
+    this.trainedChat.onReply = at => this.speakingTube?.noteOwnReply(at)
 
     // Initialize PatinaSystem
     this.patinaSystem = new PatinaSystem()
@@ -618,6 +635,7 @@ class ObservableLab {
       trainingRig: this.trainingRig,
       practiceBench: this.practiceBench,
       practicePanel: () => this.practicePanel,
+      speakingTube: this.speakingTube,
       jspace: this.jspaceLens,
       voices: this.latestVoice,
       // Frame cost of the last rendered frame (draw calls, triangles)
@@ -1197,6 +1215,12 @@ class ObservableLab {
     // and only then does its panel call its own route.
     this.trainedChat?.setAvailable((state as unknown as { trained_chat_enabled?: unknown }).trained_chat_enabled === true)
     this.trainedChat?.setStoryAvailable((state as unknown as { research_talk_enabled?: unknown }).research_talk_enabled === true)
+    // The speaking tube: the server's record of the newest good chat reply, only while the chat is on
+    {
+      const chatOn = (state as unknown as { trained_chat_enabled?: unknown }).trained_chat_enabled === true
+      this.speakingTube?.setChatOn(chatOn)
+      this.speakingTube?.setActivity(chatOn ? parseChatActivity((state as unknown as { trained_chat_activity?: unknown }).trained_chat_activity) : null, false)
+    }
     // The practice bench: only what the state stored about the newest Tinker RL run (no record: dark and still)
     {
       const practice = parsePractice((state as unknown as { rl_practice?: unknown }).rl_practice)
@@ -2852,6 +2876,7 @@ class ObservableLab {
     // Training rig (lamps, fan, data pulses, gauge)
     this.trainingRig?.update(deltaTime)
     this.practiceBench?.update(deltaTime)
+    this.speakingTube?.update(deltaTime)
 
     // J-space lens follows its scientist
     this.jspaceLens?.update(deltaTime, this.camera)

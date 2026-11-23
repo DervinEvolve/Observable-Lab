@@ -1,5 +1,12 @@
-// "Talk to what they trained": a small chat with the adapters the lab's
-// models fine-tuned on Tinker (docs/TOOLS.md, "Talking to a trained adapter").
+// "Talk to what they trained": a chat with the adapters the lab's models
+// fine-tuned on Tinker (docs/TOOLS.md, "Talking to a trained adapter").
+//
+// It looks like the rest of the room: warm paper, ink and brass. Each trained
+// model is a specimen card on a shelf, with a before and after gauge made from
+// the held-out score the lab measured. The conversation reads like letters on
+// the Commentator's desk. On a wide screen the shelf and the conversation sit
+// side by side and scroll on their own; on a phone they are two views of one
+// full-height sheet.
 //
 // It asks for nothing until the room's own state (GET /api/experiment, which
 // the page reads anyway) says the chat is switched on: main.ts passes that on
@@ -8,26 +15,30 @@
 // on, the panel reads GET /api/experiment/trained-chat for the adapters, and
 // again every two minutes while the chat stays on. Every number shown
 // comes from the lab's record of the run: the base model, the epoch, the
-// model that wrote the data, and the held-out loss the lab measured before
+// model that wrote the data, and the held-out score the lab measured before
 // and after training. A message goes to POST /api/experiment/trained-chat,
 // which holds the limits (message length, turns, a rate limit per visitor
 // and a small daily budget) and answers with a plain sentence when one is
 // reached.
 //
-// An adapter may carry a display name its author gave it, and may be marked
-// to keep. Both are labels from the lab's record: the name is shown above the
-// lab id, which stays the adapter's identity and is what a message is sent
-// to, and a kept adapter gets a small "kept" mark. The server lists kept
-// adapters first.
+// When the server offers it (compare_enabled), a switch asks the untrained
+// base model the same question and shows both answers side by side. Both
+// answers must come back for a question to count as a turn.
 //
-// An adapter trained on rows of a public dataset (the server lists one only
-// when the owner allowed it) says so in place of "Data written by": the
-// dataset's name, and that nobody at the lab has read those rows.
+// An adapter may carry a display name its author gave it, and may be marked
+// to keep. Both are labels from the lab's record. The server lists kept
+// adapters first. An adapter trained on rows of a public dataset says so in
+// its details: the dataset's name, and that nobody at the lab has read those
+// rows.
 //
 // The panel can also hold the story box of the research loop's best kept
 // model (ResearchStoryBox.ts), which has its own switch and its own route.
-// main.ts attaches it. The panel's button is on the page while either is on;
+// main.ts attaches it. It is a card on the shelf; choosing it puts the box in
+// the conversation pane. The panel's button is on the page while either is on;
 // with only the story box on, the chat's own parts are hidden.
+//
+// The panel reports each real reply through onReply, so the room's speaking
+// tube can glow. Nothing here animates to suggest a model is working.
 //
 // All text from the server and from the model is put on the page as text,
 // never as markup.
@@ -51,6 +62,8 @@ export interface TrainedAdapterView {
   scoreBefore?: number | null
   scoreAfter?: number | null
   expiresAt: string | null
+  /** When the lab stored it, if the server says. */
+  createdAt?: string
   /** The display name its author gave it, when it has one. A label only. */
   name: string | null
   /** Marked to keep, and by whom ("the owner" or a model's name). */
@@ -125,6 +138,7 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
       lossAfter: num(o.holdout_loss_after),
       ...(o.kind === 'rl' ? { kind: 'rl' as const, scoreBefore: num(o.rl_score_before), scoreAfter: num(o.rl_score_after) } : {}),
       expiresAt: expires,
+      ...(typeof o.created_at === 'string' && !Number.isNaN(Date.parse(o.created_at)) ? { createdAt: o.created_at } : {}),
       name: text(o.name, 40),
       kept: o.kept === true,
       keptBy: o.kept === true ? text(o.kept_by, 60) : null,
@@ -179,22 +193,375 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
   }
 }
 
+// ---------------------------------------------------------------------------
+// Pure helpers for the shelf, the gauge and the request. No DOM here.
+// ---------------------------------------------------------------------------
+
+/** What the chat route's GET answer says, strictly read. */
+export interface ChatList {
+  enabled: boolean
+  /** The route could not read the list: say so, never "nothing has been trained". */
+  unavailable: boolean
+  compareEnabled: boolean
+  adapters: TrainedAdapterView[]
+  limits: ChatLimits
+  notice: string | null
+}
+
+export function parseListResponse(raw: unknown): ChatList {
+  const o = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {}
+  return {
+    enabled: o.enabled === true,
+    unavailable: o.unavailable === true,
+    compareEnabled: o.compare_enabled === true,
+    adapters: parseAdapters(o),
+    limits: parseLimits(o),
+    notice: text(o.notice, 300),
+  }
+}
+
+/** The word on a card's tag: how the model was made. */
+export function kindLabel(a: TrainedAdapterView | 'story'): string {
+  if (a === 'story') return 'Story Model'
+  return a.kind === 'rl' ? 'Practice by Reward' : 'Fine-Tuned'
+}
+
+/** Neutral mark colour for a maker with no accent: the wood edge. */
+export const ACCENT_NEUTRAL = '#7A6548'
+const ACCENTS: Array<[string, string]> = [
+  ['gemini', '#4285F4'], ['deepseek', '#10A37F'], ['claude', '#D97706'], ['gpt', '#412991'], ['grok', '#1DA1F2'],
+]
+/** The room's accent for a maker, by name. A fallback model follows its own name. Anything else is neutral. */
+export function accentFor(authorName: string | null | undefined): string {
+  const name = (authorName ?? '').trim().toLowerCase()
+  for (const [prefix, colour] of ACCENTS) if (name.startsWith(prefix)) return colour
+  return ACCENT_NEUTRAL
+}
+
+export interface GaugeView {
+  kind: 'sft' | 'rl' | 'none'
+  heading: string
+  caption: string
+  rows: Array<{ label: 'Before' | 'After'; value: number; text: string; pct: number }>
+  aria: string
+  /** Only for kind 'none'. */
+  none: string
+}
+
+/**
+ * The before and after gauge of a card. It exists only when the lab measured
+ * both numbers. Loss bars are proportional to the larger of the two (a
+ * comparison, with no invented maximum); a reward score is on its real 0 to 1
+ * scale.
+ */
+export function gaugeView(a: TrainedAdapterView): GaugeView {
+  const none: GaugeView = { kind: 'none', heading: '', caption: '', rows: [], aria: '', none: 'No held-out score recorded.' }
+  const rl = a.kind === 'rl'
+  const before = rl ? a.scoreBefore ?? null : a.lossBefore
+  const after = rl ? a.scoreAfter ?? null : a.lossAfter
+  if (before === null || after === null) return none
+  const clamp = (n: number) => Math.max(0, Math.min(100, n))
+  if (rl) {
+    return {
+      kind: 'rl', heading: 'Held-Out Score', caption: 'Higher Is Better', none: '',
+      rows: [
+        { label: 'Before', value: before, text: before.toFixed(2), pct: clamp(before * 100) },
+        { label: 'After', value: after, text: after.toFixed(2), pct: clamp(after * 100) },
+      ],
+      aria: `Held-out rubric score ${before.toFixed(2)} before training, ${after.toFixed(2)} after. Higher is better. Measured by the lab.`,
+    }
+  }
+  const top = Math.max(before, after)
+  const pct = (v: number) => (top > 0 ? clamp((v / top) * 100) : 0)
+  return {
+    kind: 'sft', heading: 'Held-Out Loss', caption: 'Lower Is Better', none: '',
+    rows: [
+      { label: 'Before', value: before, text: before.toFixed(2), pct: pct(before) },
+      { label: 'After', value: after, text: after.toFixed(2), pct: pct(after) },
+    ],
+    aria: `Held-out loss ${before.toFixed(2)} before training, ${after.toFixed(2)} after. Lower is better. Measured by the lab.`,
+  }
+}
+
+/** A string that changes when anything the shelf draws changes, so a refresh can skip an identical redraw. */
+export function shelfSignature(parts: { adapters: TrainedAdapterView[]; story: boolean; chat: boolean; state: string; compare: boolean; limits: ChatLimits; notice: string | null }): string {
+  return JSON.stringify(parts)
+}
+
+/** "Turn 3 of 8" is the turn the next message will be; once all are used it says so. */
+export function turnCounterText(used: number, max: number): string {
+  return used >= max ? `${max} of ${max} used` : `Turn ${used + 1} of ${max}`
+}
+
+/** The character counter shows from 80 percent of the limit. */
+export function counterVisible(length: number, limit: number): boolean {
+  return limit > 0 && length >= Math.ceil(limit * 0.8)
+}
+
+/** What the visitor's box holds in compare mode: the untrained side's earlier answers. Null means a normal chat. */
+export function buildChatBody(adapter: string, history: Turn[], baseReplies: string[] | null): Record<string, unknown> {
+  const messages = history.map(t => ({ role: t.role, content: t.content }))
+  return baseReplies === null ? { adapter, messages } : { adapter, messages, compare: true, base_replies: [...baseReplies] }
+}
+
+export type ReplySide = { ok: true; reply: string; cutShort: boolean } | { ok: false; message: string | null }
+export type ReadReply =
+  | { kind: 'error'; message: string | null }
+  | { kind: 'single'; reply: string; cutShort: boolean; turnsLeft: number | null }
+  | { kind: 'pair'; trained: ReplySide; untrained: ReplySide; baseModel: string | null; turnsLeft: number | null; commit: boolean }
+
+function readSide(v: unknown): ReplySide {
+  const o = v && typeof v === 'object' ? v as Record<string, unknown> : {}
+  const reply = o.ok === true ? text(o.reply, 1200) : null
+  if (reply) return { ok: true, reply, cutShort: o.cut_short === true }
+  return { ok: false, message: text(o.message, 300) }
+}
+
+/**
+ * The answer to a message, strictly read. `ok` is the HTTP result. Anything
+ * that does not match the server's shapes is an error, never a throw.
+ */
+export function readReply(ok: boolean, json: unknown, compare: boolean): ReadReply {
+  const o = json && typeof json === 'object' ? json as Record<string, unknown> : {}
+  const message = text(o.message, 300)
+  if (!ok) return { kind: 'error', message }
+  const left = num(o.turns_left)
+  const turnsLeft = left !== null && Number.isInteger(left) && left >= 0 && left <= 50 ? left : null
+  if (!compare) {
+    const reply = text(o.reply, 1200)
+    return reply ? { kind: 'single', reply, cutShort: o.cut_short === true, turnsLeft } : { kind: 'error', message }
+  }
+  if (o.compare !== true) return { kind: 'error', message }
+  const trained = readSide(o.trained)
+  const untrained = readSide(o.untrained)
+  if (!trained.ok && !untrained.ok) return { kind: 'error', message: trained.message ?? untrained.message ?? message }
+  return { kind: 'pair', trained, untrained, baseModel: text(o.base_model, 80), turnsLeft, commit: trained.ok && untrained.ok }
+}
+
+/** A line for the details: "Trained N days ago." from the record's created_at, when the server sends one. */
+export function trainedAgoText(createdAt: string | undefined, nowMs: number): string | null {
+  if (!createdAt) return null
+  const t = Date.parse(createdAt)
+  if (Number.isNaN(t) || t > nowMs) return null
+  const days = Math.floor((nowMs - t) / 86_400_000)
+  return days === 0 ? 'Trained today.' : `Trained ${days} ${days === 1 ? 'day' : 'days'} ago.`
+}
+
+// ---------------------------------------------------------------------------
+// The panel
+// ---------------------------------------------------------------------------
+
 interface Turn { role: 'user' | 'assistant'; content: string }
+
+/** The server stops waiting for a model after this long (TRAINED_CHAT_TIMEOUT_MS in api/_lib/tinker-chat.ts). */
+const SERVER_WAIT_SECONDS = 45
+const STORY = 'story'
+const WIDE = '(max-width: 760px)'
+const TUBE_LINE = 'When someone gets a reply here, the Commentator\'s speaking tube in the room glows for two minutes.'
+const EMPTY_AFTER = 'None has been saved yet, so there is no one to talk to.'
+
+export const PANEL_CSS = `
+      #trained-chat-container { position: fixed; bottom: 188px; right: 20px; z-index: 150; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+      #trained-chat-toggle { width: 44px; height: 44px; border-radius: 50%; background: rgba(251,249,244,0.94); border: 1px solid #7A6548; cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 12px rgba(60,42,20,0.18); transition: transform 0.2s ease, box-shadow 0.2s ease; color: #2B241B; padding: 0; }
+      #trained-chat-toggle:hover { transform: scale(1.05); box-shadow: 0 4px 16px rgba(60,42,20,0.25); }
+      #trained-chat-toggle:focus-visible { outline: 2px solid #6B5A1E; outline-offset: 2px; }
+      #trained-chat-toggle svg { width: 20px; height: 20px; opacity: 0.8; }
+      #trained-chat-panel { --tc-surface: #F5F2EB; --tc-raised: #FBF9F4; --tc-sunk: #EAE4D6; --tc-ink: #2B241B; --tc-ink2: #5B4E3D; --tc-brass: #B5A642; --tc-brass-edge: #8A7A2A; --tc-brass-ink: #6B5A1E; --tc-wood-edge: #7A6548; --tc-visitor: #E9DFC8; --tc-model: #FFFFFF; --tc-danger: #8E2F2A; --tc-danger-bg: #F6E1DC; --tc-focus: #6B5A1E; --tc-hair: rgba(139,115,85,0.35); --tc-serif: Georgia, 'Times New Roman', serif; }
+      #trained-chat-panel { position: fixed; right: 76px; bottom: 20px; width: min(880px, calc(100vw - 96px)); height: min(720px, calc(100dvh - 40px)); box-sizing: border-box; background: var(--tc-surface); border: 1px solid var(--tc-wood-edge); border-radius: 14px; box-shadow: 0 10px 36px rgba(60,42,20,0.28); display: none; flex-direction: column; overflow: hidden; z-index: 1080; color: var(--tc-ink); font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; font-size: 15px; line-height: 1.5; }
+      #trained-chat-panel.open { display: flex; }
+      #trained-chat-panel *, #trained-chat-panel *::before, #trained-chat-panel *::after { box-sizing: border-box; }
+      #trained-chat-panel :focus-visible { outline: 2px solid var(--tc-focus); outline-offset: 2px; }
+      #trained-chat-panel button { font-family: inherit; color: var(--tc-ink); }
+      #trained-chat-panel .tc-head { flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; min-height: 52px; padding: 2px 4px 2px 18px; background: var(--tc-raised); border-top: 3px solid var(--tc-brass); border-bottom: 1px solid var(--tc-hair); }
+      #trained-chat-panel .tc-title { font-family: var(--tc-serif); font-size: 17px; font-weight: 700; color: var(--tc-ink); }
+      #trained-chat-panel .tc-close { width: 44px; height: 44px; background: none; border: 0; font-size: 24px; line-height: 1; cursor: pointer; border-radius: 10px; }
+      #trained-chat-panel .tc-close:hover { background: var(--tc-sunk); }
+      #trained-chat-panel .tc-body { flex: 1 1 auto; min-height: 0; display: grid; grid-template-columns: 272px minmax(0, 1fr); }
+      #trained-chat-panel .tc-shelf { min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px; padding: 14px 14px 16px; background: var(--tc-sunk); border-right: 1px solid var(--tc-wood-edge); }
+      #trained-chat-panel .tc-shelf-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+      #trained-chat-panel .tc-shelf-title { font-family: var(--tc-serif); font-size: 15px; font-weight: 700; }
+      #trained-chat-panel .tc-shelf-count { font-size: 13px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-cards { display: flex; flex-direction: column; gap: 8px; }
+      #trained-chat-panel .tc-card { display: flex; flex-direction: column; gap: 5px; width: 100%; min-height: 76px; padding: 10px 12px 10px 14px; text-align: left; background: var(--tc-raised); border: 1px solid var(--tc-wood-edge); border-radius: 10px; cursor: pointer; font-size: 13px; line-height: 1.35; position: relative; transition: background 0.12s ease; }
+      #trained-chat-panel .tc-card:hover { background: var(--tc-surface); }
+      #trained-chat-panel .tc-card[aria-pressed="true"] { border: 2px solid var(--tc-brass-edge); padding: 9px 11px 9px 13px; }
+      #trained-chat-panel .tc-card[aria-pressed="true"]::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--tc-brass); border-radius: 8px 0 0 8px; }
+      #trained-chat-panel .tc-card-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+      #trained-chat-panel .tc-card-title { font-family: var(--tc-serif); font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
+      #trained-chat-panel .tc-card-title.tc-mono { font: 600 13px/1.3 ui-monospace, Menlo, monospace; }
+      #trained-chat-panel .tc-kept { flex: none; padding: 0 7px; border-radius: 9px; border: 1px solid var(--tc-brass-edge); background: var(--tc-brass); color: var(--tc-ink); font: 600 12px/18px 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+      #trained-chat-panel .tc-maker { display: flex; align-items: center; gap: 7px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-swatch { flex: none; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--tc-ink); }
+      #trained-chat-panel .tc-tag { align-self: flex-start; padding: 0 8px; border-radius: 10px; border: 1px solid var(--tc-brass-edge); font-size: 12px; font-variant: small-caps; letter-spacing: 0.4px; font-weight: 600; line-height: 18px; color: var(--tc-ink); }
+      #trained-chat-panel .tc-gauge { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; font-size: 12px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-gauge-head { display: flex; justify-content: space-between; gap: 6px; }
+      #trained-chat-panel .tc-gauge-row { display: grid; grid-template-columns: 44px 1fr 34px; align-items: center; gap: 6px; }
+      #trained-chat-panel .tc-track { height: 8px; background: var(--tc-sunk); border: 1px solid var(--tc-wood-edge); border-radius: 4px; overflow: hidden; }
+      #trained-chat-panel .tc-bar { height: 100%; background: #8B7B66; }
+      #trained-chat-panel .tc-bar.tc-after { background: var(--tc-brass); border-right: 1px solid var(--tc-brass-edge); }
+      #trained-chat-panel .tc-gauge-num { text-align: right; font-variant-numeric: tabular-nums; color: var(--tc-ink); }
+      #trained-chat-panel .tc-shelf-foot { margin-top: auto; padding-top: 6px; border-top: 1px solid var(--tc-hair); font-size: 12px; color: var(--tc-ink2); display: flex; flex-direction: column; gap: 6px; }
+      #trained-chat-panel .tc-shelf-foot p, #trained-chat-panel .tc-sheet p { margin: 0; }
+      #trained-chat-panel .tc-sheet { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; padding: 28px 24px; max-width: 520px; }
+      #trained-chat-panel .tc-sheet h2 { margin: 0; font-family: var(--tc-serif); font-size: 18px; font-weight: 700; }
+      #trained-chat-panel .tc-shelf .tc-sheet { padding: 4px 0 0; max-width: none; font-size: 14px; }
+      #trained-chat-panel .tc-shelf .tc-sheet h2 { font-size: 15px; }
+      #trained-chat-panel.tc-full-sheet .tc-body { grid-template-columns: minmax(0, 1fr); }
+      #trained-chat-panel.tc-full-sheet .tc-shelf { background: var(--tc-surface); border-right: 0; }
+      #trained-chat-panel.tc-full-sheet .tc-conv, #trained-chat-panel.tc-full-sheet .tc-shelf-head, #trained-chat-panel.tc-full-sheet .tc-cards { display: none; }
+      #trained-chat-panel.tc-full-sheet .tc-sheet-host { margin: auto 0; display: flex; justify-content: center; }
+      #trained-chat-panel.tc-full-sheet .tc-shelf .tc-sheet { padding: 28px 24px; max-width: 480px; align-items: center; text-align: center; font-size: 15px; }
+      #trained-chat-panel.tc-full-sheet .tc-shelf .tc-sheet h2 { font-size: 20px; }
+      #trained-chat-panel.tc-full-sheet .tc-shelf-foot { margin-top: 0; }
+      #trained-chat-panel .tc-conv { min-height: 0; min-width: 0; display: flex; flex-direction: column; background: var(--tc-surface); }
+      #trained-chat-panel .tc-conv-head { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-height: 56px; padding: 8px 14px; background: var(--tc-raised); border-bottom: 1px solid var(--tc-hair); }
+      #trained-chat-panel .tc-who { flex: 1 1 220px; min-width: 0; }
+      #trained-chat-panel .tc-who-title { display: flex; align-items: center; gap: 7px; font-family: var(--tc-serif); font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
+      #trained-chat-panel .tc-who-sub { font-size: 12.5px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+      #trained-chat-panel .tc-btn, #trained-chat-panel .tc-back { min-height: 44px; padding: 0 12px; background: var(--tc-raised); border: 1px solid var(--tc-wood-edge); border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; color: var(--tc-ink); }
+      #trained-chat-panel .tc-btn:hover, #trained-chat-panel .tc-back:hover { background: var(--tc-sunk); }
+      #trained-chat-panel .tc-back { display: none; }
+      #trained-chat-panel .tc-switch { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 10px; background: var(--tc-raised); border: 1px solid var(--tc-wood-edge); border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; }
+      #trained-chat-panel .tc-switch[aria-disabled="true"] { cursor: default; opacity: 0.75; }
+      #trained-chat-panel .tc-switch-knob { position: relative; flex: none; width: 34px; height: 18px; border-radius: 9px; border: 1.5px solid var(--tc-wood-edge); background: var(--tc-sunk); }
+      #trained-chat-panel .tc-switch-knob::after { content: ''; position: absolute; top: 1px; left: 1px; width: 12px; height: 12px; border-radius: 50%; background: var(--tc-wood-edge); }
+      #trained-chat-panel .tc-switch[aria-checked="true"] .tc-switch-knob { background: var(--tc-brass); border-color: var(--tc-brass-edge); }
+      #trained-chat-panel .tc-switch[aria-checked="true"] .tc-switch-knob::after { left: 17px; background: var(--tc-ink); }
+      #trained-chat-panel .tc-switch-note { flex: none; margin: 0; padding: 6px 14px; font-size: 12.5px; color: var(--tc-ink2); border-bottom: 1px solid var(--tc-hair); background: var(--tc-surface); }
+      #trained-chat-panel .tc-details { flex: none; max-height: 34%; overflow-y: auto; padding: 8px 14px; background: var(--tc-raised); border-bottom: 1px solid var(--tc-hair); }
+      #trained-chat-panel [hidden] { display: none !important; }
+      #trained-chat-panel .tc-details p { margin: 0 0 6px; font-size: 13px; color: var(--tc-ink); }
+      #trained-chat-panel .tc-log { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 16px 16px 12px; }
+      #trained-chat-panel .tc-log-empty { margin: auto; max-width: 360px; text-align: center; color: var(--tc-ink2); font-size: 14px; }
+      #trained-chat-panel .tc-ex { display: flex; flex-direction: column; gap: 8px; }
+      #trained-chat-panel .tc-who-label { font-size: 12px; font-variant: small-caps; letter-spacing: 0.5px; font-weight: 600; color: var(--tc-ink2); margin-bottom: 2px; }
+      #trained-chat-panel .tc-slip { align-self: flex-end; max-width: 85%; }
+      #trained-chat-panel .tc-slip .tc-who-label { text-align: right; }
+      #trained-chat-panel .tc-msg { padding: 9px 12px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.5; }
+      #trained-chat-panel .tc-msg.user { background: var(--tc-visitor); border: 1px solid var(--tc-wood-edge); border-radius: 10px 10px 2px 10px; }
+      #trained-chat-panel .tc-msg.assistant { background: var(--tc-model); border: 1px solid var(--tc-wood-edge); border-left-width: 3px; border-radius: 2px 10px 10px 10px; }
+      #trained-chat-panel .tc-msg.wait { background: transparent; border: 1px dashed var(--tc-wood-edge); border-radius: 2px 10px 10px 10px; color: var(--tc-ink2); font-size: 14px; }
+      #trained-chat-panel .tc-msg.failed { background: var(--tc-danger-bg); border: 1px solid var(--tc-danger); border-radius: 2px 10px 10px 10px; color: var(--tc-danger); font-size: 14px; }
+      #trained-chat-panel .tc-sheet-wrap { align-self: flex-start; max-width: 92%; min-width: 0; }
+      #trained-chat-panel .tc-pair { display: grid; grid-template-columns: minmax(0, 1fr); gap: 10px; }
+      #trained-chat-panel .tc-pair .tc-sheet-wrap { max-width: none; width: 100%; }
+      #trained-chat-panel .tc-pair.tc-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      #trained-chat-panel .tc-sheet-wrap.tc-untrained .tc-msg.assistant { background: var(--tc-sunk); border: 1px dashed var(--tc-wood-edge); border-left: 3px solid var(--tc-wood-edge); }
+      #trained-chat-panel .tc-fine { font-size: 12px; color: var(--tc-ink2); margin-top: 3px; }
+      #trained-chat-panel .tc-story-slot { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+      #trained-chat-panel:not(.tc-story-chosen) .tc-story-slot, #trained-chat-panel.tc-story-chosen .tc-chatonly { display: none; }
+      #trained-chat-panel.tc-chat-off .tc-shelf { display: none; }
+      #trained-chat-panel.tc-chat-off .tc-body { grid-template-columns: minmax(0, 1fr); }
+      #trained-chat-panel.tc-chat-off .tc-back { display: none; }
+      #trained-chat-panel .tc-foot { flex: none; padding: 8px 14px 10px; background: var(--tc-raised); border-top: 1px solid var(--tc-wood-edge); }
+      #trained-chat-panel .tc-banner { margin: 0 0 8px; padding: 8px 10px; border: 1px solid var(--tc-danger); border-radius: 8px; background: var(--tc-danger-bg); color: var(--tc-danger); font-size: 14px; }
+      #trained-chat-panel .tc-form { display: flex; flex-direction: column; gap: 6px; }
+      #trained-chat-panel .tc-input-row { display: flex; gap: 8px; align-items: flex-end; }
+      #trained-chat-panel textarea { flex: 1; min-height: 44px; max-height: 130px; resize: none; border-radius: 10px; border: 1px solid var(--tc-wood-edge); background: var(--tc-model); color: var(--tc-ink); padding: 10px; font-family: inherit; font-size: 16px; line-height: 1.3; }
+      #trained-chat-panel .tc-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-count.tc-over { color: var(--tc-danger); font-weight: 600; }
+      #trained-chat-panel .tc-limit { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; }
+      #trained-chat-panel .tc-limit p { margin: 0; flex: 1 1 200px; }
+      #trained-chat-panel .tc-note { margin: 6px 0 0; font-size: 12px; color: var(--tc-ink2); }
+      .tc-send, #trained-chat-panel .tc-new { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--tc-brass-edge); background: var(--tc-brass); color: var(--tc-ink); cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600; }
+      #trained-chat-panel .tc-send, #trained-chat-panel .tc-new, #trained-chat-panel .tc-again { font-size: 15px; color: var(--tc-ink); }
+      #trained-chat-panel .tc-new { background: var(--tc-raised); border-color: var(--tc-wood-edge); font-size: 14px; font-weight: 600; }
+      #trained-chat-panel .tc-again { min-height: 44px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--tc-wood-edge); background: var(--tc-raised); font-weight: 600; cursor: pointer; }
+      #trained-chat-panel button:disabled, #trained-chat-panel textarea:disabled { opacity: 0.55; cursor: default; }
+      #trained-chat-panel .tc-sr { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
+      #trained-chat-panel .tc-story { display: flex; flex-direction: column; gap: 10px; padding: 16px; }
+      #trained-chat-panel .tc-story-title { font-family: var(--tc-serif); font-size: 16px; font-weight: 700; color: var(--tc-ink); }
+      #trained-chat-panel .tc-story-about, #trained-chat-panel .tc-story-note { color: var(--tc-ink2); font-size: 14px; }
+      #trained-chat-panel .tc-notice { padding: 8px 10px; border-radius: 8px; background: var(--tc-visitor); border: 1px solid var(--tc-wood-edge); color: var(--tc-ink); font-size: 13px; }
+      #trained-chat-panel .tc-story-form { display: flex; gap: 8px; }
+      #trained-chat-panel .tc-story-input { flex: 1; min-width: 0; min-height: 44px; border-radius: 10px; border: 1px solid var(--tc-wood-edge); background: var(--tc-model); color: var(--tc-ink); padding: 0 10px; font-family: inherit; font-size: 16px; }
+      #trained-chat-panel .tc-story-text { padding: 10px 12px; border-radius: 2px 10px 10px 10px; background: var(--tc-model); border: 1px solid var(--tc-wood-edge); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.5; }
+      #trained-chat-panel .tc-story .tc-status { color: var(--tc-ink2); font-size: 13px; min-height: 0; }
+      @media (max-width: 760px) {
+        #trained-chat-panel { inset: 0; right: 0; bottom: 0; width: 100%; height: 100dvh; border-radius: 0; border: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+        #trained-chat-panel .tc-body { grid-template-columns: minmax(0, 1fr); }
+        #trained-chat-panel.tc-view-shelf .tc-conv { display: none; }
+        #trained-chat-panel.tc-view-chat .tc-shelf { display: none; }
+        #trained-chat-panel.tc-view-chat.tc-full-sheet .tc-shelf { display: flex; }
+        #trained-chat-panel .tc-shelf { border-right: 0; }
+        #trained-chat-panel .tc-back { display: inline-block; }
+        #trained-chat-panel .tc-pair.tc-two { grid-template-columns: minmax(0, 1fr); }
+        #trained-chat-panel .tc-slip { max-width: 92%; }
+        #trained-chat-panel .tc-conv-head { gap: 4px 8px; padding: 6px 12px 8px; }
+        #trained-chat-panel .tc-controls { display: contents; }
+        #trained-chat-panel .tc-back { order: 1; }
+        #trained-chat-panel .tc-controls .tc-new { order: 2; margin-left: auto; }
+        #trained-chat-panel .tc-who { order: 3; flex-basis: 100%; }
+        #trained-chat-panel .tc-controls .tc-btn, #trained-chat-panel .tc-controls .tc-switch { order: 4; }
+        #trained-chat-panel .tc-sheet { padding: 24px 18px; }
+      }
+      @media (max-height: 560px) {
+        #trained-chat-panel .tc-switch-note, #trained-chat-panel .tc-who-sub, #trained-chat-panel .tc-note, #trained-chat-panel .tc-log-empty { display: none; }
+        #trained-chat-panel .tc-head { min-height: 44px; }
+        #trained-chat-panel .tc-details { max-height: 25%; }
+      }
+      @media (prefers-reduced-motion: reduce) { #trained-chat-toggle, #trained-chat-panel .tc-card { transition: none; } }
+    `
+
+function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, content?: string): HTMLElementTagNameMap[K] {
+  const e = document.createElement(tag)
+  if (className) e.className = className
+  if (content !== undefined) e.textContent = content
+  return e
+}
+
+const FOCUSABLE = 'button:not([disabled]), textarea:not([disabled]), input:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
 
 export class TrainedChatPanel {
   private container: HTMLDivElement
   private toggle: HTMLButtonElement
   private panel: HTMLDivElement
-  private list: HTMLDivElement
+  private shelf: HTMLElement
+  private shelfHead: HTMLDivElement
+  private shelfCount: HTMLSpanElement
+  private cards: HTMLDivElement
+  private shelfSheet: HTMLDivElement
+  private shelfFoot: HTMLDivElement
+  private conv: HTMLElement
+  private backButton: HTMLButtonElement
+  private whoTitle: HTMLDivElement
+  private whoSub: HTMLDivElement
+  private detailsButton: HTMLButtonElement
+  private details: HTMLDivElement
+  private switchButton: HTMLButtonElement
+  private switchNote: HTMLParagraphElement
+  private newButton: HTMLButtonElement
   private log: HTMLDivElement
+  private storySlot: HTMLDivElement
+  private banner: HTMLDivElement
+  private form: HTMLFormElement
   private input: HTMLTextAreaElement
   private send: HTMLButtonElement
-  private status: HTMLDivElement
-  private notice: HTMLDivElement
+  private again: HTMLButtonElement
+  private counter: HTMLSpanElement
+  private turnLabel: HTMLSpanElement
+  private limitRow: HTMLDivElement
+  private inputRow: HTMLDivElement
+  private meta: HTMLDivElement
+  private statusLine: HTMLDivElement
+
   private adapters: TrainedAdapterView[] = []
   private limits: ChatLimits = { maxMessageChars: 500, maxTurns: 8 }
+  private notice: string | null = null
+  private compareEnabled = false
+  /** 'ok', 'unavailable' (the route could not read the list) or 'error' (the request failed). */
+  private loadState: 'ok' | 'unavailable' | 'error' = 'ok'
   private chosen: string | null = null
+  /** The trained side's conversation, in the shape the server wants. */
   private turns: Turn[] = []
+  /** The untrained side's earlier answers (compare only). */
+  private baseReplies: string[] = []
+  private serverTurnsLeft: number | null = null
+  private compareOn = false
+  /** Elements of the exchange that is not yet part of the conversation (waiting, or half answered). */
+  private openBlock: HTMLElement | null = null
+  private halfPair = false
   private busy = false
   private isOpen = false
   /** What the room's state last said about the chat being switched on. */
@@ -203,59 +570,19 @@ export class TrainedChatPanel {
   /** True while the chat route itself has said the chat is on. */
   private chatShown = false
   private story: PanelSection | null = null
+  private signature = ''
+  private undoInert: Array<() => void> = []
+  private keyHandler: ((e: KeyboardEvent) => void) | null = null
+  private viewportHandler: (() => void) | null = null
+  /** Called once with the time (ms) of every real reply from a trained model. The page uses it for the room's cue. */
+  onReply?: (at: number) => void
 
   constructor() {
     this.container = document.createElement('div')
     this.container.id = 'trained-chat-container'
     this.container.style.display = 'none' // shown only once the server says the chat is on
     const style = document.createElement('style')
-    style.textContent = `
-      #trained-chat-container { position: fixed; bottom: 188px; right: 20px; z-index: 150; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
-      #trained-chat-toggle { width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.9); backdrop-filter: blur(8px); border: 1px solid rgba(0,0,0,0.1); cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 12px rgba(0,0,0,0.1); transition: transform 0.2s ease, box-shadow 0.2s ease; color: #3a3226; padding: 0; }
-      #trained-chat-toggle:hover { transform: scale(1.05); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
-      #trained-chat-toggle:focus-visible, #trained-chat-panel button:focus-visible, #trained-chat-panel textarea:focus-visible { outline: 2px solid #B5A642; outline-offset: 2px; }
-      #trained-chat-toggle svg { width: 20px; height: 20px; opacity: 0.6; }
-      #trained-chat-panel { position: fixed; right: 20px; bottom: 76px; width: min(400px, calc(100vw - 40px)); max-height: min(78vh, calc(100dvh - 96px)); background: rgba(24,22,19,0.95); backdrop-filter: blur(16px); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); border: 1px solid rgba(181,166,66,0.25); display: none; flex-direction: column; overflow: hidden; z-index: 1090; color: rgba(245,242,235,0.88); font-size: 12px; line-height: 1.45; }
-      #trained-chat-panel.open { display: flex; }
-      #trained-chat-panel .tc-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 6px 6px 6px 14px; border-bottom: 1px solid rgba(255,255,255,0.08); }
-      #trained-chat-panel .tc-title { color: #f5f2eb; font-size: 13px; font-weight: 600; letter-spacing: 0.3px; }
-      #trained-chat-panel .tc-close { width: 44px; height: 44px; background: none; border: 0; color: rgba(245,242,235,0.7); font-size: 20px; cursor: pointer; border-radius: 10px; }
-      #trained-chat-panel .tc-body { overflow-y: auto; padding: 10px 14px 12px; display: flex; flex-direction: column; gap: 10px; }
-      #trained-chat-panel .tc-notice { padding: 8px 10px; border-radius: 8px; background: rgba(181,166,66,0.12); border: 1px solid rgba(181,166,66,0.3); color: #e8dfb0; font-size: 12px; }
-      #trained-chat-panel .tc-adapter { display: block; width: 100%; min-height: 44px; text-align: left; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); color: inherit; cursor: pointer; font: inherit; }
-      #trained-chat-panel .tc-adapter[aria-pressed="true"] { border-color: #B5A642; background: rgba(181,166,66,0.14); }
-      #trained-chat-panel .tc-adapter b { color: #f5f2eb; font: 12px/1.3 ui-monospace, Menlo, monospace; word-break: break-all; }
-      #trained-chat-panel .tc-adapter b.tc-name { font: 600 13px/1.3 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; word-break: break-word; }
-      #trained-chat-panel .tc-adapter span { display: block; color: rgba(245,242,235,0.62); font-size: 11px; margin-top: 2px; }
-      #trained-chat-panel .tc-adapter span.tc-id { font: 11px/1.3 ui-monospace, Menlo, monospace; word-break: break-all; }
-      #trained-chat-panel .tc-adapter i.tc-kept { display: inline-block; margin-left: 6px; padding: 0 6px; border-radius: 8px; border: 1px solid rgba(181,166,66,0.6); color: #e8dfb0; font: 600 10px/16px 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; letter-spacing: 0.4px; text-transform: uppercase; vertical-align: 1px; }
-      #trained-chat-panel .tc-adapters { display: flex; flex-direction: column; gap: 6px; }
-      #trained-chat-panel .tc-empty { color: rgba(245,242,235,0.5); font-style: italic; }
-      #trained-chat-panel .tc-log { display: flex; flex-direction: column; gap: 6px; }
-      #trained-chat-panel .tc-msg { padding: 7px 10px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; max-width: 92%; }
-      #trained-chat-panel .tc-msg.user { align-self: flex-end; background: rgba(139,115,85,0.4); color: #f5f2eb; }
-      #trained-chat-panel .tc-msg.assistant { align-self: flex-start; background: rgba(255,255,255,0.07); }
-      #trained-chat-panel .tc-status { color: #ffcc80; font-size: 11px; min-height: 16px; }
-      #trained-chat-panel .tc-form { display: flex; gap: 8px; align-items: flex-end; padding: 10px 14px 12px; border-top: 1px solid rgba(255,255,255,0.08); }
-      #trained-chat-panel textarea { flex: 1; min-height: 44px; max-height: 120px; resize: none; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: #f5f2eb; padding: 10px; font-family: inherit; font-size: 16px; line-height: 1.3; }
-      #trained-chat-panel .tc-send, #trained-chat-panel .tc-new { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid rgba(181,166,66,0.5); background: rgba(181,166,66,0.2); color: #f5f2eb; cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600; }
-      #trained-chat-panel .tc-new { background: none; border-color: rgba(255,255,255,0.15); font-weight: 400; align-self: flex-start; }
-      #trained-chat-panel button:disabled { opacity: 0.4; cursor: default; }
-      #trained-chat-panel .tc-chat { display: flex; flex-direction: column; gap: 10px; }
-      #trained-chat-panel.tc-chat-off .tc-chat, #trained-chat-panel.tc-chat-off .tc-form { display: none; }
-      #trained-chat-panel .tc-story { display: flex; flex-direction: column; gap: 8px; padding-bottom: 12px; border-bottom: 1px solid rgba(255,255,255,0.08); }
-      #trained-chat-panel.tc-chat-off .tc-story { padding-bottom: 0; border-bottom: 0; }
-      #trained-chat-panel .tc-story-title { color: #f5f2eb; font-size: 12px; font-weight: 600; }
-      #trained-chat-panel .tc-story-about, #trained-chat-panel .tc-story-note { color: rgba(245,242,235,0.62); font-size: 11px; }
-      #trained-chat-panel .tc-story-form { display: flex; gap: 8px; }
-      #trained-chat-panel .tc-story-input { flex: 1; min-width: 0; min-height: 44px; box-sizing: border-box; border-radius: 10px; border: 1px solid rgba(255,255,255,0.15); background: rgba(0,0,0,0.3); color: #f5f2eb; padding: 0 10px; font-family: inherit; font-size: 16px; }
-      #trained-chat-panel .tc-story-input:focus-visible { outline: 2px solid #B5A642; outline-offset: 2px; }
-      #trained-chat-panel .tc-story-text { padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.07); white-space: pre-wrap; word-break: break-word; font-size: 13px; line-height: 1.5; }
-      @media (max-width: 760px) {
-        #trained-chat-panel { right: 10px; left: 10px; width: auto; bottom: 10px; max-height: calc(100dvh - 20px); }
-      }
-      @media (prefers-reduced-motion: reduce) { #trained-chat-toggle { transition: none; } }
-    `
+    style.textContent = PANEL_CSS
     this.container.appendChild(style)
     document.body.appendChild(this.container)
 
@@ -269,45 +596,157 @@ export class TrainedChatPanel {
     this.toggle.addEventListener('click', () => (this.isOpen ? this.close() : this.open()))
     this.container.appendChild(this.toggle)
 
+    // The panel sits on the page itself, not in the toggle's container: the container's own
+    // stacking level (150) would keep it under the dev button and other panels.
     this.panel = document.createElement('div')
     this.panel.id = 'trained-chat-panel'
     this.panel.setAttribute('role', 'dialog')
+    this.panel.setAttribute('aria-modal', 'true')
     this.panel.setAttribute('aria-label', 'Talk to what they trained')
-    this.panel.innerHTML = `
-      <div class="tc-head"><div class="tc-title">Talk to what they trained</div><button type="button" class="tc-close" aria-label="Close">&times;</button></div>
-      <div class="tc-body">
-        <div class="tc-chat">
-          <div class="tc-notice"></div>
-          <div class="tc-adapters"></div>
-          <div class="tc-log" aria-live="polite"></div>
-          <button type="button" class="tc-new">New conversation</button>
-          <div class="tc-status" role="status"></div>
-        </div>
-      </div>
-      <form class="tc-form">
-        <textarea rows="1" aria-label="Your message" placeholder="Write a message"></textarea>
-        <button type="submit" class="tc-send">Send</button>
-      </form>`
-    this.container.appendChild(this.panel)
-    this.notice = this.panel.querySelector('.tc-notice') as HTMLDivElement
-    this.list = this.panel.querySelector('.tc-adapters') as HTMLDivElement
-    this.log = this.panel.querySelector('.tc-log') as HTMLDivElement
-    this.status = this.panel.querySelector('.tc-status') as HTMLDivElement
-    this.input = this.panel.querySelector('textarea') as HTMLTextAreaElement
-    this.send = this.panel.querySelector('.tc-send') as HTMLButtonElement
-    this.notice.textContent = 'A small model fine-tuned by the lab\'s AI models on data they wrote. Replies are not reviewed.'
-    ;(this.panel.querySelector('.tc-close') as HTMLButtonElement).addEventListener('click', () => this.close())
-    ;(this.panel.querySelector('.tc-new') as HTMLButtonElement).addEventListener('click', () => this.reset())
-    ;(this.panel.querySelector('form') as HTMLFormElement).addEventListener('submit', e => {
+    this.panel.setAttribute('tabindex', '-1')
+    this.panel.classList.add('tc-view-shelf')
+    this.panel.style.display = 'none'
+    document.body.appendChild(this.panel)
+
+    // Header
+    const head = el('div', 'tc-head')
+    head.appendChild(el('div', 'tc-title', 'Talk to What They Trained'))
+    const close = el('button', 'tc-close', '×')
+    close.type = 'button'
+    close.setAttribute('aria-label', 'Close')
+    close.addEventListener('click', () => this.close())
+    head.appendChild(close)
+    this.panel.appendChild(head)
+
+    const body = el('div', 'tc-body')
+    this.panel.appendChild(body)
+
+    // Shelf column
+    this.shelf = el('aside', 'tc-shelf')
+    this.shelf.setAttribute('aria-label', 'On the shelf')
+    this.shelfHead = el('div', 'tc-shelf-head')
+    this.shelfHead.appendChild(el('div', 'tc-shelf-title', 'On the Shelf'))
+    this.shelfCount = el('span', 'tc-shelf-count')
+    this.shelfHead.appendChild(this.shelfCount)
+    this.cards = el('div', 'tc-cards')
+    this.shelfSheet = el('div', 'tc-sheet-host')
+    this.shelfFoot = el('div', 'tc-shelf-foot')
+    this.shelf.append(this.shelfHead, this.shelfSheet, this.cards, this.shelfFoot)
+    body.appendChild(this.shelf)
+
+    // Conversation column
+    this.conv = el('section', 'tc-conv')
+    this.conv.setAttribute('aria-label', 'Conversation')
+    const convHead = el('div', 'tc-conv-head')
+    this.backButton = el('button', 'tc-back', 'Back to Shelf')
+    this.backButton.type = 'button'
+    this.backButton.addEventListener('click', () => {
+      this.panel.classList.remove('tc-view-chat')
+      this.panel.classList.add('tc-view-shelf')
+      this.focusFirstCard()
+    })
+    convHead.appendChild(this.backButton)
+    const who = el('div', 'tc-who')
+    this.whoTitle = el('div', 'tc-who-title')
+    this.whoSub = el('div', 'tc-who-sub')
+    who.append(this.whoTitle, this.whoSub)
+    convHead.appendChild(who)
+    const controls = el('div', 'tc-controls tc-chatonly')
+    this.detailsButton = el('button', 'tc-btn', 'Details')
+    this.detailsButton.type = 'button'
+    this.detailsButton.setAttribute('aria-expanded', 'false')
+    this.detailsButton.setAttribute('aria-controls', 'trained-chat-details')
+    this.detailsButton.addEventListener('click', () => {
+      const open = this.details.hidden
+      this.details.hidden = !open
+      this.detailsButton.setAttribute('aria-expanded', String(open))
+    })
+    this.switchButton = el('button', 'tc-switch')
+    this.switchButton.type = 'button'
+    this.switchButton.setAttribute('role', 'switch')
+    this.switchButton.setAttribute('aria-checked', 'false')
+    this.switchButton.appendChild(el('span', 'tc-switch-label', 'Compare With Untrained'))
+    this.switchButton.appendChild(el('span', 'tc-switch-knob'))
+    this.switchButton.addEventListener('click', () => this.flipCompare())
+    this.switchButton.hidden = true
+    this.newButton = el('button', 'tc-new', 'New Conversation')
+    this.newButton.type = 'button'
+    this.newButton.hidden = true
+    this.newButton.addEventListener('click', () => {
+      this.reset()
+      this.renderConversation()
+      if (!this.coarse()) this.input.focus?.()
+    })
+    controls.append(this.detailsButton, this.switchButton, this.newButton)
+    convHead.appendChild(controls)
+    this.switchNote = el('p', 'tc-switch-note tc-chatonly')
+    this.switchNote.hidden = true
+    this.details = el('div', 'tc-details tc-chatonly')
+    this.details.id = 'trained-chat-details'
+    this.details.hidden = true
+    this.log = el('div', 'tc-log tc-chatonly')
+    this.log.setAttribute('role', 'log')
+    this.log.setAttribute('aria-live', 'polite')
+    this.log.setAttribute('aria-relevant', 'additions')
+    this.log.setAttribute('aria-label', 'Conversation')
+    this.storySlot = el('div', 'tc-story-slot')
+
+    const foot = el('div', 'tc-foot tc-chatonly')
+    this.banner = el('div', 'tc-banner')
+    this.banner.setAttribute('role', 'alert')
+    this.banner.hidden = true
+    this.form = el('form', 'tc-form')
+    this.inputRow = el('div', 'tc-input-row')
+    this.input = el('textarea')
+    this.input.rows = 2
+    this.input.setAttribute('aria-label', 'Your message')
+    this.input.placeholder = 'Write a message'
+    this.send = el('button', 'tc-send', 'Send')
+    this.send.type = 'submit'
+    this.again = el('button', 'tc-again', 'Ask Again')
+    this.again.type = 'button'
+    this.again.hidden = true
+    this.again.addEventListener('click', () => void this.submit())
+    this.inputRow.append(this.input, this.again, this.send)
+    this.meta = el('div', 'tc-meta')
+    this.turnLabel = el('span', 'tc-turns')
+    this.counter = el('span', 'tc-count')
+    this.meta.append(this.counter, this.turnLabel)
+    this.form.append(this.inputRow, this.meta)
+    this.limitRow = el('div', 'tc-limit')
+    this.limitRow.hidden = true
+    this.limitRow.appendChild(el('p', undefined, 'This conversation has used all its turns. Start a new one to keep going.'))
+    const again = el('button', 'tc-new', 'New Conversation')
+    again.type = 'button'
+    again.addEventListener('click', () => {
+      this.reset()
+      this.renderConversation()
+      if (!this.coarse()) this.input.focus?.()
+    })
+    this.limitRow.appendChild(again)
+    const standing = el('p', 'tc-note', 'Replies are not reviewed. They come from small models and can be wrong.')
+    foot.append(this.banner, this.form, this.limitRow, standing)
+    this.statusLine = el('div', 'tc-sr')
+    this.statusLine.setAttribute('role', 'status')
+
+    this.conv.append(convHead, this.switchNote, this.details, this.log, this.storySlot, foot, this.statusLine)
+    body.appendChild(this.conv)
+
+    this.form.addEventListener('submit', e => {
       e.preventDefault()
       void this.submit()
     })
     this.input.addEventListener('keydown', e => {
-      if (e.key === 'Enter' && !e.shiftKey) {
+      if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
         e.preventDefault()
         void this.submit()
       }
-      if (e.key === 'Escape') this.close()
+    })
+    this.input.addEventListener('input', () => {
+      this.input.style.height = 'auto'
+      this.input.style.height = `${Math.min(this.input.scrollHeight, 130)}px`
+      if (!this.banner.hidden) this.clearBanner()
+      this.refreshMeta()
     })
   }
 
@@ -331,15 +770,15 @@ export class TrainedChatPanel {
   }
 
   /**
-   * Puts the story box above the chat. `make` is given the function to call
+   * Puts the story box in the panel. `make` is given the function to call
    * whenever the section starts or stops being shown. The section stays
-   * hidden, and asks for nothing, until it is switched on.
+   * hidden, and asks for nothing, until it is switched on. It shows in the
+   * conversation pane when its card on the shelf is chosen.
    */
   attachStory(make: (onChange: () => void) => PanelSection): void {
     if (this.story) return
     this.story = make(() => this.sync())
-    const body = this.panel.querySelector('.tc-body') as HTMLDivElement
-    body.insertBefore(this.story.element, body.firstChild)
+    this.storySlot.appendChild(this.story.element)
   }
 
   /**
@@ -362,6 +801,8 @@ export class TrainedChatPanel {
     else this.panel.classList.add('tc-chat-off')
     if (!any) this.close()
     this.container.style.display = any ? '' : 'none'
+    this.panel.style.display = any ? '' : 'none'
+    this.renderAll()
   }
 
   private stopRefresh(): void {
@@ -374,30 +815,126 @@ export class TrainedChatPanel {
     if (SLUG.test(slug) && this.chosen !== slug) {
       this.chosen = slug
       this.reset()
+      this.renderAll(true)
     }
+    this.panel.classList.remove('tc-view-shelf')
+    this.panel.classList.add('tc-view-chat')
     this.open()
   }
 
+  private coarse(): boolean {
+    return window.matchMedia?.('(pointer: coarse)')?.matches === true
+  }
+
   private open(): void {
+    if (this.isOpen) return
     this.isOpen = true
     this.panel.classList.add('open')
     this.toggle.setAttribute('aria-expanded', 'true')
     void this.load()
     this.story?.refresh()
-    if (this.chatShown) this.input.focus()
+    this.trapOn()
+    // A phone gets focus on the sheet, not the box, so the keyboard does not jump up.
+    if (this.coarse()) this.panel.focus?.()
+    else if (this.chatShown && this.chosen && this.chosen !== STORY && !this.input.disabled) this.input.focus?.()
+    else this.focusFirstCard()
+    // Nothing to focus (an empty or failed shelf): the sheet itself, so Escape and Tab work from the first key press.
+    if (!(this.panel.contains?.(document.activeElement) === true)) this.panel.focus?.()
   }
 
   private close(): void {
+    const wasOpen = this.isOpen
     this.isOpen = false
     this.panel.classList.remove('open')
     this.toggle.setAttribute('aria-expanded', 'false')
+    this.trapOff()
+    if (wasOpen) this.toggle.focus?.()
+  }
+
+  /** While open: everything else on the page is inert, Tab stays inside, Escape closes, a phone keyboard shrinks the sheet. */
+  private trapOn(): void {
+    this.trapOff()
+    const kids = Array.from(document.body?.children ?? []) as HTMLElement[]
+    for (const kid of kids) {
+      if (kid === this.panel || kid === this.container || kid.id === 'kg-overlay' || kid.tagName === 'SCRIPT' || kid.tagName === 'STYLE') continue
+      if (kid.inert) continue
+      kid.inert = true
+      this.undoInert.push(() => { kid.inert = false })
+    }
+    this.keyHandler = (e: KeyboardEvent) => {
+      const target = e.target as Node | null
+      const inside = !!target && (this.panel.contains?.(target) === true || target === document.body || target === this.toggle)
+      if (e.key === 'Escape' && inside) {
+        e.preventDefault()
+        this.close()
+        return
+      }
+      if (e.key !== 'Tab') return
+      const items = Array.from(this.panel.querySelectorAll(FOCUSABLE) as NodeListOf<HTMLElement>).filter(n => n.getClientRects?.().length)
+      if (!items.length) return
+      const first = items[0]
+      const last = items[items.length - 1]
+      const active = document.activeElement
+      if (e.shiftKey && (active === first || active === this.panel || !this.panel.contains?.(active))) {
+        e.preventDefault()
+        last.focus()
+      } else if (!e.shiftKey && (active === last || !this.panel.contains?.(active))) {
+        e.preventDefault()
+        first.focus()
+      }
+    }
+    document.addEventListener('keydown', this.keyHandler)
+    const vv = window.visualViewport
+    if (vv) {
+      this.viewportHandler = () => {
+        if (window.matchMedia?.(WIDE)?.matches) {
+          this.panel.style.height = `${vv.height}px`
+          this.log.scrollTop = this.log.scrollHeight
+        } else this.panel.style.height = ''
+      }
+      vv.addEventListener('resize', this.viewportHandler)
+      this.viewportHandler()
+    }
+  }
+
+  private trapOff(): void {
+    for (const undo of this.undoInert) undo()
+    this.undoInert = []
+    if (this.keyHandler) document.removeEventListener?.('keydown', this.keyHandler)
+    this.keyHandler = null
+    if (this.viewportHandler) {
+      window.visualViewport?.removeEventListener('resize', this.viewportHandler)
+      this.panel.style.height = ''
+    }
+    this.viewportHandler = null
+  }
+
+  private focusFirstCard(): void {
+    const first = this.shelf.querySelector?.('button') as HTMLElement | null
+    first?.focus?.()
   }
 
   private reset(): void {
     this.turns = []
+    this.baseReplies = []
+    this.serverTurnsLeft = null
+    this.compareOn = false
+    this.openBlock = null
+    this.halfPair = false
     this.log.replaceChildren()
-    this.status.textContent = ''
-    this.refreshForm()
+    this.statusLine.textContent = ''
+    this.clearBanner()
+    this.input.value = ''
+  }
+
+  private clearBanner(): void {
+    this.banner.hidden = true
+    this.banner.textContent = ''
+  }
+
+  private showBanner(message: string | null): void {
+    this.banner.textContent = `Your message was not sent. ${message ?? 'The lab could not be reached. Check your connection and try again.'}`
+    this.banner.hidden = false
   }
 
   /** Reads what can be talked to. With the chat off, or no backend, the button stays hidden. */
@@ -406,8 +943,8 @@ export class TrainedChatPanel {
     try {
       const res = await fetch(API, { headers: { Accept: 'application/json' } })
       if (!res.ok) throw new Error(String(res.status))
-      const data = await res.json() as { enabled?: unknown; notice?: unknown }
-      if (data.enabled !== true) {
+      const list = parseListResponse(await res.json())
+      if (!list.enabled) {
         // The route itself says the chat is off: stop asking. It is asked
         // again only after the room's state has said off and then on again.
         this.stopRefresh()
@@ -416,135 +953,386 @@ export class TrainedChatPanel {
         return
       }
       this.chatShown = true
-      this.sync()
-      this.adapters = parseAdapters(data)
-      this.limits = parseLimits(data)
-      const notice = text(data.notice, 300)
-      if (notice) this.notice.textContent = notice
-      if (this.chosen && !this.adapters.some(a => a.slug === this.chosen)) {
+      this.loadState = list.unavailable ? 'unavailable' : 'ok'
+      this.adapters = list.adapters
+      this.limits = list.limits
+      this.notice = list.notice
+      this.compareEnabled = list.compareEnabled
+      if (this.chosen && this.chosen !== STORY && !this.adapters.some(a => a.slug === this.chosen)) {
         this.chosen = null
         this.reset()
       }
-      if (!this.chosen && this.adapters.length) this.chosen = this.adapters[0].slug
-      this.renderAdapters()
-      this.refreshForm()
+      this.sync()
     } catch {
       if (!this.isOpen) {
         this.chatShown = false
         this.sync()
+      } else {
+        this.loadState = 'error'
+        this.renderAll()
       }
     }
   }
 
-  private renderAdapters(): void {
-    this.list.replaceChildren()
-    if (!this.adapters.length) {
-      const empty = document.createElement('div')
-      empty.className = 'tc-empty'
-      empty.textContent = 'Nothing has been trained yet, or what was trained has expired. When a model trains one, it appears here.'
-      this.list.appendChild(empty)
+  private storyShown(): boolean {
+    return this.story?.isShown() === true
+  }
+
+  private current(): TrainedAdapterView | null {
+    return this.chosen && this.chosen !== STORY ? this.adapters.find(a => a.slug === this.chosen) ?? null : null
+  }
+
+  /** The conversation is with an adapter that is on the shelf now. */
+  private canChat(): boolean {
+    return this.chatShown && this.loadState === 'ok' && this.current() !== null
+  }
+
+  private renderAll(force = false): void {
+    // The first chosen card: kept first, then newest, as the server lists them.
+    if (!this.chosen || (this.chosen === STORY && !this.storyShown())) {
+      this.chosen = this.adapters[0]?.slug ?? (this.storyShown() ? STORY : null)
+    }
+    const signature = shelfSignature({
+      adapters: this.adapters, story: this.storyShown(), chat: this.chatShown, state: this.loadState,
+      compare: this.compareEnabled, limits: this.limits, notice: this.notice,
+    }) + `|${this.chosen}`
+    if (!force && signature === this.signature) return
+    this.signature = signature
+    this.renderShelf()
+    this.renderConversation()
+  }
+
+  private renderShelf(): void {
+    const activeSlug = (document.activeElement as HTMLElement | null)?.getAttribute?.('data-slug') ?? null
+    this.cards.replaceChildren()
+    this.shelfSheet.replaceChildren()
+    this.shelfFoot.replaceChildren()
+    const story = this.storyShown()
+    const chat = this.chatShown
+    const sheet = (heading: string, paragraphs: string[], retry: boolean) => {
+      const box = el('div', 'tc-sheet')
+      box.appendChild(el('h2', undefined, heading))
+      for (const p of paragraphs) box.appendChild(el('p', undefined, p))
+      if (retry) {
+        const b = el('button', 'tc-btn', 'Try Again')
+        b.type = 'button'
+        b.addEventListener('click', () => void this.load())
+        box.appendChild(b)
+      }
+      this.shelfSheet.appendChild(box)
+    }
+    const failed = chat && this.loadState !== 'ok'
+    const empty = chat && !failed && this.adapters.length === 0
+    this.panel.classList.remove('tc-full-sheet')
+    if (failed) {
+      sheet('The Shelf Could Not Be Read', ['Please try again in a moment.'], true)
+      if (!story) this.panel.classList.add('tc-full-sheet')
+    } else if (empty) {
+      sheet('Nothing Is on the Shelf Yet', [
+        'The lab\'s models can fine-tune small models. Each one that is saved appears here, and you can talk to it.',
+        EMPTY_AFTER,
+      ], false)
+      if (!story) this.panel.classList.add('tc-full-sheet')
+    }
+    const list = chat && !failed ? this.adapters : []
+    this.shelfHead.style.display = chat && !failed && !empty ? '' : 'none'
+    this.shelfCount.textContent = `${list.length} ${list.length === 1 ? 'model' : 'models'}`
+    for (const a of list) this.cards.appendChild(this.adapterCard(a))
+    if (story) this.cards.appendChild(this.storyCard())
+    if (chat) {
+      if (this.notice) this.shelfFoot.appendChild(el('p', undefined, this.notice))
+      this.shelfFoot.appendChild(el('p', undefined, TUBE_LINE))
+    }
+    if (activeSlug) {
+      const again = Array.from(this.cards.querySelectorAll?.('button') ?? []).find(b => (b as HTMLElement).getAttribute('data-slug') === activeSlug) as HTMLElement | undefined
+      again?.focus?.()
+    }
+  }
+
+  private makerRow(authorName: string): HTMLDivElement {
+    const row = el('div', 'tc-maker')
+    const swatch = el('span', 'tc-swatch')
+    swatch.style.background = accentFor(authorName)
+    swatch.setAttribute('aria-hidden', 'true')
+    row.append(swatch, el('span', undefined, `Trained by ${authorName}`))
+    return row
+  }
+
+  private adapterCard(a: TrainedAdapterView): HTMLButtonElement {
+    const d = describeAdapter(a)
+    const card = el('button', 'tc-card')
+    card.type = 'button'
+    card.setAttribute('data-slug', a.slug)
+    card.setAttribute('aria-pressed', String(a.slug === this.chosen))
+    const top = el('div', 'tc-card-top')
+    top.appendChild(el('span', a.name ? 'tc-card-title' : 'tc-card-title tc-mono', d.title))
+    if (d.mark) top.appendChild(el('span', 'tc-kept', 'Kept'))
+    card.appendChild(top)
+    card.appendChild(this.makerRow(a.authorName))
+    card.appendChild(el('span', 'tc-tag', kindLabel(a)))
+    card.appendChild(this.gaugeNode(a))
+    card.addEventListener('click', () => this.choose(a.slug))
+    return card
+  }
+
+  private storyCard(): HTMLButtonElement {
+    const card = el('button', 'tc-card')
+    card.type = 'button'
+    card.setAttribute('data-slug', STORY)
+    card.setAttribute('aria-pressed', String(this.chosen === STORY))
+    const top = el('div', 'tc-card-top')
+    top.appendChild(el('span', 'tc-card-title', 'The Research Loop\'s Story Model'))
+    card.appendChild(top)
+    card.appendChild(el('div', 'tc-maker', 'Continues a line you write.'))
+    card.appendChild(el('span', 'tc-tag', kindLabel('story')))
+    card.addEventListener('click', () => this.choose(STORY))
+    return card
+  }
+
+  private gaugeNode(a: TrainedAdapterView): HTMLElement {
+    const g = gaugeView(a)
+    if (g.kind === 'none') return el('div', 'tc-gauge', g.none)
+    const box = el('div', 'tc-gauge')
+    box.setAttribute('role', 'img')
+    box.setAttribute('aria-label', g.aria)
+    const head = el('div', 'tc-gauge-head')
+    head.append(el('span', undefined, g.heading), el('span', undefined, g.caption))
+    box.appendChild(head)
+    for (const row of g.rows) {
+      const line = el('div', 'tc-gauge-row')
+      const track = el('div', 'tc-track')
+      const bar = el('div', row.label === 'After' ? 'tc-bar tc-after' : 'tc-bar')
+      bar.style.width = `${row.pct.toFixed(1)}%`
+      track.appendChild(bar)
+      line.append(el('span', undefined, row.label), track, el('span', 'tc-gauge-num', row.text))
+      box.appendChild(line)
+    }
+    return box
+  }
+
+  private choose(slug: string): void {
+    if (this.chosen !== slug) {
+      this.chosen = slug
+      this.reset()
+    }
+    this.signature = ''
+    this.renderAll(true)
+    this.panel.classList.remove('tc-view-shelf')
+    this.panel.classList.add('tc-view-chat')
+    if (this.coarse()) this.panel.focus?.()
+    else if (slug === STORY) (this.storySlot.querySelector?.('input') as HTMLElement | null)?.focus?.()
+    else this.input.focus?.()
+  }
+
+  private renderConversation(): void {
+    const a = this.current()
+    const storyChosen = this.chosen === STORY
+    if (storyChosen) this.panel.classList.add('tc-story-chosen')
+    else this.panel.classList.remove('tc-story-chosen')
+    this.whoTitle.replaceChildren()
+    this.whoSub.textContent = ''
+    this.details.replaceChildren()
+    if (storyChosen) {
+      this.whoTitle.textContent = 'Story Model'
       return
     }
-    for (const a of this.adapters) {
-      const d = describeAdapter(a)
-      const button = document.createElement('button')
-      button.type = 'button'
-      button.className = 'tc-adapter'
-      button.setAttribute('aria-pressed', String(a.slug === this.chosen))
-      const title = document.createElement('b')
-      title.textContent = d.title
-      if (d.id) title.className = 'tc-name'
-      button.appendChild(title)
-      if (d.mark) {
-        const mark = document.createElement('i')
-        mark.className = 'tc-kept'
-        mark.textContent = d.mark
-        button.appendChild(mark)
-      }
-      if (d.id) {
-        const id = document.createElement('span')
-        id.className = 'tc-id'
-        id.textContent = d.id
-        button.appendChild(id)
-      }
-      for (const line of [a.purpose, d.origin, d.label, d.score, d.kept]) {
-        if (!line) continue
-        const span = document.createElement('span')
-        span.textContent = line
-        button.appendChild(span)
-      }
-      button.addEventListener('click', () => {
-        if (this.chosen === a.slug) return
-        this.chosen = a.slug
-        this.reset()
-        this.renderAdapters()
-      })
-      this.list.appendChild(button)
+    if (!a || !this.canChat()) {
+      this.whoTitle.textContent = ''
+      this.switchNote.hidden = true
+      this.switchButton.hidden = true
+      return
     }
+    const d = describeAdapter(a)
+    const swatch = el('span', 'tc-swatch')
+    swatch.style.background = accentFor(a.authorName)
+    swatch.setAttribute('aria-hidden', 'true')
+    this.whoTitle.append(swatch, el('span', undefined, d.title))
+    this.whoSub.textContent = `Trained by ${a.authorName}. Base model ${a.baseModel}.`
+    for (const line of [a.purpose, d.origin, d.label, d.score, d.kept]) {
+      if (!line) continue
+      this.details.appendChild(el('p', undefined, line))
+    }
+    const ago = trainedAgoText(a.createdAt, Date.now())
+    if (ago) this.details.appendChild(el('p', undefined, ago))
+    this.refreshCompare()
+    this.refreshForm()
+    this.showHint()
   }
 
-  /** Says something under the conversation and keeps it in view. */
-  private note(message: string): void {
-    this.status.textContent = message
-    if (message) this.status.scrollIntoView({ block: 'nearest' })
+  /** The invitation in an empty conversation. */
+  private showHint(): void {
+    const a = this.current()
+    if (!a || this.committedTurns() > 0 || this.openBlock || this.log.querySelector?.('.tc-log-empty') || this.log.querySelector?.('.tc-ex')) return
+    this.log.appendChild(el('p', 'tc-log-empty', `Write a message to ${describeAdapter(a).title} below. It answers when you send it.`))
+  }
+
+  private committedTurns(): number {
+    return this.turns.filter(t => t.role === 'user').length
   }
 
   private turnsUsed(): number {
-    return this.turns.filter(t => t.role === 'user').length
+    return this.serverTurnsLeft !== null ? Math.max(0, this.limits.maxTurns - this.serverTurnsLeft) : this.committedTurns()
+  }
+
+  private refreshCompare(): void {
+    const a = this.current()
+    const show = this.compareEnabled && a !== null
+    this.switchButton.hidden = !show
+    this.switchNote.hidden = !show
+    if (!show || !a) return
+    const locked = this.committedTurns() > 0
+    this.switchButton.setAttribute('aria-checked', String(this.compareOn))
+    this.switchButton.setAttribute('aria-disabled', String(locked))
+    this.switchNote.textContent = locked
+      ? 'Start a new conversation to change this.'
+      : `Asks the untrained ${a.baseModel} the same question, so you can see what training changed. Each question uses two of your messages.`
+  }
+
+  private flipCompare(): void {
+    if (this.busy || this.committedTurns() > 0) return
+    this.compareOn = !this.compareOn
+    if (this.halfPair) this.discardOpenBlock()
+    this.refreshCompare()
+    this.refreshForm()
+  }
+
+  private discardOpenBlock(): void {
+    this.openBlock?.remove()
+    this.openBlock = null
+    this.halfPair = false
+  }
+
+  private refreshMeta(): void {
+    const limit = this.limits.maxMessageChars
+    const length = this.input.value?.length ?? 0
+    const show = counterVisible(length, limit)
+    this.counter.textContent = show ? `${length} of ${limit}` : ''
+    if (length >= limit) this.counter.classList.add('tc-over')
+    else this.counter.classList.remove('tc-over')
+    this.turnLabel.textContent = turnCounterText(this.turnsUsed(), this.limits.maxTurns)
   }
 
   private refreshForm(): void {
     const full = this.turnsUsed() >= this.limits.maxTurns
+    const ok = this.canChat()
     this.input.maxLength = this.limits.maxMessageChars
-    this.input.disabled = this.busy || !this.chosen || full
-    this.send.disabled = this.busy || !this.chosen || full
-    if (full && !this.status.textContent) this.note(`This conversation has reached its ${this.limits.maxTurns} turns. Start a new one to keep going.`)
+    this.input.disabled = this.busy || !ok
+    this.send.disabled = this.busy || !ok
+    this.send.textContent = this.busy ? 'Sending' : this.compareOn ? 'Ask Both' : 'Send'
+    this.newButton.hidden = this.committedTurns() === 0 && !this.halfPair
+    this.again.hidden = !this.halfPair
+    this.again.disabled = this.busy
+    this.form.style.display = full ? 'none' : ''
+    this.limitRow.hidden = !full
+    this.refreshMeta()
   }
 
-  private addMessage(turn: Turn): void {
-    const el = document.createElement('div')
-    el.className = `tc-msg ${turn.role}`
-    el.textContent = turn.content
-    this.log.appendChild(el)
-    el.scrollIntoView({ block: 'nearest' })
+  private scrollEnd(): void {
+    this.log.scrollTop = this.log.scrollHeight
+  }
+
+  private slip(content: string): HTMLElement {
+    const wrap = el('div', 'tc-slip')
+    wrap.appendChild(el('div', 'tc-who-label', 'You'))
+    wrap.appendChild(el('div', 'tc-msg user', content))
+    return wrap
+  }
+
+  private sheetFor(label: string, content: string, opts: { accent?: string; untrained?: boolean; failed?: boolean; cut?: boolean; wait?: boolean }): HTMLElement {
+    const wrap = el('div', opts.untrained ? 'tc-sheet-wrap tc-untrained' : 'tc-sheet-wrap')
+    wrap.appendChild(el('div', 'tc-who-label', label))
+    const msg = el('div', opts.failed ? 'tc-msg failed' : opts.wait ? 'tc-msg wait' : 'tc-msg assistant', content)
+    if (opts.accent && !opts.failed && !opts.wait) msg.style.borderLeftColor = opts.accent
+    wrap.appendChild(msg)
+    if (opts.cut) wrap.appendChild(el('div', 'tc-fine', 'The reply was cut at its length limit.'))
+    return wrap
   }
 
   private async submit(): Promise<void> {
     const message = this.input.value.trim()
-    if (!message || this.busy || !this.chosen || this.turnsUsed() >= this.limits.maxTurns) return
-    const adapter = this.chosen
-    const history = [...this.turns, { role: 'user' as const, content: message.slice(0, this.limits.maxMessageChars) }]
+    const a = this.current()
+    if (!message || this.busy || !a || !this.canChat() || this.committedTurns() >= this.limits.maxTurns) return
+    if (this.halfPair) this.discardOpenBlock()
+    this.clearBanner()
+    this.log.querySelector?.('.tc-log-empty')?.remove()
+    const compare = this.compareOn && this.compareEnabled
+    const text1 = message.slice(0, this.limits.maxMessageChars)
+    const history: Turn[] = [...this.turns, { role: 'user', content: text1 }]
+    const title = describeAdapter(a).title
     this.busy = true
-    this.addMessage(history[history.length - 1])
-    this.note('Waiting for the model')
+    const block = el('div', 'tc-ex')
+    block.appendChild(this.slip(text1))
+    block.appendChild(this.sheetFor(
+      title,
+      compare
+        ? `Waiting for ${title} and the untrained ${a.baseModel}. The server stops waiting after ${SERVER_WAIT_SECONDS} seconds.`
+        : `Waiting for ${title}. The server stops waiting after ${SERVER_WAIT_SECONDS} seconds.`,
+      { wait: true },
+    ))
+    this.log.appendChild(block)
+    this.openBlock = block
+    this.scrollEnd()
+    this.statusLine.textContent = compare ? `Waiting for ${title} and the untrained model` : `Waiting for ${title}`
     this.input.value = ''
+    this.input.style.height = ''
     this.refreshForm()
+    const fail = (why: string | null) => {
+      this.discardOpenBlock()
+      this.input.value = message
+      this.statusLine.textContent = ''
+      this.showBanner(why)
+      this.showHint()
+    }
     try {
       const res = await fetch(API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify({ adapter, messages: history }),
+        body: JSON.stringify(buildChatBody(a.slug, history, compare ? this.baseReplies : null)),
       })
-      const data = await res.json().catch(() => ({})) as { reply?: unknown; message?: unknown; cut_short?: unknown }
-      const reply = text(data.reply, 1200)
-      if (!res.ok || !reply) {
-        // The visitor's message stays on screen but is not kept in the conversation, so it can be sent again.
-        this.log.lastElementChild?.remove()
-        this.input.value = message
-        this.note(text(data.message, 300) ?? 'The chat is not available just now. Please try again later.')
-        return
+      const json = await res.json().catch(() => ({}))
+      const read = readReply(res.ok, json, compare)
+      if (read.kind === 'error') {
+        fail(read.message)
+      } else if (read.kind === 'single') {
+        this.turns = [...history, { role: 'assistant', content: read.reply }]
+        this.serverTurnsLeft = read.turnsLeft
+        block.replaceChildren(this.slip(text1), this.sheetFor(title, read.reply, { accent: accentFor(a.authorName), cut: read.cutShort }))
+        this.openBlock = null
+        this.statusLine.textContent = 'Reply received'
+        this.onReply?.(Date.now())
+      } else {
+        const side = (r: ReplySide, label: string, who: string, untrained: boolean): HTMLElement => r.ok
+          ? this.sheetFor(label, r.reply, { accent: untrained ? undefined : accentFor(a.authorName), untrained, cut: r.cutShort })
+          : this.sheetFor(label, r.message ?? `The ${who} model did not answer.`, { failed: true, untrained })
+        const pair = el('div', 'tc-pair tc-two')
+        pair.append(
+          side(read.trained, `Trained: ${title}`, 'trained', false),
+          side(read.untrained, `Untrained: ${read.baseModel ?? a.baseModel}`, 'untrained', true),
+        )
+        block.replaceChildren(this.slip(text1), pair)
+        if (read.commit && read.trained.ok && read.untrained.ok) {
+          this.turns = [...history, { role: 'assistant', content: read.trained.reply }]
+          this.baseReplies = [...this.baseReplies, read.untrained.reply]
+          this.serverTurnsLeft = read.turnsLeft
+          this.openBlock = null
+          this.statusLine.textContent = 'Both replies received'
+        } else {
+          // Only one side answered: the good answer stays, nothing is kept in the conversation, and the text can be asked again.
+          this.halfPair = true
+          this.input.value = message
+          block.appendChild(el('div', 'tc-fine', 'Only one answer came back. Ask again to get both.'))
+          this.statusLine.textContent = 'Only one answer came back'
+        }
+        if (read.trained.ok) this.onReply?.(Date.now())
       }
-      this.turns = [...history, { role: 'assistant', content: reply }]
-      this.addMessage({ role: 'assistant', content: reply })
-      this.note(data.cut_short === true ? 'The reply was cut at its length limit.' : '')
     } catch {
-      this.log.lastElementChild?.remove()
-      this.input.value = message
-      this.note('The chat is not available just now. Please try again later.')
+      fail(null)
     } finally {
       this.busy = false
+      this.refreshCompare()
       this.refreshForm()
-      if (this.isOpen && !this.input.disabled) this.input.focus()
+      this.scrollEnd()
+      if (this.isOpen && !this.input.disabled && !this.coarse()) this.input.focus?.()
     }
   }
 }
