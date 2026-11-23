@@ -26,7 +26,7 @@ beforeEach(() => {
   db.handler = (text, values) => lab.handle(text, values)
   activity.resetChatActivityCache()
 })
-const enableChat = () => Object.assign(process.env, { LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY })
+const enableChat = () => { Object.assign(process.env, { LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY }); lab.addAdapter({ slug: 'e41-0a1b2c3d' }); lab.addAdapter({ slug: 'e30-11112222' }) }
 const row = (status, at, slug = 'e41-0a1b2c3d') => lab.chatCalls.push({ slug, status, http_status: 200, turns: 3, prompt_chars: 99, prompt_tokens: 20, completion_tokens: 8, cost_usd: 0.0001, duration_ms: 400, created_at: new Date(at) })
 const NOW = new Date('2026-11-23T14:03:10.000Z')
 
@@ -46,7 +46,7 @@ test('absent when no answered call was made in the last 24 hours', async () => {
   activity.resetChatActivityCache()
   row('ok', new Date(NOW.getTime() - 23 * 3600_000))
   const a = await activity.chatActivity(NOW)
-  assert.equal(a.last.at, new Date(NOW.getTime() - 23 * 3600_000).toISOString())
+  assert.equal(a.last.at, '2026-11-22T15:03:00.000Z') // rounded down to 30 s
 })
 
 test('the field has exactly the public shape, and counts only answered calls', async () => {
@@ -59,7 +59,7 @@ test('the field has exactly the public shape, and counts only answered calls', a
   row('base_ok', '2026-11-23T14:02:50.000Z')
   row('base_upstream', '2026-11-23T14:02:55.000Z')
   const a = await activity.chatActivity(NOW)
-  assert.deepEqual(a, { now: '2026-11-23T14:03:10.000Z', today: 2, last: { adapter: 'e41-0a1b2c3d', at: '2026-11-23T14:01:52.000Z' } })
+  assert.deepEqual(a, { now: '2026-11-23T14:03:00.000Z', today: 2, last: { adapter: 'e41-0a1b2c3d', at: '2026-11-23T14:01:30.000Z' } })
   assert.deepEqual(Object.keys(a), ['now', 'today', 'last'])
   assert.deepEqual(Object.keys(a.last), ['adapter', 'at'])
 
@@ -67,7 +67,7 @@ test('the field has exactly the public shape, and counts only answered calls', a
   activity.resetChatActivityCache()
   const after = await activity.chatActivity(new Date('2026-11-24T00:00:01.000Z'))
   assert.equal(after.today, 0)
-  assert.equal(after.last.at, '2026-11-23T14:01:52.000Z')
+  assert.equal(after.last.at, '2026-11-23T14:01:30.000Z')
 })
 
 test('only an answered call lights it: an error, a refusal and an untrained row never do', async () => {
@@ -131,4 +131,31 @@ test('docs, env example and the new strings', () => {
   assert.match(read('docs/OPERATIONS.md'), /Qwen\/Qwen3\.5-4B/)
   assert.ok(read('docs/TOOLS.md').includes('trained_chat_activity'))
   for (const p of ['api/_lib/trained-chat.ts', 'api/_lib/trained-chat-activity.ts']) assert.equal(/[–—]/.test(read(p)), false, `a dash in ${p}`)
+})
+
+test('times are rounded down to 30 seconds, so two chats 20 s apart look the same', async () => {
+  enableChat()
+  const at = (sec, ms = 0) => new Date(Date.UTC(2026, 10, 23, 12, 0, sec, ms))
+  const one = activity.publicChatActivity({ slug: 'e41-0a1b2c3d', at: at(7, 431) }, 1, at(40))
+  assert.equal(one.last.at, '2026-11-23T12:00:00.000Z')
+  assert.equal(one.now, '2026-11-23T12:00:30.000Z')
+  const two = activity.publicChatActivity({ slug: 'e41-0a1b2c3d', at: at(27) }, 1, at(40))
+  assert.equal(two.last.at, one.last.at)
+  const three = activity.publicChatActivity({ slug: 'e41-0a1b2c3d', at: at(31) }, 1, at(40))
+  assert.equal(three.last.at, '2026-11-23T12:00:30.000Z')
+})
+
+test('an adapter that is no longer offered is not named', async () => {
+  enableChat()
+  lab.addAdapter({ slug: 'e50-aaaaaaaa' })
+  lab.tinkerRuns[lab.tinkerRuns.length - 1].settings = JSON.stringify({ rank: 16, learning_rate: 0.0002, epochs: 2, batch_size: 8 })
+  // Gone (expired): not offered.
+  row('ok', NOW, 'e99-deadbeef')
+  assert.equal(await activity.chatActivity(NOW), null)
+  // Expired run: not offered either.
+  activity.resetChatActivityCache()
+  const run = lab.tinkerRuns.find(r => r.slug === 'e50-aaaaaaaa')
+  run.expires_at = new Date(NOW.getTime() - 1000).toISOString()
+  row('ok', new Date(NOW.getTime() + 1000), 'e50-aaaaaaaa')
+  assert.equal(await activity.chatActivity(new Date(NOW.getTime() + 2000)), null)
 })

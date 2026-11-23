@@ -239,7 +239,7 @@ test('response shapes: a normal turn is unchanged, a pair, a half pair and a fai
   globalThis.fetch = fakeTinker(sent, (_r, isBase) => (isBase ? new Response('{"error":{"message":"overloaded"}}', { status: 503 }) : completion()))
   const half = await visit(compareAsk(slug), { ip: freshIp() })
   assert.equal(half.code, 200)
-  assert.deepEqual(half.body.untrained, { ok: false, error: 'busy', message: 'The model did not answer this time. Please try again in a moment.' })
+  assert.deepEqual(half.body.untrained, { ok: false, error: 'busy', message: 'The untrained model did not answer. It may not be available.' })
   assert.equal(half.body.trained.ok, true)
 
   // Both fail: the old failure shape, 502, or 504 when both timed out.
@@ -479,4 +479,74 @@ test('source: only tinker-chat.ts reads the Tinker key, and the new visitor stri
   assert.equal(strings.length, 2)
   for (const s of strings) assert.equal(/[–—]/.test(s), false)
   assert.equal(/[–—]/.test(source), false, 'a dash in trained-chat.ts')
+})
+
+// ---- review fixes: retrying one side, the budget edge, the index and pruning ----
+
+const rateTotal = () => [...lab.rate.entries()].filter(([k]) => k.includes('|w:')).reduce((n, [, c]) => n + c, 0)
+
+test('retrying one side asks only that side, counts one message and sets aside only that side', async () => {
+  enableChat()
+  const slug = lab.addAdapter()
+  const sent = []
+  globalThis.fetch = fakeTinker(sent, (_r, isBase) => completion({ content: isBase ? 'Base again.' : 'Trained again.' }))
+  const only = (side, extra = {}) => ({ ...compareAsk(slug), only: side, ...extra })
+
+  const a = await visit(only('untrained'), { ip: freshIp() })
+  assert.equal(a.code, 200)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].isBase, true)
+  assert.deepEqual(a.body.untrained, { ok: true, reply: 'Base again.', cut_short: false })
+  assert.equal(a.body.trained.ok, false)
+  assert.equal(a.body.trained.error, 'skipped')
+  // One message counted at the address and one at the visitor, not two each.
+  assert.equal(rateTotal(), 2) // the ten minute window, address and visitor, one pass
+  assert.deepEqual(lab.chatCalls.map(c => c.status), ['base_ok'])
+
+  sent.length = 0
+  const b = await visit(only('trained'), { ip: freshIp() })
+  assert.equal(b.code, 200)
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].isBase, false)
+  assert.equal(b.body.trained.reply, 'Trained again.')
+  assert.equal(b.body.untrained.error, 'skipped')
+  assert.deepEqual(lab.chatCalls.map(c => c.status), ['base_ok', 'ok'])
+
+  // A retry that fails says so with the untrained message and counts like a call.
+  globalThis.fetch = fakeTinker(sent, () => new Response('{"error":{"message":"no such model"}}', { status: 404 }))
+  const c = await visit(only('untrained'), { ip: freshIp() })
+  assert.deepEqual([c.code, c.body.message], [502, 'The untrained model did not answer. It may not be available.'])
+})
+
+test('"only" is accepted only with compare, and only with a known side', async () => {
+  enableChat()
+  const slug = lab.addAdapter()
+  const read = trainedChat.readChatRequest
+  assert.equal(read({ adapter: slug, messages: [{ role: 'user', content: 'x' }], only: 'trained' }).ok, false)
+  assert.equal(read({ adapter: slug, messages: [{ role: 'user', content: 'x' }], compare: true, base_replies: [], only: 'both' }).ok, false)
+  assert.equal(read({ adapter: slug, messages: [{ role: 'user', content: 'x' }], compare: true, base_replies: [], only: 'trained' }).only, 'trained')
+  assert.equal(read({ adapter: slug, messages: [{ role: 'user', content: 'x' }], compare: true, base_replies: [] }).only, null)
+})
+
+test('the lab budget check asks that the call\'s worst case still fits, so parallel calls at the edge are refused', async () => {
+  enableChat({ LAB_DAILY_BUDGET_USD: '1' })
+  const slug = lab.addAdapter()
+  const sent = []
+  globalThis.fetch = fakeTinker(sent)
+  // $0.0000001 left: the old check (spent >= budget) let this through.
+  lab.modelCalls.push({ cost_usd: 0.9999999, created_at: new Date() })
+  const r = await visit(compareAsk(slug), { ip: freshIp() })
+  assert.equal(r.code, 429)
+  assert.equal(sent.length, 0)
+  assert.equal(lab.chatCalls.length, 0)
+})
+
+test('the room signal reads use an index, and call rows older than thirty days are pruned', async () => {
+  enableChat()
+  // The tables are made once per process, so read the statement from the source.
+  assert.match(readFileSync(join(root, 'api/_lib/tinker-store.ts'), 'utf8'), /CREATE INDEX IF NOT EXISTS idx_trained_chat_calls_ok ON trained_chat_calls\(created_at DESC\) WHERE status = 'ok'/)
+  const day = 86400_000
+  lab.chatCalls.push({ slug: 'e1-00000000', status: 'ok', created_at: new Date(Date.now() - 31 * day) }, { slug: 'e2-00000000', status: 'ok', created_at: new Date(Date.now() - 29 * day) })
+  await store.pruneVisitorCounts(new Date())
+  assert.deepEqual(lab.chatCalls.map(c => c.slug), ['e2-00000000'])
 })

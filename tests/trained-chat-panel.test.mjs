@@ -74,8 +74,8 @@ test('card tags, counters and the shelf signature', () => {
   assert.equal(panel.kindLabel(view(sft())), 'Fine-Tuned')
   assert.equal(panel.kindLabel(view(rl())), 'Practice by Reward')
   assert.equal(panel.kindLabel('story'), 'Story Model')
-  assert.equal(panel.turnCounterText(0, 8), 'Turn 1 of 8')
-  assert.equal(panel.turnCounterText(2, 8), 'Turn 3 of 8')
+  assert.equal(panel.turnCounterText(0, 8), 'Question 1 of 8')
+  assert.equal(panel.turnCounterText(2, 8), 'Question 3 of 8')
   assert.equal(panel.turnCounterText(8, 8), '8 of 8 used')
   assert.equal(panel.counterVisible(399, 500), false)
   assert.equal(panel.counterVisible(400, 500), true)
@@ -273,7 +273,7 @@ test('a shelf of specimen cards: name, maker, kind, gauge, and the honest tube l
     assert.equal(root.all('.tc-shelf-count')[0].textContent, '2 models')
     const foot = root.all('.tc-shelf-foot')[0].textContent
     assert.ok(foot.includes('A notice.'))
-    assert.ok(foot.includes('speaking tube in the room glows for two minutes'))
+    assert.ok(foot.includes('speaking tube in the room glows for up to two minutes'))
     // who you are talking to is always on screen
     assert.equal(root.all('.tc-who-title')[0].textContent, 'Rootkeeper')
     assert.equal(root.all('.tc-who-sub')[0].textContent, `Trained by Claude Fable 5.2. Base model ${BASE}.`)
@@ -291,8 +291,10 @@ test('nothing on the shelf is an invitation with no inputs, and a failed read is
     p.setAvailable(true)
     await settle()
     const root = body.children.find(c => c.id === 'trained-chat-panel')
-    assert.ok(root.textContent.includes('Nothing Is on the Shelf Yet'))
-    assert.ok(root.textContent.includes('None has been saved yet, so there is no one to talk to.'))
+    assert.ok(root.textContent.includes('Nothing Is on the Shelf Right Now'))
+    assert.ok(root.textContent.includes('No trained model is on the shelf. The lab\'s models can train small models. When the lab saves one, it appears here.'))
+    assert.equal(root.textContent.includes('no one to talk to'), false)
+    assert.equal(root.all('.tc-slot').length, 1) // an outline of an empty slot, marked decorative
     assert.match(root.className, /tc-full-sheet/)
     assert.equal(root.all('.tc-card').length, 0)
     assert.equal(root.all('.tc-shelf-head')[0].style.display, 'none')
@@ -302,7 +304,7 @@ test('nothing on the shelf is an invitation with no inputs, and a failed read is
     await settle()
     assert.ok(root.textContent.includes('The Shelf Could Not Be Read'))
     assert.ok(root.textContent.includes('Try Again'))
-    assert.equal(root.textContent.includes('Nothing Is on the Shelf Yet'), false)
+    assert.equal(root.textContent.includes('Nothing Is on the Shelf Right Now'), false)
   })
 })
 
@@ -329,7 +331,9 @@ test('the story model is a card; choosing it shows the box and hides the chat', 
     assert.ok(cards[0].textContent.includes('Continues a line you write.'))
     assert.match(root.className, /tc-story-chosen/) // the only choice, so it is chosen
     assert.equal(/tc-full-sheet/.test(root.className), false) // and the shelf note sits above it, not instead of it
-    assert.ok(root.textContent.includes('Nothing Is on the Shelf Yet'))
+    assert.ok(root.textContent.includes('No Fine-Tuned Models Right Now'))
+    assert.equal(root.all('.tc-slot').length, 0)
+    assert.ok(cards[0].textContent.includes('Its score is self-reported.'))
     // one input at a time: the story box has its own, the chat's is hidden by its class
     const slot = root.all('.tc-story-slot')[0]
     assert.equal(slot.all('input').length, 1)
@@ -355,7 +359,7 @@ test('compare: both answers count as one turn, half a pair is not kept, and the 
     assert.equal(sw.hidden, false)
     assert.equal(sw.getAttribute('role'), 'switch')
     assert.equal(sw.getAttribute('aria-checked'), 'false') // off by default
-    assert.ok(root.all('.tc-switch-note')[0].textContent.includes(`Asks the untrained ${BASE} the same question`))
+    assert.equal(root.all('.tc-switch-note')[0].textContent, 'Also asks the untrained model. Uses 2 messages.')
     click(sw)
     assert.equal(sw.getAttribute('aria-checked'), 'true')
     assert.equal(root.all('.tc-send')[0].textContent, 'Ask Both')
@@ -370,23 +374,25 @@ test('compare: both answers count as one turn, half a pair is not kept, and the 
     assert.deepEqual(sent[0].body, { adapter: 'e41-0a1b2c3d', messages: [{ role: 'user', content: 'First question' }], compare: true, base_replies: [] })
     assert.ok(root.textContent.includes('trained 1'))
     assert.ok(root.textContent.includes('The model did not answer this time.')) // the server's own sentence, under the Untrained label
-    assert.ok(root.textContent.includes('Only one answer came back. Ask again to get both.'))
+    assert.ok(root.textContent.includes('Only one answer came back. Ask Again asks only the model that did not answer, and uses one more message.'))
     assert.equal(box.value, 'First question')
     assert.equal(root.all('.tc-again')[0].hidden, false)
     assert.equal(sw.getAttribute('aria-disabled'), 'false') // not committed, so it may still be switched
     assert.equal(replies.length, 1) // the trained side really answered
 
     // asking again with both answering commits one turn
-    state.post = () => pair(1)
+    // the retry asks only the side that failed, and keeps the answer that came back
+    state.post = () => ({ adapter: 'e41-0a1b2c3d', compare: true, base_model: BASE, trained: { ok: false, error: 'skipped', message: 'x' }, untrained: { ok: true, reply: 'base 1' }, turns_left: 7 })
     click(root.all('.tc-again')[0])
     await settle()
     sent = asked.filter(a => a.method === 'POST')
-    assert.deepEqual(sent[1].body.base_replies, [])
+    assert.deepEqual(sent[1].body, { adapter: 'e41-0a1b2c3d', messages: [{ role: 'user', content: 'First question' }], compare: true, base_replies: [], only: 'untrained' })
     assert.ok(root.textContent.includes('trained 1') && root.textContent.includes('base 1'))
     assert.equal(root.all('.tc-ex').length, 1) // the half pair was replaced, not stacked
-    assert.equal(root.all('.tc-turns')[0].textContent, 'Turn 2 of 8')
+    assert.equal(root.all('.tc-turns')[0].textContent, 'Question 2 of 8')
     assert.equal(sw.getAttribute('aria-disabled'), 'true')
-    assert.ok(root.all('.tc-switch-note')[0].textContent.includes('Start a new conversation to change this.'))
+    assert.ok(root.all('.tc-switch-note')[0].textContent.includes('Locked for this conversation. Start a new one to change it.'))
+    assert.equal(root.all('.tc-switch-state')[0].textContent, 'On, locked') // the reason is visible text, not only a dimmed knob
     assert.deepEqual(texts(root, '.tc-who-label').filter(t => /^(Trained|Untrained)/.test(t)), ['Trained: Rootkeeper', `Untrained: ${BASE}`])
 
     // the next question sends each side its own earlier answer
@@ -397,7 +403,7 @@ test('compare: both answers count as one turn, half a pair is not kept, and the 
     sent = asked.filter(a => a.method === 'POST')
     assert.deepEqual(sent[2].body.messages.map(m => m.content), ['First question', 'trained 1', 'Second question'])
     assert.deepEqual(sent[2].body.base_replies, ['base 1'])
-    assert.equal(replies.length, 3)
+    assert.equal(replies.length, 2) // the retry asked only the untrained side, so it was no new trained reply
   }, { compare: false })
 })
 
@@ -416,6 +422,15 @@ test('a refused message comes back into the box with the reason, and a normal ch
     assert.equal(banner.hidden, false)
     assert.equal(banner.getAttribute('role'), 'alert')
     assert.equal(banner.textContent, 'Your message was not sent. Please wait a few minutes.')
+    // a busy answer did reach the model: the banner does not claim it was not sent
+    state.post = () => ({ status: 502, body: { error: 'busy', message: 'The model did not answer this time. Please try again in a moment.' } })
+    root.all('form')[0].fire('submit')
+    await settle()
+    assert.equal(banner.textContent, 'The model did not answer this time. Please try again in a moment. Your text is still in the box.')
+    assert.equal(banner.textContent.includes('not sent'), false)
+    state.post = () => ({ status: 429, body: { error: 'rate', message: 'Please wait a few minutes.' } })
+    root.all('form')[0].fire('submit')
+    await settle()
     assert.equal(box.value, 'Hello')
     assert.equal(root.all('.tc-ex').length, 0)
     state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'Hi.', cut_short: false, turns_left: 7 })
@@ -423,7 +438,7 @@ test('a refused message comes back into the box with the reason, and a normal ch
     await settle()
     assert.deepEqual(asked.filter(a => a.method === 'POST').at(-1).body, { adapter: 'e41-0a1b2c3d', messages: [{ role: 'user', content: 'Hello' }] })
     assert.equal(banner.hidden, true)
-    assert.equal(root.all('.tc-turns')[0].textContent, 'Turn 2 of 8')
+    assert.equal(root.all('.tc-turns')[0].textContent, 'Question 2 of 8')
     assert.deepEqual(texts(root, '.tc-who-label').filter(t => t === 'You' || t === 'Rootkeeper'), ['You', 'Rootkeeper']) // every reply carries the model's name
   })
 })
@@ -445,7 +460,7 @@ test('server and model text is set as text, never as markup', async () => {
 // ---------------------------------------------------------------------------
 test('the source keeps its pinned rules, its dash rule, and its safety rules', () => {
   assert.match(source, /#trained-chat-panel textarea \{[^}]*font-family: inherit; font-size: 16px; line-height: 1\.3;/)
-  assert.match(source, /\.tc-send, #trained-chat-panel \.tc-new \{[^}]*font-family: inherit; font-size: 12px; font-weight: 600;/)
+  assert.match(source, /\.tc-send, #trained-chat-panel \.tc-new \{[^}]*font-family: inherit; font-size: 13px; font-weight: 600;/)
   assert.match(source, /\.tc-story-input \{[^}]*min-height: 44px;[^}]*font-family: inherit; font-size: 16px;/)
   assert.match(source, /min-height: 44px/)
   assert.match(source, /Replies are not reviewed/)
@@ -473,6 +488,207 @@ test('the source keeps its pinned rules, its dash rule, and its safety rules', (
   // the textarea and the story box both keep 16px so a phone does not zoom
   assert.equal(/font-size:\s*1[0-5]px;[^}]*\}[^]*textarea/.test(''), false)
   const css = source.slice(source.indexOf('export const PANEL_CSS'))
-  assert.equal(/font-size:\s*(?:[0-9]|1[01])(?:\.[0-9]+)?px/.test(css), false, 'text under 12px')
+  assert.equal(/font-size:\s*(?:[0-9]|1[0-2])(?:\.[0-9]+)?px/.test(css), false, 'text under 13px')
+  assert.equal(/font:\s*\d+\s+(?:[0-9]|1[0-2])(?:\.[0-9]+)?px/.test(css), false, 'text under 13px in a font shorthand')
+  assert.equal(/small-caps/.test(css), false, 'small caps shrink the letters')
   assert.equal(/backdrop-filter|rgba\(24,22,19/.test(css), false, 'no dark glass')
+})
+
+// ---------------------------------------------------------------------------
+// Review fixes: a reply never lands in another conversation, a failed refresh
+// keeps the screen, a model that leaves the shelf closes its conversation,
+// and the pure helpers for the verdict and the date.
+// ---------------------------------------------------------------------------
+const parts = body => ({
+  root: body.children.find(c => c.id === 'trained-chat-panel'),
+  toggle: body.children.find(c => c.id === 'trained-chat-container').all('#trained-chat-toggle')[0] ?? body.children.find(c => c.id === 'trained-chat-container').children.find(c => c.id === 'trained-chat-toggle'),
+})
+const reopen = async (toggle, settle) => { click(toggle); await settle(); click(toggle); await settle() }
+const deferred = () => { let resolve; const promise = new Promise(r => { resolve = r }); return { promise, resolve } }
+
+test('a reply that comes back after the visitor switched models is not drawn into the new conversation', async () => {
+  await withPage(async ({ body, state, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    const heard = []
+    p.onReply = at => heard.push(at)
+    p.setAvailable(true)
+    await settle()
+    const { root } = parts(body)
+    const box = root.all('textarea')[0]
+    const real = globalThis.fetch
+    const gate = deferred()
+    globalThis.fetch = (url, options = {}) => (options.method === 'POST' ? gate.promise : real(url, options))
+    box.value = 'Question for the first model'
+    root.all('form')[0].fire('submit')
+    assert.equal(root.all('.tc-send')[0].disabled, true)
+    click(root.all('.tc-card')[1]) // the visitor picks another model while the first is still thinking
+    assert.equal(root.all('textarea')[0].disabled, false) // the new conversation is usable at once
+    assert.equal(root.all('.tc-send')[0].disabled, false)
+    gate.resolve(new Response(JSON.stringify({ adapter: 'e41-0a1b2c3d', reply: 'Late reply.', cut_short: false, turns_left: 7 }), { headers: { 'content-type': 'application/json' } }))
+    await settle()
+    assert.equal(root.textContent.includes('Late reply.'), false)
+    assert.equal(root.textContent.includes('Question for the first model'), false)
+    assert.equal(root.all('.tc-ex').length, 0)
+    assert.equal(root.all('.tc-turns')[0].textContent, 'Question 1 of 8')
+    assert.equal(heard.length, 1) // the reply was real, so the room still hears it
+    // and the next message carries only the new conversation
+    globalThis.fetch = real
+    const sent = []
+    state.post = b => { sent.push(b); return { adapter: 'e42-0a1b2c3d', reply: 'Fresh.', cut_short: false, turns_left: 7 } }
+    root.all('textarea')[0].value = 'Hello second'
+    root.all('form')[0].fire('submit')
+    await settle()
+    assert.deepEqual(sent[0], { adapter: 'e42-0a1b2c3d', messages: [{ role: 'user', content: 'Hello second' }] })
+  })
+})
+
+test('a failed refresh keeps the conversation on screen; a model that left the shelf closes its conversation', async () => {
+  await withPage(async ({ body, state, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    p.setAvailable(true)
+    await settle()
+    const { root, toggle } = parts(body)
+    state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'Hi.', cut_short: false, turns_left: 7 })
+    root.all('textarea')[0].value = 'Hello'
+    root.all('form')[0].fire('submit')
+    await settle()
+    // the list cannot be read for a moment
+    const real = globalThis.fetch
+    globalThis.fetch = (url, options = {}) => (options.method === 'POST' || String(url).endsWith('research-talk') ? real(url, options) : Promise.reject(new Error('offline')))
+    await reopen(toggle, settle)
+    assert.equal(/tc-full-sheet/.test(root.className), false)
+    assert.ok(root.textContent.includes('Hi.'))
+    assert.equal(root.textContent.includes('The Shelf Could Not Be Read'), false)
+    assert.equal(root.all('textarea')[0].disabled, false)
+    globalThis.fetch = real
+    // the model leaves the shelf (it expired): the words stay, the box closes, and nothing else is chosen for the visitor
+    state.list = { ...state.list, adapters: [rl()] }
+    await reopen(toggle, settle)
+    assert.ok(root.textContent.includes('Hi.'))
+    assert.equal(root.all('.tc-info')[0].hidden, false)
+    assert.ok(root.all('.tc-info')[0].textContent.startsWith('This model is no longer on the shelf.'))
+    assert.equal(root.all('textarea')[0].disabled, true)
+    assert.equal(root.all('.tc-card')[0].getAttribute('aria-pressed'), 'false')
+    // a new conversation moves on to the first card that is there
+    click(root.all('.tc-new')[0])
+    assert.equal(root.all('.tc-info')[0].hidden, true)
+    assert.equal(root.all('textarea')[0].disabled, false)
+    assert.equal(root.all('.tc-card')[0].getAttribute('aria-pressed'), 'true')
+  })
+})
+
+test('with the chat off and the story on, the story is what is chosen, and nothing dead is left', async () => {
+  await withPage(async ({ body, state, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    p.attachStory(onChange => {
+      const element = new El('div'); element.className = 'tc-story'
+      return { element, isShown: () => true, refresh() {}, setAvailable() { onChange() } }
+    })
+    p.setStoryAvailable(true)
+    p.setAvailable(true)
+    await settle()
+    const { root, toggle } = parts(body)
+    assert.equal(/tc-story-chosen/.test(root.className), false) // an adapter is chosen first
+    state.list = { enabled: false, adapters: [] }
+    await reopen(toggle, settle)
+    assert.match(root.className, /tc-chat-off/)
+    assert.match(root.className, /tc-story-chosen/)
+    assert.deepEqual(root.all('.tc-card').map(c => c.getAttribute('data-slug')), ['story']) // no adapter card is left behind
+  })
+})
+
+test('"talk to it" ignores a slug that is not on the shelf, and waits for the list when it has not loaded', async () => {
+  await withPage(async ({ body, state, settle }) => {
+    state.list = { enabled: true, adapters: [sft({ name: 'Rootkeeper' }), rl()], limits: {} }
+    const p = new panel.TrainedChatPanel()
+    const { root } = (() => ({ root: null }))()
+    p.setAvailable(true)
+    await settle()
+    const panelEl = body.children.find(c => c.id === 'trained-chat-panel')
+    p.openWith('e99-deadbeef') // not offered
+    assert.match(panelEl.className, /tc-view-shelf/)
+    assert.equal(panelEl.all('.tc-card')[0].getAttribute('aria-pressed'), 'true')
+    p.openWith('e42-0a1b2c3d')
+    assert.match(panelEl.className, /tc-view-chat/)
+    assert.equal(panelEl.all('.tc-card')[1].getAttribute('aria-pressed'), 'true')
+    void root
+  })
+  // before the list was read: the choice is kept and applied when the list arrives
+  await withPage(async ({ body, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    p.openWith('e42-0a1b2c3d')
+    p.setAvailable(true)
+    await settle()
+    const panelEl = body.children.find(c => c.id === 'trained-chat-panel')
+    assert.equal(panelEl.all('.tc-card')[1].getAttribute('aria-pressed'), 'true')
+    assert.match(panelEl.className, /tc-view-chat/)
+  })
+})
+
+test('a refresh that turns comparing off under a conversation says so and sends one model', async () => {
+  await withPage(async ({ body, asked, state, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    p.setAvailable(true)
+    await settle()
+    const { root, toggle } = parts(body)
+    state.list = { ...state.list, compare_enabled: true }
+    await reopen(toggle, settle)
+    click(root.all('.tc-switch')[0])
+    assert.equal(root.all('.tc-send')[0].textContent, 'Ask Both')
+    state.list = { ...state.list, compare_enabled: false }
+    await reopen(toggle, settle)
+    assert.equal(root.all('.tc-switch')[0].hidden, true)
+    assert.equal(root.all('.tc-send')[0].textContent, 'Send') // the label follows what will really be sent
+    state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'One.', cut_short: false, turns_left: 7 })
+    root.all('textarea')[0].value = 'Hi'
+    root.all('form')[0].fire('submit')
+    await settle()
+    assert.equal(asked.filter(a => a.method === 'POST').at(-1).body.compare, undefined)
+  })
+})
+
+test('a reply that arrives lights a line saying so, and a failed send does not', async () => {
+  await withPage(async ({ body, state, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    p.setAvailable(true)
+    await settle()
+    const { root } = parts(body)
+    const line = root.all('.tc-tube-own')[0]
+    assert.equal(line.hidden, true)
+    state.post = () => ({ status: 429, body: { message: 'Slow down.' } })
+    root.all('textarea')[0].value = 'Hi'
+    root.all('form')[0].fire('submit')
+    await settle()
+    assert.equal(line.hidden, true)
+    state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'Yes.', cut_short: false, turns_left: 7 })
+    root.all('form')[0].fire('submit')
+    await settle()
+    assert.equal(line.hidden, false)
+    assert.equal(line.textContent, 'Your reply lit the speaking tube in the room.')
+  })
+})
+
+test('the verdict comes from the two stored numbers only, and dates read plainly', () => {
+  assert.equal(panel.verdictOf(2.95, 1.1, false), 'Better')
+  assert.equal(panel.verdictOf(1, 2, false), 'Worse')
+  assert.equal(panel.verdictOf(3.02, 2.88, false), 'Little change') // under 5 percent of the larger number
+  assert.equal(panel.verdictOf(0.25, 0.75, true), 'Better')
+  assert.equal(panel.verdictOf(0.75, 0.25, true), 'Worse')
+  assert.equal(panel.verdictOf(0, 0, true), 'Little change')
+  assert.equal(panel.gaugeView(view(sft())).verdict, 'Better')
+  assert.equal(panel.gaugeView(view(sft({ holdout_loss_before: 3.02, holdout_loss_after: 2.88 }))).verdict, 'Little change')
+  assert.equal(panel.gaugeView(view(rl())).verdict, 'Better')
+  assert.ok(panel.gaugeView(view(sft())).explain.startsWith('Loss is how wrong the model was on examples it never trained on.'))
+  assert.equal(panel.formatDay('2026-12-01'), '1 Dec 2026')
+  assert.equal(panel.formatDay('soon'), 'soon')
+  assert.equal(panel.describeAdapter(view(sft())).kept, 'Removed after 2 Dec 2026 unless it is marked to keep.')
+  assert.equal(panel.describeAdapter(view(sft({ kept: true, kept_by: 'owner' }))).kept, 'Marked to keep by owner. Stays until 2026-12-02.')
+  assert.deepEqual(panel.buildChatBody('e41-0a1b2c3d', [{ role: 'user', content: 'x' }], [], 'untrained'), { adapter: 'e41-0a1b2c3d', messages: [{ role: 'user', content: 'x' }], compare: true, base_replies: [], only: 'untrained' })
+})
+
+test('the story box checks the switch again after its request returns', () => {
+  const story = readFileSync(join(root, 'src/systems/ResearchStoryBox.ts'), 'utf8')
+  const load = story.slice(story.indexOf('private async load()'))
+  assert.ok(load.indexOf('await res.json()') < load.indexOf('if (!this.available) return', load.indexOf('await res.json()')))
+  assert.ok(load.indexOf('if (!this.available) return', load.indexOf('await res.json()')) < load.indexOf('this.refused = true'))
 })

@@ -122,6 +122,11 @@ export class FakeDb {
       return { rows: [{ n: n + 1 }] }
     }
     if (text.startsWith('DELETE FROM trained_chat_rate')) return { rows: [] }
+    if (text.startsWith('DELETE FROM trained_chat_calls WHERE created_at < ?')) {
+      const cut = new Date(v[0])
+      this.chatCalls = this.chatCalls.filter(c => c.created_at >= cut)
+      return { rows: [] }
+    }
     if (text.startsWith('INSERT INTO trained_chat_calls')) {
       const [slug, status, http_status, turns, prompt_chars, prompt_tokens, completion_tokens, cost_usd, duration_ms] = v
       this.chatCalls.push({ slug, status, http_status, turns, prompt_chars, prompt_tokens, completion_tokens, cost_usd, duration_ms, created_at: new Date() })

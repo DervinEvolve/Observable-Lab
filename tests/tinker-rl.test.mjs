@@ -870,6 +870,6 @@ test('the visitor chat lists an RL adapter with its rubric scores, higher is bet
   assert.equal(adapter.kind, 'rl')
   const d = panel.describeAdapter(adapter)
   assert.match(d.score, /Held-out rubric score 0\.25 before training, 0\.75 after, on 3 tasks the lab held out\. Measured by the lab\. Higher is better\./)
-  assert.match(d.origin, /Reinforcement learning on 20 tasks and a rubric written by Claude Fable 5\.2/)
+  assert.match(d.origin, /Practice by Reward \(reinforcement learning\) on 20 tasks and a rubric written by Claude Fable 5\.2/)
   assert.ok(!d.score.includes('loss'))
 })
