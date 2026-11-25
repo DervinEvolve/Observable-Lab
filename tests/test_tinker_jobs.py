@@ -283,6 +283,9 @@ class CheckJobTests(unittest.TestCase):
         self.assertGreater(M.cost_usd(result["tokens"], PRICES), M.cost_usd(result["tokens"], prices))
 
 
+TAIL_CHECK = "the weights cover the answer and at most 4 format tokens on each side of it"
+
+
 class RenderCheckTests(unittest.TestCase):
     """judge_render: what a correct renderer passes and what a wrong one fails. Token lists stand in for the real tokenizer."""
 
@@ -322,13 +325,39 @@ class RenderCheckTests(unittest.TestCase):
         weights = [0.0] * len(prompt) + [0.1] * (len(example) - len(prompt))
         failed = self.failed(prompt, other, example, weights)
         self.assertIn("the weighted tokens are the answer", failed)
-        self.assertIn("the weights cover the answer and no more than a little format after it", failed)
+        self.assertIn(TAIL_CHECK, failed)
+
+    def test_format_markers_with_long_names_pass_because_they_are_counted_as_tokens(self):
+        # Inkling as the runner really renders it (cookbook 0.7.1): two marker tokens before the answer and two after,
+        # 33 and 45 characters when decoded. Judged in characters this failed on the real service on 25 November 2026.
+        names = {900: "<|message_model|>", 901: "<|content_text|>", 902: "<|end_message|>", 903: "<|content_model_end_sampling|>"}
+        decode = lambda ids: "".join(names.get(i, chr(i)) for i in ids)
+        prompt, other, _, _ = self.good()
+        answer = [ord(c) for c in M.RENDER_CHECK_ANSWER]
+        example = prompt + [900, 901] + answer + [902, 903]
+        weights = [0.0] * len(prompt) + [1.0] * (len(answer) + 4)
+        self.assertEqual([c["what"] for c in M.judge_render(prompt, other, example, weights, decode) if not c["ok"]], [])
+        self.assertEqual(M.answer_edges(example[len(prompt):], decode), (2, 2))
+
+    def test_five_trained_tokens_before_the_answer_fail(self):
+        prompt, other, _, _ = self.good()
+        answer = [ord(c) for c in M.RENDER_CHECK_ANSWER]
+        example = prompt + [ord("x")] * 5 + answer + [5]
+        weights = [0.0] * len(prompt) + [0.1] * (len(answer) + 6)
+        self.assertEqual(self.failed(prompt, other, example, weights), [TAIL_CHECK])
+
+    def test_the_answer_twice_fails(self):
+        prompt, other, _, _ = self.good()
+        answer = [ord(c) for c in M.RENDER_CHECK_ANSWER]
+        example = prompt + answer + answer + [5]
+        weights = [0.0] * len(prompt) + [0.1] * (2 * len(answer) + 1)
+        self.assertEqual(self.failed(prompt, other, example, weights), [TAIL_CHECK])
 
     def test_thirty_extra_trained_format_tokens_fail(self):
         prompt, other, example, weights = self.good()
         example = example + [ord("x")] * 30
         weights = weights + [0.1] * 30
-        self.assertIn("the weights cover the answer and no more than a little format after it", self.failed(prompt, other, example, weights))
+        self.assertIn(TAIL_CHECK, self.failed(prompt, other, example, weights))
 
     def test_the_wrong_renderer_or_tokenizer_family_fails(self):
         ok = M.judge_family("thinkingmachines/Inkling-2-Mini", "tml_v0", "H200kBaseChatTokenizer")

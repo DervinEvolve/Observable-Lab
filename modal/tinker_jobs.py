@@ -1870,6 +1870,32 @@ RENDER_CHECK_USER = "What is the lab code for the colour red?"
 RENDER_CHECK_ANSWER = "The lab code for red is OL-100."
 
 
+# How many trained tokens of chat format may sit on each side of the answer.
+# Counted in tokens, not characters: one Inkling marker such as
+# <|content_model_end_sampling|> is a single token with a long name. Inkling
+# trains two before the answer (it writes its own message header) and two
+# after it (the end of the message, then the token sampling stops on).
+RENDER_FORMAT_TOKENS = 4
+
+
+def trained_tokens(example, weights) -> list:
+    """The tokens of a training example that carry weight, in order."""
+    return [example[i] for i, w in enumerate(weights) if w > 0]
+
+
+def answer_edges(tokens, decode):
+    """(trained tokens before RENDER_CHECK_ANSWER, trained tokens after it), or None when the answer is not in them."""
+    if RENDER_CHECK_ANSWER not in decode(tokens):
+        return None
+    head = 0
+    while head < len(tokens) and RENDER_CHECK_ANSWER in decode(tokens[head + 1:]):
+        head += 1
+    end = len(tokens)
+    while end > head and RENDER_CHECK_ANSWER in decode(tokens[head:end - 1]):
+        end -= 1
+    return head, len(tokens) - end
+
+
 def judge_render(prompt, other_prompt, example, weights, decode) -> list:
     """The checks of one renderer, from token lists. Returns [{"what", "ok"}]. Touches nothing.
 
@@ -1880,17 +1906,17 @@ def judge_render(prompt, other_prompt, example, weights, decode) -> list:
     """
     weighted = [i for i, w in enumerate(weights) if w > 0]
     first = weighted[0] if weighted else -1
-    trained_text = decode([example[i] for i in weighted]) if weighted else ""
-    # Judged on text, not on a token count compared with a character count: the answer, then at most a short end marker.
-    at = trained_text.rfind(RENDER_CHECK_ANSWER)
-    tail_ok = at >= 0 and len(trained_text) - at - len(RENDER_CHECK_ANSWER) <= 16 and len(trained_text[:at]) <= 16
+    trained = trained_tokens(example, weights)
+    trained_text = decode(trained) if trained else ""
+    edges = answer_edges(trained, decode) if trained else None
+    edges_ok = edges is not None and edges[0] <= RENDER_FORMAT_TOKENS and edges[1] <= RENDER_FORMAT_TOKENS
     return [
         {"what": "the generation prompt is not empty", "ok": len(prompt) > 0},
         {"what": "a different effort gives a different prompt, so the effort is really sent", "ok": list(prompt) != list(other_prompt)},
         {"what": "the generation prompt is the start of the training example, token for token", "ok": len(prompt) > 0 and list(example[:len(prompt)]) == list(prompt)},
         {"what": "training weighs nothing the sampling prompt already holds", "ok": first >= len(prompt) > 0},
         {"what": "the weighted tokens are the answer", "ok": RENDER_CHECK_ANSWER in trained_text},
-        {"what": "the weights cover the answer and no more than a little format after it", "ok": tail_ok},
+        {"what": "the weights cover the answer and at most %d format tokens on each side of it" % RENDER_FORMAT_TOKENS, "ok": edges_ok},
     ]
 
 
@@ -1975,6 +2001,7 @@ class TinkerDeps:
         return {
             "status": "ok" if all(c["ok"] for c in checks) else "failed", "renderer": name, "effort": renderer.effort,
             "prompt_tokens": int(prompt.length), "prompt_text": decode(prompt.to_ints()), "checks": checks,
+            "trained_text": decode(trained_tokens(example.to_ints(), [float(w) for w in weights.tolist()])),
         }
 
     def open_client(self, job: dict):

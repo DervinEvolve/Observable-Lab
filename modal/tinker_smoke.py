@@ -157,6 +157,8 @@ def render(model: str) -> int:
     print("renderer %s, effort %s, %s tokens in the generation prompt" % (result.get("renderer"), result.get("effort"), result.get("prompt_tokens")))
     if result.get("prompt_text"):
         print("the generation prompt, decoded:\n%s" % result["prompt_text"])
+    if result.get("trained_text"):
+        print("what training weighs, decoded:\n%s" % result["trained_text"])
     for check in result.get("checks", []):
         print("%s %s" % ("ok  " if check["ok"] else "FAIL", check["what"]))
     if result.get("status") == "skipped":
