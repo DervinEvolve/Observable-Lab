@@ -638,6 +638,60 @@ What I expect: `"status": "ok"`, `n_train` 13 and `n_holdout` 3 (16 tasks, 15% r
 
 **Turning it off.** Set `LAB_ENABLE_TINKER_RL=false` in Vercel (Production) and redeploy. The tool then disappears from what the models are told, and a request for it is stored as not enabled. A run that is already going is still collected, settled and recorded, and its adapter stays until it expires. To stop all Tinker use, also unset `TINKER_JOBS_TOKEN`; the hourly collection only asks the runner and closes rows, and it keeps doing that while the address and token are set.
 
+## The Socratic lesson
+
+The Socratic lesson is on by default. `LAB_ENABLE_TINKER_TUTOR` is on unless it is `false`, `0`, `off` or `no` (any capitals). What it does, checks and records is in [TOOLS.md](TOOLS.md#the-socratic-lesson). It needs no new Modal deploy and no new secret: the training leg is a `train` job that the runner already runs, the small model's answers go through the same Tinker endpoint the visitor chat uses, and the teacher is an ordinary OpenRouter call. It does need the same things Tinker training needs apart from that switch: `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL`, `TINKER_JOBS_TOKEN`, `TINKER_API_KEY` on the server, a base model on `LAB_TINKER_BASE_MODELS`, and non-zero `LAB_TINKER_RUN_USD` and `LAB_TINKER_DAILY_USD`. If one of them is missing the tool is off and says which one: the server logs a line starting `[Tools] the Socratic lesson is on by default and is off here:` once per reason (and nothing when I switched it off on purpose), and `GET /api/experiment` has `tutor_lesson.off_reason`. **Because it is on by default, it is live as soon as this code is deployed to a place where all of that is set. To deploy dark, set `LAB_ENABLE_TINKER_TUTOR=false` in Vercel before the first deploy.**
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LAB_ENABLE_TINKER_TUTOR` | on | The switch. Off only for `false`, `0`, `off` or `no`. |
+| `LAB_TINKER_TUTOR_PER_DAY` | 1 | Lessons a UTC day, 0 to 5. A lesson counts unless it was refused before any call was sent at no cost. It counts apart from `LAB_TINKER_PER_DAY` and `LAB_TINKER_RL_PER_DAY`, though all three draw on the same dollars and an epoch has one Tinker run of any kind. |
+| `LAB_TUTOR_TEACHER_USD` | 1 | The most one lesson's teacher calls may cost, in OpenRouter's reported dollars. Hard ceiling 3. 0 turns the tool off. Counted in `LAB_DAILY_BUDGET_USD`. |
+| `LAB_TUTOR_TEACHER_MODEL` | empty | One fixed teacher, an OpenRouter id the lab knows a price for (the five in the rotation, the two fallbacks, the two wildcards). Empty: the model that answered as Executor in that epoch teaches. A value the lab does not know turns the tool off with that reason. |
+
+The Tinker part of a lesson uses `LAB_TINKER_RUN_USD` (default $2, the most one lesson's Tinker use may be estimated at) and `LAB_TINKER_DAILY_USD` (default $10 a UTC day), shared with training and RL. A large two round lesson is refused at $2; I raise the run cap only if I want those. With the defaults one lesson counts for at most about $3 of a $15 day ($2 Tinker, $1 teacher).
+
+**The cron entry.** `vercel.json` now has a second cron: `/api/epoch/lesson` every 10 minutes, and gives the function `maxDuration` 800 (each call works for up to 700 seconds). It is a new function, so the project now has 26 in all (the four new routes are `api/epoch/lesson.ts`, `api/experiment/lesson.ts`, `api/experiment/chat-offer.ts` and `api/experiment/visitor-offers.ts`); I check that this fits my Vercel plan before I deploy. Like the tick it takes `CRON_SECRET` only, and answers 401 to anything else before it reads anything. With no open lesson a call makes one query. Without this entry a lesson only gets its first slice, in the epoch's follow-up, and then waits; the page shows it as not live and it is closed after 6 hours. After deploying, I confirm the second entry appears under the project's Cron Jobs.
+
+**Reading a lesson, and a stuck one.**
+
+- `GET /api/experiment` has `tutor_lesson`. For an open lesson look at `lesson.stage` (`diagnostic`, `teaching`, `training`, `retest`, `closing`, `done`), `lesson.round`, `lesson.live` (true while the progress record is under 15 minutes old), `lesson.progress` (`graded` of `to_grade`, `taught` of `to_teach`, `seq` and `updated_at`) and `lesson.cost`. A lesson between slices has `live: false`, which is normal for up to 10 minutes. `GET /api/experiment/lesson?slug=<slug>` has the whole record.
+- A lesson whose `progress.updated_at` is older than about 25 minutes while its stage is not `done` is stuck. The usual causes: the cron entry is missing or failing (look at the Cron Jobs log for `/api/epoch/lesson`), `CRON_SECRET` is wrong, the runner or Tinker is not answering (the lesson waits and retries each slice), or a request died and its lease (14 minutes) has not run out yet. A call that fails is tried again in a later slice up to 3 times and then stored as no answer; more than 10% of any test unanswered fails the lesson.
+- In the database: `SELECT slug, stage, round, lease_until, teacher_calls, teacher_usd, teacher_reserved_usd, teacher_cap_usd, stop_reason, progress->>'updated_at' AS last FROM tutor_lessons ORDER BY created_at DESC LIMIT 5`. A `teacher_reserved_usd` above 0 with no lease is a reservation left by a request that died; the next slice releases it when it takes the lease. `stop_reason` says why teaching stopped (the teacher cap, the daily budget, three truncated answers, a real cost above the worst case, or 3 hours since the lesson opened).
+- To move one now, I call the route by hand (the secret is read without echo and is not left in the shell):
+
+```
+read -s CRON_SECRET
+HOST='https://...my deployment...'
+curl -sS "$HOST/api/epoch/lesson" -H "Authorization: Bearer $CRON_SECRET"
+unset CRON_SECRET
+```
+
+It answers `{ "lessons": [ { "slug", "stage", "status" } ] }`. A lesson another request holds the lease on is listed as `running` and left alone.
+
+**Stopping a lesson.** Teaching ends by itself 3 hours after the lesson opened and any lesson still open after 6 hours is closed (`ok` if a retest finished, otherwise `failed`) with its money settled. **There is no stop button.** Setting `LAB_ENABLE_TINKER_TUTOR=false` stops new lessons and removes the tool from the prompts, but an open lesson is still carried on and settled while `TINKER_JOBS_*` and `TINKER_API_KEY` are set, as an open Tinker run is. To make the worker stop calling anything, I unset `TINKER_JOBS_TOKEN` (or `TINKER_API_KEY`) as well and redeploy: from then on the cron route makes no model or runner call, and it closes any lesson that is more than 6 hours old as `failed` with the reason `the lesson was left open and the tool is off`, settling its reservation. A lesson younger than 6 hours stays open until it reaches that age. If I need one gone sooner, that is a manual database change that I have not written down because I have not tried it.
+
+**What I check after the first lesson.**
+
+1. `GET /api/experiment` has `tutor_lesson` with a lesson, and the chart on the wall above the practice bench shows its topic and rows. The lamp is lit only while the lesson is live.
+2. `lesson.questions` and `lesson.subskills` match what the Executor wrote (the counts, the subskill names), and `lesson.cost` has two figures: the Tinker estimate (labelled an estimate) and the teacher's cost as OpenRouter reported it.
+3. The `tool_runs` row for tool `tinker_tutor`, and the ledger rows `tool/tinker_tutor` and, for the teacher, the model's own rows under purpose `tinker_tutor`.
+4. No teacher call carried a held back question. This is tested against a fake; to look at a real lesson I read `tutor_turns.teacher_text` and compare it with the held back questions in the request.
+5. The adapter appears in "Talk to what they trained" with a skill map card, and the held out loss is stored.
+6. Once, that Tinker's endpoint answers for the untrained base model: the chat's "Compare With Untrained" makes the same call. If it does not, a lesson fails at its first call at no cost, with the reason stored.
+
+**Not checked from the development machine.** It cannot reach Tinker, Modal or OpenRouter, so no lesson has run for real. Everything ran against fakes: the whole lesson loop (the tests drive `runTinkerTutor` and the stage machine with a fake Tinker endpoint, a fake OpenRouter and a fake runner), the request checks, the money and its reservations, the public record and the chart and panel (the page was read from stubbed `/api` routes). What only a real deployment proves:
+
+- that the SQL runs on a real Postgres: the reservation update, the lease update, the closing statement and the conditional claims were run only against a small in-memory fake, and nobody has run the `jsonb` operators;
+- that Tinker's endpoint answers for an untrained base model and for an adapter with the `reasoning_effort` the base model needs (the lesson passes the base model with the adapter so the same form is used for both);
+- that each teacher model accepts the request the lab builds (JSON mode, an exact output limit, the lowest reasoning effort it lists) and that a real call's cost stays under the lab's worst case;
+- that a whole lesson goes from the Reviewer's approval through every stage to its closing: the epoch path was tested up to a refusal, and the lesson itself was tested directly;
+- that Vercel's cron runs the entry every 10 minutes and honours `maxDuration` 800;
+- that the runner's training leg works for examples with up to 10 messages (the limit is 12);
+- how the room looks with a real record: the chart and panel were drawn from records I wrote by hand, and the draw call figures are from a development build with nothing connected.
+
+I have not run a lesson, so I do not know whether one teaches a model anything. The pass bands are counts of answers that met rules a model wrote.
+
 ## Naming and keeping trained adapters
 
 Two more switches on top of [Tinker training](#tinker-training), both default false and independent of each other. `LAB_ENABLE_TINKER_NAMES` lets a training request carry a display name for its adapter. `LAB_ENABLE_TINKER_KEEP` lets an adapter be marked kept, by a model with the Reviewer's approval or by me, so that it stays on Tinker for a year instead of two weeks and a copy of its weights is written to my own Modal Volume. What each does, checks and records is in [TOOLS.md](TOOLS.md#naming-a-trained-adapter). With both off nothing changes: the prompts, the requests to the runner, the routes' answers and the tick are as before, and the database gets no new table or column.
@@ -732,6 +786,63 @@ What a keep answers: 200 with `"status": "ok"` and a sentence saying until when 
 **Things I know are not checked from the development machine.** It cannot reach Modal or Tinker, so no adapter has been kept for real. What was checked: the runner file parses on Python 3.9 (it is deployed on 3.12); the SDK calls the keeper makes (`set_checkpoint_ttl_from_tinker_path`, `get_external_weights_urls`, `list_user_checkpoints`, `save_weights_external`) match the signatures of the installed `tinker` 0.39.1 and Tinker's documentation as I read it on 18 November 2026; the reading of the base model's config and safetensors headers ran against the real Hugging Face repositories of all three base models (a second or two, about 100 KB on disk for the 4B model, instead of 9 GB); and the cookbook's real `build_lora_adapter` 0.6.1 converted an adapter I made up, with the weight names I believe Tinker uses, against those headers. What step 2 is the first real test of: that Tinker saves external weights for my account at all, what files that export really holds and how its weights are named, the signed download, the conversion of a real export, the Volume mount and its commit, and the time to live being changed on a sampler checkpoint. Not checked anywhere yet: that the stub files the conversion reads (the real length with only the header written) take no room in a Modal container the way they do on my machine. If they did take room the conversion would fail and the copy would be stored as Tinker exported it, with the reason. I have also not loaded a kept copy into `peft` or vLLM, and whether `list_user_checkpoints` counts the whole organisation or only my key's user is not something the documentation settles, so I read the stored number as "at least".
 
 **Turning it off.** Set `LAB_ENABLE_TINKER_KEEP` to anything but `true` and redeploy: the models are no longer told about it, `keep_adapter` is an unknown tool again, runs stop saving weights for download, and the operator route refuses a new keep. Adapters that are already kept stay kept and keep answering until their time runs out; they are listed in the chat in the ordinary order without the mark. A keep that was still going when I switched off keeps its place until the switch is on again, and so does a kept adapter that expires in the meantime; no money is tied to either. I can still unkeep through the operator route with the switch off. `LAB_ENABLE_TINKER_NAMES` turns off the same way: `name` is an unknown field again, and names already given are shown nowhere but stay in the database, so turning it back on shows them again. To empty the Volume: `modal volume rm -r oblab-kept-models <lab id>` for one adapter, or `modal volume delete oblab-kept-models` for all of it.
+
+## Visitor offers
+
+Visitors of the room can offer a conversation they had with a trained model to the lab. What it does, stores and checks is in [TOOLS.md](TOOLS.md#conversations-visitors-offer). It is on by default wherever the visitor chat is on: `LAB_ENABLE_VISITOR_OFFERS` is on unless it is `false`, `0`, `off` or `no` (any capitals). It also needs `LAB_OPERATOR_SECRET` or `CRON_SECRET`, because receipts are signed with a key derived from one of them (and from nothing else; there is no database URL fallback). With neither set offers are off and the chat answers exactly as it did before. **To deploy dark, set `LAB_ENABLE_VISITOR_OFFERS=false` in Vercel before the first deploy.** No Modal deploy and no new secret: the runner is sent a normal training job.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `LAB_ENABLE_VISITOR_OFFERS` | on | The switch. Off only for `false`, `0`, `off` or `no`. |
+| `LAB_VISITOR_OFFERS_DAYS` | 180 | Days an offer is kept after the end of the day it was made, 30 to 365. Then its text is deleted. |
+| `LAB_VISITOR_OFFERS_MAX` | 2000 | Offers stored at one time, hard 20000. When full, new offers get 429 `full`. |
+| `LAB_VISITOR_OFFERS_PER_DAY` | 100 | Offers accepted a UTC day from everyone, 0 to 1000. |
+| `LAB_TRAINED_CHAT_VISITOR_ADAPTERS` | false | Exactly `true` lets the visitor chat list and answer for an adapter trained on visitor offers. Off, such an adapter is not listed and a message to it is refused. I leave it off: nobody has read that text. |
+
+The limits that have no variable: 3 offers a day for a visitor (an address with a browser string) and 6 for an address, 20 a day for one adapter, one stored offer for each (adapter, first visitor message), 10 take back tries a day for an address. They are in `api/_lib/visitor-offers.ts`.
+
+**What happens by itself.** The hourly tick deletes the text of offers past their days and leaves the row as a count. It runs whether offers are on or off, so the deletion holds after I switch them off. (On a lab that never had offers it creates the `visitor_offers` table, empty.) The table is created on first use otherwise.
+
+**The operator route.** `POST /api/experiment/visitor-offers`, `Authorization: Bearer <LAB_OPERATOR_SECRET>`, 401 otherwise before anything is read. It works whether offers are on or off. It is a POST, even for a read, and has no GET, so a prefetch or a cache cannot count as a read. **Every read sets `read_at` on each row it returns, and the public record counts those rows (`read_by_owner`).** I read only when I need to.
+
+```
+read -s LAB_OPERATOR_SECRET
+HOST='https://...my deployment...'
+# Read up to 20 stored offers, newest day first. This counts as a read of each one.
+curl -sS -X POST "$HOST/api/experiment/visitor-offers" -H "Authorization: Bearer $LAB_OPERATOR_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "read", "limit": 20}'
+# The next page: offers from days before this one.
+curl -sS -X POST "$HOST/api/experiment/visitor-offers" -H "Authorization: Bearer $LAB_OPERATOR_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "read", "limit": 20, "before": "2026-11-20"}'
+# Delete one offer's text. The id is the one the read returned.
+curl -sS -X POST "$HOST/api/experiment/visitor-offers?confirm=true" -H "Authorization: Bearer $LAB_OPERATOR_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "delete", "id": "00000000-0000-0000-0000-000000000000"}'
+unset LAB_OPERATOR_SECRET
+```
+
+A read answers `{ offers, count }`, each offer with its id, day, adapter, base model, messages, status, which runs claimed it, `read_at` and expiry. `delete` and `delete_all` need `?confirm=true` and answer `{ deleted: n }`.
+
+**Deleting everything.** Delete the text of every offer, now:
+
+```
+read -s LAB_OPERATOR_SECRET
+HOST='https://...my deployment...'
+curl -sS -X POST "$HOST/api/experiment/visitor-offers?confirm=true" -H "Authorization: Bearer $LAB_OPERATOR_SECRET" \
+  -H 'Content-Type: application/json' -d '{"action": "delete_all"}'
+unset LAB_OPERATOR_SECRET
+```
+
+It sets the text to NULL and the status to `deleted` on every row that still has text, and leaves the rows as counts. To remove the rows as well I drop the table (`DROP TABLE visitor_offers`), which also removes the take back codes' hashes, so nobody can take an offer back afterwards (there is nothing left to take back). To stop new offers I also set `LAB_ENABLE_VISITOR_OFFERS=false`. Deleting does not reach what has left the lab: a run that claimed an offer may already have sent it to the training runner, and a model trained on it cannot unlearn it. Which runs claimed an offer is in its `used_in` column; the run's own row has `dataset_source`, with counts only.
+
+**A claim left behind.** When a run on offers is being set up, the offers it will read are marked with a temporary `claim-<salt>` token in `used_in`, and that is replaced with the run's slug once the job has been sent, or removed if the job is never started. If the function dies in between, the token stays. A take back of such an offer then answers `trained_on: true`, which errs on the safe side. Nothing cleans these tokens.
+
+**If I want to know what a visitor will see.** I read the sheet once as a visitor on a phone, with offers on and a conversation with a trained model: the consent text, the number of days it names (it comes from `LAB_VISITOR_OFFERS_DAYS`), the code after offering and the take back form in the shelf's footer. I also decide whether the room needs a privacy line elsewhere, because the lab now stores text a person wrote.
+
+**What the checks do not do.** The automatic screening refuses a conversation with an email address, a long number, a link, a user name, too little text, repeated text, or a model that mostly repeated the visitor. It does not understand meaning, so it does not find names, street addresses written in words, other private details or abuse. No model reads an offer. If something private or abusive gets in, the only people who can see it are me through this route, and the services that receive a training run on it. The consent text says so and asks visitors not to offer anything private.
+
+**The logs.** The lab's own code writes no message text to the Vercel logs: the offer and operator routes log fixed sentences only, and a test captures everything the lab's code logs through a full offer and a full run on offers and checks that no offered text is in it. I read the runner, `modal/tinker_jobs.py`, for lines that print example text and found none: its log lines print numbers, counts, step losses or an exception passed through `scrub()`. One thing I could not rule out: when a training job raises, the last 300 characters of the exception become the run's stored `error`, and if Tinker's tokenizer quoted an input in its message, that could reach the stored reason. I could not make that happen.
+
+**Not checked from the development machine.** Everything ran against fakes: the receipts, the screening, the limits, the claim and release SQL (a small in-memory fake of the database, so the `jsonb` operators and the single `UPDATE ... RETURNING` have not run on a real Postgres), a complete run on offers through the epoch (it asks the fake runner for 0 samples and nothing offered appears in the run row, the tool run, the adapter, the outcome or the logs), and the sheet and the take back form in a browser from stubbed routes. What only a real deployment proves: that the runner really takes `samples: 0` (its validation allows 0 to its maximum; I read it, I did not run it); that a real chat reply gets a receipt that a real offer verifies, end to end; that the take back code is accepted from a phone's keyboard; and how the consent sheet reads on my own phone. Whether anyone will offer anything, and what they will write, I do not know.
 
 ## Stories from the research model
 
