@@ -1023,3 +1023,28 @@ test('switched on, the models are told of the lesson and the Reviewer is asked t
   assert.match(section, /- A Socratic lesson: a lesson\. The lab counts which answers pass\.\n/)
   assert.match(section, /Nothing is opened or started without "approve"\./)
 })
+
+test('the worked example of a lesson request in TOOLS.md is one the lab\'s own reader accepts', async () => {
+  const rubric = await load('api/_lib/rubric.js')
+  const tutor = await load('api/_lib/tinker-tutor.js')
+  const doc = readFileSync(join(root, 'docs/TOOLS.md'), 'utf8')
+  const start = doc.indexOf('"tinker_tutor": {')
+  const block = doc.slice(start, doc.indexOf('```', start))
+  const sub = JSON.parse(block.slice(block.indexOf('{ "name": "Metres and feet"'), block.indexOf('    ...\n  ],')).trim().replace(/,\s*$/, '').replaceAll(', ... ]', ' ]'))
+  assert.equal(sub.name, 'Metres and feet')
+  const read = rubric.normalizeRubric(sub.rubric)
+  assert.ok('rubric' in read, read.error)
+  for (const [field, list] of [['practice', sub.practice], ['held_back', sub.held_back]]) {
+    assert.equal(list.length, 1)
+    const task = rubric.normalizeTask(list[0], `subskills[0].${field}[0]`)
+    assert.ok('task' in task, task.error)
+    assert.equal(typeof task.task.data.target, 'string', 'a fraction is written as text')
+  }
+  // and its rule reads that text as the number it is
+  const practice = rubric.normalizeTask(sub.practice[0], 'x').task
+  assert.equal(tutor.passes(read.rubric, practice, 'It is about 9.8 feet.').passed, true)
+  assert.equal(tutor.passes(read.rubric, practice, '3 feet').passed, false)
+  // a fraction written as a number is what the reader refuses
+  assert.match(rubric.normalizeTask({ prompt: 'How many feet is 3 metres?', data: { target: 9.84 } }, 'x').error, /data\.target must be a whole number, or text for anything else/)
+  assert.match(doc, /A `data` value written as a number must be a whole number; a fraction is written as text/)
+})
