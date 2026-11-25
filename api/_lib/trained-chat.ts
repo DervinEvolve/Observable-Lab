@@ -103,9 +103,9 @@ export const TRAINED_CHAT_NOTICE = 'Small models trained by the lab\'s AI models
 /** Shown instead while the list holds an adapter trained on a public dataset (only with LAB_TRAINED_CHAT_DATASET_ADAPTERS on). */
 export const TRAINED_CHAT_NOTICE_DATASETS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on data the models wrote, and some on rows of a public dataset that nobody at the lab has read. Replies are not reviewed.'
 /** Shown instead while the list holds an adapter trained on conversations visitors offered (only with LAB_TRAINED_CHAT_VISITOR_ADAPTERS on). */
-export const TRAINED_CHAT_NOTICE_VISITORS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on conversations written by visitors that nobody at the lab has read. Replies are not reviewed.'
+export const TRAINED_CHAT_NOTICE_VISITORS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on conversations written by visitors, which no model read and nobody reviewed. Replies are not reviewed.'
 /** Shown instead while the list holds both kinds. */
-export const TRAINED_CHAT_NOTICE_DATASETS_VISITORS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on rows of a public dataset, and some on conversations written by visitors, that nobody at the lab has read. Replies are not reviewed.'
+export const TRAINED_CHAT_NOTICE_DATASETS_VISITORS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on rows of a public dataset that nobody at the lab has read, and some on conversations written by visitors, which no model read and nobody reviewed. Replies are not reviewed.'
 
 /**
  * May the visitor chat answer with this adapter? One trained on data a model

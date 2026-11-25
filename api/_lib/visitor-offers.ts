@@ -248,10 +248,19 @@ export type ScreenReason = 'email' | 'number' | 'link' | 'handle' | 'short' | 'r
 export type ScreenResult = { ok: true } | { ok: false; reason: ScreenReason }
 
 const EMAIL = /[A-Za-z0-9._%+-]+\s?(?:@|\(at\)|\[at\])\s?[A-Za-z0-9.-]+\.[A-Za-z]{2,}/i
-const NUMBER = /(?:\+?\d[\s().-]?){9,}/
+/**
+ * Nine or more digits, with up to three characters that are neither letters
+ * nor digits between any two: "(555) 123-4567", "555 - 123 - 4567",
+ * "555/123/4567", card and id numbers. A price ("12.50") or a year does not
+ * reach nine digits.
+ */
+const NUMBER = /(?:\d[^\p{L}\d]{0,3}){8}\d/u
 const LINK = /\b(?:https?:\/\/|www\.)\S+/i
-const DOMAIN = /\b[a-z0-9-]{2,}\.(?:com|org|net|io|ai|co|dev|app|info|me|ly|gg|xyz|ru|cn|uk|de|fr)\b/i
-const HANDLE = /(?:^|\s)@[A-Za-z0-9_]{3,}/
+const DOMAIN = /\b[a-z0-9-]{2,}\.(?:com|org|net|edu|gov|io|ai|co|dev|app|info|biz|me|ly|gg|xyz|site|online|tech|store|blog|link|page|live|news|top|club|tv|fm|to|cc|eu|uk|de|fr|nl|be|at|ch|es|it|pt|se|no|dk|fi|pl|cz|ie|ru|ua|cn|jp|kr|in|au|nz|ca|us|mx|br|ar|za)\b/i
+/** An @ name, after anything that is not a letter, a digit, an underscore or a dot (so "twitter:@name" too, and not an email). */
+const HANDLE = /(?:^|[^\w.@])@[A-Za-z0-9_]{3,}/
+/** Characters that print nothing (zero width spaces and joiners, and other format characters): removed before screening. */
+const INVISIBLE = /\p{Cf}/gu
 /** One character, other than white space, 40 or more times in a row. */
 const RUN = /(\S)\1{39,}/u
 export const SCREEN_SHORT_CHARS = 12
@@ -278,7 +287,8 @@ function jaccard(a: Set<string>, b: Set<string>): number {
  * meaning: it cannot see a name, an address written in words, or abuse.
  */
 export function screenOffer(messages: readonly OfferMessage[]): ScreenResult {
-  const all = messages.map(m => ({ role: m.role, text: m.content.normalize('NFKC') }))
+  // NFKC first, then every format character out: a zero width space must not split an address or a number.
+  const all = messages.map(m => ({ role: m.role, text: m.content.normalize('NFKC').replace(INVISIBLE, '') }))
   for (const [reason, test] of [
     ['email', (t: string) => EMAIL.test(t)],
     ['number', (t: string) => NUMBER.test(t)],
@@ -342,7 +352,7 @@ export const OFFER_MESSAGES = {
  * and that every claim names real columns.
  */
 export const OFFER_CLAIMS: ReadonlyArray<{ claim: string; columns: readonly string[] }> = [
-  { claim: 'the lab stores this conversation: your messages, the model\'s replies', columns: ['messages', 'turns', 'chars'] },
+  { claim: 'the lab stores this conversation: your messages, the model\'s replies', columns: ['messages'] },
   { claim: 'which model you talked to', columns: ['adapter_slug', 'base_model', 'adapter_from_visitors'] },
   { claim: 'and the day', columns: ['day'] },
   { claim: 'It does not store your address or an account.', columns: [] },
@@ -644,7 +654,7 @@ export function offersToTinkerRequest(asked: TinkerOffersRequest, offers: readon
  */
 export function visitorOffersNote(opts: { total: number }): string {
   const total = Math.max(0, Math.floor(opts.total))
-  return `Visitor conversations: a visitor of the room may offer a chat they had with a trained adapter to the lab. The lab holds ${total} of them now. A Tinker training request may name them instead of writing its examples: "visitor_offers": { "adapter" (optional, an adapter id), "limit" ${OFFERS_RUN_LIMIT.min} to ${OFFERS_RUN_LIMIT.max}, "system" (optional text, at most ${OFFERS_MAX_SYSTEM_BYTES} bytes) }. Give one of "examples", "dataset" and "visitor_offers". The lab's own code reads them, not yours, and you never see their text. Nobody has read them: only automatic checks were made (no email addresses, phone numbers, long numbers, user names or links). Each conversation is one example, its first ${offerExampleMessages(false) / 2} turns at most (${offerExampleMessages(true) / 2} with a system text), and only its last reply is trained on. The lab picks which ones, at most a quarter from any one day. Conversations had with an adapter that was itself trained on visitor conversations are never used. The run then goes on like any other: the same limits, cost estimate, caps and held out slice. Its record says how many conversations were used and nothing of what they said. Everything trained from them is labelled "${ORIGIN_VISITORS}", and such an adapter is not offered in the visitor chat unless the owner allows it.`
+  return `Visitor conversations: a visitor of the room may offer a chat they had with a trained adapter to the lab. The lab holds ${total} of them now. A Tinker training request may name them instead of writing its examples: "visitor_offers": { "adapter" (optional, an adapter id), "limit" ${OFFERS_RUN_LIMIT.min} to ${OFFERS_RUN_LIMIT.max}, "system" (optional text, at most ${OFFERS_MAX_SYSTEM_BYTES} bytes) }. Give one of "examples", "dataset" and "visitor_offers". The lab's own code reads them, not yours, and you never see their text. No model reads them and nobody reviewed them: only automatic checks were made (no email addresses, phone numbers, long numbers, user names or links). The lab's owner can read them through an operator route, and each read is counted in the public record. Each conversation is one example, its first ${offerExampleMessages(false) / 2} turns at most (${offerExampleMessages(true) / 2} with a system text), and only its last reply is trained on. The lab picks which ones, at most a quarter from any one day. Conversations had with an adapter that was itself trained on visitor conversations are never used. The run then goes on like any other: the same limits, cost estimate, caps and held out slice. Its record says how many conversations were used and nothing of what they said. Everything trained from them is labelled "${ORIGIN_VISITORS}", and such an adapter is not offered in the visitor chat unless the owner allows it.`
 }
 
 /**

@@ -6,14 +6,19 @@
  *                    hashes for uniqueness and for the take back code, the
  *                    runs that read it, when the owner first read it, and when
  *                    it expires. Nothing that identifies a sender: no address,
- *                    no hash of one, no browser string, no time of day.
+ *                    no hash of one, no browser string, no time of day, and
+ *                    no size (no turn or character count, which the chat's
+ *                    own per reply call rows could be matched against).
+ *                    Once the text is taken back, deleted or expired, the
+ *                    row's hashes of that text are overwritten too.
  *
  * The per visitor limits are counted in the chat's existing trained_chat_rate
  * table (tinker-store.ts), by the chat's own daily keyed hashes, under the
  * buckets od:<day> (offers) and ow:<day> (take back tries). Those rows hold a
- * count and are pruned after 48 hours as before; they carry no offer id. The
- * all-offers and per-adapter day caps are counted there too, under names that
- * are not hashes of anyone.
+ * count and are pruned after 48 hours as before; they carry no offer id, but
+ * they do have a time of their own (created_at). The all-offers and
+ * per-adapter day caps are counted in visitor_offer_caps, which holds a day,
+ * a name and a count, and no time.
  *
  * No function here logs or throws text a visitor wrote. Errors are reported
  * by the callers with a fixed line.
@@ -40,8 +45,6 @@ export function ensureOfferTables(): Promise<void> {
           adapter_slug TEXT NOT NULL,
           base_model TEXT NOT NULL,
           messages JSONB,
-          turns INTEGER NOT NULL,
-          chars INTEGER NOT NULL,
           transcript_sha256 TEXT NOT NULL UNIQUE,
           code_sha256 TEXT NOT NULL UNIQUE,
           status TEXT NOT NULL,
@@ -55,6 +58,8 @@ export function ensureOfferTables(): Promise<void> {
       `
       await sql`CREATE INDEX IF NOT EXISTS idx_visitor_offers_live ON visitor_offers(status, adapter_slug, day)`
       await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_visitor_offers_prompt ON visitor_offers(adapter_slug, first_user_sha256) WHERE status = 'stored'`
+      // The day caps of all offers and of one adapter: a count a day and nothing else, so no row records when an offer came.
+      await sql`CREATE TABLE IF NOT EXISTS visitor_offer_caps (day TEXT NOT NULL, name TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (day, name))`
     })().catch(e => {
       tablesReady = null
       throw e
@@ -92,8 +97,6 @@ export interface NewOffer {
   adapter: string
   baseModel: string
   messages: OfferMessage[]
-  turns: number
-  chars: number
   transcriptSha256: string
   codeSha256: string
   firstUserSha256: string
@@ -110,8 +113,8 @@ export interface NewOffer {
 export async function insertOffer(offer: NewOffer): Promise<'stored' | 'duplicate'> {
   await ensureOfferTables()
   const r = await sql`
-    INSERT INTO visitor_offers (day, adapter_slug, base_model, messages, turns, chars, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at)
-    VALUES (${offer.day}, ${offer.adapter}, ${offer.baseModel}, ${JSON.stringify(offer.messages)}::jsonb, ${offer.turns}, ${offer.chars}, ${offer.transcriptSha256}, ${offer.codeSha256}, ${'stored'}, ${OFFER_SCREEN_VERSION}, ${offer.firstUserSha256}, ${offer.adapterFromVisitors}, ${offer.expiresAt})
+    INSERT INTO visitor_offers (day, adapter_slug, base_model, messages, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at)
+    VALUES (${offer.day}, ${offer.adapter}, ${offer.baseModel}, ${JSON.stringify(offer.messages)}::jsonb, ${offer.transcriptSha256}, ${offer.codeSha256}, ${'stored'}, ${OFFER_SCREEN_VERSION}, ${offer.firstUserSha256}, ${offer.adapterFromVisitors}, ${offer.expiresAt})
     ON CONFLICT DO NOTHING
     RETURNING id
   `
@@ -130,7 +133,8 @@ export async function withdrawOffer(codeHash: string): Promise<{ found: false } 
   await ensureOfferTables()
   const r = await sql`
     UPDATE visitor_offers
-    SET messages = NULL, status = CASE WHEN status = 'stored' THEN 'withdrawn' ELSE status END
+    SET messages = NULL, status = CASE WHEN status = 'stored' THEN 'withdrawn' ELSE status END,
+      transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text
     WHERE code_sha256 = ${codeHash}
     RETURNING used_in
   `
@@ -255,10 +259,12 @@ export async function pruneOffers(now: Date = new Date()): Promise<number> {
   try {
     await ensureOfferTables()
     const r = await sql`
-      UPDATE visitor_offers SET messages = NULL, status = 'expired'
+      UPDATE visitor_offers SET messages = NULL, status = 'expired', transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text
       WHERE status = 'stored' AND expires_at < ${now.toISOString()}
       RETURNING id
     `
+    // The day caps are needed for today only; yesterday's is kept for a day as the rate rows are.
+    await sql`DELETE FROM visitor_offer_caps WHERE day < ${utcDay(new Date(now.getTime() - 2 * 86_400_000))}`
     return r.rows.length
   } catch {
     console.warn('[visitor-offers] could not expire old offers')
@@ -276,6 +282,7 @@ export interface OwnerOfferRow {
   adapter_slug: string
   base_model: string
   messages: unknown
+  /** Counted from the text when it is read: the row stores no size. */
   turns: number
   chars: number
   status: string
@@ -301,12 +308,17 @@ export async function ownerReadOffers(opts: { limit: number; beforeDay: string |
       ORDER BY day DESC, id DESC
       LIMIT ${opts.limit}
     )
-    RETURNING id, day, adapter_slug, base_model, messages, turns, chars, status, used_in, adapter_from_visitors, read_at, expires_at
+    RETURNING id, day, adapter_slug, base_model, messages, status, used_in, adapter_from_visitors, read_at, expires_at
   `
   const iso = (v: unknown) => (v instanceof Date ? v.toISOString() : typeof v === 'string' ? v : null)
+  const size = (m: unknown) => {
+    const list = Array.isArray(m) ? m as Array<{ content?: unknown }> : []
+    return { turns: Math.floor(list.length / 2), chars: list.reduce((a, x) => a + (typeof x?.content === 'string' ? x.content.length : 0), 0) }
+  }
   return asRows(r.rows).map(row => ({
     id: String(row.id), day: String(row.day), adapter_slug: String(row.adapter_slug), base_model: String(row.base_model),
-    messages: typeof row.messages === 'string' ? JSON.parse(row.messages) : row.messages, turns: num(row.turns), chars: num(row.chars),
+    messages: typeof row.messages === 'string' ? JSON.parse(row.messages) : row.messages,
+    ...size(typeof row.messages === 'string' ? JSON.parse(row.messages) : row.messages),
     status: String(row.status), used_in: typeof row.used_in === 'string' ? JSON.parse(row.used_in) : row.used_in,
     adapter_from_visitors: row.adapter_from_visitors === true, read_at: iso(row.read_at), expires_at: iso(row.expires_at),
   })).sort((a, b) => (a.day === b.day ? (a.id < b.id ? 1 : -1) : a.day < b.day ? 1 : -1))
@@ -315,14 +327,14 @@ export async function ownerReadOffers(opts: { limit: number; beforeDay: string |
 /** Deletes one offer's text (the row stays as a count). False when there was no text to delete. */
 export async function ownerDeleteOffer(id: string): Promise<boolean> {
   await ensureOfferTables()
-  const r = await sql`UPDATE visitor_offers SET messages = NULL, status = 'deleted' WHERE id::text = ${id} AND messages IS NOT NULL RETURNING id`
+  const r = await sql`UPDATE visitor_offers SET messages = NULL, status = 'deleted', transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text WHERE id::text = ${id} AND messages IS NOT NULL RETURNING id`
   return r.rows.length > 0
 }
 
 /** Deletes the text of every offer that still has some. The rows stay as counts. */
 export async function ownerDeleteAllOffers(): Promise<number> {
   await ensureOfferTables()
-  const r = await sql`UPDATE visitor_offers SET messages = NULL, status = 'deleted' WHERE messages IS NOT NULL RETURNING id`
+  const r = await sql`UPDATE visitor_offers SET messages = NULL, status = 'deleted', transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text WHERE messages IS NOT NULL RETURNING id`
   return r.rows.length
 }
 
@@ -331,7 +343,23 @@ export function isOfferId(v: unknown): v is string {
   return typeof v === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(v)
 }
 
-/** Not a hash of anyone: the names the all-offers and per-adapter day caps are counted under in trained_chat_rate. */
+/** Not a hash of anyone: the names the all-offers and per-adapter day caps are counted under in visitor_offer_caps. */
 export function capCounterName(kind: 'all' | 'adapter', adapter = ''): string {
   return kind === 'all' ? 'visitor-offers|all' : `visitor-offers|adapter|${isAdapterSlug(adapter) ? adapter : 'unknown'}`
+}
+
+/**
+ * Takes one place of a day cap in one statement. False when the day is full,
+ * and always for a limit below 1 (a limit of 0 takes nothing). The row holds
+ * the day, the name and the count: no time.
+ */
+export async function countOfferCap(name: string, day: string, limit: number): Promise<boolean> {
+  if (!(limit >= 1)) return false
+  await ensureOfferTables()
+  const r = await sql`
+    INSERT INTO visitor_offer_caps (day, name, n) VALUES (${day}, ${name}, 1)
+    ON CONFLICT (day, name) DO UPDATE SET n = visitor_offer_caps.n + 1 WHERE visitor_offer_caps.n < ${limit}
+    RETURNING n
+  `
+  return r.rows.length > 0
 }

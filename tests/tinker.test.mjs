@@ -2042,7 +2042,7 @@ test('a lesson adapter carries its skill map and the losses of its last training
   const adapter = store.publicAdapter(row)
   assert.equal(adapter.kind, 'tutor')
   assert.deepEqual(adapter.skill_map, {
-    topic: 'Unit conversion', teacher_name: 'Grok 4.7', seen_only: true,
+    topic: 'Unit conversion', teacher_name: 'Grok 4.7', seen_only: true, within_noise: false, cut_short: false,
     rows: [
       { name: 'Metres to feet', before: cell(2, 6, 2), after: cell(5, 6, 4) },
       { name: 'Litres to gallons', before: cell(1, 6, 1), after: null },
@@ -2058,10 +2058,11 @@ test('a lesson adapter carries its skill map and the losses of its last training
 })
 
 // A small lesson that the lesson's reader accepts (tinker-tutor.ts): 4 subskills, 3 practice and 3 held back questions each.
-const LESSON_WORDS = ['amber', 'basil', 'cedar', 'delta', 'ember', 'fjord', 'grove', 'heron', 'iris', 'juniper', 'kelp', 'lumen', 'maple', 'nectar', 'onyx', 'pearl', 'quartz', 'raven', 'sage', 'tundra']
+// Every question has a first word of its own, so no held back question nearly repeats a practice question of any subskill.
+const LESSON_WORDS = ['amber', 'basil', 'cedar', 'delta', 'ember', 'fjord', 'grove', 'heron', 'iris', 'juniper', 'kelp', 'lumen', 'maple', 'nectar', 'onyx', 'pearl', 'quartz', 'raven', 'sage', 'tundra', 'umber', 'vale', 'willow', 'xenon', 'yarrow', 'zephyr']
 const lessonQuestion = (s, held, j) => {
-  const n = s * 5 + (held ? 3 : 0) + j
-  return { prompt: `${held ? 'Recall' : 'Name'} the code for ${LESSON_WORDS[n % 20]} ${LESSON_WORDS[(n + 7) % 20]} ${s}${j}${held ? 'h' : 'p'}. Give it on the last line.`, expected: `${held ? 'h' : 'p'}${s}${j}code` }
+  const n = s * 6 + (held ? 3 : 0) + j
+  return { prompt: `${held ? 'Recall' : 'Name'} the code for ${LESSON_WORDS[n % 26]} ${s}${j}${held ? 'h' : 'p'}. Give it on the last line.`, expected: `${held ? 'h' : 'p'}${s}${j}code` }
 }
 const lessonAsk = (extra = {}) => ({
   purpose: 'teach the code words', topic: 'Code words',
@@ -2353,7 +2354,40 @@ test('a run on visitor conversations that is refused or never sent gives its cla
   assert.equal(lab.toolRuns.at(-1).status, 'skipped')
 })
 
-test('the measure note is one sentence list, the same on the chart, the lesson panel, the chat card, the tool run line and the review facts', async () => {
+test('a run on visitor conversations whose close fails after a confirmed start keeps its claim as the run id, so a take back says it may have trained', async () => {
+  enableOffers()
+  const table = withOffers(offerRows())
+  const sent = []
+  globalThis.fetch = fakeRunner(sent, [{ status: 'done', result: runnerOk() }])
+  // the database fails when the finished run is closed: completeRun throws inside runTinkerTrain
+  const inner = db.handler
+  db.handler = (text, values) => {
+    if (text.startsWith('UPDATE tinker_runs SET status = ?, reason = ?, cost_usd = ?, result = ?')) throw new Error('the database went away')
+    return inner(text, values)
+  }
+  await deliver(toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig()))
+  assert.ok(sent.some(x => x.kind === 'start'), 'the job was sent')
+  const run = lab.tinkerRuns[0]
+  const used = table.rows.filter(r => r.used_in.length)
+  assert.equal(used.length, 20)
+  assert.ok(used.every(r => r.used_in.length === 1 && r.used_in[0] === run.slug), JSON.stringify(used.map(r => r.used_in)))
+})
+
+test('a failed run on visitor conversations keeps a fixed reason, never the runner\'s own words', async () => {
+  enableOffers()
+  withOffers(offerRows())
+  const sent = []
+  const quoted = `tokenizer error near "${SAID(5)[0]}"`
+  globalThis.fetch = fakeRunner(sent, [{ status: 'done', result: { status: 'error', stage: 'train', error: quoted } }])
+  await deliver(toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig()))
+  const run = lab.tinkerRuns[0]
+  const kept = JSON.stringify({ run, toolRuns: lab.toolRuns })
+  assert.equal(kept.includes('Crumbly Lancashire'), false)
+  assert.equal(run.reason, runs.VISITOR_RUN_FAILED)
+  assert.match(lab.toolRuns.at(-1).output_tail, /its message is not shown for runs on visitor conversations/)
+})
+
+test('the measure note is one sentence list, the same on the lesson panel (which the chart opens), the chat card, the tool run line and the review facts', async () => {
   const { TUTOR_MEASURE_NOTE } = await load('api/_lib/tinker-tutor.js')
   assert.match(TUTOR_MEASURE_NOTE, /^The lab counts which answers pass\. .*Nobody has checked that the rules measure the skill\.$/)
   // The page cannot import the server's code, so each surface holds a copy; every copy is the server's text, word for word.
@@ -2361,12 +2395,16 @@ test('the measure note is one sentence list, the same on the chart, the lesson p
     const m = readFileSync(join(root, file), 'utf8').match(/export const TUTOR_MEASURE_NOTE = '([^']+)'/)
     return m ? m[1] : null
   }
-  assert.equal(declared('src/systems/skillMap.ts'), TUTOR_MEASURE_NOTE, 'the skill map (chart and lesson panel)')
+  assert.equal(declared('src/systems/skillMap.ts'), TUTOR_MEASURE_NOTE, 'the skill map module (the lesson panel reads it from here)')
   assert.equal(declared('src/systems/TrainedChatPanel.ts'), TUTOR_MEASURE_NOTE, 'the chat card')
   assert.match(readFileSync(join(root, 'src/systems/LessonPanel.ts'), 'utf8'), /\$\{TUTOR_MEASURE_NOTE\}/)
   assert.match(readFileSync(join(root, 'src/systems/TrainedChatPanel.ts'), 'utf8'), /\$\{TUTOR_BANDS_NOTE\} \$\{TUTOR_MEASURE_NOTE\}/)
-  // The chart's paper carries the short foot line; the chart module names the note it stands for.
-  assert.match(readFileSync(join(root, 'src/entities/SkillMapChart.ts'), 'utf8'), /skillMap/)
+  // The chart's paper does NOT carry the note: at 1024 by 640 canvas pixels it has room for the short foot line only
+  // (CHART_FOOT, drawn on every state), and a click on the chart opens the lesson panel, which carries the note in full.
+  const chart = readFileSync(join(root, 'src/entities/SkillMapChart.ts'), 'utf8')
+  assert.equal(chart.match(/fillText\(fit\(ctx, CHART_FOOT/g)?.length, 2, 'the foot line on the blank sheet and on a lesson')
+  assert.doesNotMatch(chart, /TUTOR_MEASURE_NOTE/)
+  assert.match(chart, /userData\.inspect = \{ kind: 'lesson' \}/)
   // The server's own surfaces: the tool run line and the review facts.
   const run = readFileSync(join(root, 'api/_lib/tinker-tutor-run.ts'), 'utf8')
   assert.match(run, /TUTOR_MEASURE_NOTE/)

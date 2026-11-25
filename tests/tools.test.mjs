@@ -907,11 +907,20 @@ test('docs/EXHIBITS.md and docs/TOOLS.md state the same numbers as the code', ()
 // existed. "Before" is the server code of the commit that came before them,
 // read from git and run here beside the current code, on the same fakes.
 // ---------------------------------------------------------------------------
-const BEFORE = '24c797f7ac05f470164b2ee0e9bbcafcba1fc9ca'
+// The parent of the groundwork commit (2a4f0e0), on run2: the last commit before either feature.
+const BEFORE = 'adfbeab'
+/** True inside a git checkout: there the commit must be found, and a missing one fails the test instead of skipping it. */
+const inGit = (() => {
+  try {
+    return execFileSync('git', ['-C', root, 'rev-parse', '--is-inside-work-tree'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim() === 'true'
+  } catch {
+    return false
+  }
+})()
 function compileBefore() {
   let files
   try {
-    files = execFileSync('git', ['-C', root, 'ls-tree', '-r', '--name-only', BEFORE, 'api'], { encoding: 'utf8' }).split('\n').filter(f => f.endsWith('.ts'))
+    files = execFileSync('git', ['-C', root, 'ls-tree', '-r', '--name-only', BEFORE, 'api'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\n').filter(f => f.endsWith('.ts'))
   } catch {
     return null
   }
@@ -928,7 +937,13 @@ function compileBefore() {
 }
 const beforeDir = compileBefore()
 
-test('with the lesson and visitor offers switched off, the prompts and the public state are exactly what they were before them', { skip: beforeDir ? false : 'git history is not available' }, async () => {
+test('the commit the switched off comparison reads is in this checkout', { skip: inGit ? false : 'not a git checkout' }, () => {
+  assert.ok(beforeDir, `commit ${BEFORE} is not in this checkout's history: fetch the full history of run2 (a shallow clone cannot run the section 4 comparison)`)
+  assert.doesNotThrow(() => execFileSync('git', ['-C', root, 'merge-base', '--is-ancestor', BEFORE, 'HEAD'], { stdio: 'ignore' }), `${BEFORE} is not an ancestor of HEAD`)
+})
+
+test('with the lesson and visitor offers switched off, the prompts and the public state are exactly what they were before them', { skip: beforeDir ? false : inGit ? false : 'not a git checkout' }, async () => {
+  assert.ok(beforeDir, `commit ${BEFORE} is not in this checkout's history`)
   const old = {
     prompts: await import(pathToFileURL(join(beforeDir, 'api/_lib/prompts.js')).href),
     experiment: (await import(pathToFileURL(join(beforeDir, 'api/experiment/index.js')).href)).default,

@@ -947,6 +947,9 @@ test('an approved keep: the runner is sent the lab\'s own record, the adapter\'s
   assert.match(described.kept, /^Marked to keep by Grok 4\.7\. Stays until \d{4}-\d\d-\d\d\.$/)
   assert.equal(panel.describeAdapter(views[1]).mark, undefined)
   assert.equal(store.adapterDescription(listed[0]), `"Brass Finch", kept by Grok 4.7. A LoRA adapter trained in this lab on ${BASE}; the id is its identity, the name is a label.`)
+  // an adapter trained on visitor conversations says so wherever it is described (the keyed lab model list included)
+  assert.equal(store.adapterDescription({ ...listed[0], from_visitors: true }), `"Brass Finch", kept by Grok 4.7. A LoRA adapter trained in this lab on ${BASE}; the id is its identity, the name is a label. Trained on conversations written by visitors.`)
+  assert.equal(store.adapterDescription({ ...listed[1], from_visitors: true }), 'Trained on conversations written by visitors.')
   // The checkpoint path is still never part of what the public is sent.
   assert.equal(JSON.stringify(listed).includes('tinker://'), false)
 })

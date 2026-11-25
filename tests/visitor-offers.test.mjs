@@ -65,7 +65,7 @@ class OfferDb extends FakeDb {
   seedOffer({ day = '2026-11-20', adapter = SLUG, messages, fromVisitors = false, status = 'stored', code = null } = {}) {
     const id = `10000000-0000-4000-8000-${String(this.nextOffer++).padStart(12, '0')}`
     this.offers.push({
-      id, day, adapter_slug: adapter, base_model: BASE, messages: messages ?? convo(id), turns: 1, chars: 10, transcript_sha256: `t-${id}`,
+      id, day, adapter_slug: adapter, base_model: BASE, messages: messages ?? convo(id), transcript_sha256: `t-${id}`,
       code_sha256: code ?? `c-${id}`, status, screen_v: 1, first_user_sha256: `f-${id}`, adapter_from_visitors: fromVisitors, used_in: [], read_at: null,
       expires_at: '2027-06-01T00:00:00.000Z',
     })
@@ -77,28 +77,44 @@ class OfferDb extends FakeDb {
   }
 
   handle(text, v) {
-    if (!/visitor_offers/.test(text) || /^(CREATE|ALTER)\b/.test(text)) return super.handle(text, v)
+    if (!/visitor_offer/.test(text) || /^(CREATE|ALTER)\b/.test(text)) return super.handle(text, v)
     this.statements.push({ text, values: v })
     if (this.failOffers) throw new Error('offers table down')
+    // the day caps: a day, a name and a count, no time
+    if (text.startsWith('INSERT INTO visitor_offer_caps (day, name, n) VALUES (?, ?, 1) ON CONFLICT (day, name) DO UPDATE SET n = visitor_offer_caps.n + 1 WHERE visitor_offer_caps.n < ? RETURNING n')) {
+      this.caps ??= new Map()
+      const key = `${v[0]}|${v[1]}`
+      const n = this.caps.get(key)
+      if (n === undefined) { this.caps.set(key, 1); return { rows: [{ n: 1 }] } }
+      if (!(n < v[2])) return { rows: [] }
+      this.caps.set(key, n + 1)
+      return { rows: [{ n: n + 1 }] }
+    }
+    if (text.startsWith('DELETE FROM visitor_offer_caps WHERE day < ?')) {
+      for (const key of [...(this.caps ?? new Map()).keys()]) if (key.split('|')[0] < v[0]) this.caps.delete(key)
+      return { rows: [] }
+    }
     const ids = csv => new Set(String(csv).split(','))
     if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored'") return { rows: [{ n: String(this.offers.filter(o => o.status === 'stored').length) }] }
     if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_slug = ?") return { rows: [{ n: String(this.offers.filter(o => o.status === 'stored' && o.adapter_slug === v[0]).length) }] }
     if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL") return { rows: [{ n: String(this.usable().length) }] }
     if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL AND adapter_slug = ?") return { rows: [{ n: String(this.usable(v[0]).length) }] }
-    if (text.startsWith('INSERT INTO visitor_offers (day, adapter_slug, base_model, messages, turns, chars, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at) VALUES')) {
+    if (text.startsWith('INSERT INTO visitor_offers (day, adapter_slug, base_model, messages, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at) VALUES')) {
       this.offerInserts.push({ text, values: v })
-      const [day, adapter_slug, base_model, messages, turns, chars, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at] = v
+      const [day, adapter_slug, base_model, messages, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at] = v
       const clash = this.offers.some(o => o.transcript_sha256 === transcript_sha256 || o.code_sha256 === code_sha256 ||
         (o.status === 'stored' && status === 'stored' && o.adapter_slug === adapter_slug && o.first_user_sha256 === first_user_sha256))
       if (clash) return { rows: [] }
       const id = `20000000-0000-4000-8000-${String(this.nextOffer++).padStart(12, '0')}`
-      this.offers.push({ id, day, adapter_slug, base_model, messages: JSON.parse(messages), turns, chars, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, used_in: [], read_at: null, expires_at })
+      this.offers.push({ id, day, adapter_slug, base_model, messages: JSON.parse(messages), transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, used_in: [], read_at: null, expires_at })
       return { rows: [{ id }] }
     }
-    if (text.startsWith("UPDATE visitor_offers SET messages = NULL, status = CASE WHEN status = 'stored' THEN 'withdrawn' ELSE status END WHERE code_sha256 = ? RETURNING used_in")) {
+    const forget = o => { o.transcript_sha256 = `removed:${o.id}`; o.first_user_sha256 = `removed:${o.id}` }
+    if (text.startsWith("UPDATE visitor_offers SET messages = NULL, status = CASE WHEN status = 'stored' THEN 'withdrawn' ELSE status END, transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text WHERE code_sha256 = ? RETURNING used_in")) {
       const o = this.offers.find(x => x.code_sha256 === v[0])
       if (!o) return { rows: [] }
       o.messages = null
+      forget(o)
       if (o.status === 'stored') o.status = 'withdrawn'
       return { rows: [{ used_in: [...o.used_in] }] }
     }
@@ -135,9 +151,9 @@ class OfferDb extends FakeDb {
         read_by_owner: this.offers.filter(o => o.read_at).length,
       }] }
     }
-    if (text.startsWith("UPDATE visitor_offers SET messages = NULL, status = 'expired' WHERE status = 'stored' AND expires_at < ? RETURNING id")) {
+    if (text.startsWith("UPDATE visitor_offers SET messages = NULL, status = 'expired', transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text WHERE status = 'stored' AND expires_at < ? RETURNING id")) {
       const rows = []
-      for (const o of this.offers) if (o.status === 'stored' && new Date(o.expires_at) < new Date(v[0])) { o.messages = null; o.status = 'expired'; rows.push({ id: o.id }) }
+      for (const o of this.offers) if (o.status === 'stored' && new Date(o.expires_at) < new Date(v[0])) { o.messages = null; o.status = 'expired'; forget(o); rows.push({ id: o.id }) }
       return { rows }
     }
     if (text.startsWith('UPDATE visitor_offers SET read_at = COALESCE(read_at, NOW()) WHERE id IN ( SELECT id FROM visitor_offers WHERE messages IS NOT NULL')) {
@@ -147,16 +163,17 @@ class OfferDb extends FakeDb {
       for (const o of pick) o.read_at ??= new Date().toISOString()
       return { rows: pick.map(o => ({ ...o })) }
     }
-    if (text === "UPDATE visitor_offers SET messages = NULL, status = 'deleted' WHERE id::text = ? AND messages IS NOT NULL RETURNING id") {
+    if (text === "UPDATE visitor_offers SET messages = NULL, status = 'deleted', transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text WHERE id::text = ? AND messages IS NOT NULL RETURNING id") {
       const o = this.offers.find(x => x.id === v[0] && x.messages !== null)
       if (!o) return { rows: [] }
       o.messages = null
+      forget(o)
       o.status = 'deleted'
       return { rows: [{ id: o.id }] }
     }
-    if (text === "UPDATE visitor_offers SET messages = NULL, status = 'deleted' WHERE messages IS NOT NULL RETURNING id") {
+    if (text === "UPDATE visitor_offers SET messages = NULL, status = 'deleted', transcript_sha256 = 'removed:' || id::text, first_user_sha256 = 'removed:' || id::text WHERE messages IS NOT NULL RETURNING id") {
       const rows = []
-      for (const o of this.offers) if (o.messages !== null) { o.messages = null; o.status = 'deleted'; rows.push({ id: o.id }) }
+      for (const o of this.offers) if (o.messages !== null) { o.messages = null; o.status = 'deleted'; forget(o); rows.push({ id: o.id }) }
       return { rows }
     }
     throw new Error(`unexpected offers query: ${text.slice(0, 160)}`)
@@ -429,7 +446,9 @@ test('a whole visit: talk, offer with the last receipt, get a code shown once, t
   const row = lab.offers[0]
   assert.deepEqual(row.messages, messages)
   assert.equal(row.status, 'stored')
-  assert.equal(row.turns, 2)
+  // no size is stored: a turn or character count could be matched against the chat's own call rows
+  assert.equal('turns' in row || 'chars' in row, false)
+  assert.equal(lab.offerInserts[0].text.includes('turns') || lab.offerInserts[0].text.includes('chars'), false)
   assert.equal(row.day, day)
   assert.equal(row.adapter_from_visitors, false)
   // Only the code's hash is stored.
@@ -441,6 +460,9 @@ test('a whole visit: talk, offer with the last receipt, get a code shown once, t
   assert.equal(back.code, 200)
   assert.deepEqual(back.body, { withdrawn: true, trained_on: false, message: 'Done. The lab deleted the stored text.' })
   assert.equal(row.messages, null)
+  // and the row's hashes of the text are overwritten: what is left is a count
+  assert.equal(row.transcript_sha256, `removed:${row.id}`)
+  assert.equal(row.first_user_sha256, `removed:${row.id}`)
   assert.equal(row.status, 'withdrawn')
   assert.equal(lab.offers.length, 1, 'the row is kept as a count')
   // A second take back finds it again and keeps its status.
@@ -555,6 +577,23 @@ test('the limits: 3 a visitor, 6 an address, the store full, the day full, 20 an
   assert.equal(tries.code, 429)
 })
 
+test('a day cap of 0 takes no offer, and the day caps are kept where no time is', async () => {
+  enableChat()
+  lab.addAdapter({ slug: SLUG })
+  process.env.LAB_VISITOR_OFFERS_PER_DAY = '0'
+  const before = [...lab.rate.keys()].length
+  assert.deepEqual((await offer(signed(convo('zero')))).body, { error: 'full', message: 'The lab is not taking more conversations just now.' })
+  assert.equal(lab.offers.length, 0)
+  assert.equal([...lab.rate.keys()].length, before, 'nothing was counted for the visitor')
+  process.env.LAB_VISITOR_OFFERS_PER_DAY = '100'
+  assert.equal((await offer(signed(convo('one')))).code, 201)
+  // the all-offers and per-adapter caps are in visitor_offer_caps (day, name, count), not in the timed rate rows
+  assert.equal([...lab.rate.keys()].some(k => /\|oa(d)?:/.test(k)), false)
+  assert.deepEqual([...lab.caps.entries()].sort(), [[`${store.utcDay()}|visitor-offers|adapter|${SLUG}`, 1], [`${store.utcDay()}|visitor-offers|all`, 1]])
+  const source = readFileSync(join(root, 'api/_lib/visitor-offers-store.ts'), 'utf8')
+  assert.match(source, /CREATE TABLE IF NOT EXISTS visitor_offer_caps \(day TEXT NOT NULL, name TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, PRIMARY KEY \(day, name\)\)/)
+})
+
 test('nothing identifying is written on or beside an offer', async () => {
   enableChat()
   lab.addAdapter({ slug: SLUG })
@@ -583,7 +622,8 @@ test('every claim of the consent text maps to a column, and every column is acco
   const lines = table.split('\n')
   const columns = lines.slice(1, lines.findIndex(l => l.trim() === ')')).map(l => l.trim().split(/\s+/)[0])
   for (const c of columns) assert.match(c, /^[a-z_0-9]+$/)
-  assert.ok(columns.length >= 16)
+  assert.ok(columns.length >= 14)
+  assert.equal(columns.includes('turns') || columns.includes('chars') || columns.includes('created_at'), false, 'no size and no time on an offer')
   const claimed = new Set([...offers.OFFER_CLAIMS.flatMap(c => c.columns), ...offers.OFFER_BOOKKEEPING_COLUMNS])
   for (const column of columns) assert.ok(claimed.has(column), `no claim covers ${column}`)
   for (const column of claimed) assert.ok(columns.includes(column), `a claim names ${column}, which is not a column`)
@@ -600,16 +640,22 @@ test('the screening patterns, each with cases that match and cases that pass', (
   assert.deepEqual(one(fine), { ok: true })
   const cases = {
     email: ['mail me at jane.doe@example.org now', 'write to name (at) host.org please', 'it is name [at] host.org ok', 'ｊａｎｅ＠ｅｘａｍｐｌｅ．ｏｒｇ full width'],
-    number: ['call +44 20 7946 0958 tonight', 'my number is 555 123 4567 ok', 'the id is 123456789 here', 'card 4111-1111-1111-1111 stop'],
-    link: ['see https://jam.test/x for it', 'go to www.recipes for jam', 'the site jamrecipes.com has it', 'ask at shop.co please'],
-    handle: ['follow @jamlover for more', '@cook_42 knows the answer'],
+    number: ['call +44 20 7946 0958 tonight', 'my number is 555 123 4567 ok', 'the id is 123456789 here', 'card 4111-1111-1111-1111 stop',
+      // the review's cases: the common US form, wide separators, a slash, and a zero width space between digits
+      'call me at (555) 123-4567 about the garden', 'call 555 - 123 - 4567 about the garden', 'call 555. 123. 4567 about the garden', 'it is 555/123/4567 ok',
+      'ring 555\u200b123\u200b4567 later', '+44 (0) 20 7946 0958 is the shop', 'the number 123-45-6789 here'],
+    link: ['see https://jam.test/x for it', 'go to www.recipes for jam', 'the site jamrecipes.com has it', 'ask at shop.co please', 'look at mysite.nl for it', 'my page jam.tv has it'],
+    handle: ['follow @jamlover for more', '@cook_42 knows the answer', 'find me on twitter:@johnsmith ok', 'I am (@jamlover) there'],
   }
+  // a zero width space inside an email address does not hide it
+  assert.deepEqual(one('write to john\u200b@example\u200b.org please'), { ok: false, reason: 'email' })
   for (const [reason, list] of Object.entries(cases)) {
     for (const text of list) assert.deepEqual(one(text), { ok: false, reason }, text)
   }
   // A model reply is screened too.
   assert.deepEqual(one(fine, 'Write to the cook at cook@example.com for it.'), { ok: false, reason: 'email' })
-  for (const text of ['it costs 12.50 at the market today', 'the recipe dates from 1987 in Seville', 'mix 250 g sugar with 3 oranges', 'about 10:30 in the morning works', 'an email about jam is fine to mention', 'use a 1.5 litre pan for this']) {
+  for (const text of ['it costs 12.50 at the market today', 'the recipe dates from 1987 in Seville', 'mix 250 g sugar with 3 oranges', 'about 10:30 in the morning works', 'an email about jam is fine to mention', 'use a 1.5 litre pan for this',
+    'from 1987 to 2026 the shop sold jam', 'boil it for 20 to 25 minutes, then cool for 10', 'e.g. a pan, i.e. a big one']) {
     assert.deepEqual(one(text), { ok: true }, text)
   }
   // short
@@ -823,7 +869,7 @@ test('chatOffers hides an adapter trained on offers unless its switch is on, and
   process.env.LAB_TRAINED_CHAT_VISITOR_ADAPTERS = 'true'
   const shown = await chat({}, { method: 'GET' })
   assert.deepEqual(shown.body.adapters.map(a => a.slug).sort(), [SLUG, VISITOR_SLUG].sort())
-  assert.equal(shown.body.notice, 'Small models fine-tuned by the lab\'s AI models. Some were trained on conversations written by visitors that nobody at the lab has read. Replies are not reviewed.')
+  assert.equal(shown.body.notice, 'Small models fine-tuned by the lab\'s AI models. Some were trained on conversations written by visitors, which no model read and nobody reviewed. Replies are not reviewed.')
   assert.equal((await chat({ adapter: VISITOR_SLUG, messages: [{ role: 'user', content: 'Hello' }] })).code, 200)
   assert.equal(trainedChat.chatNotice([{ from_dataset: true }, { from_visitors: true }]), trainedChat.TRAINED_CHAT_NOTICE_DATASETS_VISITORS)
 })

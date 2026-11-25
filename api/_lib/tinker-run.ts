@@ -133,7 +133,11 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
   // held out prompts are visitor text, and samples reach the public record
   // (spec 2.7). The job asked for none; any that came back are dropped here.
   const visitors = fromVisitorOffers(row)
-  const result: TinkerRunResult = visitors ? { ...answered, samples: [] } : answered
+  // Nor does it keep the runner's own words about a failure: an exception
+  // message could quote an input message, and the reason is public.
+  const result: TinkerRunResult = visitors
+    ? { ...answered, samples: [], ...(answered.status !== 'ok' && answered.reason ? { reason: VISITOR_RUN_FAILED } : {}) }
+    : answered
   // Usage is known when the runner answered in its own words (ok, refused, error).
   const usageKnown = poll.state === 'done' && result.status !== 'failed'
   const costUsd = usageKnown ? tinkerCostUsd(row.base_model, result.tokens) : row.reserved_usd
@@ -219,7 +223,11 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
  */
 export async function runTinkerTrain(
   ctx: TinkerRunContext, request: TinkerRequest,
-  opts: { maxWaitMs?: number; pollMs?: number; dataset?: TinkerDatasetRecord; offers?: VisitorOffersRecord } = {},
+  opts: {
+    maxWaitMs?: number; pollMs?: number; dataset?: TinkerDatasetRecord; offers?: VisitorOffersRecord
+    /** Called with the run's id as soon as the job may have been sent, before anything after the start can fail (spec 2.7: the claim on visitor conversations becomes the run's id). */
+    onSent?: (slug: string) => void
+  } = {},
 ): Promise<TinkerOutcome> {
   const skipped = (reason: string): TinkerOutcome => ({ tool: TINKER_TOOL, status: 'skipped', summary: reason })
   // A run reads its examples from one place: inline, a shelf dataset, or conversations visitors offered.
@@ -309,6 +317,8 @@ export async function runTinkerTrain(
   // For a run on visitor conversations the caller marks them with the run's
   // id once the job was sent (spec 2.7); nothing else gets the field.
   const sent = opts.offers ? { sent: row.slug } : {}
+  // Told at once, so a failure further down (storing the call id, waiting, closing the run) cannot leave the claim released.
+  if (opts.offers && (started.ok || started.unconfirmed)) opts.onSent?.(row.slug)
   if (!started.ok && started.unconfirmed) {
     // The request left and nothing settles whether a run was started: it may
     // be training. Its row stays open with the money set aside. A later tick
@@ -346,6 +356,9 @@ export async function runTinkerTrain(
     ...sent,
   }
 }
+
+/** The public reason of a failed run on visitor conversations: a fixed sentence, never the runner's own words. */
+export const VISITOR_RUN_FAILED = 'the runner failed; its message is not shown for runs on visitor conversations'
 
 /** A run still marked as going this long after it was opened is given up as lost. */
 export const TINKER_LOST_AFTER_MS = (TINKER_RUN_TIMEOUT_S + 900) * 1000

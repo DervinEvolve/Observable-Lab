@@ -751,6 +751,10 @@ export interface TutorSkillMap {
   teacher_name: string
   rows: Array<{ name: string; before: Cell | null; after: Cell | null }>
   seen_only: boolean
+  /** The overall change from before to after is smaller than one pass band. */
+  within_noise: boolean
+  /** Many untrained answers were cut off by the token limit or empty, or fewer were after training: a gain may be shorter answers. */
+  cut_short: boolean
 }
 
 const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
@@ -794,6 +798,8 @@ export function readTutorSkillMap(result: Record<string, unknown>): TutorSkillMa
     teacher_name: teacher ? modelDisplayName(teacher) || teacher.split('/').pop() || teacher : '',
     rows,
     seen_only: flags.seen_only === true,
+    within_noise: flags.within_noise === true,
+    cut_short: flags.cut_short_before === true || flags.cut_off_fell === true,
   }
 }
 
@@ -1027,8 +1033,10 @@ export function adapterDescription(adapter: TrainedAdapter): string {
   const parts: string[] = []
   if (adapter.name) parts.push(`"${adapter.name}"`)
   if (adapter.kept) parts.push(`kept${adapter.kept_by ? ` by ${adapter.kept_by}` : ''}`)
-  if (!parts.length) return ''
-  return `${parts.join(', ')}. A LoRA adapter trained in this lab on ${adapter.base_model}; the id is its identity, the name is a label.`
+  // The visitor label is said wherever the adapter is listed, as on the chat card (spec 2.7), whatever else it has.
+  const visitors = adapter.from_visitors === true ? ` Trained on conversations ${ORIGIN_VISITORS}.` : ''
+  if (!parts.length) return visitors.trim()
+  return `${parts.join(', ')}. A LoRA adapter trained in this lab on ${adapter.base_model}; the id is its identity, the name is a label.${visitors}`
 }
 
 /** Who marked an adapter to keep, in words. */

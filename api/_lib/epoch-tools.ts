@@ -534,8 +534,8 @@ export async function runDeliverables(
       try {
         const ok = await allowed(TINKER_TOOL, config, tinkerWorstCaseUsd(read.request), () => tinkerRunsToday())
         if (!ok.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, ok.reason))
-        const outcome = await runTinkerTrain(ctx, read.request, { offers: read.record })
-        sent = outcome.sent ?? null
+        const outcome = await runTinkerTrain(ctx, read.request, { offers: read.record, onSent: slug => { sent = slug } })
+        sent = outcome.sent ?? sent
         if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_TOOL, summary, outcome.summary))
         out.push({ tool: outcome.tool, status: outcome.status, summary: outcome.summary })
       } finally {

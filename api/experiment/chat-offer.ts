@@ -6,7 +6,7 @@ import {
   codeSha256, firstUserSha256, newOfferCode, offerExpiry, readOfferCode, readOfferRequest, screenOffer, transcriptSha256, verifyReceipt,
   visitorOffersMax, visitorOffersPerDay, visitorOffersStatus,
 } from '../_lib/visitor-offers.js'
-import { capCounterName, insertOffer, storedOfferCount, withdrawOffer } from '../_lib/visitor-offers-store.js'
+import { capCounterName, countOfferCap, insertOffer, storedOfferCount, withdrawOffer } from '../_lib/visitor-offers-store.js'
 
 // POST /api/experiment/chat-offer   (public, JSON only, body at most 32 KB)
 //   { adapter, messages, receipt }  offers a conversation from the visitor chat to the lab
@@ -68,6 +68,9 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const screen = screenOffer(read.messages)
   if (!screen.ok) return say(res, 422, 'screened', OFFER_MESSAGES[screen.reason], { reason: screen.reason })
 
+  // A day cap of 0 takes no offer at all (LAB_VISITOR_OFFERS_PER_DAY=0), before anything is counted.
+  if (visitorOffersPerDay() < 1) return say(res, 429, 'full', OFFER_MESSAGES.full)
+
   try {
     // One visitor's share: the address alone first (it is the limit a sender
     // cannot get around), then the address with the browser string.
@@ -77,13 +80,14 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
     const run = await getRun(read.adapter)
     if (!run) return say(res, 404, 'gone', OFFER_MESSAGES.gone)
     if ((await storedOfferCount()) >= visitorOffersMax()) return say(res, 429, 'full', OFFER_MESSAGES.full)
-    if (!(await countVisitorMessage(capCounterName('all'), `oa:${day}`, visitorOffersPerDay()))) return say(res, 429, 'full', OFFER_MESSAGES.full)
-    if (!(await countVisitorMessage(capCounterName('adapter', read.adapter), `oad:${day}`, OFFERS_PER_ADAPTER_DAY))) return say(res, 429, 'adapter_day', OFFER_MESSAGES.adapter_day)
+    // The day caps are counted where no time is kept, so the first offer of a day leaves no timed row beside the sender's.
+    if (!(await countOfferCap(capCounterName('all'), day, visitorOffersPerDay()))) return say(res, 429, 'full', OFFER_MESSAGES.full)
+    if (!(await countOfferCap(capCounterName('adapter', read.adapter), day, OFFERS_PER_ADAPTER_DAY))) return say(res, 429, 'adapter_day', OFFER_MESSAGES.adapter_day)
 
     const code = newOfferCode()
     const expiresAt = offerExpiry(day)
     const stored = await insertOffer({
-      day, adapter: read.adapter, baseModel: run.base_model, messages: read.messages, turns: read.turns, chars: read.chars,
+      day, adapter: read.adapter, baseModel: run.base_model, messages: read.messages,
       transcriptSha256: transcriptSha256(read.messages), codeSha256: codeSha256(readOfferCode(code) ?? code), firstUserSha256: firstUserSha256(read.messages),
       adapterFromVisitors: fromVisitorOffers(run), expiresAt,
     })
