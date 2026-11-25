@@ -40,6 +40,19 @@
 // The panel reports each real reply through onReply, so the room's speaking
 // tube can glow. Nothing here animates to suggest a model is working.
 //
+// When the server's GET answer carries an offers block (visitor offers on),
+// the conversation view gets one more button: "Offer This Conversation to the
+// Lab". It is enabled only while the panel holds the receipt of the last reply
+// (see chatOffer.ts and spec 2.2): a conversation the lab's own endpoint gave,
+// in order. Pressing it opens a sheet with the consent text and the exact
+// conversation; only "Offer It" sends anything. The take back code lives in
+// this panel's memory and nowhere else. Without an offers block none of this
+// exists on the page.
+//
+// An adapter made by a Socratic lesson (kind 'tutor') is a card with its skill
+// map: pass bands before and after, counted by the lab on questions held back
+// from teaching, with the note that the rules were written by models.
+//
 // All text from the server and from the model is put on the page as text,
 // never as markup.
 
@@ -47,8 +60,16 @@ import {
   PAPER_TOKENS, installPaperTheme, paperCard, paperCardSelected, paperFocusRing, paperHeader, paperHeading, paperInput,
   paperPrimaryButton, paperQuietButton, paperShell, paperTag,
 } from './paperTheme'
+import {
+  OFFERED_BUTTON, OFFER_BUTTON, OFFER_CANCEL, OFFER_COPIED, OFFER_COPY, OFFER_COPY_FAILED, OFFER_DISABLED_NOTE, OFFER_DONE, OFFER_HEADING,
+  OFFER_PREVIEW_LABEL, OFFER_SENDING, OFFER_SUBMIT, OFFER_TAKE_BACK, OFFER_TAKING_BACK, OFFER_THANKS, OFFER_UNREACHED, TAKE_BACK_BAD_CODE,
+  TAKE_BACK_HEADING, TAKE_BACK_HELP, TAKE_BACK_LABEL, TAKE_BACK_OPEN, buildOfferBody, buildWithdrawBody, canOffer, consentParagraphs,
+  normalizeCode, readOfferAnswer, readOffers, readReceipt, readWithdrawAnswer,
+} from './chatOffer'
+import type { OffersInfo } from './chatOffer'
 
 const API = '/api/experiment/trained-chat'
+const OFFER_API = '/api/experiment/chat-offer'
 const REFRESH_MS = 120_000
 
 export interface TrainedAdapterView {
@@ -62,8 +83,12 @@ export interface TrainedAdapterView {
   holdoutExamples: number | null
   lossBefore: number | null
   lossAfter: number | null
-  /** Present, and 'rl', for an adapter made by Tinker RL: its "examples" are tasks and its scores are rubric scores, higher is better. */
-  kind?: 'rl'
+  /** Present for an adapter made by Tinker RL ('rl': its "examples" are tasks and its scores are rubric scores, higher is better) or by a Socratic lesson ('tutor': a skill map, no loss gauge). */
+  kind?: 'rl' | 'tutor'
+  /** Only for kind 'tutor', when the server's record can be read. */
+  skillMap?: SkillMapView
+  /** Trained on conversations visitors offered to the lab. */
+  fromVisitors?: true
   scoreBefore?: number | null
   scoreAfter?: number | null
   expiresAt: string | null
@@ -84,6 +109,15 @@ export interface TrainedAdapterView {
   dataOrigin?: string
 }
 
+/** One cell of a skill map: answers that passed of answers asked, and the pass band from 0 to 5. All counted by the lab. */
+export interface SkillCell { passed: number; total: number; band: number }
+export interface SkillRowView { name: string; before: SkillCell | null; after: SkillCell | null }
+export interface SkillMapView { topic: string; teacherName: string; rows: SkillRowView[]; seenOnly: boolean }
+
+/** One sentence list, the same on every surface that shows a lesson (api/_lib/tinker-tutor.ts holds the same words; a test compares them). */
+export const TUTOR_MEASURE_NOTE = 'The lab counts which answers pass. The rules, the questions and the teaching text were written by models, and a model approved the rules. Nobody has checked that the rules measure the skill.'
+export const TUTOR_BANDS_NOTE = 'Pass bands come from questions held back from teaching.'
+
 export interface ChatLimits { maxMessageChars: number; maxTurns: number }
 
 /** What the panel needs of a second section it can hold (the story box). */
@@ -100,7 +134,7 @@ const SLUG = /^e[0-9]{1,6}-[0-9a-f]{8}$/
 /** "org/name@commit", as the server names the public dataset an adapter was trained on. */
 const DATA_FROM = /^([A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96})@[0-9a-f]{40}$/
 /** The two origin labels the server sends. Anything else is not shown. */
-const DATA_ORIGIN = /^(?:written by the models|public dataset (?:[A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96}@[0-9a-f]{40}|\(its stored source cannot be read\)))$/
+const DATA_ORIGIN = /^(?:written by the models|written by visitors(?: in chats with lab\/e[0-9]{1,6}-[0-9a-f]{8})?|public dataset (?:[A-Za-z0-9._-]{1,96}\/[A-Za-z0-9._-]{1,96}@[0-9a-f]{40}|\(its stored source cannot be read\)))$/
 
 /** A dataset origin with its commit shortened to twelve characters, for a narrow panel. */
 function shortOrigin(origin: string): string {
@@ -116,6 +150,36 @@ function text(v: unknown, max: number): string | null {
 }
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 
+/** A cell of a skill map: whole counts, at least one answer, no more passed than asked, a band from 0 to 5. Anything else is not a cell. */
+export function readSkillCell(raw: unknown): SkillCell | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const { passed, total, band } = o
+  if (typeof passed !== 'number' || typeof total !== 'number' || typeof band !== 'number') return null
+  if (!Number.isInteger(passed) || !Number.isInteger(total) || !Number.isInteger(band)) return null
+  if (total < 1 || total > 100_000 || passed < 0 || passed > total || band < 0 || band > 5) return null
+  return { passed, total, band }
+}
+
+/** The skill map of a lesson adapter, strictly read: at most 10 rows. Null when the topic or the rows cannot be read. */
+export function readSkillMap(raw: unknown): SkillMapView | null {
+  if (!raw || typeof raw !== 'object') return null
+  const o = raw as Record<string, unknown>
+  const topic = text(o.topic, 120)
+  const teacherName = text(o.teacher_name, 60)
+  if (!topic || !teacherName || !Array.isArray(o.rows)) return null
+  const rows: SkillRowView[] = []
+  for (const item of o.rows.slice(0, 10)) {
+    if (!item || typeof item !== 'object') continue
+    const r = item as Record<string, unknown>
+    const name = text(r.name, 60)
+    if (!name) continue
+    rows.push({ name, before: readSkillCell(r.before), after: readSkillCell(r.after) })
+  }
+  if (rows.length === 0) return null
+  return { topic, teacherName, rows, seenOnly: o.seen_only === true }
+}
+
 /** The adapters in a GET answer, strictly read: anything that is not a well formed adapter is left out. */
 export function parseAdapters(raw: unknown): TrainedAdapterView[] {
   const list = raw && typeof raw === 'object' ? (raw as { adapters?: unknown }).adapters : null
@@ -130,6 +194,7 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
     if (!base || epoch === null) continue
     const expires = typeof o.expires_at === 'string' && !Number.isNaN(Date.parse(o.expires_at)) ? o.expires_at : null
     const origin = typeof o.origin === 'string' && DATA_ORIGIN.test(o.origin) ? o.origin : null
+    const skillMap = o.kind === 'tutor' ? readSkillMap(o.skill_map) : null
     out.push({
       slug: o.slug,
       modelId: `lab/${o.slug}`,
@@ -142,6 +207,8 @@ export function parseAdapters(raw: unknown): TrainedAdapterView[] {
       lossBefore: num(o.holdout_loss_before),
       lossAfter: num(o.holdout_loss_after),
       ...(o.kind === 'rl' ? { kind: 'rl' as const, scoreBefore: num(o.rl_score_before), scoreAfter: num(o.rl_score_after) } : {}),
+      ...(o.kind === 'tutor' ? { kind: 'tutor' as const, ...(skillMap ? { skillMap } : {}) } : {}),
+      ...(o.from_visitors === true ? { fromVisitors: true as const } : {}),
       expiresAt: expires,
       ...(typeof o.created_at === 'string' && !Number.isNaN(Date.parse(o.created_at)) ? { createdAt: o.created_at } : {}),
       name: text(o.name, 40),
@@ -173,7 +240,12 @@ export function parseLimits(raw: unknown): ChatLimits {
  * label, there only when the server sent one.
  */
 export function describeAdapter(a: TrainedAdapterView): { title: string; id?: string; mark?: string; origin: string; label?: string; score: string; kept: string } {
-  const score = a.kind === 'rl'
+  const lesson = a.kind === 'tutor' ? skillSummary(a.skillMap) : null
+  const score = a.kind === 'tutor'
+    ? lesson
+      ? `Pass bands come from questions held back from teaching: ${lesson.text}. Counted by the lab.`
+      : 'No held-out score recorded.'
+    : a.kind === 'rl'
     ? a.scoreBefore != null && a.scoreAfter != null
       ? `Held-out rubric score ${a.scoreBefore.toFixed(2)} before training, ${a.scoreAfter.toFixed(2)} after${a.holdoutExamples ? `, on ${a.holdoutExamples} tasks the lab held out` : ''}. Measured by the lab. Higher is better.`
       : 'No held-out score recorded.'
@@ -185,8 +257,12 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
     title: a.name ?? a.modelId,
     ...(a.name ? { id: a.modelId } : {}),
     ...(a.kept ? { mark: 'kept' } : {}),
-    origin: a.kind === 'rl'
+    origin: a.kind === 'tutor'
+      ? `Epoch ${a.epoch}. A lesson${a.skillMap ? ` on "${a.skillMap.topic}"` : ''} written by ${a.authorName}${a.skillMap ? `, taught by ${a.skillMap.teacherName}` : ''}. Base model ${a.baseModel}.`
+      : a.kind === 'rl'
       ? `Epoch ${a.epoch}. Practice by Reward (reinforcement learning) on ${a.examples} tasks and a rubric written by ${a.authorName}. Base model ${a.baseModel}.`
+      : a.fromVisitors
+      ? `Epoch ${a.epoch}. Trained on ${a.examples} conversations written by visitors, in a run ${a.authorName} asked for. Nobody at the lab has read them. Base model ${a.baseModel}.`
       : a.dataFrom
       ? `Epoch ${a.epoch}. Trained on ${a.examples} rows of the public dataset ${a.dataFrom}, chosen by ${a.authorName}. Nobody at the lab has read those rows. Base model ${a.baseModel}.`
       : `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
@@ -196,6 +272,39 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
       ? `Marked to keep${a.keptBy ? ` by ${a.keptBy}` : ''}.${until ? ` Stays until ${until}.` : ''}`
       : until ? `Removed after ${formatDay(until)} unless it is marked to keep.` : '',
   }
+}
+
+/** "3 to 5", or what is known of a row that has only one side measured. */
+export function bandText(row: SkillRowView): string {
+  if (row.before && row.after) return `${row.before.band} to ${row.after.band}`
+  if (row.before) return `${row.before.band} before`
+  if (row.after) return `${row.after.band} after`
+  return 'Not measured'
+}
+
+const cellSentence = (label: 'Before' | 'After', c: SkillCell | null) =>
+  c ? `${label}: ${c.passed} of ${c.total} answers passed. Pass band ${c.band} of 5.` : `${label}: not measured.`
+
+/** One row as a sentence, for the details and for a screen reader. */
+export function skillSentence(row: SkillRowView): string {
+  return `${row.name}. ${cellSentence('Before', row.before)} ${cellSentence('After', row.after)}`
+}
+
+/**
+ * The lesson's overall held back counts, from the rows that were measured
+ * before and after. "More Answers Passed" only when the share that passed went
+ * up. Null when no row has both.
+ */
+export function skillSummary(map: SkillMapView | undefined): { more: boolean; verdict: string; text: string } | null {
+  if (!map) return null
+  let bp = 0, bt = 0, ap = 0, at = 0
+  for (const r of map.rows) {
+    if (!r.before || !r.after) continue
+    bp += r.before.passed; bt += r.before.total; ap += r.after.passed; at += r.after.total
+  }
+  if (bt === 0 || at === 0) return null
+  const more = ap * bt > bp * at
+  return { more, verdict: more ? 'More Answers Passed' : 'Not More Answers Passed', text: `from ${bp} of ${bt} to ${ap} of ${at} answers passed` }
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -220,6 +329,8 @@ export interface ChatList {
   adapters: TrainedAdapterView[]
   limits: ChatLimits
   notice: string | null
+  /** Present only when the server says visitor offers are on. Without it there is no offer button. */
+  offers: OffersInfo | null
 }
 
 export function parseListResponse(raw: unknown): ChatList {
@@ -231,12 +342,14 @@ export function parseListResponse(raw: unknown): ChatList {
     adapters: parseAdapters(o),
     limits: parseLimits(o),
     notice: text(o.notice, 300),
+    offers: readOffers(o),
   }
 }
 
 /** The word on a card's tag: how the model was made. */
 export function kindLabel(a: TrainedAdapterView | 'story'): string {
   if (a === 'story') return 'Story Model'
+  if (a.kind === 'tutor') return 'Taught by Questions'
   return a.kind === 'rl' ? 'Practice by Reward' : 'Fine-Tuned'
 }
 
@@ -284,6 +397,7 @@ export function verdictOf(before: number, after: number, higherIsBetter: boolean
  */
 export function gaugeView(a: TrainedAdapterView): GaugeView {
   const none: GaugeView = { kind: 'none', heading: '', caption: '', explain: '', verdict: '', rows: [], aria: '', none: 'No held-out score recorded.' }
+  if (a.kind === 'tutor') return none // a lesson shows its skill map, not a loss
   const rl = a.kind === 'rl'
   const before = rl ? a.scoreBefore ?? null : a.lossBefore
   const after = rl ? a.scoreAfter ?? null : a.lossAfter
@@ -331,22 +445,26 @@ export function counterVisible(length: number, limit: number): boolean {
 }
 
 /** What the visitor's box holds in compare mode: the untrained side's earlier answers. Null means a normal chat. */
-export function buildChatBody(adapter: string, history: Turn[], baseReplies: string[] | null, only?: 'trained' | 'untrained' | null): Record<string, unknown> {
+export function buildChatBody(adapter: string, history: Turn[], baseReplies: string[] | null, only?: 'trained' | 'untrained' | null, receipt?: string | null): Record<string, unknown> {
   const messages = history.map(t => ({ role: t.role, content: t.content }))
-  if (baseReplies === null) return { adapter, messages }
-  return { adapter, messages, compare: true, base_replies: [...baseReplies], ...(only ? { only } : {}) }
+  // The receipt of the conversation so far goes with the next message, only when the panel holds one.
+  const proof = receipt ? { receipt } : {}
+  if (baseReplies === null) return { adapter, messages, ...proof }
+  return { adapter, messages, compare: true, base_replies: [...baseReplies], ...(only ? { only } : {}), ...proof }
 }
 
-export type ReplySide = { ok: true; reply: string; cutShort: boolean } | { ok: false; message: string | null }
+/** A reply may carry a receipt, only when the server issued one. */
+export type ReplySide = { ok: true; reply: string; cutShort: boolean; receipt?: string } | { ok: false; message: string | null }
 export type ReadReply =
   | { kind: 'error'; message: string | null }
-  | { kind: 'single'; reply: string; cutShort: boolean; turnsLeft: number | null }
+  | { kind: 'single'; reply: string; cutShort: boolean; turnsLeft: number | null; receipt?: string }
   | { kind: 'pair'; trained: ReplySide; untrained: ReplySide; baseModel: string | null; turnsLeft: number | null; commit: boolean }
 
 function readSide(v: unknown): ReplySide {
   const o = v && typeof v === 'object' ? v as Record<string, unknown> : {}
   const reply = o.ok === true ? text(o.reply, 1200) : null
-  if (reply) return { ok: true, reply, cutShort: o.cut_short === true }
+  const receipt = readReceipt(o.receipt)
+  if (reply) return { ok: true, reply, cutShort: o.cut_short === true, ...(receipt ? { receipt } : {}) }
   return { ok: false, message: text(o.message, 300) }
 }
 
@@ -362,7 +480,8 @@ export function readReply(ok: boolean, json: unknown, compare: boolean): ReadRep
   const turnsLeft = left !== null && Number.isInteger(left) && left >= 0 && left <= 50 ? left : null
   if (!compare) {
     const reply = text(o.reply, 1200)
-    return reply ? { kind: 'single', reply, cutShort: o.cut_short === true, turnsLeft } : { kind: 'error', message }
+    const receipt = readReceipt(o.receipt)
+    return reply ? { kind: 'single', reply, cutShort: o.cut_short === true, turnsLeft, ...(receipt ? { receipt } : {}) } : { kind: 'error', message }
   }
   if (o.compare !== true) return { kind: 'error', message }
   const trained = readSide(o.trained)
@@ -526,9 +645,38 @@ export const PANEL_CSS = `
       #trained-chat-panel .tc-notice { padding: 8px 10px; border-radius: var(--paper-radius-sm); background: var(--paper-visitor); border: 1px solid var(--paper-line); color: var(--paper-ink); font-size: 13px; }
       #trained-chat-panel .tc-story-form { display: flex; gap: 8px; }
       #trained-chat-panel .tc-story-input { flex: 1; min-width: 0; min-height: 44px; padding: 0 10px; font-family: inherit; font-size: 16px; }
-      ${paperInput('#trained-chat-panel textarea, #trained-chat-panel .tc-story-input')}
+      ${paperInput('#trained-chat-panel textarea, #trained-chat-panel .tc-story-input, #trained-chat-panel .tc-code-input')}
       #trained-chat-panel .tc-story-text { padding: 10px 12px; border-radius: 2px 10px 10px 10px; background: var(--paper-white); border: 1px solid var(--paper-line); white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.5; }
       #trained-chat-panel .tc-story .tc-status { color: var(--paper-ink-2); font-size: 13px; min-height: 0; }
+      #trained-chat-panel .tc-skill { gap: 5px; }
+      #trained-chat-panel .tc-skill-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 8px; align-items: center; padding: 4px 0 0; border-top: 1px solid var(--paper-hair); }
+      #trained-chat-panel .tc-skill-name { grid-column: 1 / -1; font-weight: 600; color: var(--paper-ink); overflow-wrap: anywhere; }
+      #trained-chat-panel .tc-skill-bars { display: flex; flex-direction: column; gap: 3px; }
+      #trained-chat-panel .tc-bar.tc-hatch { background: repeating-linear-gradient(135deg, var(--paper-bar) 0, var(--paper-bar) 3px, var(--paper-sunk) 3px, var(--paper-sunk) 6px); }
+      #trained-chat-panel .tc-skill-band { font-variant-numeric: tabular-nums; color: var(--paper-ink); text-align: right; }
+      #trained-chat-panel .tc-skill-key { display: flex; flex-wrap: wrap; gap: 0 10px; color: var(--paper-ink-2); }
+      #trained-chat-panel .tc-skill-flag { margin: 2px 0 0; color: var(--paper-danger); font-weight: 600; }
+      #trained-chat-panel .tc-offer-row { display: flex; flex-direction: column; align-items: flex-start; gap: 4px; margin-top: 8px; }
+      #trained-chat-panel .tc-offer-note { margin: 0; font-size: 13px; color: var(--paper-ink-2); }
+      #trained-chat-panel .tc-offer { min-height: 44px; padding: 0 14px; font-size: 14px; font-weight: 600; }
+      #trained-chat-panel .tc-takeback { align-self: flex-start; }
+      #trained-chat-panel .tc-offer-sheet { position: absolute; inset: 0; z-index: 5; display: flex; align-items: center; justify-content: center; padding: 16px; background: var(--paper-raised-veil); }
+      #trained-chat-panel .tc-offer-card { display: flex; flex-direction: column; width: min(580px, 100%); max-height: 100%; background: var(--paper-surface); border: 1px solid var(--paper-line); border-radius: var(--paper-radius); box-shadow: var(--paper-shadow-soft); overflow: hidden; }
+      #trained-chat-panel .tc-offer-scroll { flex: 1 1 auto; min-height: 0; overflow-y: auto; padding: 16px 18px 8px; display: flex; flex-direction: column; gap: 10px; font-size: 15px; line-height: 1.45; }
+      #trained-chat-panel .tc-offer-scroll p { margin: 0; }
+      #trained-chat-panel .tc-offer-title { margin: 0; font-family: var(--paper-serif); font-size: 19px; font-weight: 700; }
+      #trained-chat-panel .tc-offer-conv { flex: none; min-height: 88px; max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 8px 10px; background: var(--paper-white); border: 1px solid var(--paper-line); border-radius: var(--paper-radius-sm); }
+      #trained-chat-panel .tc-offer-turn { display: flex; flex-direction: column; gap: 1px; }
+      #trained-chat-panel .tc-offer-turn-text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 14px; line-height: 1.4; }
+      #trained-chat-panel .tc-offer-code { padding: 8px 10px; font: 700 20px/1.3 var(--paper-mono); letter-spacing: 0.08em; background: var(--paper-white); border: 1px solid var(--paper-line); border-radius: var(--paper-radius-sm); user-select: all; overflow-wrap: anywhere; }
+      #trained-chat-panel .tc-offer-actions { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 10px 18px 14px; border-top: 1px solid var(--paper-hair); background: var(--paper-raised); }
+      #trained-chat-panel .tc-offer-alert { flex: 1 1 100%; margin: 0; padding: 8px 10px; border: 1px solid var(--paper-danger); border-radius: var(--paper-radius-sm); background: var(--paper-danger-bg); color: var(--paper-danger); font-size: 14px; }
+      #trained-chat-panel .tc-offer-status { flex: 1 1 100%; margin: 0; font-size: 13px; color: var(--paper-ink-2); }
+      #trained-chat-panel .tc-offer-go { min-height: 44px; padding: 0 14px; font-family: inherit; font-size: 15px; font-weight: 600; }
+      ${paperPrimaryButton('#trained-chat-panel .tc-offer-go')}
+      #trained-chat-panel .tc-offer-go { color: var(--paper-ink); }
+      #trained-chat-panel .tc-code-input { min-height: 44px; padding: 0 10px; font-family: inherit; font-size: 16px; text-transform: uppercase; }
+      #trained-chat-panel .tc-offer-label { font-weight: 700; font-size: 14px; }
       @media (max-width: 760px) {
         #trained-chat-panel { inset: 0; right: 0; bottom: 0; width: 100%; height: 100dvh; border-radius: 0; border: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
         #trained-chat-panel .tc-body { grid-template-columns: minmax(0, 1fr); }
@@ -550,8 +698,14 @@ export const PANEL_CSS = `
         #trained-chat-panel .tc-controls .tc-switch { order: 4; flex-basis: 100%; justify-content: space-between; }
         #trained-chat-panel .tc-switch-note { padding: 4px 12px; }
         #trained-chat-panel .tc-sheet { padding: 24px 18px; }
+        #trained-chat-panel .tc-offer { width: 100%; }
+        #trained-chat-panel .tc-offer-sheet { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+        #trained-chat-panel .tc-offer-card { width: 100%; height: 100%; border: 0; border-radius: 0; box-shadow: none; }
+        #trained-chat-panel .tc-offer-conv { max-height: 30dvh; }
+        #trained-chat-panel .tc-offer-actions .tc-btn, #trained-chat-panel .tc-offer-actions .tc-offer-go { flex: 1 1 140px; }
       }
       #trained-chat-panel.tc-short .tc-back, #trained-chat-panel.tc-short .tc-controls .tc-new, #trained-chat-panel.tc-short .tc-controls .tc-btn, #trained-chat-panel.tc-short .tc-who-sub, #trained-chat-panel.tc-short .tc-switch-note, #trained-chat-panel.tc-short .tc-details, #trained-chat-panel.tc-short .tc-note, #trained-chat-panel.tc-short .tc-tube-own, #trained-chat-panel.tc-short .tc-log-empty { display: none; }
+      #trained-chat-panel.tc-short .tc-offer-row { display: none; }
       #trained-chat-panel.tc-short .tc-conv-head { min-height: 0; padding-top: 4px; padding-bottom: 4px; }
       @media (max-height: 560px) {
         #trained-chat-panel .tc-switch-note, #trained-chat-panel .tc-who-sub, #trained-chat-panel .tc-note, #trained-chat-panel .tc-log-empty { display: none; }
@@ -605,6 +759,30 @@ export class TrainedChatPanel {
   private infoLine: HTMLParagraphElement
   private tubeOwn: HTMLParagraphElement
   private switchState: HTMLSpanElement
+  private headBar: HTMLDivElement
+  private bodyBox: HTMLDivElement
+  private offerRow: HTMLDivElement
+  private offerButton: HTMLButtonElement
+  private offerNote: HTMLParagraphElement
+  private sheet: HTMLDivElement
+  private sheetAlert: HTMLParagraphElement | null = null
+  private sheetStatus: HTMLParagraphElement | null = null
+  private sheetButtons: HTMLButtonElement[] = []
+  private sheetHeading: HTMLElement | null = null
+
+  /** The offers block of the last GET answer. Null means offers are off: no button, no receipt, no take back link. */
+  private offers: OffersInfo | null = null
+  /** The receipt of the last reply of the trained side, in memory only. Dropped with the conversation or the adapter. */
+  private receipt: string | null = null
+  /** This conversation was offered (or the lab said it already holds it). */
+  private offered = false
+  /** What the sheet is showing, if it is open. */
+  private sheetMode: 'offer' | 'withdraw' | null = null
+  private sheetBusy = false
+  private sheetToken = 0
+  private sheetInert: Array<() => void> = []
+  /** The take back code from a 201, in this panel's memory only, until the sheet closes. */
+  private offerCode: string | null = null
 
   private adapters: TrainedAdapterView[] = []
   private limits: ChatLimits = { maxMessageChars: 500, maxTurns: 8 }
@@ -690,9 +868,11 @@ export class TrainedChatPanel {
     close.addEventListener('click', () => this.close())
     head.appendChild(close)
     this.panel.appendChild(head)
+    this.headBar = head
 
     const body = el('div', 'tc-body')
     this.panel.appendChild(body)
+    this.bodyBox = body
 
     // Shelf column
     this.shelf = el('aside', 'tc-shelf')
@@ -796,12 +976,25 @@ export class TrainedChatPanel {
     this.infoLine.hidden = true
     this.tubeOwn = el('p', 'tc-tube-own')
     this.tubeOwn.hidden = true
-    foot.append(this.banner, this.infoLine, this.form, this.limitRow, standing, this.tubeOwn)
+    this.offerRow = el('div', 'tc-offer-row')
+    this.offerRow.hidden = true
+    this.offerButton = el('button', 'tc-btn tc-offer', OFFER_BUTTON)
+    this.offerButton.type = 'button'
+    this.offerButton.disabled = true
+    this.offerButton.addEventListener('click', () => this.openOfferSheet())
+    this.offerNote = el('p', 'tc-offer-note', OFFER_DISABLED_NOTE)
+    this.offerRow.append(this.offerButton, this.offerNote)
+    foot.append(this.banner, this.infoLine, this.form, this.limitRow, standing, this.offerRow, this.tubeOwn)
     this.statusLine = el('div', 'tc-sr')
     this.statusLine.setAttribute('role', 'status')
 
     this.conv.append(convHead, this.switchNote, this.details, this.log, this.storySlot, foot, this.statusLine)
     body.appendChild(this.conv)
+
+    // The sheet for offering a conversation or taking an offer back. It sits inside the panel, over everything else in it.
+    this.sheet = el('div', 'tc-offer-sheet')
+    this.sheet.hidden = true
+    this.panel.appendChild(this.sheet)
 
     this.form.addEventListener('submit', e => {
       e.preventDefault()
@@ -847,6 +1040,8 @@ export class TrainedChatPanel {
     this.adapters = []
     this.compareEnabled = false
     this.pendingSlug = null
+    this.offers = null
+    if (this.sheetMode !== null && !this.sheetBusy) this.closeSheet(false)
     if (this.chosen !== STORY) this.chosen = null
     this.reset()
   }
@@ -938,6 +1133,8 @@ export class TrainedChatPanel {
     if (this.coarse()) this.panel.focus?.()
     else if (this.chatShown && this.chosen && this.chosen !== STORY && !this.input.disabled) this.input.focus?.()
     else this.focusFirstCard()
+    // A sheet that was open when the panel was closed is still there: its heading takes focus.
+    if (this.sheetMode !== null) this.sheetHeading?.focus?.()
     // Nothing to focus (an empty or failed shelf): the sheet itself, so Escape and Tab work from the first key press.
     if (!(this.panel.contains?.(document.activeElement) === true)) this.panel.focus?.()
   }
@@ -970,21 +1167,25 @@ export class TrainedChatPanel {
     this.keyHandler = (e: KeyboardEvent) => {
       const target = e.target as Node | null
       const inside = !!target && (this.panel.contains?.(target) === true || target === document.body || target === this.toggle)
+      // While the offer sheet is open it holds the keyboard: Escape closes it (not the panel), Tab stays inside it.
+      const scope: HTMLElement = this.sheetMode !== null ? this.sheet : this.panel
       if (e.key === 'Escape' && inside) {
         e.preventDefault()
-        this.close()
+        if (this.sheetMode !== null) {
+          if (!this.sheetBusy) this.closeSheet(true)
+        } else this.close()
         return
       }
       if (e.key !== 'Tab') return
-      const items = Array.from(this.panel.querySelectorAll(FOCUSABLE) as NodeListOf<HTMLElement>).filter(n => n.getClientRects?.().length)
+      const items = Array.from(scope.querySelectorAll(FOCUSABLE) as NodeListOf<HTMLElement>).filter(n => n.getClientRects?.().length)
       if (!items.length) return
       const first = items[0]
       const last = items[items.length - 1]
       const active = document.activeElement
-      if (e.shiftKey && (active === first || active === this.panel || !this.panel.contains?.(active))) {
+      if (e.shiftKey && (active === first || active === scope || active === this.sheetHeading || !scope.contains?.(active))) {
         e.preventDefault()
         last.focus()
-      } else if (!e.shiftKey && (active === last || !this.panel.contains?.(active))) {
+      } else if (!e.shiftKey && (active === last || !scope.contains?.(active))) {
         e.preventDefault()
         first.focus()
       }
@@ -1034,6 +1235,10 @@ export class TrainedChatPanel {
     this.held = null
     this.compareDropped = false
     this.tubeOwn.hidden = true
+    // A new conversation, or another model: the receipt and the offer belong to the old one.
+    this.receipt = null
+    this.offered = false
+    if (this.sheetMode === 'offer' && !this.sheetBusy) this.closeSheet(false)
     this.turns = []
     this.baseReplies = []
     this.serverTurnsLeft = null
@@ -1099,6 +1304,8 @@ export class TrainedChatPanel {
       this.adapters = list.adapters
       this.limits = list.limits
       this.notice = list.notice
+      this.offers = list.offers
+      if (!list.offers) this.receipt = null
       this.compareEnabled = list.compareEnabled
       if (!list.compareEnabled && this.compareOn) {
         this.compareOn = false
@@ -1163,7 +1370,7 @@ export class TrainedChatPanel {
     const signature = shelfSignature({
       adapters: this.adapters, story: this.storyShown(), chat: this.chatShown, state: this.loadState,
       compare: this.compareEnabled, limits: this.limits, notice: this.notice,
-    }) + `|${this.chosen}|${this.retired?.slug ?? ''}`
+    }) + `|${this.chosen}|${this.retired?.slug ?? ''}|${this.offers ? `${this.offers.keepDays}/${this.offers.perDay}` : '-'}`
     if (!force && signature === this.signature) return
     this.signature = signature
     this.renderShelf()
@@ -1215,6 +1422,12 @@ export class TrainedChatPanel {
     if (chat) {
       if (this.notice) this.shelfFoot.appendChild(el('p', undefined, this.notice))
       this.shelfFoot.appendChild(el('p', undefined, TUBE_LINE))
+      if (this.offers) {
+        const back = el('button', 'tc-btn tc-link tc-takeback', TAKE_BACK_OPEN)
+        back.type = 'button'
+        back.addEventListener('click', () => this.openWithdrawSheet())
+        this.shelfFoot.appendChild(back)
+      }
     }
     // A redrawn "Try Again" must not drop focus on the page body.
     if (sheetFocus) (this.shelfSheet.querySelector?.('button') as HTMLElement | null)?.focus?.()
@@ -1265,7 +1478,45 @@ export class TrainedChatPanel {
     return card
   }
 
+  /** The card of a lesson: up to four skill rows with a before and an after bar, then the overall count and the honest notes. */
+  private skillNode(a: TrainedAdapterView): HTMLElement {
+    const map = a.skillMap
+    if (!map) return el('div', 'tc-gauge', 'No held-out score recorded.')
+    const box = el('div', 'tc-gauge tc-skill')
+    box.appendChild(el('div', 'tc-gauge-head', 'Pass Bands, Higher Is Better'))
+    box.appendChild(el('div', 'tc-skill-key', 'Hatched bar: before. Solid bar: after.'))
+    const shown = map.rows.slice(0, 4)
+    for (const row of shown) {
+      const line = el('div', 'tc-skill-row')
+      line.setAttribute('role', 'group')
+      line.setAttribute('aria-label', skillSentence(row))
+      line.appendChild(el('span', 'tc-skill-name', row.name))
+      const bars = el('div', 'tc-skill-bars')
+      bars.setAttribute('aria-hidden', 'true')
+      for (const [cell, cls] of [[row.before, 'tc-bar tc-hatch'], [row.after, 'tc-bar tc-after']] as const) {
+        const track = el('div', 'tc-track')
+        const bar = el('div', cls)
+        bar.style.width = `${cell ? ((cell.passed / cell.total) * 100).toFixed(1) : '0'}%`
+        track.appendChild(bar)
+        bars.appendChild(track)
+      }
+      line.append(bars, el('span', 'tc-skill-band', bandText(row)))
+      box.appendChild(line)
+    }
+    if (map.rows.length > shown.length) box.appendChild(el('div', undefined, `and ${map.rows.length - shown.length} more in Details`))
+    const sum = skillSummary(map)
+    if (sum) {
+      const verdict = el('div', 'tc-verdict')
+      verdict.append(el('span', 'tc-verdict-word', sum.verdict), el('span', undefined, sum.text))
+      box.appendChild(verdict)
+    }
+    if (map.seenOnly) box.appendChild(el('p', 'tc-skill-flag', 'Flag: better only on questions seen in teaching.'))
+    box.appendChild(el('p', 'tc-explain', `${TUTOR_BANDS_NOTE} ${TUTOR_MEASURE_NOTE}`))
+    return box
+  }
+
   private gaugeNode(a: TrainedAdapterView): HTMLElement {
+    if (a.kind === 'tutor') return this.skillNode(a)
     const g = gaugeView(a)
     if (g.kind === 'none') return el('div', 'tc-gauge', g.none)
     const box = el('div', 'tc-gauge')
@@ -1322,6 +1573,7 @@ export class TrainedChatPanel {
     this.details.replaceChildren()
     if (storyChosen) {
       this.whoTitle.textContent = 'Story Model'
+      this.offerRow.hidden = true
       return
     }
     if (!a || !(this.canChat() || this.retired !== null)) {
@@ -1329,6 +1581,7 @@ export class TrainedChatPanel {
       this.switchNote.hidden = true
       this.switchButton.hidden = true
       this.infoLine.hidden = true
+      this.offerRow.hidden = true
       return
     }
     const d = describeAdapter(a)
@@ -1345,6 +1598,12 @@ export class TrainedChatPanel {
     }
     const ago = trainedAgoText(a.createdAt, Date.now())
     if (ago) this.details.appendChild(el('p', undefined, ago))
+    if (a.kind === 'tutor' && a.skillMap) {
+      this.details.appendChild(el('p', undefined, `Taught by ${a.skillMap.teacherName}.`))
+      for (const row of a.skillMap.rows) this.details.appendChild(el('p', undefined, skillSentence(row)))
+      if (a.skillMap.seenOnly) this.details.appendChild(el('p', undefined, 'Flag: better only on questions seen in teaching.'))
+      this.details.appendChild(el('p', undefined, `${TUTOR_BANDS_NOTE} ${TUTOR_MEASURE_NOTE}`))
+    }
     this.refreshCompare()
     this.refreshForm()
     this.showHint()
@@ -1435,6 +1694,7 @@ export class TrainedChatPanel {
     this.form.style.display = full ? 'none' : ''
     this.limitRow.hidden = !full
     this.refreshMeta()
+    this.refreshOffer()
   }
 
   private scrollEnd(): void {
@@ -1523,7 +1783,7 @@ export class TrainedChatPanel {
       const res = await fetch(API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(buildChatBody(a.slug, history, compare ? this.baseReplies : null, only)),
+        body: JSON.stringify(buildChatBody(a.slug, history, compare ? this.baseReplies : null, only, this.offers ? this.receipt : null)),
       })
       const json = await res.json().catch(() => ({}))
       const read = readReply(res.ok, json, compare)
@@ -1537,6 +1797,7 @@ export class TrainedChatPanel {
         fail(read.message, busy)
       } else if (read.kind === 'single') {
         this.turns = [...history, { role: 'assistant', content: read.reply }]
+        this.receipt = this.offers ? read.receipt ?? null : null
         this.serverTurnsLeft = read.turnsLeft
         block.replaceChildren(this.slip(text1), this.sheetFor(title, read.reply, { accent: accentFor(a.authorName), cut: read.cutShort }))
         this.openBlock = null
@@ -1555,6 +1816,7 @@ export class TrainedChatPanel {
         block.replaceChildren(this.slip(text1), pair)
         if (trainedSide.ok && untrainedSide.ok) {
           this.turns = [...history, { role: 'assistant', content: trainedSide.reply }]
+          this.receipt = this.offers ? trainedSide.receipt ?? null : null
           this.baseReplies = [...this.baseReplies, untrainedSide.reply]
           this.serverTurnsLeft = read.turnsLeft
           this.openBlock = null
@@ -1585,6 +1847,273 @@ export class TrainedChatPanel {
         if (this.isOpen && !this.input.disabled && !this.coarse()) this.input.focus?.()
       }
     }
+  }
+
+  // -------------------------------------------------------------------------
+  // Offering a conversation, and taking an offer back (spec 2.2)
+  // -------------------------------------------------------------------------
+
+  /** Shows or hides the offer button, and says why it is disabled. Absent unless the server's GET answered offers. */
+  private refreshOffer(): void {
+    const show = this.offers !== null && this.chatShown && this.chosen !== STORY && this.canChat()
+    this.offerRow.hidden = !show
+    if (!show) return
+    const ready = canOffer(this.turns, this.receipt) && !this.busy && !this.halfPair
+    this.offerButton.textContent = this.offered ? OFFERED_BUTTON : OFFER_BUTTON
+    this.offerButton.disabled = this.offered || !ready
+    this.offerNote.hidden = this.offered || ready
+    this.offerNote.textContent = OFFER_DISABLED_NOTE
+  }
+
+  /** Opens the sheet over the panel and moves focus to its heading. */
+  private showSheet(mode: 'offer' | 'withdraw'): void {
+    this.sheetMode = mode
+    this.sheetBusy = false
+    this.sheet.hidden = false
+    if (this.sheetInert.length === 0) {
+      for (const part of [this.headBar, this.bodyBox]) {
+        part.inert = true
+        this.sheetInert.push(() => { part.inert = false })
+      }
+    }
+  }
+
+  /** Closes the sheet and forgets what it held, the take back code included. Focus goes back to the button that opened it. */
+  private closeSheet(returnFocus: boolean): void {
+    const mode = this.sheetMode
+    this.sheetMode = null
+    this.sheetBusy = false
+    this.sheetToken++
+    this.offerCode = null
+    this.sheetAlert = null
+    this.sheetStatus = null
+    this.sheetButtons = []
+    this.sheetHeading = null
+    this.sheet.hidden = true
+    this.sheet.replaceChildren()
+    for (const undo of this.sheetInert) undo()
+    this.sheetInert = []
+    if (!returnFocus || !mode) return
+    const opener = mode === 'offer' ? this.offerButton : (this.shelfFoot.querySelector?.('.tc-takeback') as HTMLElement | null)
+    opener?.focus?.()
+    if (document.activeElement !== opener) this.panel.focus?.()
+  }
+
+  /** Builds the sheet's frame: a heading, a scrolling body and a row of actions. Returns the parts to fill. */
+  private sheetFrame(title: string): { scroll: HTMLDivElement; actions: HTMLDivElement } {
+    this.sheet.replaceChildren()
+    const card = el('div', 'tc-offer-card')
+    card.setAttribute('role', 'dialog')
+    card.setAttribute('aria-modal', 'true')
+    const heading = el('h2', 'tc-offer-title', title)
+    heading.id = 'trained-chat-offer-title'
+    heading.setAttribute('tabindex', '-1')
+    card.setAttribute('aria-labelledby', heading.id)
+    const scroll = el('div', 'tc-offer-scroll')
+    scroll.appendChild(heading)
+    const actions = el('div', 'tc-offer-actions')
+    this.sheetAlert = el('p', 'tc-offer-alert')
+    this.sheetAlert.setAttribute('role', 'alert')
+    this.sheetAlert.hidden = true
+    this.sheetStatus = el('p', 'tc-offer-status')
+    this.sheetStatus.setAttribute('role', 'status')
+    this.sheetStatus.hidden = true
+    actions.append(this.sheetAlert, this.sheetStatus)
+    card.append(scroll, actions)
+    this.sheet.appendChild(card)
+    this.sheetHeading = heading
+    this.sheetButtons = []
+    return { scroll, actions }
+  }
+
+  private sheetButton(parent: HTMLElement, label: string, className: string, onClick: () => void): HTMLButtonElement {
+    const b = el('button', className, label)
+    b.type = 'button'
+    b.addEventListener('click', onClick)
+    parent.appendChild(b)
+    this.sheetButtons.push(b)
+    return b
+  }
+
+  private setSheetBusy(busy: boolean, go?: HTMLButtonElement, label?: string, busyLabel?: string): void {
+    this.sheetBusy = busy
+    for (const b of this.sheetButtons) b.disabled = busy
+    if (go && label && busyLabel) go.textContent = busy ? busyLabel : label
+  }
+
+  private showSheetAlert(message: string): void {
+    if (!this.sheetAlert) return
+    this.sheetAlert.textContent = message
+    this.sheetAlert.hidden = false
+  }
+
+  private showSheetStatus(message: string): void {
+    if (!this.sheetStatus) return
+    this.sheetStatus.textContent = message
+    this.sheetStatus.hidden = false
+  }
+
+  /** The consent text and the exact conversation, with "Offer It" and "Not Now". */
+  private openOfferSheet(): void {
+    const a = this.current()
+    if (!this.offers || !a || !this.receipt || !canOffer(this.turns, this.receipt) || this.offered) return
+    this.showSheet('offer')
+    const { scroll, actions } = this.sheetFrame(OFFER_HEADING)
+    for (const paragraph of consentParagraphs(this.offers.keepDays)) scroll.appendChild(el('p', undefined, paragraph))
+    scroll.appendChild(el('p', 'tc-offer-label', OFFER_PREVIEW_LABEL))
+    if (this.compareOn) scroll.appendChild(el('p', undefined, 'Only the trained model\'s side is offered. The untrained answers are not part of it.'))
+    const conv = el('div', 'tc-offer-conv')
+    conv.setAttribute('role', 'region')
+    conv.setAttribute('aria-label', 'The conversation that would be stored')
+    conv.setAttribute('tabindex', '0')
+    const title = describeAdapter(a).title
+    for (const t of this.turns) {
+      const turn = el('div', 'tc-offer-turn')
+      turn.append(el('div', 'tc-who-label', t.role === 'user' ? 'You' : title), el('div', 'tc-offer-turn-text', t.content))
+      conv.appendChild(turn)
+    }
+    scroll.appendChild(conv)
+    const go = this.sheetButton(actions, OFFER_SUBMIT, 'tc-offer-go', () => void this.sendOffer(go))
+    this.sheetButton(actions, OFFER_CANCEL, 'tc-btn', () => this.closeSheet(true))
+    this.sheetHeading?.focus?.()
+  }
+
+  private async sendOffer(go: HTMLButtonElement): Promise<void> {
+    const a = this.current()
+    const receipt = this.receipt
+    if (this.sheetBusy || this.sheetMode !== 'offer' || !a || !receipt) return
+    if (this.sheetAlert) this.sheetAlert.hidden = true
+    this.setSheetBusy(true, go, OFFER_SUBMIT, OFFER_SENDING)
+    const token = ++this.sheetToken
+    let answer: ReturnType<typeof readOfferAnswer>
+    try {
+      const res = await fetch(OFFER_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(buildOfferBody(a.slug, this.turns, receipt)),
+      })
+      answer = readOfferAnswer(res.status, await res.json().catch(() => ({})))
+    } catch {
+      answer = { kind: 'refused', status: 0, error: 'unavailable', message: OFFER_UNREACHED }
+    }
+    if (token !== this.sheetToken || this.sheetMode !== 'offer') return
+    this.sheetBusy = false
+    if (answer.kind === 'stored') {
+      this.offered = true
+      this.offerCode = answer.code
+      this.showStored(answer.code, answer.keptUntil, answer.message)
+      this.refreshOffer()
+      return
+    }
+    this.setSheetBusy(false, go, OFFER_SUBMIT, OFFER_SENDING)
+    // The lab cannot verify this conversation any more: the button says so, and the receipt is let go.
+    if (answer.error === 'not_verified') this.receipt = null
+    // The lab already holds this conversation: it cannot be offered a second time.
+    if (answer.error === 'already_offered') this.offered = true
+    this.showSheetAlert(answer.message)
+    this.refreshOffer()
+  }
+
+  /** After a 201: the code, shown once, with Copy Code, Take It Back and Done. */
+  private showStored(code: string, keptUntil: string | null, message: string): void {
+    const { scroll, actions } = this.sheetFrame(OFFER_HEADING)
+    scroll.appendChild(el('p', undefined, message === OFFER_THANKS ? message : `${OFFER_THANKS} ${message}`.trim()))
+    scroll.appendChild(el('p', undefined, 'Your code to take it back:'))
+    const shown = el('div', 'tc-offer-code', code)
+    shown.setAttribute('aria-label', `Your take back code: ${code.split('').join(' ')}`)
+    scroll.appendChild(shown)
+    scroll.appendChild(el('p', undefined, 'Keep it. The lab cannot show it again.'))
+    if (keptUntil) scroll.appendChild(el('p', undefined, `The lab keeps the conversation until ${formatDay(keptUntil.slice(0, 10))}.`))
+    this.sheetButton(actions, OFFER_COPY, 'tc-btn', () => void this.copyCode())
+    const back = this.sheetButton(actions, OFFER_TAKE_BACK, 'tc-btn', () => void this.sendWithdraw(code, back))
+    this.sheetButton(actions, OFFER_DONE, 'tc-offer-go', () => this.closeSheet(true))
+    this.sheetHeading?.focus?.()
+  }
+
+  private async copyCode(): Promise<void> {
+    const code = this.offerCode
+    if (!code) return
+    try {
+      const clip = globalThis.navigator?.clipboard
+      if (!clip?.writeText) throw new Error('no clipboard')
+      await clip.writeText(code)
+      this.showSheetStatus(OFFER_COPIED)
+    } catch {
+      this.showSheetStatus(OFFER_COPY_FAILED)
+    }
+  }
+
+  /** The one field form, from the shelf's footer. */
+  private openWithdrawSheet(): void {
+    if (!this.offers) return
+    this.showSheet('withdraw')
+    const { scroll, actions } = this.sheetFrame(TAKE_BACK_HEADING)
+    scroll.appendChild(el('p', undefined, TAKE_BACK_HELP))
+    const form = el('form', 'tc-offer-form')
+    const label = el('label', 'tc-offer-label', TAKE_BACK_LABEL)
+    const input = el('input', 'tc-code-input')
+    input.type = 'text'
+    input.id = 'trained-chat-take-back'
+    label.setAttribute('for', input.id)
+    input.maxLength = 24
+    input.autocomplete = 'off'
+    input.spellcheck = false
+    input.setAttribute('autocapitalize', 'characters')
+    input.setAttribute('aria-describedby', 'trained-chat-offer-title')
+    input.placeholder = 'XXXX-XXXX-XXXX'
+    form.style.display = 'flex'
+    form.style.flexDirection = 'column'
+    form.style.gap = '6px'
+    form.append(label, input)
+    scroll.appendChild(form)
+    const go = this.sheetButton(actions, OFFER_TAKE_BACK, 'tc-offer-go', () => void submitCode())
+    this.sheetButton(actions, OFFER_CANCEL, 'tc-btn', () => this.closeSheet(true))
+    const submitCode = async () => {
+      if (this.sheetAlert) this.sheetAlert.hidden = true
+      const code = normalizeCode(input.value ?? '')
+      if (!code) {
+        this.showSheetAlert(TAKE_BACK_BAD_CODE)
+        input.focus?.()
+        return
+      }
+      await this.sendWithdraw(code, go)
+    }
+    form.addEventListener('submit', e => {
+      e.preventDefault()
+      void submitCode()
+    })
+    this.sheetHeading?.focus?.()
+  }
+
+  private async sendWithdraw(code: string, go: HTMLButtonElement): Promise<void> {
+    if (this.sheetBusy || this.sheetMode === null) return
+    const mode = this.sheetMode
+    if (this.sheetAlert) this.sheetAlert.hidden = true
+    this.setSheetBusy(true, go, OFFER_TAKE_BACK, OFFER_TAKING_BACK)
+    const token = ++this.sheetToken
+    let answer: ReturnType<typeof readWithdrawAnswer>
+    try {
+      const res = await fetch(OFFER_API, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify(buildWithdrawBody(code)),
+      })
+      answer = readWithdrawAnswer(res.status, await res.json().catch(() => ({})))
+    } catch {
+      answer = { kind: 'refused', status: 0, error: 'unavailable', message: 'The lab could not be reached. Try again in a moment.' }
+    }
+    if (token !== this.sheetToken || this.sheetMode !== mode) return
+    this.sheetBusy = false
+    if (answer.kind === 'refused') {
+      this.setSheetBusy(false, go, OFFER_TAKE_BACK, OFFER_TAKING_BACK)
+      this.showSheetAlert(answer.message)
+      return
+    }
+    this.offerCode = null
+    const { scroll, actions } = this.sheetFrame(mode === 'offer' ? OFFER_HEADING : TAKE_BACK_HEADING)
+    scroll.appendChild(el('p', undefined, answer.message))
+    this.sheetButton(actions, OFFER_DONE, 'tc-offer-go', () => this.closeSheet(true))
+    this.sheetHeading?.focus?.()
   }
 
   /** The visitor's own reply really arrived, so the room's tube was told: say so, once, in the conversation's foot. */
