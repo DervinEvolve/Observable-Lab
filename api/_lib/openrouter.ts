@@ -253,6 +253,9 @@ export interface CompletionOptions {
   webSearch: boolean
   maxTokens?: number
   effort?: string // reasoning effort to ask for; default medium
+  // An exact output limit, reasoning included: sent as min(exactLimit, the
+  // model's own limit), with no 1000 token floor and no doubling for reasoning.
+  exactLimit?: number
 }
 
 /**
@@ -289,7 +292,7 @@ export function buildRequestBody(
   // A truncated answer is unparseable JSON, which throws the work away.
   // Reasoning tokens count against the same limit, so double it when on.
   const answer = Math.max(1000, opts.maxTokens ?? DEFAULT_ANSWER_TOKENS)
-  let limit = effort ? answer * 2 : answer
+  let limit = opts.exactLimit !== undefined ? Math.max(1, Math.floor(opts.exactLimit)) : effort ? answer * 2 : answer
   if (caps?.max_completion_tokens) limit = Math.min(limit, caps.max_completion_tokens)
   if (supported.has('max_tokens')) body.max_tokens = limit
   else if (supported.has('max_completion_tokens')) body.max_completion_tokens = limit
@@ -365,10 +368,11 @@ async function requestCompletion(
   maxTokens?: number,
   assigned = modelId,
   timeoutMs = COMPLETION_TIMEOUT_MS,
-  effort?: string
+  effort?: string,
+  exactLimit?: number
 ): Promise<{ data: any; content: string; citations: WebCitation[]; usage: CallUsage }> {
   const caps = await getModelCapabilities(modelId)
-  const requestBody = buildRequestBody(modelId, caps, systemPrompt, userPrompt, { jsonOnly, webSearch, maxTokens, effort })
+  const requestBody = buildRequestBody(modelId, caps, systemPrompt, userPrompt, { jsonOnly, webSearch, maxTokens, effort, exactLimit })
 
   const response = await fetch(CHAT_URL, {
     method: 'POST',
@@ -635,4 +639,40 @@ export async function callModel(
   }
 
   return { output: parsed, cost, citations, servedBy, usage };
+}
+
+export type CallOnceResult =
+  | { ok: true; parsed: unknown; usage: CallUsage }
+  | { ok: false; reason: 'refused' | 'truncated' | 'timeout' | 'unparseable' | 'error'; usage: CallUsage | null }
+
+/**
+ * One request to one model, for work whose every call is counted and capped
+ * by its caller (the Socratic lesson's teacher, tinker-tutor-run.ts). JSON
+ * mode, an exact output limit (reasoning included), no retry and no fallback.
+ * The ledger row is written by requestCompletion as for every call. Never
+ * throws: a failure is a reason, with the usage when the call was billed.
+ */
+export async function callModelOnce(
+  modelId: string,
+  systemPrompt: string,
+  userPrompt: string,
+  opts: { maxTokensExact: number; effort?: string; timeoutMs?: number },
+): Promise<CallOnceResult> {
+  if (!OPENROUTER_API_KEY) return { ok: false, reason: 'error', usage: null }
+  let result: { content: string; usage: CallUsage }
+  try {
+    result = await requestCompletion(modelId, systemPrompt, userPrompt, true, false, undefined, modelId, opts.timeoutMs ?? COMPLETION_TIMEOUT_MS, opts.effort, opts.maxTokensExact)
+  } catch (e) {
+    if (e instanceof ModelRefusalError) return { ok: false, reason: 'refused', usage: e.usage }
+    if (e instanceof ModelTruncatedError) return { ok: false, reason: 'truncated', usage: e.usage }
+    if (isTimeoutError(e)) return { ok: false, reason: 'timeout', usage: null }
+    return { ok: false, reason: 'error', usage: null }
+  }
+  try {
+    const parsed = extractJson(result.content || '')
+    if (parsed === undefined) return { ok: false, reason: 'unparseable', usage: result.usage }
+    return { ok: true, parsed, usage: result.usage }
+  } catch {
+    return { ok: false, reason: 'unparseable', usage: result.usage }
+  }
 }
