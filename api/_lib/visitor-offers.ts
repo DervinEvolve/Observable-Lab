@@ -20,9 +20,16 @@
  * when the conversation before it carried a valid receipt too. So a receipt
  * exists only for a conversation in which every reply came from the lab's
  * endpoint, in order. Nothing is stored to do this. The key is derived from
- * LAB_OPERATOR_SECRET or CRON_SECRET and from nothing else: a leaked database
- * URL must not be able to forge receipts, so with neither secret set no
- * receipt is issued and nothing can be offered.
+ * LAB_OPERATOR_SECRET and from nothing else: a leaked database URL must not
+ * be able to forge receipts, so without that secret no receipt is issued and
+ * nothing can be offered.
+ *
+ * The owner's route. A stored offer can be read and deleted only through
+ * POST /api/experiment/visitor-offers, which opens with LAB_OPERATOR_SECRET
+ * of at least 32 characters and with nothing else (auth.ts). So offers are on
+ * only while that secret is set at that length: the lab stores nothing a
+ * visitor gave that its owner could not delete. CRON_SECRET alone does not
+ * turn offers on. Taking an offer back and the hourly prune need neither.
  *
  * Import note: trained-chat.ts imports this file and this file imports the
  * chat's message reader from trained-chat.ts. Neither uses the other's
@@ -64,38 +71,55 @@ export function visitorAdaptersFlag(): boolean {
 }
 
 /**
- * The key receipts are signed with, or null when this server has neither
- * operator secret at its full length. There is deliberately no POSTGRES_URL fallback (unlike the
- * chat's visitor hashes): a leaked database URL must not forge receipts.
- */
-function receiptKey(): Buffer | null {
-  const usable = (v: string | undefined) => ((v || '').trim().length >= RECEIPT_SECRET_MIN_CHARS ? (v as string).trim() : '')
-  const secret = usable(process.env.LAB_OPERATOR_SECRET) || usable(process.env.CRON_SECRET)
-  if (!secret) return null
-  return createHash('sha256').update(`visitor-offer|${secret}`, 'utf8').digest()
-}
-
-/**
- * The shortest secret a receipt key is made from: the length requireBearer
- * (auth.ts) asks of the same secrets. Every chat reply hands the visitor a
+ * The shortest LAB_OPERATOR_SECRET that turns offers on and that a receipt
+ * key is made from: the length requireBearer (auth.ts) asks of it before the
+ * owner's read and delete route opens. Every chat reply hands the visitor a
  * receipt made with this key, so a guess of the secret can be tested against
  * one receipt without asking the server: the secret has to be long and random.
  */
 export const RECEIPT_SECRET_MIN_CHARS = 32
 
 /**
- * Are offers on? The switch, the visitor chat (no chat, no button), and a
- * receipt key (no key, no receipt, nothing could be offered). With `models`
- * it also asks that Tinker training is on, for what the models are told.
+ * LAB_OPERATOR_SECRET when the owner's read and delete route would open with
+ * it (requireBearer in auth.ts asks for 32 characters), or ''. CRON_SECRET is
+ * not looked at: it does not open that route.
+ */
+function ownerSecret(): string {
+  const secret = (process.env.LAB_OPERATOR_SECRET || '').trim()
+  return secret.length >= RECEIPT_SECRET_MIN_CHARS ? secret : ''
+}
+
+/**
+ * The key receipts are signed with, or null when LAB_OPERATOR_SECRET is not
+ * set at its full length. There is deliberately no CRON_SECRET and no
+ * POSTGRES_URL fallback (unlike the chat's visitor hashes): the scheduler's
+ * secret does not let the owner delete an offer, and a leaked database URL
+ * must not forge receipts.
+ */
+function receiptKey(): Buffer | null {
+  const secret = ownerSecret()
+  if (!secret) return null
+  return createHash('sha256').update(`visitor-offer|${secret}`, 'utf8').digest()
+}
+
+/**
+ * Are offers on? The switch, the visitor chat (no chat, no button), and
+ * LAB_OPERATOR_SECRET at its full length: it opens the only route the owner
+ * can read and delete an offer through, and the receipt key is made from it
+ * (no key, no receipt, nothing could be offered). With `models` it also asks
+ * that Tinker training is on, for what the models are told. This one answer
+ * decides the public state, the chat's Offer button, the offer route, the
+ * models' note and the training request form.
  * While off: the chat answers exactly what it answered before this feature,
  * the offer route answers 503 without touching the database, and taking an
- * offer back and the operator route still work.
+ * offer back, the hourly prune and the operator route still work for offers
+ * already stored.
  */
 export function visitorOffersStatus(opts: { models?: boolean } = {}): TinkerStatus {
   if (!visitorOffersFlag()) return { enabled: false, off_reason: 'LAB_ENABLE_VISITOR_OFFERS is off' }
   const chat = trainedChatStatus()
   if (!chat.enabled) return { enabled: false, off_reason: `the visitor chat is off (${chat.off_reason ?? 'unknown'})` }
-  if (!receiptKey()) return { enabled: false, off_reason: `neither LAB_OPERATOR_SECRET nor CRON_SECRET is set with at least ${RECEIPT_SECRET_MIN_CHARS} characters, so no receipt can be issued` }
+  if (!ownerSecret()) return { enabled: false, off_reason: `LAB_OPERATOR_SECRET is not set with at least ${RECEIPT_SECRET_MIN_CHARS} characters, so the owner could not read or delete an offer and no receipt can be issued` }
   if (opts.models) {
     const tinker = tinkerStatus()
     if (!tinker.enabled) return { enabled: false, off_reason: `Tinker training is off (${tinker.off_reason ?? 'unknown'})` }

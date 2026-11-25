@@ -1395,7 +1395,8 @@ test('an adapter call is refused for an expired or unknown adapter, a tool messa
 // The visitor chat
 // ===========================================================================
 function enableChat(extra = {}) {
-  Object.assign(process.env, { LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY, CRON_SECRET: 'test-only-scheduler-secret-0000000000', ...extra })
+  // LAB_OPERATOR_SECRET is what turns visitor offers on beside the chat: it opens the owner's read and delete route.
+  Object.assign(process.env, { LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY, CRON_SECRET: 'test-only-scheduler-secret-0000000000', LAB_OPERATOR_SECRET: 'test-only-operator-secret-0000000000000000', ...extra })
 }
 const IP = '203.0.113.77'
 const VISITOR_TEXT = 'a private thought about marmalade'
@@ -1428,7 +1429,7 @@ test('the chat lists kept adapters with the lab-measured scores, and answers a m
   globalThis.fetch = fakeTinker(sent, () => tinkerCompletion({ content: '  Marmalade is orange.  ' }))
   const res = await visit(say(slug))
   assert.equal(res.code, 200)
-  // Visitor offers are on by default (and CRON_SECRET is set), so the reply also carries a receipt for it; nothing else changed.
+  // Visitor offers are on by default (and LAB_OPERATOR_SECRET is set), so the reply also carries a receipt for it; nothing else changed.
   const { receipt, ...body } = res.body
   assert.match(receipt, /^\d{4}-\d{2}-\d{2}\.[A-Za-z0-9_-]{43}$/)
   assert.deepEqual(body, { adapter: slug, reply: 'Marmalade is orange.', cut_short: false, turns_left: 7 })
@@ -2249,7 +2250,7 @@ function withOffers(rows) {
   return table
 }
 function enableOffers(extra = {}) {
-  enableTinker({ TINKER_API_KEY: TINKER_KEY, LAB_ENABLE_TRAINED_CHAT: 'true', CRON_SECRET: 'test-only-scheduler-secret-0000000000', ...extra })
+  enableTinker({ TINKER_API_KEY: TINKER_KEY, LAB_ENABLE_TRAINED_CHAT: 'true', CRON_SECRET: 'test-only-scheduler-secret-0000000000', LAB_OPERATOR_SECRET: 'test-only-operator-secret-0000000000000000', ...extra })
 }
 const offersAsk = (extra = {}) => ({ purpose: 'what visitors asked about', visitor_offers: { limit: 20 }, ...extra })
 
@@ -2269,7 +2270,8 @@ test('a training request may name visitor conversations only while offers are on
   assert.ok(plan.tinker_train_offers)
   assert.ok(plan.ignored.some(x => x.tool === 'tinker_tutor' && x.reason.endsWith('also asks for tinker_train')))
   // Offers off: the field is an unknown field of a training request, as it always was.
-  for (const off of [{ LAB_ENABLE_VISITOR_OFFERS: 'off' }, { LAB_ENABLE_TRAINED_CHAT: 'false' }, { CRON_SECRET: '' }]) {
+  // Without the owner's secret at full length (CRON_SECRET is still set) offers are off: the owner could not delete what visitors gave.
+  for (const off of [{ LAB_ENABLE_VISITOR_OFFERS: 'off' }, { LAB_ENABLE_TRAINED_CHAT: 'false' }, { LAB_OPERATOR_SECRET: '' }, { LAB_OPERATOR_SECRET: 'x'.repeat(31) }]) {
     enableOffers(off)
     plan = toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig())
     assert.equal(plan.tinker_train_offers, undefined, JSON.stringify(off))

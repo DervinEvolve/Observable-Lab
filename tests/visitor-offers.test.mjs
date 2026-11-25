@@ -207,7 +207,8 @@ beforeEach(() => {
 })
 
 function enableChat(extra = {}) {
-  Object.assign(process.env, { LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY, CRON_SECRET: CRON, ...extra })
+  // LAB_OPERATOR_SECRET is what turns offers on (it opens the owner's read and delete route); CRON_SECRET alone does not.
+  Object.assign(process.env, { LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY, CRON_SECRET: CRON, LAB_OPERATOR_SECRET: OPERATOR, ...extra })
 }
 /** fetch that answers like Tinker, with a new reply every call. */
 function fakeTinker(sent = [], answer = () => completion({ content: `A warm reply about gardens and the weather today, number ${++replyCount}.` })) {
@@ -259,7 +260,7 @@ async function converse(slug, texts) {
 // The switch
 // ---------------------------------------------------------------------------
 
-test('the switch is on unless false, 0, off or no, with spaces and capitals; the status needs the chat and a receipt key', () => {
+test('the switch is on unless false, 0, off or no, with spaces and capitals; the status needs the chat and the owner\'s secret', () => {
   for (const value of [undefined, '', 'true', 'yes', '1', 'anything']) {
     if (value === undefined) delete process.env.LAB_ENABLE_VISITOR_OFFERS
     else process.env.LAB_ENABLE_VISITOR_OFFERS = value
@@ -284,19 +285,25 @@ test('the switch is on unless false, 0, off or no, with spaces and capitals; the
   }
 })
 
-test('no receipt key without LAB_OPERATOR_SECRET or CRON_SECRET: never from POSTGRES_URL', async () => {
+test('no receipt key without LAB_OPERATOR_SECRET: never from CRON_SECRET or POSTGRES_URL', async () => {
   enableChat({ POSTGRES_URL: 'postgres://test-only:placeholder@localhost/db' })
-  delete process.env.CRON_SECRET
   delete process.env.LAB_OPERATOR_SECRET
+  assert.equal(process.env.CRON_SECRET, CRON, 'the scheduler secret is set and is not enough')
   const messages = convo('k')
   assert.equal(offers.issueReceipt(SLUG, messages), null)
   assert.equal(offers.visitorOffersStatus().enabled, false)
-  assert.match(offers.visitorOffersStatus().off_reason, /LAB_OPERATOR_SECRET nor CRON_SECRET/)
-  // A receipt made with the database URL as the key does not verify either.
-  process.env.CRON_SECRET = process.env.POSTGRES_URL
-  const forged = offers.issueReceipt(SLUG, messages)
-  delete process.env.CRON_SECRET
-  assert.equal(offers.verifyReceipt(forged, SLUG, messages), false)
+  assert.match(offers.visitorOffersStatus().off_reason, /^LAB_OPERATOR_SECRET is not set with at least 32 characters/)
+  // A receipt made with the database URL or the scheduler secret as the key does not verify either.
+  for (const other of [process.env.POSTGRES_URL, CRON]) {
+    process.env.LAB_OPERATOR_SECRET = other
+    const forged = offers.issueReceipt(SLUG, messages)
+    assert.ok(forged)
+    delete process.env.LAB_OPERATOR_SECRET
+    assert.equal(offers.verifyReceipt(forged, SLUG, messages), false)
+    process.env.LAB_OPERATOR_SECRET = OPERATOR
+    assert.equal(offers.verifyReceipt(forged, SLUG, messages), false)
+    delete process.env.LAB_OPERATOR_SECRET
+  }
   // And the chat issues none and refuses "receipt" as an unknown key.
   lab.addAdapter({ slug: SLUG })
   globalThis.fetch = fakeTinker()
@@ -308,7 +315,9 @@ test('no receipt key without LAB_OPERATOR_SECRET or CRON_SECRET: never from POST
   // The source has no POSTGRES_URL in the receipt key.
   const source = readFileSync(join(root, 'api/_lib/visitor-offers.ts'), 'utf8')
   const keyFn = source.slice(source.indexOf('function receiptKey()'), source.indexOf('export function visitorOffersStatus'))
-  assert.equal(keyFn.includes('POSTGRES_URL'), false)
+  assert.equal(keyFn.includes('process.env'), false, 'the key is made from the owner\'s secret and reads nothing else')
+  const secretFn = source.slice(source.indexOf('function ownerSecret()'), source.indexOf('function receiptKey()'))
+  assert.deepEqual(secretFn.match(/process\.env\.[A-Z_]+/g), ['process.env.LAB_OPERATOR_SECRET'])
 })
 
 // ---------------------------------------------------------------------------
@@ -337,7 +346,7 @@ test('the receipt: a chain of turns verifies; a changed reply, slug, day or a cu
   assert.equal(offers.verifyReceipt(42, SLUG, one, now), false)
   assert.equal(offers.verifyReceipt(`${r1}${'A'.repeat(80)}`, SLUG, one, now), false)
   // A different key does not verify.
-  process.env.LAB_OPERATOR_SECRET = OPERATOR
+  process.env.LAB_OPERATOR_SECRET = 'another-test-only-operator-secret-00000000'
   assert.equal(offers.verifyReceipt(r1, SLUG, one, now), false)
 })
 
@@ -1158,21 +1167,88 @@ test('a reply cut at its limit never ends in half a character, and broken text i
   assert.equal(JSON.stringify([...(lab.caps ?? new Map()).entries()]), caps)
 })
 
-test('a receipt key needs a secret of full length, as the bearer check does', () => {
+test('offers and the receipt key need LAB_OPERATOR_SECRET at full length, as the bearer check of the owner\'s route does', () => {
   enableChat()
-  delete process.env.CRON_SECRET
-  for (const short of ['abc', 'x'.repeat(31)]) {
+  const reason = 'LAB_OPERATOR_SECRET is not set with at least 32 characters, so the owner could not read or delete an offer and no receipt can be issued'
+  for (const short of ['', 'abc', 'x'.repeat(31), ` ${'x'.repeat(31)} `]) {
     process.env.LAB_OPERATOR_SECRET = short
     assert.equal(offers.issueReceipt(SLUG, convo('s')), null, `a ${short.length} character secret makes no receipt`)
-    assert.deepEqual(offers.visitorOffersStatus(), { enabled: false, off_reason: 'neither LAB_OPERATOR_SECRET nor CRON_SECRET is set with at least 32 characters, so no receipt can be issued' })
+    // a usable scheduler secret does not stand in for it: that secret does not open the owner's route
+    assert.equal(process.env.CRON_SECRET, CRON)
+    assert.deepEqual(offers.visitorOffersStatus(), { enabled: false, off_reason: reason })
+    assert.deepEqual(offers.visitorOffersStatus({ models: true }), { enabled: false, off_reason: reason })
   }
   process.env.LAB_OPERATOR_SECRET = 'x'.repeat(32)
   assert.equal(offers.visitorOffersStatus().enabled, true)
-  // a short operator secret does not hide a usable scheduler secret
-  process.env.LAB_OPERATOR_SECRET = 'abc'
-  process.env.CRON_SECRET = CRON
-  assert.equal(offers.visitorOffersStatus().enabled, true)
+  assert.ok(offers.issueReceipt(SLUG, convo('s')))
+  delete process.env.CRON_SECRET
+  assert.equal(offers.visitorOffersStatus().enabled, true, 'the scheduler secret is not needed for offers')
   assert.equal(offers.RECEIPT_SECRET_MIN_CHARS, 32)
+})
+
+test('with only CRON_SECRET set offers are off everywhere: nothing is stored or counted, and the owner\'s route would not open', async () => {
+  // An offer stored earlier, while the owner's secret was set.
+  enableChat()
+  lab.addAdapter({ slug: SLUG })
+  const earlier = await offer(signed(convo('kept')))
+  assert.equal(earlier.code, 201)
+  const stored = signed(convo('later'))
+
+  delete process.env.LAB_OPERATOR_SECRET
+  assert.equal(process.env.CRON_SECRET, CRON)
+  assert.equal(offers.visitorOffersStatus().enabled, false)
+  // the owner's route answers 503 in exactly this state: it is why offers are off
+  const closed = await owner({ action: 'read' }, { auth: `Bearer ${CRON}` })
+  assert.equal(closed.code, 503)
+
+  // the offer route refuses before the database: nothing stored, nothing counted
+  const offersBefore = lab.offers.length
+  const rate = JSON.stringify([...lab.rate.entries()])
+  const caps = JSON.stringify([...(lab.caps ?? new Map()).entries()])
+  const statements = lab.statements.length
+  const res = await offer(stored)
+  assert.equal(res.code, 503)
+  assert.deepEqual(res.body, { error: 'off', message: 'Offering conversations to the lab is switched off.' })
+  assert.equal(lab.statements.length, statements, 'no statement was sent')
+  assert.equal(lab.offers.length, offersBefore)
+  assert.equal(JSON.stringify([...lab.rate.entries()]), rate)
+  assert.equal(JSON.stringify([...(lab.caps ?? new Map()).entries()]), caps)
+
+  // the chat: no offers block (so the room shows no Offer button), no receipt, and "receipt" is an unknown key, as with the switch off
+  globalThis.fetch = fakeTinker()
+  const list = await chat({}, { method: 'GET' })
+  assert.deepEqual(Object.keys(list.body), ['enabled', 'adapters', 'limits', 'notice', 'compare_enabled'])
+  const reply = await chat({ adapter: SLUG, messages: [{ role: 'user', content: 'Tell me about marmalade' }] })
+  assert.equal(reply.code, 200)
+  assert.equal('receipt' in reply.body, false)
+  assert.equal((await chat({ adapter: SLUG, messages: [{ role: 'user', content: 'Hello' }], receipt: 'x' })).code, 400)
+  process.env.LAB_ENABLE_VISITOR_OFFERS = 'off'
+  const switchedOff = await chat({}, { method: 'GET' })
+  delete process.env.LAB_ENABLE_VISITOR_OFFERS
+  assert.equal(JSON.stringify(list.body), JSON.stringify(switchedOff.body), 'the public chat state is the same as with the switch off')
+
+  // the public counts say off, and the models are told nothing
+  assert.equal((await offerStore.offersCounts()).enabled, false)
+  Object.assign(process.env, { LAB_ENABLE_TINKER: 'true', TINKER_JOBS_START_URL: 'https://lab--oblab-tinker-start.modal.example/', TINKER_JOBS_STATUS_URL: 'https://lab--oblab-tinker-status.modal.example/', TINKER_JOBS_TOKEN: 'test-only-tinker-jobs-token-000000' })
+  assert.equal(offers.visitorOffersStatus({ models: true }).enabled, false)
+  assert.equal(await offerStore.offersCountForPrompt(true), null)
+
+  // what was stored earlier can still be taken back, and the hourly prune still deletes expired text
+  const second = lab.seedOffer({})
+  lab.offers.find(o => o.id === second).expires_at = '2026-01-01T00:00:00.000Z'
+  assert.equal(await offerStore.pruneOffers(new Date('2026-06-01T00:00:00Z')), 1)
+  assert.equal(lab.offers.find(o => o.id === second).messages, null)
+  const back = await offer({ withdraw: earlier.body.code })
+  assert.equal(back.code, 200)
+  assert.equal(back.body.withdrawn, true)
+
+  // a 32 character LAB_OPERATOR_SECRET turns offers on: the route opens for it and an offer is stored
+  process.env.LAB_OPERATOR_SECRET = 'y'.repeat(32)
+  assert.equal(offers.visitorOffersStatus().enabled, true)
+  assert.equal(offers.visitorOffersStatus({ models: true }).enabled, true, offers.visitorOffersStatus({ models: true }).off_reason)
+  assert.deepEqual((await chat({}, { method: 'GET' })).body.offers, { enabled: true, keep_days: 180, per_day: 3, public_text: false })
+  assert.equal((await owner({ action: 'read' }, { auth: `Bearer ${'y'.repeat(32)}` })).code, 200)
+  assert.equal((await offer(signed(convo('now on')))).code, 201)
 })
 
 test('the visitor note reaches the models through one gate, which is shut while offers or training are off', async () => {

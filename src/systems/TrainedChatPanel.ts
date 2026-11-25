@@ -789,6 +789,12 @@ export class TrainedChatPanel {
   private receipt: string | null = null
   /** This conversation was offered (or the lab said it already holds it). */
   private offered = false
+  /**
+   * The take back code of the offer of the conversation on screen, in this panel's memory only and dropped with the
+   * conversation. It is kept past the sheet so that a take back with this code, from the sheet or typed later, can
+   * put the button back; it is never shown again. Null when this conversation was not offered from this panel.
+   */
+  private offeredCode: string | null = null
   /** What the sheet is showing, if it is open. */
   private sheetMode: 'offer' | 'withdraw' | null = null
   private sheetBusy = false
@@ -1257,6 +1263,7 @@ export class TrainedChatPanel {
     // A new conversation, or another model: the receipt and the offer belong to the old one.
     this.receipt = null
     this.offered = false
+    this.offeredCode = null
     if (this.sheetMode === 'offer' && !this.sheetBusy) this.closeSheet(false)
     this.turns = []
     this.baseReplies = []
@@ -2021,6 +2028,8 @@ export class TrainedChatPanel {
     this.sheetBusy = false
     if (answer.kind === 'stored') {
       if (conv === this.convId) this.offered = true
+      // Kept with the conversation, so that a take back with this code can put the button back.
+      if (conv === this.convId) this.offeredCode = normalizeCode(answer.code) ?? answer.code
       this.offerCode = answer.code
       this.showStored(answer.code, answer.keptUntil, answer.message)
       this.refreshOffer()
@@ -2122,6 +2131,14 @@ export class TrainedChatPanel {
       answer = readWithdrawAnswer(res.status, await res.json().catch(() => ({})))
     } catch {
       answer = { kind: 'refused', status: 0, error: 'unavailable', message: 'The lab could not be reached. Try again in a moment.' }
+    }
+    // The take back went through for the code of the conversation on screen: the lab no longer holds it, so its button
+    // goes back to its normal state, whether or not the sheet that asked is still open. A code that belongs to some
+    // other conversation (typed, or from an offer made before the visitor moved on) changes nothing on screen.
+    if (answer.kind !== 'refused' && this.offeredCode !== null && (normalizeCode(code) ?? code) === this.offeredCode) {
+      this.offered = false
+      this.offeredCode = null
+      this.refreshOffer()
     }
     if (token !== this.sheetToken || this.sheetMode !== mode) return
     this.sheetBusy = false

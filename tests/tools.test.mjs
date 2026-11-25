@@ -952,7 +952,7 @@ test('with the lesson and visitor offers switched off, the prompts and the publi
   const TINKER = {
     LAB_ENABLE_TINKER: 'true', TINKER_JOBS_START_URL: 'https://tinker.example/start', TINKER_JOBS_STATUS_URL: 'https://tinker.example/status',
     TINKER_JOBS_TOKEN: JOBS_TOKEN, TINKER_API_KEY: 'test-only-tinker-key-00000000000000000', LAB_ENABLE_TRAINED_CHAT: 'true',
-    CRON_SECRET: 'test-only-cron-secret-0000000000000000000000', LAB_ENABLE_TINKER_NAMES: 'true',
+    CRON_SECRET: 'test-only-cron-secret-0000000000000000000000', LAB_OPERATOR_SECRET: 'test-only-operator-secret-0000000000000000', LAB_ENABLE_TINKER_NAMES: 'true',
   }
   const settings = [{ ...OFF }, { ...OFF, everything: true }, { ...OFF, everything: true, ...TINKER }]
   const reviewerSection = p => p.reviewerToolSection({ tinker_train: { line: 'a run' }, tinker_rl: { line: 'an RL run' }, keep_adapter: { line: 'a keep' } })
@@ -1004,6 +1004,23 @@ test('with the lesson and visitor offers switched off, the prompts and the publi
   assert.deepEqual(offers, { enabled: true, stored: 0, offered_today: 0, trained_on: 0, taken_back: 0, read_by_owner: 0 })
   assert.deepEqual(toolsNow, [...toolsThen.filter(t => t !== 'live_model' && t !== 'live_trained'), 'tinker_tutor', ...toolsThen.filter(t => t === 'live_model' || t === 'live_trained')])
   assert.equal(JSON.stringify(rest), JSON.stringify(restThen))
+
+  // Without LAB_OPERATOR_SECRET the owner could not read or delete an offer, so offers are off whatever the switch says:
+  // the public state has no visitor_offers part, as with the switch off, and the models are told nothing of offers.
+  assert.match(prompts.executorToolsSection(), /visitor_offers/, 'with the owner\'s secret set the Executor is shown the form')
+  delete process.env.LAB_OPERATOR_SECRET
+  lab = new FakeLab()
+  db.handler = (text, values) => lab.handle(text, values)
+  lab.addExperiment()
+  const noOwner = response()
+  await experimentHandler({ method: 'GET', headers: {}, query: {} }, noOwner)
+  assert.equal('visitor_offers' in noOwner.body, false)
+  assert.deepEqual(noOwner.body.tutor_lesson, { enabled: true, lesson: null })
+  process.env.LAB_ENABLE_VISITOR_OFFERS = 'false'
+  const switchedOff = prompts.executorToolsSection()
+  delete process.env.LAB_ENABLE_VISITOR_OFFERS
+  assert.equal(prompts.executorToolsSection(), switchedOff, 'the Executor reads the same with only CRON_SECRET set as with offers switched off')
+  assert.doesNotMatch(prompts.executorToolsSection(), /visitor_offers/)
 })
 
 test('switched on, the models are told of the lesson and the Reviewer is asked to rule on it', () => {

@@ -1217,6 +1217,120 @@ test('Take It Back in the code sheet sends the code it holds; a refresh that tur
   })
 })
 
+test('after a take back of the conversation on screen its button no longer says Offered; a code for another conversation changes nothing', async () => {
+  await withOfferPage(async ({ body, asked, state, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    p.setAvailable(true)
+    await settle()
+    const { root } = parts(body)
+    const { button, sheet } = offerParts(root)
+    const normal = button.textContent
+    const offerIt = async code => {
+      click(button)
+      state.post = () => ({ status: 201, body: { offered: true, code, kept_until: '2027-02-23T00:00:00.000Z', message: 'Thank you. The lab stored this conversation.' } })
+      click(sheetButton(root, 'Offer It'))
+      await settle()
+    }
+    const typeCode = async (code, answer) => {
+      click(root.all('.tc-takeback')[0])
+      sheet.all('input')[0].value = code
+      state.post = answer
+      sheet.all('form')[0].fire('submit')
+      await settle()
+    }
+    const done = { withdrawn: true, trained_on: false, message: 'Done. The lab deleted the stored text.' }
+    state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'Hi.', turns_left: 7, receipt: 'r1' })
+    await say(root, settle, 'Hello')
+    assert.equal(normal, 'Offer This Conversation to the Lab')
+    assert.equal(button.disabled, false)
+
+    // 1. from the offer sheet: Take It Back succeeds, and the button is back to normal at once and after Done
+    await offerIt('ABCD-EFGH-JKMN')
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+    state.post = () => done
+    click(sheetButton(root, 'Take It Back'))
+    await settle()
+    assert.deepEqual(POSTS(asked).at(-1).body, { withdraw: 'ABCD-EFGH-JKMN' })
+    assert.deepEqual([button.textContent, button.disabled], [normal, false])
+    assert.equal(offerParts(root).note.hidden, true, 'nothing says why it is disabled: it is not')
+    click(sheetButton(root, 'Done'))
+    assert.deepEqual([button.textContent, button.disabled], [normal, false])
+    assert.equal(root.textContent.includes('ABCD-EFGH-JKMN'), false, 'the code is still shown nowhere')
+
+    // 2. offered again; a take back the lab refuses changes nothing
+    await offerIt('QRST-VWXY-Z234')
+    state.post = () => ({ status: 404, body: { error: 'unknown_code' } })
+    click(sheetButton(root, 'Take It Back'))
+    await settle()
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+    click(sheetButton(root, 'Done'))
+
+    // 3. a code typed for some other conversation is taken back, and nothing on screen changes
+    await typeCode('7777-8888-9999', () => done)
+    assert.deepEqual(POSTS(asked).at(-1).body, { withdraw: '7777-8888-9999' })
+    assert.ok(sheetText(root).includes('Done. The lab deleted the stored text.'))
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+    click(sheetButton(root, 'Done'))
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+
+    // 4. this conversation's own code, typed in another form: the button is back to normal
+    await typeCode('qrst vwxy z234', () => done)
+    assert.deepEqual(POSTS(asked).at(-1).body, { withdraw: 'QRST-VWXY-Z234' })
+    assert.deepEqual([button.textContent, button.disabled], [normal, false])
+    click(sheetButton(root, 'Done'))
+
+    // 5. a conversation the lab said it already holds has no code here: no typed code puts its button back
+    click(button)
+    state.post = () => ({ status: 409, body: { error: 'already_offered', message: 'This conversation was already offered.' } })
+    click(sheetButton(root, 'Offer It'))
+    await settle()
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+    click(sheetButton(root, 'Not Now'))
+    await typeCode('QRST-VWXY-Z234', () => done)
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+    click(sheetButton(root, 'Done'))
+  })
+})
+
+test('a take back code is forgotten with its conversation: taking back an earlier offer leaves a new conversation as it is', async () => {
+  await withOfferPage(async ({ body, state, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    p.setAvailable(true)
+    await settle()
+    const { root } = parts(body)
+    const { button, sheet } = offerParts(root)
+    state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'Hi.', turns_left: 7, receipt: 'r1' })
+    await say(root, settle, 'Hello')
+    click(button)
+    state.post = () => ({ status: 201, body: { offered: true, code: 'ABCD-EFGH-JKMN', kept_until: '2027-02-23T00:00:00.000Z', message: 'Thank you. The lab stored this conversation.' } })
+    click(sheetButton(root, 'Offer It'))
+    await settle()
+    click(sheetButton(root, 'Done'))
+    assert.equal(button.textContent, 'Offered')
+    // a new conversation, offered in its turn
+    const fresh = root.all('button').find(b => b.textContent === 'Start Over' || b.textContent === 'New Conversation')
+    assert.ok(fresh, 'the panel has a button that starts a new conversation')
+    click(fresh)
+    await settle()
+    state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'Hello again.', turns_left: 7, receipt: 'r2' })
+    await say(root, settle, 'Another one')
+    assert.deepEqual([button.textContent, button.disabled], ['Offer This Conversation to the Lab', false])
+    click(button)
+    state.post = () => ({ status: 201, body: { offered: true, code: 'QRST-VWXY-Z234', kept_until: '2027-02-23T00:00:00.000Z', message: 'Thank you. The lab stored this conversation.' } })
+    click(sheetButton(root, 'Offer It'))
+    await settle()
+    click(sheetButton(root, 'Done'))
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+    // the first conversation's code is taken back: the conversation on screen is the second, and it stays offered
+    click(root.all('.tc-takeback')[0])
+    sheet.all('input')[0].value = 'ABCD-EFGH-JKMN'
+    state.post = () => ({ withdrawn: true, trained_on: false, message: 'Done. The lab deleted the stored text.' })
+    sheet.all('form')[0].fire('submit')
+    await settle()
+    assert.deepEqual([button.textContent, button.disabled], ['Offered', true])
+  })
+})
+
 test('the story model never shows the offer button', async () => {
   await withPage(async ({ body, state, settle }) => {
     state.list = withOffers({ adapters: [] })
