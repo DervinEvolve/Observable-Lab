@@ -8,6 +8,7 @@
 // and shows nothing invented.
 import { BACKEND_TO_FRONTEND_MODEL, type ModelId } from '../shared/types'
 import { COLORS } from '../scene/colors'
+import { installPaperTheme, paperFocusRing, paperShell, paperHeader, paperHeading, paperQuietButton } from './paperTheme'
 
 const API = '/api/experiment/activity'
 const REFRESH_MS = 30_000
@@ -180,43 +181,53 @@ export class ActivityPanel {
   private timer: number | null = null
 
   constructor() {
+    installPaperTheme()
     this.container = document.createElement('div')
     this.container.id = 'activity-panel-container'
     this.container.innerHTML = `
       <style>
-        #activity-panel-container { position: fixed; bottom: 76px; right: 20px; z-index: 150; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
-        #activity-toggle { width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.9); backdrop-filter: blur(8px); border: 1px solid rgba(0,0,0,0.1); cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 12px rgba(0,0,0,0.1); transition: all 0.2s ease; }
-        #activity-toggle:hover { transform: scale(1.05); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
-        #activity-toggle svg { width: 20px; height: 20px; opacity: 0.6; }
-        #activity-panel { position: absolute; bottom: 56px; right: 0; width: min(380px, calc(100vw - 40px)); max-height: min(70vh, calc(100vh - 160px)); background: rgba(20,20,20,0.92); backdrop-filter: blur(16px); border-radius: 16px; box-shadow: 0 8px 32px rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.08); opacity: 0; transform: translateY(10px) scale(0.95); pointer-events: none; transition: all 0.25s cubic-bezier(0.4,0,0.2,1); overflow: hidden; display: flex; flex-direction: column; }
+        #activity-panel-container { position: fixed; bottom: 76px; right: 20px; z-index: 150; font-family: var(--paper-sans); }
+        ${paperFocusRing('#activity-panel-container')}
+        #activity-toggle { width: 44px; height: 44px; border-radius: 50%; background: var(--paper-raised-veil); backdrop-filter: blur(8px); border: 1px solid var(--paper-line); color: var(--paper-ink); cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: var(--paper-shadow-soft); transition: all 0.2s ease; }
+        #activity-toggle:hover { transform: scale(1.05); box-shadow: var(--paper-shadow-lift); }
+        #activity-toggle svg { width: 20px; height: 20px; opacity: 0.8; }
+        #activity-panel { position: absolute; bottom: 56px; right: 0; width: min(380px, calc(100vw - 40px)); max-height: min(70vh, calc(100vh - 160px)); opacity: 0; transform: translateY(10px) scale(0.95); pointer-events: none; transition: all 0.25s cubic-bezier(0.4,0,0.2,1); overflow: hidden; display: flex; flex-direction: column; }
+        ${paperShell('#activity-panel')}
         #activity-panel.open { opacity: 1; transform: none; pointer-events: auto; }
-        #activity-panel .act-head { padding: 12px 14px; border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-        #activity-panel .act-title { color: #f5f2eb; font-size: 12px; font-weight: 600; letter-spacing: 0.5px; }
-        #activity-panel .act-sub { color: rgba(255,255,255,0.4); font-size: 9px; text-transform: uppercase; letter-spacing: 0.8px; }
-        #activity-panel .act-nav button { background: rgba(255,255,255,0.08); color: #f5f2eb; border: 0; border-radius: 6px; padding: 3px 8px; cursor: pointer; font-size: 11px; }
-        #activity-panel .act-nav button:disabled { opacity: 0.3; cursor: default; }
-        #activity-panel .act-body { overflow-y: auto; padding: 10px 14px 14px; color: rgba(245,242,235,0.85); font-size: 11px; line-height: 1.45; }
-        #activity-panel .act-legend { color: rgba(255,255,255,0.45); font-size: 10px; margin-bottom: 10px; }
-        #activity-panel .act-role { padding: 8px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
+        #activity-panel .act-head { padding: 9px 14px 12px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+        ${paperHeader('#activity-panel .act-head')}
+        #activity-panel .act-title { line-height: 1.25; }
+        ${paperHeading('#activity-panel .act-title', 16)}
+        #activity-panel .act-sub { color: var(--paper-ink-2); font-size: 13px; line-height: 1.3; }
+        #activity-panel .act-nav button { padding: 3px 8px; font-size: 11px; }
+        ${paperQuietButton('#activity-panel .act-nav button')}
+        #activity-panel .act-nav button { border-radius: var(--paper-radius-sm); }
+        #activity-panel .act-nav button:disabled { opacity: 0.55; cursor: default; }
+        #activity-panel .act-nav button:disabled:hover { background: var(--paper-raised); border-color: var(--paper-line); }
+        #activity-panel .act-body { overflow-y: auto; padding: 10px 14px 14px; color: var(--paper-ink); font-size: 13px; line-height: 1.45; }
+        #activity-panel .act-legend { color: var(--paper-ink-2); font-size: 13px; margin-bottom: 10px; }
+        #activity-panel .act-role { padding: 8px 0; border-bottom: 1px solid var(--paper-hair); }
         #activity-panel .act-who { margin-bottom: 4px; }
-        #activity-panel .act-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; }
-        #activity-panel .act-role-name { color: rgba(255,255,255,0.45); font-size: 10px; text-transform: uppercase; letter-spacing: 0.5px; margin-left: 4px; }
-        #activity-panel .act-fallback { font-size: 9px; color: #ffb74d; border: 1px solid rgba(255,183,77,0.4); border-radius: 4px; padding: 0 4px; margin-left: 4px; }
+        #activity-panel .act-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; margin-right: 5px; vertical-align: middle; box-shadow: 0 0 0 1px var(--paper-line); }
+        #activity-panel .act-role-name { color: var(--paper-ink-2); font-size: 13px; margin-left: 4px; }
+        #activity-panel .act-fallback { font-size: 13px; color: var(--paper-ink); border: 1px solid var(--paper-brass-edge); border-radius: 4px; padding: 0 4px; margin-left: 4px; }
         #activity-panel .act-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
-        #activity-panel .act-label { color: rgba(255,255,255,0.4); font-size: 9px; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 2px; }
+        #activity-panel .act-label { color: var(--paper-ink-2); font-size: 13px; font-weight: 700; letter-spacing: 0.2px; margin-bottom: 2px; }
         #activity-panel ul { margin: 0; padding-left: 14px; }
         #activity-panel li { margin: 1px 0; word-break: break-word; }
-        #activity-panel a { color: #8fc1ff; text-decoration: none; }
-        #activity-panel a:hover { text-decoration: underline; }
-        #activity-panel .act-domain { color: rgba(255,255,255,0.35); font-size: 9px; margin-left: 3px; }
-        #activity-panel .act-none { color: rgba(255,255,255,0.35); font-style: italic; }
-        #activity-panel .act-flag { margin-top: 5px; padding: 4px 6px; border-radius: 6px; background: rgba(255,183,77,0.1); color: #ffcc80; font-size: 10px; }
-        #activity-panel .act-section { margin: 12px 0 4px; color: #f5f2eb; font-weight: 600; font-size: 11px; }
-        #activity-panel .act-tool { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
-        #activity-panel .act-status { color: rgba(255,255,255,0.55); }
-        #activity-panel .act-request { color: rgba(255,255,255,0.55); margin-top: 2px; }
-        #activity-panel .act-output { margin: 4px 0 0; padding: 6px; background: rgba(0,0,0,0.35); border-radius: 6px; font: 10px/1.35 ui-monospace, Menlo, monospace; white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow: auto; color: rgba(245,242,235,0.75); }
-        #activity-panel .act-spend { display: flex; flex-wrap: wrap; gap: 4px 10px; color: rgba(255,255,255,0.55); font-size: 10px; }
+        #activity-panel a { color: var(--paper-brass-ink); text-decoration: underline; text-underline-offset: 2px; }
+        #activity-panel a:hover { color: var(--paper-ink); }
+        #activity-panel .act-domain { color: var(--paper-ink-2); font-size: 13px; margin-left: 3px; }
+        #activity-panel .act-none { color: var(--paper-ink-2); font-style: italic; }
+        #activity-panel .act-flag { margin-top: 5px; padding: 4px 6px; border-radius: var(--paper-radius-sm); background: var(--paper-visitor); box-shadow: inset 0 0 0 1px var(--paper-line); color: var(--paper-ink); font-size: 13px; }
+        #activity-panel .act-section { margin: 12px 0 4px; }
+        ${paperHeading('#activity-panel .act-section', 15)}
+        #activity-panel .act-tool { padding: 6px 0; border-bottom: 1px solid var(--paper-hair); }
+        #activity-panel .act-status { color: var(--paper-ink-2); }
+        #activity-panel .act-request { color: var(--paper-ink-2); margin-top: 2px; }
+        #activity-panel .act-output { margin: 4px 0 0; padding: 6px; background: var(--paper-sunk); box-shadow: inset 0 0 0 1px var(--paper-hair); border-radius: var(--paper-radius-sm); font: 13px/1.35 var(--paper-mono); white-space: pre-wrap; word-break: break-word; max-height: 120px; overflow: auto; color: var(--paper-ink); }
+        #activity-panel .act-spend { display: flex; flex-wrap: wrap; gap: 4px 10px; color: var(--paper-ink-2); font-size: 13px; }
+        @media (prefers-reduced-motion: reduce) { #activity-toggle, #activity-panel { transition: none; } }
       </style>`
     document.body.appendChild(this.container)
 

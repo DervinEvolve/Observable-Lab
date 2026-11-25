@@ -35,6 +35,7 @@ const KIND_TEXT: Record<string, [string, string]> = {
   said: ['said', 'said by'], said_in: ['said in', 'what was said'],
 }
 import { PROVIDER_LOGOS } from '../shared/types'
+import { installPaperTheme, paperFocusRing, paperPrimaryButton, paperQuietButton } from './paperTheme'
 
 const REFRESH_MS = 120_000
 const HOP_MS = 750 // one hop of a recall replay
@@ -47,6 +48,29 @@ const COMMON = new Set(['the', 'in', 'on', 'of', 'to', 'and', 'or', 'a', 'an', '
 const ABOUT = 'Who proposed, changed or challenged which part of the agent, the conflicts between parts, the notes the models leave each other and the sites they cited. Built from the stored record only. The models read this same graph as memory each epoch.'
 
 const esc = (s: string): string => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c] as string))
+/**
+ * Colours for what is drawn on the canvas and as inline marks, taken from the paper theme (src/systems/paperTheme.ts)
+ * so the graph reads as ink on paper. The node and model hues stay as the fills; where a hue is used for a line, a ring
+ * or a name it is darkened toward the theme's ink only as far as needed to reach its contrast on the paper it sits on.
+ */
+type RGB = [number, number, number]
+const hexRgb = (h: string): RGB | null => { const m = /^#?([0-9a-f]{6})$/i.exec(h.trim()); if (!m) return null; const n = parseInt(m[1], 16); return [n >> 16, (n >> 8) & 255, n & 255] }
+const luminance = (c: RGB): number => { const f = (v: number) => { const x = v / 255; return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4 }; return 0.2126 * f(c[0]) + 0.7152 * f(c[1]) + 0.0722 * f(c[2]) }
+const contrastOf = (a: RGB, b: RGB): number => { const x = luminance(a), y = luminance(b); return (Math.max(x, y) + 0.05) / (Math.min(x, y) + 0.05) }
+const mixRgb = (a: RGB, b: RGB, t: number): RGB => [0, 1, 2].map(i => Math.round(a[i] + (b[i] - a[i]) * t)) as RGB
+const cssRgba = (c: RGB, a = 1): string => `rgba(${c[0]},${c[1]},${c[2]},${a})`
+/** `c` darkened toward `ink`, in steps of 5%, until it reaches `min` contrast on `bg`. */
+const legible = (c: RGB, ink: RGB, bg: RGB, min: number): RGB => { for (let t = 0; t <= 1.001; t += 0.05) { const m = mixRgb(c, ink, t); if (contrastOf(m, bg) >= min) return m } return ink }
+interface Palette { ink: RGB; ink2: RGB; surface: RGB; raised: RGB; white: RGB; line: RGB; brass: RGB; brassEdge: RGB; danger: RGB }
+let paletteCache: Palette | null = null
+const palette = (): Palette => {
+  if (paletteCache) return paletteCache
+  installPaperTheme()
+  const css = getComputedStyle(document.documentElement)
+  const tok = (name: string): RGB => hexRgb(css.getPropertyValue(name)) ?? [0, 0, 0]
+  paletteCache = { ink: tok('--paper-ink'), ink2: tok('--paper-ink-2'), surface: tok('--paper-surface'), raised: tok('--paper-raised'), white: tok('--paper-white'), line: tok('--paper-line'), brass: tok('--paper-brass'), brassEdge: tok('--paper-brass-edge'), danger: tok('--paper-danger') }
+  return paletteCache
+}
 const colorOf = (n: GNode): string => (n.type === 'model' ? PROVIDER_COLOR[String(n.detail).split('/')[0]] ?? TYPE_COLOR.model : TYPE_COLOR[n.type])
 
 /** Layouts, shared by the stylesheet and the code that frames the graph. */
@@ -63,7 +87,7 @@ const compactCss = (o: string, captionWidth: string): string => `
         ${o} .kg-searchbar { padding: 10px 12px; }
         /* No room for a title and a caption: while a recall replays, its caption takes the title's place. */
         ${o}.replaying .kg-top { display: none; }
-        ${o} .kg-caption { align-self: flex-start; margin: 8px 0 0 12px; max-width: ${captionWidth}; padding: 7px 10px; font-size: 0.78125rem; line-height: 1.4; overflow: hidden; }
+        ${o} .kg-caption { align-self: flex-start; margin: 8px 0 0 12px; max-width: ${captionWidth}; padding: 7px 10px; font-size: 0.8125rem; line-height: 1.4; overflow: hidden; }
         ${o} .kg-caption span { display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }`
 /**
  * Little height left while typing (the keyboard is up): on a phone held upright the results get most of it;
@@ -150,57 +174,69 @@ export class KnowledgeGraphPanel {
   private framedFor = ''
 
   constructor() {
+    installPaperTheme()
     const style = document.createElement('style')
     style.textContent = `
-      #kg-toggle { position: fixed; right: 20px; bottom: 132px; z-index: 150; width: 44px; height: 44px; border-radius: 50%; background: rgba(255,255,255,0.9); backdrop-filter: blur(8px); border: 1px solid rgba(0,0,0,0.1); cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: 0 2px 12px rgba(0,0,0,0.1); transition: transform 0.2s ease, box-shadow 0.2s ease; touch-action: manipulation; }
-      #kg-toggle:hover { transform: scale(1.05); box-shadow: 0 4px 16px rgba(0,0,0,0.15); }
-      #kg-toggle svg { width: 22px; height: 22px; opacity: 0.65; }
-      #kg-toggle:focus-visible, #kg-overlay button:focus-visible, #kg-overlay input:focus-visible { outline: 2px solid #FFB74D; outline-offset: 2px; }
-      #kg-overlay { position: fixed; inset: 3vh 3vw; z-index: 1100; display: none; grid-template-columns: minmax(0, 1fr) minmax(300px, 380px); grid-template-rows: minmax(0, 1fr); background: rgba(18,18,20,0.96); backdrop-filter: blur(16px); border: 1px solid rgba(255,255,255,0.1); border-radius: 18px; box-shadow: 0 20px 60px rgba(0,0,0,0.5); overflow: hidden; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; color: #F5F2EB; touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+      #kg-toggle { position: fixed; right: 20px; bottom: 132px; z-index: 150; width: 44px; height: 44px; border-radius: 50%; background: var(--paper-raised-veil); border: 1px solid var(--paper-line); color: var(--paper-ink); cursor: pointer; display: flex; align-items: center; justify-content: center; box-shadow: var(--paper-shadow-soft); transition: transform 0.2s ease, box-shadow 0.2s ease; touch-action: manipulation; }
+      #kg-toggle:hover { transform: scale(1.05); box-shadow: var(--paper-shadow-lift); }
+      #kg-toggle svg { width: 22px; height: 22px; opacity: 0.8; }
+      #kg-toggle:focus-visible { outline: 2px solid var(--paper-focus); outline-offset: 2px; }
+      ${paperFocusRing('#kg-overlay')}
+      @media (prefers-reduced-motion: reduce) { #kg-toggle { transition: none; } }
+      #kg-overlay { position: fixed; inset: 3vh 3vw; z-index: 1100; display: none; grid-template-columns: minmax(0, 1fr) minmax(300px, 380px); grid-template-rows: minmax(0, 1fr); background: var(--paper-surface); border: 1px solid var(--paper-line); border-radius: var(--paper-radius-panel); box-shadow: var(--paper-shadow); overflow: hidden; font-family: var(--paper-sans); color: var(--paper-ink); --kg-mark-edge: color-mix(in srgb, var(--paper-ink) 60%, transparent); touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
       #kg-overlay.open { display: grid; }
       #kg-overlay:focus { outline: none; }
+      /* The brass top rule, drawn over the panel's top edge so no box changes size. */
+      #kg-overlay::before { content: ''; position: absolute; left: 0; right: 0; top: 0; height: 3px; background: var(--paper-brass); z-index: 3; pointer-events: none; }
       #kg-overlay .kg-stage { position: relative; min-width: 0; min-height: 0; overflow: hidden; }
       #kg-overlay canvas { width: 100%; height: 100%; display: block; cursor: grab; touch-action: none; user-select: none; -webkit-user-select: none; -webkit-touch-callout: none; }
       #kg-overlay canvas.dragging { cursor: grabbing; }
       #kg-overlay .kg-head { position: absolute; left: 0; top: 0; right: 0; display: flex; flex-direction: column; align-items: center; pointer-events: none; }
-      #kg-overlay .kg-top { align-self: stretch; padding: 14px 16px 28px; background: linear-gradient(rgba(18,18,20,0.96) 60%, rgba(18,18,20,0)); display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
-      #kg-overlay .kg-title { font-size: 1.0625rem; font-weight: 650; letter-spacing: 0.2px; }
-      #kg-overlay .kg-sub { font-size: 0.75rem; color: rgba(245,242,235,0.7); margin-top: 3px; max-width: 560px; line-height: 1.45; }
-      #kg-overlay .kg-legend { position: absolute; left: 16px; bottom: 14px; display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 0.75rem; color: rgba(245,242,235,0.8); max-width: calc(100% - 200px); pointer-events: none; }
+      #kg-overlay .kg-top { align-self: stretch; padding: 14px 16px 28px; background: linear-gradient(var(--paper-surface) 60%, transparent); display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+      #kg-overlay .kg-title { font-family: var(--paper-serif); font-size: 1.0625rem; font-weight: 700; letter-spacing: 0.2px; color: var(--paper-ink); }
+      #kg-overlay .kg-sub { font-size: 0.8125rem; color: var(--paper-ink-2); margin-top: 3px; max-width: 560px; line-height: 1.45; }
+      #kg-overlay .kg-legend { position: absolute; left: 16px; bottom: 14px; display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 0.8125rem; color: var(--paper-ink-2); max-width: calc(100% - 200px); pointer-events: none; }
       #kg-overlay .kg-legend span { display: inline-flex; align-items: center; gap: 5px; }
-      #kg-overlay .kg-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+      #kg-overlay .kg-legend i { width: 10px; height: 10px; border-radius: 50%; display: inline-block; box-shadow: inset 0 0 0 1px var(--kg-mark-edge); }
       #kg-overlay .kg-zoom { position: absolute; right: 14px; bottom: 14px; display: flex; gap: 6px; }
-      #kg-overlay .kg-zoom button, #kg-overlay .kg-actions button { background: rgba(255,255,255,0.08); color: #F5F2EB; border: 1px solid rgba(255,255,255,0.14); border-radius: 8px; padding: 6px 10px; font-size: 0.8125rem; cursor: pointer; }
-      #kg-overlay .kg-zoom button:hover, #kg-overlay .kg-actions button:hover { background: rgba(255,255,255,0.16); }
-      #kg-overlay .kg-side { border-left: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
-      #kg-overlay .kg-searchbar { padding: 14px; border-bottom: 1px solid rgba(255,255,255,0.08); display: flex; gap: 8px; }
-      #kg-overlay input { flex: 1; min-width: 0; background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.16); border-radius: 10px; color: #F5F2EB; padding: 9px 11px; font-size: 0.875rem; }
-      #kg-overlay input::placeholder { color: rgba(245,242,235,0.5); }
-      #kg-overlay .kg-close { background: none; border: none; color: rgba(245,242,235,0.8); font-size: 1.375rem; cursor: pointer; padding: 0 4px; }
+      #kg-overlay .kg-zoom button, #kg-overlay .kg-actions button { padding: 6px 10px; font-size: 0.8125rem; }
+      ${paperQuietButton('#kg-overlay .kg-zoom button, #kg-overlay .kg-actions button')}
+      #kg-overlay .kg-side { border-left: 1px solid var(--paper-hair); display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+      #kg-overlay .kg-searchbar { padding: 14px; background: var(--paper-raised); border-bottom: 1px solid var(--paper-hair); display: flex; gap: 8px; }
+      #kg-overlay input { flex: 1; min-width: 0; background: var(--paper-white); border: 1px solid var(--paper-line); border-radius: var(--paper-radius); color: var(--paper-ink); padding: 9px 11px; font-size: 0.875rem; }
+      #kg-overlay input::placeholder { color: var(--paper-ink-2); opacity: 1; }
+      #kg-overlay .kg-close { background: none; border: none; border-radius: var(--paper-radius-sm); color: var(--paper-ink); font-size: 1.375rem; cursor: pointer; padding: 0 4px; }
+      #kg-overlay .kg-close:hover, #kg-overlay .kg-close:active { background: var(--paper-sunk); }
       #kg-overlay .kg-scroll { overflow: auto; overscroll-behavior: contain; padding: 4px 14px 16px; flex: 1; min-height: 0; }
-      #kg-overlay .kg-results button, #kg-overlay .kg-links button { display: block; width: 100%; text-align: left; background: none; border: none; border-radius: 8px; color: #F5F2EB; padding: 7px 8px; font-size: 0.8125rem; line-height: 1.35; cursor: pointer; overflow-wrap: anywhere; }
-      #kg-overlay .kg-results button:hover, #kg-overlay .kg-links button:hover { background: rgba(255,255,255,0.08); }
-      #kg-overlay .kg-tag { font-size: 0.6875rem; text-transform: uppercase; letter-spacing: 0.6px; color: rgba(245,242,235,0.6); }
-      #kg-overlay .kg-h { font-size: 1rem; font-weight: 650; margin: 12px 0 4px; line-height: 1.3; word-break: break-word; }
-      #kg-overlay .kg-detail { font-size: 0.84375rem; line-height: 1.55; color: rgba(245,242,235,0.88); white-space: pre-wrap; word-break: break-word; }
-      #kg-overlay .kg-section { margin: 16px 0 4px; font-size: 0.75rem; font-weight: 650; color: rgba(245,242,235,0.7); text-transform: uppercase; letter-spacing: 0.6px; overflow-wrap: anywhere; }
-      #kg-overlay .kg-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; vertical-align: 1px; }
-      #kg-overlay .kg-meta { font-size: 0.78125rem; color: rgba(245,242,235,0.7); margin-top: 4px; overflow-wrap: anywhere; }
-      #kg-overlay .kg-empty { font-size: 0.8125rem; color: rgba(245,242,235,0.65); line-height: 1.5; padding: 10px 0; }
+      #kg-overlay .kg-results button, #kg-overlay .kg-links button { display: block; width: 100%; text-align: left; background: none; border: none; border-radius: var(--paper-radius-sm); color: var(--paper-ink); padding: 7px 8px; font-size: 0.8125rem; line-height: 1.35; cursor: pointer; overflow-wrap: anywhere; }
+      #kg-overlay .kg-results button:hover, #kg-overlay .kg-links button:hover { background: var(--paper-sunk); }
+      #kg-overlay .kg-results button:active, #kg-overlay .kg-links button:active { background: var(--paper-sunk); box-shadow: inset 0 0 0 1px var(--paper-line); }
+      #kg-overlay .kg-tag { font-size: 0.8125rem; text-transform: uppercase; letter-spacing: 0.2px; color: var(--paper-ink-2); }
+      #kg-overlay .kg-h { font-family: var(--paper-serif); font-size: 1rem; font-weight: 700; margin: 12px 0 4px; line-height: 1.3; word-break: break-word; color: var(--paper-ink); }
+      #kg-overlay .kg-detail { font-size: 0.84375rem; line-height: 1.55; color: var(--paper-ink); white-space: pre-wrap; word-break: break-word; }
+      #kg-overlay .kg-section { margin: 16px 0 4px; font-size: 0.8125rem; font-weight: 700; color: var(--paper-ink-2); text-transform: uppercase; letter-spacing: 0.5px; overflow-wrap: anywhere; }
+      #kg-overlay .kg-dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 7px; vertical-align: 1px; box-shadow: inset 0 0 0 1px var(--kg-mark-edge); }
+      #kg-overlay .kg-meta { font-size: 0.8125rem; color: var(--paper-ink-2); margin-top: 4px; overflow-wrap: anywhere; }
+      #kg-overlay .kg-empty { font-size: 0.8125rem; color: var(--paper-ink-2); line-height: 1.5; padding: 10px 0; }
       #kg-overlay .kg-actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 10px; }
-      #kg-overlay a { color: #8FC1FF; }
-      #kg-overlay .kg-caption { margin-top: 1px; max-width: min(640px, max(50%, min(100% - 24px, 360px))); background: rgba(10,12,16,0.9); border: 1px solid rgba(255,213,79,0.45); border-radius: 12px; padding: 9px 13px; font-size: 0.84375rem; line-height: 1.45; color: #F5F2EB; display: none; overflow-wrap: anywhere; }
+      #kg-overlay a { color: var(--paper-brass-ink); text-decoration: underline; }
+      #kg-overlay .kg-caption { margin-top: 1px; max-width: min(640px, max(50%, min(100% - 24px, 360px))); background: var(--paper-raised); border: 1px solid var(--paper-line); border-radius: var(--paper-radius); box-shadow: var(--paper-shadow-soft); padding: 9px 13px; font-size: 0.84375rem; line-height: 1.45; color: var(--paper-ink); display: none; overflow-wrap: anywhere; }
       #kg-overlay .kg-caption.show { display: block; }
-      #kg-overlay .kg-caption b { color: #FFD54F; font-weight: 650; }
+      #kg-overlay .kg-caption b { color: var(--paper-ink); font-weight: 700; }
       #kg-overlay .kg-recall { display: flex; gap: 8px; align-items: flex-start; }
-      #kg-overlay .kg-recall button.kg-play { flex: 0 0 auto; background: rgba(255,213,79,0.14); border: 1px solid rgba(255,213,79,0.45); color: #FFD54F; border-radius: 8px; padding: 4px 8px; font-size: 0.75rem; cursor: pointer; }
+      #kg-overlay .kg-recall button.kg-play { flex: 0 0 auto; padding: 4px 8px; font-size: 0.8125rem; }
+      ${paperQuietButton('#kg-overlay .kg-recall button.kg-play')}
       #kg-overlay .kg-recall .kg-q { font-size: 0.8125rem; line-height: 1.4; min-width: 0; overflow-wrap: anywhere; }
-      #kg-overlay .kg-js { background: rgba(120,200,255,0.12); border: 1px solid rgba(120,200,255,0.45); color: #78C8FF; border-radius: 8px; padding: 6px 10px; font-size: 0.8125rem; cursor: pointer; margin-top: 10px; }
+      #kg-overlay .kg-js { padding: 6px 10px; font-size: 0.8125rem; margin-top: 10px; }
+      ${paperPrimaryButton('#kg-overlay .kg-js')}
+      #kg-overlay .kg-js:hover, #kg-overlay .kg-js:active { box-shadow: inset 0 0 0 2px var(--paper-brass-edge); }
       /* Shown where the title band has no room for the subtitle and the legend is hidden (phones). */
       #kg-overlay .kg-about, #kg-overlay .kg-kinds { display: none; margin-top: 8px; }
       #kg-overlay .kg-kinds { flex-wrap: wrap; gap: 6px; }
-      #kg-overlay .kg-kinds button { display: inline-flex; align-items: center; min-height: 32px; padding: 0 12px; border-radius: 22px; background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.14); color: #F5F2EB; font-size: 0.8125rem; cursor: pointer; }
-      #kg-overlay .kg-kinds button[aria-pressed="true"] { background: rgba(255,255,255,0.18); }
+      #kg-overlay .kg-kinds button { display: inline-flex; align-items: center; min-height: 32px; padding: 0 12px; border-radius: 22px; font-size: 0.8125rem; }
+      ${paperQuietButton('#kg-overlay .kg-kinds button')}
+      #kg-overlay .kg-kinds button { font-weight: 400; }
+      #kg-overlay .kg-kinds button[aria-pressed="true"], #kg-overlay .kg-kinds button[aria-pressed="true"]:hover { background: var(--paper-brass); border-color: var(--paper-brass-edge); }
       /* Fingers need 44 px to land on, and a 16 px field so iOS does not zoom the page on focus. */
       @media (pointer: coarse) {
         #kg-overlay .kg-zoom button, #kg-overlay .kg-actions button, #kg-overlay .kg-js, #kg-overlay .kg-recall button.kg-play, #kg-overlay .kg-close { min-width: 44px; min-height: 44px; }
@@ -210,13 +246,13 @@ export class KnowledgeGraphPanel {
       }
       /* Full screen, sized to what is visible: the on-screen keyboard and the browser's bars shrink it. */
       @media ${STACKED}, ${SHORT} {
-        #kg-overlay { inset: auto; left: 0; right: 0; top: var(--kg-vt, 0px); height: 100vh; height: var(--kg-vh, 100dvh); border: none; border-radius: 0; background: #121214; backdrop-filter: none; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+        #kg-overlay { inset: auto; left: 0; right: 0; top: var(--kg-vt, 0px); height: 100vh; height: var(--kg-vh, 100dvh); border: none; border-radius: 0; padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
       }
       @media ${STACKED} {
         #kg-overlay { grid-template-columns: minmax(0, 1fr); grid-template-rows: minmax(0, 11fr) minmax(0, 9fr); }
-        #kg-overlay .kg-side { border-left: none; border-top: 1px solid rgba(255,255,255,0.08); }
-        /* The x sits over the graph here. With the title band hidden (keyboard up, or a replay's caption in its place) the graph is drawn right behind it, so it carries its own dark disc. */
-        #kg-overlay .kg-close { position: absolute; z-index: 2; top: calc(env(safe-area-inset-top) + 4px); right: calc(env(safe-area-inset-right) + 4px); min-width: 44px; min-height: 44px; background: rgba(18,18,20,0.82); border-radius: 50%; }
+        #kg-overlay .kg-side { border-left: none; border-top: 1px solid var(--paper-hair); }
+        /* The x sits over the graph here. With the title band hidden (keyboard up, or a replay's caption in its place) the graph is drawn right behind it, so it carries its own paper disc. */
+        #kg-overlay .kg-close { position: absolute; z-index: 2; top: calc(env(safe-area-inset-top) + 4px); right: calc(env(safe-area-inset-right) + 4px); min-width: 44px; min-height: 44px; background: var(--paper-raised-veil); box-shadow: inset 0 0 0 1px var(--paper-line); border-radius: 50%; }
         #kg-overlay .kg-top { padding-right: 56px; }
         #kg-overlay .kg-caption { max-width: calc(100% - 24px); }
       }
@@ -230,8 +266,8 @@ export class KnowledgeGraphPanel {
       }
       @media ${SHORT} {
         #kg-overlay { grid-template-columns: minmax(0, 1fr) minmax(260px, 40%); grid-template-rows: minmax(0, 1fr); }
-        #kg-overlay .kg-side { border-top: none; border-left: 1px solid rgba(255,255,255,0.08); }
-        #kg-overlay .kg-close { position: static; background: none; border-radius: 0; }
+        #kg-overlay .kg-side { border-top: none; border-left: 1px solid var(--paper-hair); }
+        #kg-overlay .kg-close { position: static; background: none; box-shadow: none; border-radius: var(--paper-radius-sm); }
         #kg-overlay .kg-top { padding-right: 16px; }
         #kg-overlay .kg-caption { max-width: calc(100% - 24px); }
       }
@@ -736,6 +772,10 @@ export class KnowledgeGraphPanel {
     const k = this.view.k
     const fs = this.fontScale
     const FONT = 'Inter, -apple-system, sans-serif'
+    const P = palette()
+    // A hue as a line, ring or name on paper: darkened to 3:1 (marks) or 4.5:1 (names) on the paper it sits on.
+    const markOf = (c: string): RGB => { const rgb = hexRgb(c.slice(0, 7)); return rgb ? legible(rgb, P.ink, P.surface, 3) : P.ink2 }
+    const nameOf = (c: string): RGB => { const rgb = hexRgb(c.slice(0, 7)); return rgb ? legible(rgb, P.ink, P.raised, 4.5) : P.ink }
     // Labels keep clear of what is laid over the canvas and of each other; `taken` is in canvas pixels.
     const taken: Box[] = this.blocked.map(b => ({ x0: b.x0 * dpr, y0: b.y0 * dpr, x1: b.x1 * dpr, y1: b.y1 * dpr }))
     const free = (b: Box) => b.y0 >= 0 && b.y1 <= H && !taken.some(o => overlaps(b, o))
@@ -757,10 +797,10 @@ export class KnowledgeGraphPanel {
       const [x, y] = this.toScreen(p.x, p.y)
       const color = TYPE_COLOR[c.id]
       ctx.beginPath(); ctx.arc(x, y, r * k * dpr, 0, Math.PI * 2)
-      ctx.fillStyle = `${color}12`; ctx.fill()
-      ctx.strokeStyle = `${color}55`; ctx.lineWidth = 1.5 * dpr; ctx.stroke()
+      ctx.fillStyle = `${color}26`; ctx.fill()
+      ctx.strokeStyle = cssRgba(markOf(color)); ctx.lineWidth = 1.5 * dpr; ctx.stroke()
       discs.push({ x, y, r: r * k * dpr, own: c.id })
-      names.push({ type: c.id, text: `${c.label}  ${c.count}  ×`, color, x, y, top: y - r * k * dpr, bottom: y + r * k * dpr })
+      names.push({ type: c.id, text: `${c.label}  ${c.count}  ×`, color: cssRgba(nameOf(color)), x, y, top: y - r * k * dpr, bottom: y + r * k * dpr })
     }
 
     // 2. Links. At rest, one line between each pair of clusters, as heavy as the links they share;
@@ -778,7 +818,8 @@ export class KnowledgeGraphPanel {
     for (const { a, b, n, conflict } of bundle.values()) {
       const p = this.anchor(a), q = this.anchor(b)
       const [x1, y1] = this.toScreen(p.x, p.y), [x2, y2] = this.toScreen(q.x, q.y)
-      ctx.strokeStyle = conflict > n / 2 ? `rgba(229,115,115,${focus ? 0.08 : 0.4})` : `rgba(245,242,235,${focus ? 0.05 : 0.16})`
+      // At rest the lines are drawn at 3:1 on the paper (ink 0.5, danger 0.6); with a node in focus the rest fall back to a wash.
+      ctx.strokeStyle = conflict > n / 2 ? cssRgba(P.danger, focus ? 0.1 : 0.6) : cssRgba(P.ink, focus ? 0.08 : 0.5)
       ctx.lineWidth = Math.min(10, 1 + Math.log2(n + 1) * 1.2) * dpr
       ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
     }
@@ -791,7 +832,7 @@ export class KnowledgeGraphPanel {
           const to = this.endOf(e.source === focus ? e.target : e.source)
           if (!to || to === from) continue
           const [x2, y2] = this.toScreen(to.x, to.y)
-          ctx.strokeStyle = e.kind === 'conflicts' ? 'rgba(229,115,115,0.85)' : 'rgba(255,255,255,0.7)'
+          ctx.strokeStyle = e.kind === 'conflicts' ? cssRgba(P.danger, 0.9) : cssRgba(P.ink, 0.8)
           ctx.lineWidth = 1.6 * dpr
           ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
         }
@@ -811,19 +852,24 @@ export class KnowledgeGraphPanel {
       ctx.globalAlpha = on ? 1 : 0.2
       ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2)
       const logo = !b.isCluster && b.node?.type === 'model' ? this.logoFor(b.node) : null
-      ctx.fillStyle = b.isCluster ? `${color}33` : logo ? '#F5F2EB' : color
+      ctx.fillStyle = b.isCluster ? `${color}55` : logo ? cssRgba(P.white) : color
       ctx.fill()
       if (logo) {
         const s = r * 1.25
         ctx.drawImage(logo, x - s / 2, y - s / 2, s, s)
         ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI * 2)
-        ctx.lineWidth = 2.5 * dpr; ctx.strokeStyle = color; ctx.stroke()
+        ctx.lineWidth = 2.5 * dpr; ctx.strokeStyle = cssRgba(legible(hexRgb(color) ?? P.ink2, P.ink, P.white, 3)); ctx.stroke()
       }
       ctx.lineWidth = (b.id === this.selected ? 3 : this.matches.has(b.id) ? 2.5 : b.isCluster ? 2 : 1) * dpr
-      ctx.strokeStyle = b.id === this.selected ? '#FFFFFF' : this.matches.has(b.id) ? '#FFD54F' : b.isCluster ? color : 'rgba(0,0,0,0.5)'
+      ctx.strokeStyle = b.id === this.selected ? cssRgba(P.ink) : this.matches.has(b.id) ? cssRgba(P.brassEdge) : b.isCluster ? cssRgba(markOf(color)) : cssRgba(P.ink, 0.6)
       ctx.stroke()
+      if (b.id === this.selected) {
+        // The chosen node gets the theme's brass halo round its ink edge.
+        ctx.beginPath(); ctx.arc(x, y, r + 4 * dpr, 0, Math.PI * 2)
+        ctx.lineWidth = 3 * dpr; ctx.strokeStyle = cssRgba(P.brass); ctx.stroke()
+      }
       if (!b.isCluster && b.node?.type === 'conflict' && b.node.meta.resolved !== true && r > 6 * dpr) {
-        ctx.fillStyle = '#121214'; ctx.font = `700 ${Math.round(r * 1.1)}px Inter, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
+        ctx.fillStyle = cssRgba(P.ink); ctx.font = `700 ${Math.round(r * 1.1)}px Inter, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
         ctx.fillText('!', x, y + dpr)
       }
       // Labels: always for closed bubbles; for nodes only when they are the focus, its neighbours,
@@ -839,19 +885,21 @@ export class KnowledgeGraphPanel {
 
     // 4. Names, in the order they matter: the node in focus, the open clusters, the bubbles (largest first),
     //    then search matches and other nodes. Each takes the first clear place; none is drawn over another.
-    const label = (text: string, box: Box, cx: number, size: number, weight: number, fill: string, back: string): void => {
+    const backing = cssRgba(P.raised, 0.92)
+    const label = (text: string, box: Box, cx: number, size: number, weight: number, fill: string, back: string, edge = ''): void => {
       taken.push(box)
       ctx.font = `${weight} ${size}px ${FONT}`
       ctx.textAlign = 'center'; ctx.textBaseline = 'middle'
       ctx.fillStyle = back
       ctx.fillRect(box.x0, box.y0, box.x1 - box.x0, box.y1 - box.y0)
+      if (edge) { ctx.strokeStyle = edge; ctx.lineWidth = dpr; ctx.strokeRect(box.x0 + dpr / 2, box.y0 + dpr / 2, box.x1 - box.x0 - dpr, box.y1 - box.y0 - dpr) }
       ctx.fillStyle = fill
       ctx.fillText(text, cx, (box.y0 + box.y1) / 2)
     }
     const nodeLabel = (w: { b: Body; x: number; y: number; r: number; on: boolean }, forced: boolean): void => {
       if (!inView(w.x, w.y, w.r)) return
       const text = w.b.node?.label ?? ''
-      const size = 12 * fs * dpr
+      const size = 13 * fs * dpr
       ctx.font = `500 ${size}px ${FONT}`
       let t = text.length > 38 ? `${text.slice(0, 36)}…` : text
       while (t.length > 6 && ctx.measureText(t).width > W - 16 * dpr) t = `${t.slice(0, -4)}…`
@@ -870,7 +918,7 @@ export class KnowledgeGraphPanel {
         const tries = Math.abs(dx) > Math.abs(dy) * 1.2 ? [dx > 0 ? right : left, dy > 0 ? below : above] : [dy >= 0 ? below : above, dx > 0 ? right : left]
         box = tries.find(c => clear(c, 'model') && !logos.some(d => d.id !== w.b.id && touches(c, d)))
       } else box = free(below) ? below : null
-      if (box) label(t, box, (box.x0 + box.x1) / 2, size, 500, w.on ? '#F5F2EB' : 'rgba(245,242,235,0.45)', 'rgba(18,18,20,0.82)')
+      if (box) label(t, box, (box.x0 + box.x1) / 2, size, 500, w.on ? cssRgba(P.ink) : cssRgba(P.ink, 0.5), backing)
     }
     const inFocus = wanted.find(w => w.b.id === focus && !w.b.isCluster)
     if (inFocus) {
@@ -909,7 +957,7 @@ export class KnowledgeGraphPanel {
       }
       if (!name.pill) continue
       const pill = name.pill
-      label(name.text, pill, name.x, size, 650, n.color, 'rgba(18,18,20,0.85)')
+      label(name.text, pill, name.x, size, 650, n.color, backing, cssRgba(P.line))
       const css: Box = { x0: pill.x0 / dpr, y0: pill.y0 / dpr, x1: pill.x1 / dpr, y1: pill.y1 / dpr }
       // A finger gets at least 14 px above and below the drawn name, and enough that the name with one side alone
       // is 44 px tall: a node right under the name still answers its own tap, so the other side has to be enough.
@@ -924,7 +972,7 @@ export class KnowledgeGraphPanel {
       // A bubble's name goes below it, or above, or beside it; with no clear place, only its count is written
       // inside (the legend, or the list of kinds on a phone, names the colour).
       const text = `${this.data.clusters.find(c => c.id === b.cluster)?.label ?? b.cluster}  ${b.count}`
-      const size = (this.tight ? 12 : 14) * fs * dpr
+      const size = (this.tight ? 13 : 14) * fs * dpr
       ctx.font = `650 ${size}px ${FONT}`
       const w = ctx.measureText(text).width + 8 * dpr, tall = size + 6 * dpr
       const cx = within(x, w / 2)
@@ -939,9 +987,9 @@ export class KnowledgeGraphPanel {
       const past = x < 0 ? right : x > W ? left : null
       const tries = past ? (showing >= 16 * dpr ? [past, below, above] : [past]) : this.tight && y < mid ? [above, below, right, left] : [below, above, right, left]
       const box = tries.find(c => clear(c, b.cluster))
-      const fill = on ? '#F5F2EB' : 'rgba(245,242,235,0.45)'
-      if (box) { label(text, box, (box.x0 + box.x1) / 2, size, 650, fill, 'rgba(18,18,20,0.82)'); continue }
-      const n = String(b.count ?? ''), s = 11 * fs * dpr
+      const fill = on ? cssRgba(P.ink) : cssRgba(P.ink, 0.5)
+      if (box) { label(text, box, (box.x0 + box.x1) / 2, size, 650, fill, backing); continue }
+      const n = String(b.count ?? ''), s = 13 * fs * dpr
       ctx.font = `650 ${s}px ${FONT}`
       const half = ctx.measureText(n).width / 2 + 2 * dpr
       const inside: Box = { x0: x - half, y0: y - s / 2 - dpr, x1: x + half, y1: y + s / 2 + dpr }
@@ -993,8 +1041,9 @@ export class KnowledgeGraphPanel {
     const ctx = this.ctx
     const { hop, elapsed, reduce } = at
     const pos = (id: string) => { const b = this.endOf(id) ?? this.bodies.get(id); return b ? this.toScreen(b.x, b.y) : null }
+    const P = palette()
     ctx.lineWidth = 2.5 * dpr
-    ctx.strokeStyle = 'rgba(255,213,79,0.85)'
+    ctx.strokeStyle = cssRgba(P.brassEdge, 0.9)
     for (let i = 0; i < hop; i++) {
       const p = pos(a.path[i]), q = pos(a.path[i + 1])
       if (!p || !q) continue
@@ -1004,7 +1053,7 @@ export class KnowledgeGraphPanel {
       const p = pos(a.path[i])
       if (!p) continue
       ctx.beginPath(); ctx.arc(p[0], p[1], (i === 0 ? 16 : 13) * dpr, 0, Math.PI * 2)
-      ctx.strokeStyle = 'rgba(255,213,79,0.9)'; ctx.lineWidth = 2.5 * dpr; ctx.stroke()
+      ctx.strokeStyle = cssRgba(P.brassEdge); ctx.lineWidth = 2.5 * dpr; ctx.stroke()
     }
     if (!reduce && hop < a.path.length - 1) {
       const p = pos(a.path[hop]), q = pos(a.path[hop + 1])
@@ -1012,11 +1061,11 @@ export class KnowledgeGraphPanel {
         const t = (elapsed % HOP_MS) / HOP_MS
         const e = t * t * (3 - 2 * t)
         const x = p[0] + (q[0] - p[0]) * e, y = p[1] + (q[1] - p[1]) * e
-        ctx.strokeStyle = 'rgba(255,213,79,0.5)'; ctx.lineWidth = 2 * dpr
+        ctx.strokeStyle = cssRgba(P.brassEdge, 0.6); ctx.lineWidth = 2 * dpr
         ctx.beginPath(); ctx.moveTo(p[0], p[1]); ctx.lineTo(x, y); ctx.stroke()
-        const g = ctx.createRadialGradient(x, y, 0, x, y, 14 * dpr)
-        g.addColorStop(0, 'rgba(255,236,150,1)'); g.addColorStop(1, 'rgba(255,213,79,0)')
-        ctx.fillStyle = g; ctx.beginPath(); ctx.arc(x, y, 14 * dpr, 0, Math.PI * 2); ctx.fill()
+        // A glow does not show on paper: the travelling mark is a brass dot with a brass edge.
+        ctx.fillStyle = cssRgba(P.brass); ctx.strokeStyle = cssRgba(P.brassEdge); ctx.lineWidth = 2 * dpr
+        ctx.beginPath(); ctx.arc(x, y, 7 * dpr, 0, Math.PI * 2); ctx.fill(); ctx.stroke()
       }
     }
   }
@@ -1335,11 +1384,18 @@ export class KnowledgeGraphPanel {
     return `<button data-go="${esc(id)}">${this.markHtml(n, 15)}<span class="kg-name">${esc(n.label)}</span> <span class="kg-tag">${esc(n.type)}${note ? ` · ${esc(note)}` : ''}</span></button>`
   }
 
+  /** A model's accent as a ring on a white disc: darkened only as far as a ring needs to be seen. */
+  private ringColor(n: GNode): string {
+    const P = palette()
+    const c = hexRgb(colorOf(n))
+    return c ? cssRgba(legible(c, P.ink, P.white, 3)) : cssRgba(P.ink2)
+  }
+
   /** A model's credited logo, or the coloured dot every other kind of node uses. */
   private markHtml(n: GNode, size: number): string {
     const src = n.type === 'model' ? LOGO_SRC[labOf(n)] : undefined
     return src
-      ? `<img src="${esc(src)}" alt="" width="${size}" height="${size}" style="vertical-align:-${Math.round(size / 4)}px;margin-right:7px;background:#F5F2EB;border-radius:50%;padding:2px;border:2px solid ${colorOf(n)}">`
+      ? `<img src="${esc(src)}" alt="" width="${size}" height="${size}" style="vertical-align:-${Math.round(size / 4)}px;margin-right:7px;background:var(--paper-white);border-radius:50%;padding:2px;border:2px solid ${this.ringColor(n)}">`
       : `<span class="kg-dot" style="background:${colorOf(n)}"></span>`
   }
 

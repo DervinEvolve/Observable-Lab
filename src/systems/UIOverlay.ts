@@ -6,6 +6,7 @@ import { StationRole } from '../scene/colors'
 import { MODEL_PROVIDER_NAMES, MODEL_PROVIDER_LOGOS, PROVIDER_LOGOS } from '../shared/types'
 import { panelName, panelModelId, shortName, modelSlug, providerName, wildcardName, wildcardModelId } from './modelLabels'
 import { defaultRepoLinks, type RepoLink } from './repoLinks'
+import { installPaperTheme, paperFocusRing } from './paperTheme'
 
 // Personalities stay with the scientist; the model names come from the shared
 // maps so a panel change shows everywhere without editing this file.
@@ -90,6 +91,7 @@ export class UIOverlay {
     this.scientists = scientists
 
     // Create main container
+    installPaperTheme()
     this.container = document.createElement('div')
     this.container.id = 'ui-overlay'
     this.container.innerHTML = `
@@ -102,7 +104,7 @@ export class UIOverlay {
           height: 100%;
           pointer-events: none;
           z-index: 100;
-          font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+          font-family: var(--paper-sans);
         }
 
         #labels-container {
@@ -126,8 +128,9 @@ export class UIOverlay {
         }
 
         .scientist-label:hover .label-card {
-          background: rgba(255, 255, 255, 0.95);
-          box-shadow: 0 4px 16px rgba(0,0,0,0.12);
+          background: var(--paper-surface);
+          border-color: var(--paper-ink);
+          box-shadow: var(--paper-shadow-lift);
         }
 
         .scientist-label.focused {
@@ -136,8 +139,9 @@ export class UIOverlay {
         }
 
         .scientist-label.focused .label-card {
-          background: rgba(255, 255, 255, 0.98);
-          box-shadow: 0 4px 20px rgba(0,0,0,0.15), 0 0 0 2px var(--accent-color);
+          background: var(--paper-raised);
+          border-color: var(--paper-brass-edge);
+          box-shadow: var(--paper-shadow-lift), 0 0 0 2px var(--paper-brass-edge);
         }
 
         .scientist-label.focused .label-indicator {
@@ -145,18 +149,16 @@ export class UIOverlay {
         }
 
         @keyframes focusPulse {
-          0%, 100% { transform: scale(1); box-shadow: 0 0 8px var(--accent-color); }
-          50% { transform: scale(1.4); box-shadow: 0 0 12px var(--accent-color); }
+          0%, 100% { transform: scale(1); box-shadow: 0 0 0 1px var(--paper-line); }
+          50% { transform: scale(1.4); box-shadow: 0 0 0 1px var(--paper-line); }
         }
 
         .label-card {
-          background: rgba(255, 255, 255, 0.75);
-          backdrop-filter: blur(8px);
-          -webkit-backdrop-filter: blur(8px);
+          background: var(--paper-raised-veil);
           border-radius: 16px;
           padding: 4px 10px 5px;
-          box-shadow: 0 2px 8px rgba(0,0,0,0.08);
-          border: 1px solid rgba(255,255,255,0.5);
+          box-shadow: var(--paper-shadow-soft);
+          border: 1px solid var(--paper-line);
           text-align: center;
           min-width: 56px;
         }
@@ -164,23 +166,23 @@ export class UIOverlay {
         .label-name {
           font-weight: 600;
           font-size: 10px;
-          color: #1a1a1a;
+          color: var(--paper-ink);
           letter-spacing: -0.2px;
           white-space: nowrap;
         }
 
+        /* The model accent stays as the small dot above the name; text is ink. */
         .label-role {
           font-size: 7px;
-          color: var(--accent-color);
+          color: var(--paper-ink-2);
           text-transform: uppercase;
           letter-spacing: 0.8px;
           font-weight: 500;
-          opacity: 0.9;
         }
 
         .label-status {
           font-size: 6px;
-          color: #666;
+          color: var(--paper-ink-2);
           margin-top: 2px;
           white-space: nowrap;
           overflow: hidden;
@@ -202,7 +204,7 @@ export class UIOverlay {
           border-radius: 50%;
           background: var(--accent-color);
           margin: 0 auto 3px;
-          box-shadow: 0 0 6px var(--accent-color);
+          box-shadow: 0 0 0 1px var(--paper-line);
           animation: pulse 2.5s ease-in-out infinite;
         }
 
@@ -218,14 +220,14 @@ export class UIOverlay {
           font-size: 11px;
           font-weight: 700;
           letter-spacing: 0.4px;
-          font-family: 'SF Mono', 'Courier New', monospace;
-          color: var(--accent-color);
-          background: transparent;
-          border: 1px solid var(--accent-color);
+          font-family: var(--paper-mono);
+          line-height: 12px;
+          color: var(--paper-ink);
+          border: 1px solid var(--paper-line);
           border-radius: 999px;
           cursor: pointer;
           opacity: 1;
-          background: rgba(255,255,255,0.75);
+          background: var(--paper-raised);
           transition: opacity 0.15s ease, background 0.15s ease, color 0.15s ease;
           pointer-events: auto;
         }
@@ -234,10 +236,20 @@ export class UIOverlay {
         .jspace-btn.active {
           opacity: 1;
         }
-        .jspace-btn.active {
-          background: var(--accent-color);
-          color: #fff;
+        .jspace-btn:hover {
+          background: var(--paper-sunk);
+          border-color: var(--paper-ink);
         }
+        .jspace-btn.active {
+          background: var(--paper-brass);
+          border-color: var(--paper-brass-edge);
+          color: var(--paper-ink);
+        }
+        .jspace-btn.active:hover {
+          background: var(--paper-brass);
+          border-color: var(--paper-ink);
+        }
+        ${paperFocusRing('#ui-overlay')}
 
         /* While a scientist's lens is up, their label steps aside so the
            readout isn't blocked; hover brings it back to toggle off. */
@@ -258,27 +270,25 @@ export class UIOverlay {
           font-size: 9px;
           line-height: 1.3;
           font-weight: 500;
-          color: #4a4036;
+          color: var(--paper-ink-2);
           white-space: normal;
           text-align: center;
         }
 
         @keyframes pulse {
-          0%, 100% { opacity: 1; box-shadow: 0 0 6px var(--accent-color); }
-          50% { opacity: 0.6; box-shadow: 0 0 10px var(--accent-color); }
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.6; }
         }
 
         #tooltip {
           position: absolute;
-          background: rgba(20, 20, 20, 0.88);
-          backdrop-filter: blur(16px);
-          -webkit-backdrop-filter: blur(16px);
-          color: #f5f2eb;
+          background: var(--paper-raised);
+          color: var(--paper-ink);
           padding: 14px;
-          border-radius: 14px;
+          border-radius: var(--paper-radius-panel);
           max-width: 220px;
-          box-shadow: 0 8px 32px rgba(0,0,0,0.25);
-          border: 1px solid rgba(255,255,255,0.08);
+          box-shadow: var(--paper-shadow);
+          border: 1px solid var(--paper-line);
           pointer-events: none;
           opacity: 0;
           transition: opacity 0.2s ease, transform 0.2s ease;
@@ -297,7 +307,7 @@ export class UIOverlay {
           gap: 10px;
           margin-bottom: 10px;
           padding-bottom: 8px;
-          border-bottom: 1px solid rgba(255,255,255,0.08);
+          border-bottom: 1px solid var(--paper-hair);
         }
 
         .tooltip-avatar {
@@ -315,7 +325,8 @@ export class UIOverlay {
 
         .tooltip-avatar.provider-logo {
           flex: 0 0 32px;
-          background: #fff;
+          background: var(--paper-white);
+          box-shadow: inset 0 0 0 1px var(--paper-hair);
           padding: 5px;
           box-sizing: border-box;
         }
@@ -331,14 +342,15 @@ export class UIOverlay {
         }
 
         .tooltip-name {
-          font-weight: 600;
-          font-size: 12px;
+          font-family: var(--paper-serif);
+          font-weight: 700;
+          font-size: 13px;
           margin-bottom: 1px;
         }
 
         .tooltip-provider {
-          font-size: 10px;
-          opacity: 0.72;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           text-transform: uppercase;
           letter-spacing: 0.5px;
         }
@@ -352,38 +364,42 @@ export class UIOverlay {
         }
 
         .tooltip-section-title {
-          font-size: 8px;
+          font-size: 13px;
           text-transform: uppercase;
           letter-spacing: 0.8px;
-          opacity: 0.4;
+          color: var(--paper-ink-2);
           margin-bottom: 3px;
         }
 
         .tooltip-section-content {
-          font-size: 10px;
+          font-size: 13px;
           line-height: 1.4;
-          opacity: 0.9;
+          color: var(--paper-ink);
         }
 
+        /* The model accent is a small bar on the badge edge; the words are ink. */
         .tooltip-role-badge {
           display: inline-block;
           padding: 3px 8px;
           border-radius: 6px;
-          font-size: 9px;
+          font-size: 13px;
           font-weight: 600;
+          background: var(--paper-sunk);
+          color: var(--paper-ink);
+          box-shadow: inset 3px 0 0 var(--accent-color);
         }
 
         #experiment-info {
           position: fixed;
           top: 16px;
           left: 16px;
-          background: rgba(255, 255, 255, 0.85);
-          backdrop-filter: blur(12px);
-          -webkit-backdrop-filter: blur(12px);
-          padding: 14px 16px;
-          border-radius: 14px;
-          box-shadow: 0 2px 16px rgba(0,0,0,0.08);
-          border: 1px solid rgba(255,255,255,0.6);
+          background: var(--paper-raised);
+          color: var(--paper-ink);
+          padding: 12px 16px 14px;
+          border-radius: var(--paper-radius-panel);
+          box-shadow: var(--paper-shadow-soft);
+          border: 1px solid var(--paper-line);
+          border-top: 3px solid var(--paper-brass);
           pointer-events: auto;
           max-width: 260px;
           overflow: hidden;
@@ -404,14 +420,13 @@ export class UIOverlay {
           width: 44px;
           height: 44px;
           border-radius: 50%;
-          background: rgba(255, 255, 255, 0.92);
-          backdrop-filter: blur(8px);
-          -webkit-backdrop-filter: blur(8px);
-          border: 1px solid rgba(0, 0, 0, 0.12);
+          background: var(--paper-raised-veil);
+          color: var(--paper-ink);
+          border: 1px solid var(--paper-line);
           display: flex;
           align-items: center;
           justify-content: center;
-          box-shadow: 0 2px 12px rgba(0, 0, 0, 0.1);
+          box-shadow: var(--paper-shadow-soft);
           transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
           text-decoration: none;
           -webkit-tap-highlight-color: transparent;
@@ -420,19 +435,19 @@ export class UIOverlay {
         .gh-btn:hover,
         .gh-btn.tip-open {
           transform: translateY(-2px);
-          border-color: rgba(122, 92, 18, 0.55);
-          box-shadow: 0 6px 18px rgba(0, 0, 0, 0.16);
+          border-color: var(--paper-ink);
+          box-shadow: var(--paper-shadow-lift);
         }
 
         .gh-btn:focus { outline: none; }
         .gh-btn:focus-visible {
-          box-shadow: 0 0 0 2px #1f1a14, 0 0 0 5px #f3d98b;
+          outline: 2px solid var(--paper-focus);
+          outline-offset: 2px;
         }
 
         .gh-btn svg {
           width: 22px;
           height: 22px;
-          opacity: 0.8;
         }
 
         /* Small letter under the mark so the three read apart at a glance */
@@ -440,8 +455,8 @@ export class UIOverlay {
           position: absolute;
           bottom: 3px;
           right: 5px;
-          font: 700 9px/1 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-          color: #3b2f1e;
+          font: 700 9px/1 var(--paper-sans);
+          color: var(--paper-ink);
           letter-spacing: 0.2px;
         }
 
@@ -452,11 +467,12 @@ export class UIOverlay {
           width: max-content;
           max-width: min(240px, calc(100vw - 40px));
           padding: 8px 10px;
-          border-radius: 8px;
-          background: #1f1a14;
-          color: #fff;
-          font: 500 12px/1.4 -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
-          box-shadow: 0 6px 20px rgba(0, 0, 0, 0.25);
+          border-radius: var(--paper-radius-sm);
+          background: var(--paper-raised);
+          border: 1px solid var(--paper-line);
+          color: var(--paper-ink);
+          font: 500 12px/1.4 var(--paper-sans);
+          box-shadow: var(--paper-shadow-soft);
           opacity: 0;
           transform: translateY(4px);
           transition: opacity 0.15s ease, transform 0.15s ease;
@@ -464,8 +480,8 @@ export class UIOverlay {
           white-space: normal;
         }
 
-        .gh-tip strong { color: #f3d98b; font-weight: 700; }
-        .gh-tip .gh-tip-hint { display: block; margin-top: 3px; color: #d9d2c5; font-size: 11px; }
+        .gh-tip strong { color: var(--paper-brass-ink); font-weight: 700; }
+        .gh-tip .gh-tip-hint { display: block; margin-top: 3px; color: var(--paper-ink-2); font-size: 13px; }
 
         .gh-btn:hover .gh-tip,
         .gh-btn:focus-visible .gh-tip,
@@ -479,6 +495,8 @@ export class UIOverlay {
         @media (prefers-reduced-motion: reduce) {
           .gh-btn, .gh-tip { transition: none; }
           .gh-btn:hover, .gh-btn.tip-open { transform: none; }
+          .label-indicator, .scientist-label.focused .label-indicator,
+          .agent-speech-indicator, #live-status .live-caret { animation: none; }
         }
 
         #github-commit-badge {
@@ -490,14 +508,14 @@ export class UIOverlay {
           height: 18px;
           padding: 0 4px;
           border-radius: 9px;
-          background: #1a7f37;
-          color: #fff;
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          background: var(--paper-ink);
+          color: var(--paper-raised);
+          font-family: var(--paper-sans);
           font-size: 10px;
           font-weight: 700;
           line-height: 18px;
           text-align: center;
-          box-shadow: 0 1px 4px rgba(0, 0, 0, 0.25);
+          box-shadow: 0 0 0 1px var(--paper-raised);
           transform: scale(0);
           transition: transform 0.3s cubic-bezier(0.34, 1.8, 0.4, 1);
         }
@@ -510,15 +528,14 @@ export class UIOverlay {
           position: fixed;
           min-width: 220px;
           max-width: 300px;
-          background: rgba(255, 255, 255, 0.94);
-          backdrop-filter: blur(12px);
-          -webkit-backdrop-filter: blur(12px);
-          border: 1px solid rgba(0, 0, 0, 0.08);
-          border-radius: 14px;
-          box-shadow: 0 8px 30px rgba(0, 0, 0, 0.18);
+          background: var(--paper-raised);
+          border: 1px solid var(--paper-line);
+          border-radius: var(--paper-radius-panel);
+          box-shadow: var(--paper-shadow);
+          color: var(--paper-ink);
           padding: 12px 14px;
           z-index: 300;
-          font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+          font-family: var(--paper-sans);
           pointer-events: auto;
           opacity: 0;
           transform: translateY(6px) scale(0.96);
@@ -526,31 +543,32 @@ export class UIOverlay {
         }
         #inspector-card.show { opacity: 1; transform: translateY(0) scale(1); }
         #inspector-card .insp-title {
-          font-size: 13px; font-weight: 700; color: #1a1a1a;
+          font-family: var(--paper-serif);
+          font-size: 13px; font-weight: 700; color: var(--paper-ink);
           margin: 0 18px 2px 0; letter-spacing: 0.2px;
         }
         #inspector-card .insp-sub {
-          font-size: 10px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase;
-          color: rgba(0,0,0,0.4); margin-bottom: 8px;
+          font-size: 13px; font-weight: 600; letter-spacing: 1px; text-transform: uppercase;
+          color: var(--paper-ink-2); margin-bottom: 8px;
         }
         #inspector-card .insp-row {
           display: flex; justify-content: space-between; gap: 12px;
-          font-size: 11.5px; line-height: 1.7; color: #333;
+          font-size: 13px; line-height: 1.7; color: var(--paper-ink-2);
         }
-        #inspector-card .insp-row b { font-weight: 600; color: #111; text-align: right; }
+        #inspector-card .insp-row b { font-weight: 600; color: var(--paper-ink); text-align: right; }
         #inspector-card .insp-body {
-          font-size: 11.5px; line-height: 1.55; color: #333; margin-top: 2px;
+          font-size: 13px; line-height: 1.55; color: var(--paper-ink); margin-top: 2px;
         }
         #inspector-card .insp-body ul { margin: 4px 0 0 14px; padding: 0; }
         #inspector-card a {
-          color: #2ea043; font-weight: 600; text-decoration: none; font-size: 11.5px;
+          color: var(--paper-brass-ink); font-weight: 600; text-decoration: underline; font-size: 13px;
         }
-        #inspector-card a:hover { text-decoration: underline; }
+        #inspector-card a:hover { color: var(--paper-ink); }
         #inspector-card .insp-close {
           position: absolute; top: 8px; right: 10px; cursor: pointer;
-          font-size: 13px; color: rgba(0,0,0,0.35); border: none; background: none; padding: 2px;
+          font-size: 13px; color: var(--paper-ink-2); border: none; background: none; padding: 2px;
         }
-        #inspector-card .insp-close:hover { color: rgba(0,0,0,0.7); }
+        #inspector-card .insp-close:hover { color: var(--paper-ink); }
 
         #live-status {
           position: fixed;
@@ -562,15 +580,13 @@ export class UIOverlay {
           align-items: center;
           gap: 9px;
           padding: 10px 16px;
-          background: rgba(255, 255, 255, 0.85);
-          backdrop-filter: blur(12px);
-          -webkit-backdrop-filter: blur(12px);
-          border: 1px solid rgba(255,255,255,0.6);
-          border-radius: 14px;
-          box-shadow: 0 2px 16px rgba(0,0,0,0.08);
-          font-family: 'Inter', -apple-system, sans-serif;
-          font-size: 12px;
-          color: #1a1a1a;
+          background: var(--paper-raised);
+          border: 1px solid var(--paper-line);
+          border-radius: var(--paper-radius-panel);
+          box-shadow: var(--paper-shadow-soft);
+          font-family: var(--paper-sans);
+          font-size: 13px;
+          color: var(--paper-ink);
           opacity: 0;
           transition: opacity 0.3s ease, transform 0.3s ease;
           pointer-events: auto;
@@ -580,17 +596,22 @@ export class UIOverlay {
           text-overflow: ellipsis;
         }
         #live-status.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
-        #live-status .live-role { font-weight: 700; flex-shrink: 0; letter-spacing: -0.1px; }
+        /* The model accent is a 2px underline mark; the role name itself is ink. */
+        #live-status .live-role {
+          font-weight: 700; flex-shrink: 0; letter-spacing: -0.1px; color: var(--paper-ink);
+          text-decoration: underline; text-decoration-color: var(--accent-color);
+          text-decoration-thickness: 2px; text-underline-offset: 3px;
+        }
         #live-status .live-close {
           flex-shrink: 0; margin-left: 4px; border: none; background: none; cursor: pointer;
-          color: rgba(0,0,0,0.35); font-size: 15px; line-height: 1; padding: 0 2px;
+          color: var(--paper-ink-2); font-size: 15px; line-height: 1; padding: 0 2px;
           transition: color 0.15s ease;
         }
-        #live-status .live-close:hover { color: rgba(0,0,0,0.7); }
-        #live-status .live-remark { color: rgba(0,0,0,0.6); overflow: hidden; text-overflow: ellipsis; }
+        #live-status .live-close:hover { color: var(--paper-ink); }
+        #live-status .live-remark { color: var(--paper-ink-2); overflow: hidden; text-overflow: ellipsis; }
         #live-status .live-caret {
           display: inline-block; width: 1px; height: 12px; margin-left: 1px;
-          background: rgba(0,0,0,0.55); vertical-align: -1px;
+          background: var(--paper-ink); vertical-align: -1px;
           animation: liveCaret 0.9s step-end infinite;
         }
         @keyframes liveCaret { 50% { opacity: 0; } }
@@ -602,16 +623,18 @@ export class UIOverlay {
         }
 
         .info-title {
+          font-family: var(--paper-serif);
           font-size: 15px;
+          line-height: 19px;
           font-weight: 700;
-          color: #1a1a1a;
+          color: var(--paper-ink);
           margin: 0 0 2px 0;
-          letter-spacing: -0.3px;
+          letter-spacing: 0;
         }
 
         .info-subtitle {
-          font-size: 10px;
-          color: #888;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           margin: 0;
           letter-spacing: 0.2px;
         }
@@ -621,9 +644,9 @@ export class UIOverlay {
           margin: 0 0 8px;
           padding: 2px 8px;
           border-radius: 4px;
-          background: rgba(229, 115, 115, 0.15);
-          color: #a33a3a;
-          font-size: 10.5px;
+          background: var(--paper-visitor);
+          color: var(--paper-ink);
+          font-size: 13px;
           font-weight: 600;
           letter-spacing: 0.2px;
         }
@@ -633,13 +656,13 @@ export class UIOverlay {
           align-items: center;
           gap: 12px;
           margin-bottom: 10px;
-          font-size: 11px;
-          color: #555;
+          font-size: 13px;
+          color: var(--paper-ink-2);
         }
 
         .info-epoch {
           font-weight: 600;
-          color: #333;
+          color: var(--paper-ink);
         }
 
         .info-health {
@@ -649,7 +672,7 @@ export class UIOverlay {
         }
 
         .info-health-label {
-          color: #666;
+          color: var(--paper-ink-2);
         }
 
         .health-dots {
@@ -657,6 +680,8 @@ export class UIOverlay {
           gap: 3px;
         }
 
+        /* Each dot carries a thin ink ring so the status colour never has to
+           stand alone against paper. */
         .health-dot {
           width: 8px;
           height: 8px;
@@ -665,11 +690,12 @@ export class UIOverlay {
         }
 
         .health-dot.filled {
-          box-shadow: 0 0 4px currentColor;
+          box-shadow: 0 0 0 1px var(--paper-ink-2);
         }
 
         .health-dot.empty {
-          background: rgba(0,0,0,0.12);
+          background: var(--paper-sunk);
+          box-shadow: 0 0 0 1px var(--paper-line);
         }
 
         .info-toggle {
@@ -677,15 +703,15 @@ export class UIOverlay {
           align-items: center;
           gap: 6px;
           cursor: pointer;
-          font-size: 11px;
-          color: #666;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           padding: 4px 0;
           transition: color 0.15s ease;
           user-select: none;
         }
 
         .info-toggle:hover {
-          color: #333;
+          color: var(--paper-ink);
         }
 
         .info-toggle-arrow {
@@ -713,13 +739,13 @@ export class UIOverlay {
 
         .info-divider {
           height: 1px;
-          background: rgba(0,0,0,0.08);
+          background: var(--paper-hair);
           margin: 10px 0;
         }
 
         .info-description {
-          font-size: 11px;
-          color: #555;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           line-height: 1.55;
           margin: 0;
         }
@@ -730,17 +756,18 @@ export class UIOverlay {
           min-width: 44px;
           padding: 0 14px;
           font: inherit;
-          font-size: 12px;
-          color: #3d3a30;
-          background: #f5f2eb;
-          border: 1px solid #b5a642;
-          border-radius: 6px;
+          font-size: 13px;
+          color: var(--paper-ink);
+          background: var(--paper-raised);
+          border: 1px solid var(--paper-line);
+          border-radius: var(--paper-radius);
           cursor: pointer;
           pointer-events: auto;
         }
 
         .info-bench-button:hover {
-          background: #ece7d6;
+          background: var(--paper-sunk);
+          border-color: var(--paper-ink);
         }
 
         .info-description + .info-description {
@@ -750,12 +777,12 @@ export class UIOverlay {
         .info-seed {
           margin-top: 12px;
           padding-top: 12px;
-          border-top: 1px solid rgba(0,0,0,0.08);
+          border-top: 1px solid var(--paper-hair);
         }
 
         .info-seed-label {
-          font-size: 9px;
-          color: #888;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           text-transform: uppercase;
           letter-spacing: 0.5px;
           margin-bottom: 4px;
@@ -765,8 +792,8 @@ export class UIOverlay {
         }
 
         .info-seed-purpose {
-          font-size: 12px;
-          color: #333;
+          font-size: 13px;
+          color: var(--paper-ink);
           font-style: italic;
           line-height: 1.4;
         }
@@ -774,12 +801,12 @@ export class UIOverlay {
         .info-section {
           margin-top: 12px;
           padding-top: 10px;
-          border-top: 1px solid rgba(0,0,0,0.1);
+          border-top: 1px solid var(--paper-hair);
         }
 
         .info-section-label {
-          font-size: 10px;
-          color: #666;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           text-transform: uppercase;
           letter-spacing: 0.5px;
           margin-bottom: 6px;
@@ -787,8 +814,8 @@ export class UIOverlay {
         }
 
         .info-section-content {
-          font-size: 11px;
-          color: #444;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           line-height: 1.5;
         }
 
@@ -806,12 +833,12 @@ export class UIOverlay {
         }
 
         .info-list strong {
-          color: #333;
+          color: var(--paper-ink);
         }
 
         .info-note {
-          font-size: 10px;
-          color: #666;
+          font-size: 13px;
+          color: var(--paper-ink-2);
           font-style: italic;
           margin-top: 6px;
         }
@@ -835,13 +862,11 @@ export class UIOverlay {
         }
 
         .robot-status-content {
-          background: rgba(20, 20, 20, 0.9);
-          backdrop-filter: blur(8px);
-          -webkit-backdrop-filter: blur(8px);
-          border-radius: 12px;
+          background: var(--paper-raised);
+          border-radius: var(--paper-radius);
           padding: 8px 14px;
-          box-shadow: 0 4px 16px rgba(0,0,0,0.3);
-          border: 1px solid rgba(255,255,255,0.1);
+          box-shadow: var(--paper-shadow-soft);
+          border: 1px solid var(--paper-line);
           display: flex;
           align-items: center;
           gap: 8px;
@@ -850,28 +875,34 @@ export class UIOverlay {
 
         .robot-status-icon {
           font-size: 14px;
+          color: var(--paper-ink);
         }
 
         .robot-status-text {
-          font-size: 11px;
+          font-size: 13px;
           font-weight: 600;
-          color: #fff;
+          color: var(--paper-ink);
           letter-spacing: 0.3px;
         }
 
+        /* States tell apart by edge and wash, and always by their words. Red is for errors only. */
         .robot-status-content.success {
-          border-color: rgba(79, 195, 247, 0.5);
-          box-shadow: 0 4px 16px rgba(79, 195, 247, 0.2);
+          border-color: var(--paper-ink);
         }
 
         .robot-status-content.error {
-          border-color: rgba(229, 115, 115, 0.5);
-          box-shadow: 0 4px 16px rgba(229, 115, 115, 0.2);
+          background: var(--paper-danger-bg);
+          border-color: var(--paper-danger);
+        }
+
+        .robot-status-content.error .robot-status-icon,
+        .robot-status-content.error .robot-status-text {
+          color: var(--paper-danger);
         }
 
         .robot-status-content.working {
-          border-color: rgba(255, 183, 77, 0.5);
-          box-shadow: 0 4px 16px rgba(255, 183, 77, 0.2);
+          background: var(--paper-visitor);
+          border-color: var(--paper-brass-edge);
         }
 
         /* Agent Speech Bubble */
@@ -889,25 +920,34 @@ export class UIOverlay {
         }
 
         .agent-speech-content {
-          background: linear-gradient(135deg, rgba(40, 35, 25, 0.95), rgba(30, 25, 20, 0.95));
-          backdrop-filter: blur(12px);
-          -webkit-backdrop-filter: blur(12px);
-          border-radius: 16px;
+          background: var(--paper-raised);
+          color: var(--paper-ink);
+          border-radius: var(--paper-radius-panel);
           padding: 14px 18px;
-          box-shadow: 0 8px 32px rgba(255, 215, 0, 0.15), 0 0 60px rgba(255, 215, 0, 0.1);
-          border: 1px solid rgba(255, 215, 0, 0.3);
+          box-shadow: var(--paper-shadow);
+          border: 1px solid var(--paper-line);
           position: relative;
         }
 
+        .agent-speech-content::before,
         .agent-speech-content::after {
           content: '';
           position: absolute;
-          bottom: -10px;
           left: 50%;
           transform: translateX(-50%);
-          border-width: 10px 10px 0 10px;
           border-style: solid;
-          border-color: rgba(30, 25, 20, 0.95) transparent transparent transparent;
+        }
+
+        .agent-speech-content::before {
+          bottom: -11px;
+          border-width: 11px 11px 0 11px;
+          border-color: var(--paper-line) transparent transparent transparent;
+        }
+
+        .agent-speech-content::after {
+          bottom: -10px;
+          border-width: 10px 10px 0 10px;
+          border-color: var(--paper-raised) transparent transparent transparent;
         }
 
         .agent-speech-header {
@@ -916,13 +956,14 @@ export class UIOverlay {
           gap: 8px;
           margin-bottom: 8px;
           padding-bottom: 8px;
-          border-bottom: 1px solid rgba(255, 215, 0, 0.2);
+          border-bottom: 1px solid var(--paper-hair);
         }
 
         .agent-speech-name {
-          font-size: 12px;
+          font-family: var(--paper-serif);
+          font-size: 13px;
           font-weight: 700;
-          color: #ffd700;
+          color: var(--paper-ink);
           letter-spacing: 0.5px;
           text-transform: uppercase;
         }
@@ -930,7 +971,8 @@ export class UIOverlay {
         .agent-speech-indicator {
           width: 8px;
           height: 8px;
-          background: #ffd700;
+          background: var(--paper-brass);
+          box-shadow: 0 0 0 1px var(--paper-brass-edge);
           border-radius: 50%;
           animation: agent-pulse 2s ease-in-out infinite;
         }
@@ -942,7 +984,7 @@ export class UIOverlay {
 
         .agent-speech-text {
           font-size: 13px;
-          color: #f5f5dc;
+          color: var(--paper-ink);
           line-height: 1.5;
           font-style: italic;
         }
@@ -953,7 +995,7 @@ export class UIOverlay {
           right: 10px;
           background: none;
           border: none;
-          color: rgba(255, 215, 0, 0.5);
+          color: var(--paper-ink-2);
           cursor: pointer;
           font-size: 16px;
           padding: 4px;
@@ -961,7 +1003,7 @@ export class UIOverlay {
         }
 
         .agent-speech-close:hover {
-          color: rgba(255, 215, 0, 0.8);
+          color: var(--paper-ink);
         }
       </style>
     `
@@ -1067,7 +1109,7 @@ export class UIOverlay {
     const info = getInfo()
     this.tooltipElement.innerHTML = `
       <div class="tooltip-header">
-        <div class="tooltip-avatar" style="background:${accent};display:flex;align-items:center;justify-content:center;color:#06231f;font-weight:700;">⬡</div>
+        <div class="tooltip-avatar" style="background:${accent};display:flex;align-items:center;justify-content:center;color:var(--paper-ink);font-weight:700;">⬡</div>
         <div class="tooltip-title">
           <div class="tooltip-name">Subagent</div>
           <div class="tooltip-provider">${info.parent ? 'deployed by ' + info.parent : 'autonomous helper'}</div>
@@ -1118,7 +1160,7 @@ export class UIOverlay {
       <div class="tooltip-section">
         <div class="tooltip-section-title">Current Role</div>
         <div class="tooltip-section-content">
-          <span class="tooltip-role-badge" style="background: ${accent}20; color: ${accent};">Wildcard · R&amp;D</span>
+          <span class="tooltip-role-badge" style="--accent-color: ${accent};">Wildcard · R&amp;D</span>
         </div>
       </div>
       <div class="tooltip-section">
@@ -1170,7 +1212,7 @@ export class UIOverlay {
       <div class="tooltip-section">
         <div class="tooltip-section-title">Current Role</div>
         <div class="tooltip-section-content">
-          <span class="tooltip-role-badge" style="background: ${accent}20; color: ${accent};">Wildcard · R&amp;D</span>
+          <span class="tooltip-role-badge" style="--accent-color: ${accent};">Wildcard · R&amp;D</span>
         </div>
       </div>
       <div class="tooltip-section">
@@ -1438,7 +1480,7 @@ export class UIOverlay {
     }
     const esc = (s: string) => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
     this.liveStatusEl.innerHTML = `
-      <span class="live-role" style="color:${esc(accentHex)}">${esc(role)}</span>
+      <span class="live-role" style="--accent-color:${esc(accentHex)}">${esc(role)}</span>
       <span class="live-remark"></span><span class="live-caret"></span>
       <button class="live-close" title="Hide live status" aria-label="Hide">×</button>
     `
@@ -1519,7 +1561,7 @@ export class UIOverlay {
       const tipId = `gh-tip-${link.key}`
       a.setAttribute('aria-describedby', tipId)
       a.innerHTML = `
-        <svg viewBox="0 0 16 16" fill="#1a1a1a" aria-hidden="true" focusable="false">
+        <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true" focusable="false">
           <path fill-rule="evenodd" d="${GITHUB_MARK_PATH}"/>
         </svg>
         <span class="gh-tag" aria-hidden="true">${tags[link.key] || ''}</span>
@@ -1926,7 +1968,7 @@ export class UIOverlay {
       <div class="tooltip-section">
         <div class="tooltip-section-title">Current Role</div>
         <div class="tooltip-section-content">
-          <span class="tooltip-role-badge" style="background: ${color}20; color: ${color};">
+          <span class="tooltip-role-badge" style="--accent-color: ${color};">
             ${roleInfo.title}
           </span>
         </div>

@@ -44,6 +44,7 @@ import { batchStatic } from './lib/staticBatch'
 import { getStateManager } from './api/StateManager'
 import { getTaskOrchestrator, Task, TaskType } from './systems/TaskOrchestrator'
 import { getSpritesService, SpritesActivityEvent, StreamOutputEvent, ModelId as SpriteModelId } from './systems/SpritesService'
+import { installPaperTheme } from './systems/paperTheme'
 import type { ExperimentState, ExperimentStatus } from './shared/types'
 import { BACKEND_TO_FRONTEND_MODEL, ROLES, MODEL_DISPLAY_NAMES, WILDCARD_DISPLAY_NAMES, modelDisplayName } from './shared/types'
 
@@ -2307,33 +2308,35 @@ class ObservableLab {
       bottom: 76px;
       left: 20px;
       padding: 12px 20px;
-      background: linear-gradient(135deg, #7cb342 0%, #558b2f 100%);
-      color: white;
-      border: none;
-      border-radius: 8px;
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+      background: var(--paper-raised);
+      color: var(--paper-ink);
+      border: 1px solid var(--paper-line);
+      border-radius: var(--paper-radius);
+      font-family: var(--paper-sans);
       font-size: 14px;
       font-weight: 600;
       cursor: pointer;
-      box-shadow: 0 4px 12px rgba(124, 179, 66, 0.4);
+      box-shadow: var(--paper-shadow-soft);
       transition: all 0.2s ease;
       z-index: 1000;
     `
 
     button.addEventListener('mouseenter', () => {
       button.style.transform = 'translateY(-2px)'
-      button.style.boxShadow = '0 6px 16px rgba(124, 179, 66, 0.5)'
+      button.style.boxShadow = 'var(--paper-shadow-lift)'
+      button.style.borderColor = 'var(--paper-ink)'
     })
 
     button.addEventListener('mouseleave', () => {
       button.style.transform = 'translateY(0)'
-      button.style.boxShadow = '0 4px 12px rgba(124, 179, 66, 0.4)'
+      button.style.boxShadow = 'var(--paper-shadow-soft)'
+      button.style.borderColor = 'var(--paper-line)'
     })
 
     button.addEventListener('click', async () => {
       button.disabled = true
       button.innerHTML = '⏳ Running...'
-      button.style.background = 'linear-gradient(135deg, #888 0%, #666 100%)'
+      button.style.background = 'var(--paper-sunk)'
       button.style.cursor = 'wait'
 
       console.log('%c🚀 Triggering epoch...', 'color: #7cb342; font-weight: bold; font-size: 14px')
@@ -2353,11 +2356,11 @@ class ObservableLab {
           console.log('Commentator:', result.commentator)
 
           button.innerHTML = '✅ Done!'
-          button.style.background = 'linear-gradient(135deg, #4caf50 0%, #388e3c 100%)'
+          button.style.background = 'var(--paper-brass)'
 
           setTimeout(() => {
             button.innerHTML = '🧪 Run Epoch'
-            button.style.background = 'linear-gradient(135deg, #7cb342 0%, #558b2f 100%)'
+            button.style.background = 'var(--paper-raised)'
             button.disabled = false
             button.style.cursor = 'pointer'
           }, 2000)
@@ -2365,11 +2368,11 @@ class ObservableLab {
           console.error('%c❌ Epoch failed:', 'color: #e57373; font-weight: bold', result.error)
 
           button.innerHTML = '❌ Failed'
-          button.style.background = 'linear-gradient(135deg, #e57373 0%, #c62828 100%)'
+          button.style.background = 'var(--paper-danger-bg)'
 
           setTimeout(() => {
             button.innerHTML = '🧪 Run Epoch'
-            button.style.background = 'linear-gradient(135deg, #7cb342 0%, #558b2f 100%)'
+            button.style.background = 'var(--paper-raised)'
             button.disabled = false
             button.style.cursor = 'pointer'
           }, 3000)
@@ -2378,17 +2381,18 @@ class ObservableLab {
         console.error('%c❌ Network error:', 'color: #e57373; font-weight: bold', error)
 
         button.innerHTML = '❌ Error'
-        button.style.background = 'linear-gradient(135deg, #e57373 0%, #c62828 100%)'
+        button.style.background = 'var(--paper-danger-bg)'
 
         setTimeout(() => {
           button.innerHTML = '🧪 Run Epoch'
-          button.style.background = 'linear-gradient(135deg, #7cb342 0%, #558b2f 100%)'
+          button.style.background = 'var(--paper-raised)'
           button.disabled = false
           button.style.cursor = 'pointer'
         }, 3000)
       }
     })
 
+    installPaperTheme()
     document.body.appendChild(button)
   }
 
