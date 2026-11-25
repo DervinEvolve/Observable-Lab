@@ -651,6 +651,10 @@ The Socratic lesson is on by default. `LAB_ENABLE_TINKER_TUTOR` is on unless it 
 
 The Tinker part of a lesson uses `LAB_TINKER_RUN_USD` (default $2, the most one lesson's Tinker use may be estimated at) and `LAB_TINKER_DAILY_USD` (default $10 a UTC day), shared with training and RL. A large two round lesson is refused at $2; I raise the run cap only if I want those. With the defaults one lesson counts for at most about $3 of a $15 day ($2 Tinker, $1 teacher).
 
+**When `LAB_DAILY_BUDGET_USD` sees a lesson.** The teacher's calls reach the ledger as each one answers. The Tinker part reaches it once, as one `tool/tinker_tutor` row written by the statement that closes the lesson, as every Tinker training run's does. So while a lesson runs (up to 6 hours), the daily budget check does not count its open Tinker reservation, and other work can spend the day meanwhile; and a lesson that closes after 00:00 UTC is charged to the new day. The Tinker caps hold the whole reservation from the start. I have left this as it is for every Tinker run; if it matters, the fix is to count `tinker_spend_days.reserved_usd` in the daily check.
+
+**The lessons-per-day count** is held by one conditional statement on `tutor_day_slots` (one row a UTC day), so two epochs that run at the same time (the classic and the research experiment) cannot both take the last place. A lesson refused before any call was sent gives its place back.
+
 **The cron entry.** `vercel.json` now has a second cron: `/api/epoch/lesson` every 10 minutes, and gives the function `maxDuration` 800 (each call works for up to 700 seconds). It is a new function, so the project now has 26 in all (the four new routes are `api/epoch/lesson.ts`, `api/experiment/lesson.ts`, `api/experiment/chat-offer.ts` and `api/experiment/visitor-offers.ts`); I check that this fits my Vercel plan before I deploy. Like the tick it takes `CRON_SECRET` only, and answers 401 to anything else before it reads anything. With no open lesson a call makes one query. Without this entry a lesson only gets its first slice, in the epoch's follow-up, and then waits; the page shows it as not live and it is closed after 6 hours. After deploying, I confirm the second entry appears under the project's Cron Jobs.
 
 **Reading a lesson, and a stuck one.**
@@ -796,10 +800,10 @@ Visitors of the room can offer a conversation they had with a trained model to t
 | `LAB_ENABLE_VISITOR_OFFERS` | on | The switch. Off only for `false`, `0`, `off` or `no`. |
 | `LAB_VISITOR_OFFERS_DAYS` | 180 | Days an offer is kept after the end of the day it was made, 30 to 365. Then its text is deleted. |
 | `LAB_VISITOR_OFFERS_MAX` | 2000 | Offers stored at one time, hard 20000. When full, new offers get 429 `full`. |
-| `LAB_VISITOR_OFFERS_PER_DAY` | 100 | Offers accepted a UTC day from everyone, 0 to 1000. |
-| `LAB_TRAINED_CHAT_VISITOR_ADAPTERS` | false | Exactly `true` lets the visitor chat list and answer for an adapter trained on visitor offers. Off, such an adapter is not listed and a message to it is refused. I leave it off: nobody has read that text. |
+| `LAB_VISITOR_OFFERS_PER_DAY` | 100 | Offers accepted a UTC day from everyone, 0 to 1000. 0 takes none (the route answers 429 `full`); `LAB_ENABLE_VISITOR_OFFERS=false` is the off switch. |
+| `LAB_TRAINED_CHAT_VISITOR_ADAPTERS` | false | Exactly `true` lets the visitor chat list and answer for an adapter trained on visitor offers. Off, such an adapter is not listed and a message to it is refused. The lab model endpoint (`LAB_ENABLE_LIVE_TRAINED`, behind a scoped key) is not the visitor chat and does not read this switch: it lists and serves such an adapter, and its description says it was trained on conversations written by visitors. I leave it off: no model read that text and nobody reviewed it. |
 
-The limits that have no variable: 3 offers a day for a visitor (an address with a browser string) and 6 for an address, 20 a day for one adapter, one stored offer for each (adapter, first visitor message), 10 take back tries a day for an address. They are in `api/_lib/visitor-offers.ts`.
+The limits that have no variable: 3 offers a day for a visitor (an address with a browser string) and 6 for an address, 20 a day for one adapter, one stored offer for each (adapter, first visitor message), 10 take back tries a day for an address. The all-offers and per-adapter day caps are counted in `visitor_offer_caps` (a day, a name and a count, no time); the hourly prune deletes rows older than two days. They are in `api/_lib/visitor-offers.ts`.
 
 **What happens by itself.** The hourly tick deletes the text of offers past their days and leaves the row as a count. It runs whether offers are on or off, so the deletion holds after I switch them off. (On a lab that never had offers it creates the `visitor_offers` table, empty.) The table is created on first use otherwise.
 
