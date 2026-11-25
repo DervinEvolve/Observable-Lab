@@ -377,6 +377,47 @@ class RenderCheckTests(unittest.TestCase):
         self.assertTrue(self.failed(prompt, other, example, [0.0] * len(example)))
 
 
+class ProbeReportTests(unittest.TestCase):
+    """probe_report: how a raw answer is said to have ended. Token lists stand in for the real tokenizer."""
+
+    decode = staticmethod(lambda ids: " ".join(str(i) for i in ids))
+
+    def test_an_answer_that_ends_on_the_stop_token_is_stop_and_one_that_fills_the_cap_is_cap(self):
+        report = M.probe_report([
+            {"text": "apple", "tokens": [7, 8, 99]},
+            {"text": "", "tokens": [1, 2, 3, 4]},
+            {"text": "pear", "tokens": [5, 6]},
+        ], [99], self.decode, 4)
+        self.assertEqual([a["ended"] for a in report["answers"]], ["stop", "cap", "other"])
+        self.assertEqual((report["capped"], report["empty"], report["max_tokens"]), (1, 1, 4))
+        self.assertEqual(report["answers"][0], {"raw": "7 8 99", "answer": "apple", "tokens": 3, "ended": "stop"})
+
+    def test_an_answer_that_stops_exactly_at_the_cap_is_stop_not_cap(self):
+        report = M.probe_report([{"text": "fig", "tokens": [1, 2, 3, 99]}], [99], self.decode, 4)
+        self.assertEqual(report["answers"][0]["ended"], "stop")
+        self.assertEqual(report["capped"], 0)
+
+    def test_text_stop_sequences_are_left_out_and_no_answers_is_an_empty_report(self):
+        report = M.probe_report([{"text": "kiwi", "tokens": [1, 2]}], ["<|im_end|>"], self.decode, 40)
+        self.assertEqual(report["answers"][0]["ended"], "other")
+        self.assertEqual(M.probe_report([], [99], self.decode, 40), {"max_tokens": 40, "answers": [], "capped": 0, "empty": 0})
+
+
+class ProbeReachTests(unittest.TestCase):
+    """raw_probe holds the Tinker key, so nothing but the owner's own Modal login may start it."""
+
+    def test_nothing_in_the_runner_starts_the_probe_and_the_lab_server_never_names_it(self):
+        calls = [n for n in ast.walk(TREE) if isinstance(n, ast.Name) and n.id == "raw_probe"]
+        self.assertEqual(calls, [])  # defined once, never called or spawned from the file itself
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for folder in ("api", "src"):
+            for base, _, names in os.walk(os.path.join(root, folder)):
+                for name in names:
+                    if name.endswith((".ts", ".js", ".mjs")):
+                        with open(os.path.join(base, name), encoding="utf-8") as handle:
+                            self.assertNotIn("raw_probe", handle.read(), name)
+
+
 class FixedEffortTests(unittest.TestCase):
     """FixedEffortRenderer is a class, which load() leaves out, so it is taken from the tree by itself."""
 
@@ -689,15 +730,17 @@ class DeployShapeTests(unittest.TestCase):
             self.assertIn(pin, train_image)
         self.assertNotIn("tinker", web_image)
 
-    def test_only_the_three_functions_that_talk_to_tinker_are_given_the_tinker_key(self):
+    def test_only_the_four_functions_that_talk_to_tinker_are_given_the_tinker_key(self):
         functions = [n for n in TREE.body if isinstance(n, ast.FunctionDef) and n.decorator_list]
         secrets = {}
         for node in functions:
             text = " ".join(ast.unparse(d) for d in node.decorator_list)
             secrets[node.name] = sorted(set(re.findall(r"from_name\('([^']+)'\)", text)))
-        # `train` and `train_rl` train; `keeper` sets a checkpoint's time to live and copies its weights. The two web endpoints never have the key.
+        # `train` and `train_rl` train; `keeper` sets a checkpoint's time to live and copies its weights; `raw_probe` samples a
+        # base model for the owner's smoke script. The two web endpoints never have the key.
         self.assertEqual(secrets, {
             "train": ["oblab-tinker-auth"], "train_rl": ["oblab-tinker-auth"], "keeper": ["oblab-tinker-auth"],
+            "raw_probe": ["oblab-tinker-auth"],  # started only with the owner's Modal login: see the next test
             "render_check": [],  # renders a made-up conversation: no Tinker call, no key
             "start": ["oblab-tinker-jobs-auth"], "status": ["oblab-tinker-jobs-auth"],
         })

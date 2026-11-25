@@ -1938,6 +1938,40 @@ def judge_family(base_model: str, recommended, tokenizer_class) -> list:
     return checks
 
 
+RAW_PROBE_PROMPT = "Name one fruit other than a fig. Answer with the name only."
+RAW_PROBE_CAPS = (40, 400)
+RAW_PROBE_SAMPLES = 4
+RAW_PROBE_TEMPERATURE = 1.0
+
+
+def probe_report(completions: list, stop: list, decode, max_tokens: int) -> dict:
+    """What a base model really wrote for one prompt, before the renderer takes the answer out. Touches nothing.
+
+    `completions`: [{text, tokens}] as sample_batch returns them. `stop`: the
+    renderer's stop sequences (token ids, or strings for a text renderer).
+    Each answer is reported with every token decoded, the answer the
+    renderer read from it, its length in tokens, and how it ended: "stop"
+    when its last token is a stop token, "cap" when it used all of
+    `max_tokens` without one, "other" otherwise.
+    """
+    stops = set(t for t in stop if isinstance(t, int))
+    answers = []
+    for c in completions:
+        tokens = list(c["tokens"])
+        if tokens and tokens[-1] in stops:
+            ended = "stop"
+        elif len(tokens) >= max_tokens:
+            ended = "cap"
+        else:
+            ended = "other"
+        answers.append({"raw": decode(tokens), "answer": c["text"], "tokens": len(tokens), "ended": ended})
+    return {
+        "max_tokens": max_tokens, "answers": answers,
+        "capped": sum(1 for a in answers if a["ended"] == "cap"),
+        "empty": sum(1 for a in answers if not (a["answer"] or "").strip()),
+    }
+
+
 # ---------------------------------------------------------------------------
 # The training service, as run_core uses it
 # ---------------------------------------------------------------------------
@@ -2667,6 +2701,35 @@ class KeepDeps:
 
 
 kept_volume = modal.Volume.from_name(KEPT_VOLUME, create_if_missing=True)
+
+
+@app.function(image=train_image, secrets=[modal.Secret.from_name("oblab-tinker-auth")], timeout=600, retries=0,
+              max_containers=1, cpu=(1, 2), memory=(2048, 8192))
+def raw_probe(base_model: str) -> dict:
+    """Samples one made-up prompt from an untrained base model, the way a practice run does, and returns the raw text.
+
+    For the owner's smoke script only: no web endpoint starts it and the lab
+    server never calls it. It makes RAW_PROBE_SAMPLES answers at each cap in
+    RAW_PROBE_CAPS, a few hundred tokens in all. The result never carries the Tinker key.
+    """
+    if base_model not in RENDERERS:
+        return {"status": "refused", "reason": "base_model is not one this runner trains"}
+    deps = None
+    try:
+        deps = TinkerRlDeps({"base_model": base_model, "settings": {"rank": 8}, "label": "raw probe"})
+        sampler = deps.new_sampler()
+        decode = deps._renderer.tokenizer.decode
+        reports = []
+        for cap in RAW_PROBE_CAPS:
+            batch = deps.sample_batch(sampler, [RAW_PROBE_PROMPT], RAW_PROBE_SAMPLES, cap, RAW_PROBE_TEMPERATURE)
+            reports.append(probe_report(batch[0]["completions"], deps._stop, decode, cap))
+        return {"status": "ok", "base_model": base_model, "renderer": RENDERERS[base_model], "prompt": RAW_PROBE_PROMPT,
+                "temperature": RAW_PROBE_TEMPERATURE, "reports": reports}
+    except Exception as error:  # noqa: BLE001
+        # A failure while the client was being made leaves no deps to ask, and nothing of the error is returned then.
+        if deps is None:
+            return {"status": "failed", "reason": "%s while opening the Tinker client" % type(error).__name__}
+        return {"status": "failed", "reason": scrub("%s: %s" % (type(error).__name__, str(error)[:300]), list(deps.secrets()))}
 
 
 @app.function(image=train_image, secrets=[modal.Secret.from_name("oblab-tinker-auth")], volumes={KEPT_DIR: kept_volume},

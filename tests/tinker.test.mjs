@@ -743,10 +743,11 @@ test('the price table and the limits are the same on the lab server and in the r
   assert.equal(constant('EPOCHS'), `(${tinker.TINKER_EPOCHS.min}, ${tinker.TINKER_EPOCHS.max})`)
   assert.equal(constant('BATCH_SIZE'), `(${tinker.TINKER_BATCH_SIZE.min}, ${tinker.TINKER_BATCH_SIZE.max})`)
   assert.equal(Number(constant('MAX_TTL_S').split('*').reduce((a, b) => a * Number(b), 1)), tinker.TINKER_MAX_TTL_DAYS * 86400)
-  // The runner has the Tinker key as a Modal secret, on the three functions that talk to Tinker: the two that train (a fine-tune and an RL run) and the one
-  // that keeps an adapter (tests/tinker-keep.test.mjs). Both are lab code on the training image; the web endpoints never have it.
-  assert.equal((source.match(/Secret\.from_name\("oblab-tinker-auth"\)/g) || []).length, 3)
-  assert.equal((source.match(/@app\.function\(image=train_image, secrets=\[modal\.Secret\.from_name\("oblab-tinker-auth"\)\]/g) || []).length, 3)
+  // The runner has the Tinker key as a Modal secret, on the four functions that talk to Tinker: the two that train (a fine-tune and an RL run), the one
+  // that keeps an adapter (tests/tinker-keep.test.mjs), and raw_probe, which samples a base model for my smoke script and which nothing but my own Modal
+  // login can start (tests/test_tinker_jobs.py). All are lab code on the training image; the web endpoints never have it.
+  assert.equal((source.match(/Secret\.from_name\("oblab-tinker-auth"\)/g) || []).length, 4)
+  assert.equal((source.match(/@app\.function\(image=train_image, secrets=\[modal\.Secret\.from_name\("oblab-tinker-auth"\)\]/g) || []).length, 4)
   assert.equal((source.match(/secrets=\[modal\.Secret\.from_name\("oblab-tinker-jobs-auth"\)\]/g) || []).length, 2)
 })
 

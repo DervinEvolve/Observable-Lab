@@ -19,6 +19,12 @@
 #   ... python modal/tinker_smoke.py rl --model thinkingmachines/Inkling-2-Mini
 # A model that is not in PRICES below is refused before anything is called.
 #
+# A look at what an untrained base model really writes, before the renderer
+# takes the answer out of it (eight short answers, well under a cent):
+#   uv run ... python modal/tinker_smoke.py raw --model thinkingmachines/Inkling-2-Mini
+# It shows whether a model thinks before it answers and how many tokens that
+# takes, which decides how large max_completion_tokens must be in practice.
+#
 # A check of the chat format, for a base model whose renderer takes a thinking
 # effort (Inkling 2 Mini), before any run is paid for:
 #   uv run ... python modal/tinker_smoke.py render --model thinkingmachines/Inkling-2-Mini
@@ -340,6 +346,28 @@ def keep(model: str = DEFAULT_MODEL) -> int:
     return 1 if problems else 0
 
 
+def raw(model: str) -> int:
+    """Shows what an untrained base model really writes for one practice prompt, at a short and a long token cap. 0 unless the call failed."""
+    result = modal.Function.from_name("oblab-tinker", "raw_probe").remote(model)
+    if result.get("status") != "ok":
+        print("raw: %s %s" % (result.get("status"), result.get("reason")))
+        return 1
+    print("%s with renderer %s, temperature %s" % (result["base_model"], result["renderer"], result["temperature"]))
+    print("prompt: %s" % result["prompt"])
+    spent = 0
+    for report in result["reports"]:
+        print("--- at most %d tokens an answer" % report["max_tokens"])
+        for answer in report["answers"]:
+            spent += answer["tokens"]
+            print("[%s, %d tokens] answer read: %r" % (answer["ended"], answer["tokens"], answer["answer"]))
+            print("    raw: %s" % answer["raw"])
+        print("ran to the cap without finishing: %d of %d; no answer read: %d of %d" % (
+            report["capped"], len(report["answers"]), report["empty"], len(report["answers"])))
+    print("estimated cost at the published prices: $%.6f (an estimate, not a billed amount)" % (spent * PRICES[model]["sample"] / 1e6))
+    print("raw: done")
+    return 0
+
+
 def choose_model(args: list) -> tuple:
     """(model, remaining args). --model <id> wins over TINKER_SMOKE_MODEL; the default is Qwen/Qwen3.5-4B. Exits on an unknown model."""
     rest = list(args)
@@ -381,6 +409,8 @@ if __name__ == "__main__":
         sys.exit(rl(chosen))
     if rest == ["render"]:
         sys.exit(render(chosen))
+    if rest == ["raw"]:
+        sys.exit(raw(chosen))
     if rest:
-        sys.exit("unknown argument(s) %s; use endpoints, keep, rl, render, or nothing, with --model <id>" % " ".join(rest))
+        sys.exit("unknown argument(s) %s; use endpoints, keep, rl, render, raw, or nothing, with --model <id>" % " ".join(rest))
     sys.exit(train(chosen))

@@ -578,7 +578,15 @@ For this model the smoke also judges the result, because the examples all answer
 uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py rl --model thinkingmachines/Inkling-2-Mini
 ```
 
-It runs the format check first. `keep` and `endpoints` take `--model` too. `TINKER_SMOKE_MODEL=thinkingmachines/Inkling-2-Mini` in the environment does the same as the option, and the option wins. Without either, every check runs on `Qwen/Qwen3.5-4B` as before. A model that is not in the table above stops the script before anything is called.
+It runs the format check first. On 25 November 2026 this run finished with every part working, but it used about 18 times the answer tokens the same run uses on Qwen (1,672 against 92), and every answer that did not earn the full reward earned exactly zero. My reading, which I have not confirmed, is that Inkling thinks before it answers even at effort 0, and that the cap of 40 tokens an answer cut some answers off before any answer was written. This command shows it directly. It asks the untrained model one of the smoke's questions eight times, four at a cap of 40 tokens and four at 400, and prints every token it wrote (well under one cent):
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py raw --model thinkingmachines/Inkling-2-Mini
+```
+
+It calls `raw_probe`, a function of the runner that holds the Tinker key like the training functions do. No web endpoint starts it and the lab server never names it, so only my own Modal login can run it.
+
+`keep` and `endpoints` take `--model` too. `TINKER_SMOKE_MODEL=thinkingmachines/Inkling-2-Mini` in the environment does the same as the option, and the option wins. Without either, every check runs on `Qwen/Qwen3.5-4B` as before. A model that is not in the table above stops the script before anything is called.
 
 5. The chat call on Inkling. Same as "What I expect" in step 4 of Tinker training, with the adapter path from step 3 and `"reasoning_effort": "none"` in place of `false`. For the comparison, ask the base model by its id:
 
@@ -616,7 +624,7 @@ What it adds to the environment, besides the switch:
 uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py
 ```
 
-The two endpoint URLs do not change, and the two Modal secrets are the ones already there (`oblab-tinker-auth` goes to `train`, `train_rl` and `keeper`, and nothing else). The first deploy rebuilds nothing big: `train_rl` uses the training image that is already built. It also keeps a second small Modal Dict, `oblab-tinker-progress`, of each run's latest progress record. It creates it the first time it is used; there is nothing to set up. If the Dict cannot be read or written, runs go on and the room just has no live view of them. Until the runner is redeployed, an RL request is refused by the runner with a reason, costs nothing, and the room shows the stored refusal.
+The two endpoint URLs do not change, and the two Modal secrets are the ones already there (`oblab-tinker-auth` goes to `train`, `train_rl` and `keeper`, and since 25 November 2026 to `raw_probe`, which only my own Modal login can start, and nothing else). The first deploy rebuilds nothing big: `train_rl` uses the training image that is already built. It also keeps a second small Modal Dict, `oblab-tinker-progress`, of each run's latest progress record. It creates it the first time it is used; there is nothing to set up. If the Dict cannot be read or written, runs go on and the room just has no live view of them. Until the runner is redeployed, an RL request is refused by the runner with a reason, costs nothing, and the room shows the stored refusal.
 
 **Smoke test, before any model relies on it.** This calls the deployed `train_rl` directly with my Modal login on a toy task set (16 tasks that ask for the name of a fruit, a rubric that gives half for a short answer and half for a name that starts with a letter from a to m, so the base model earns partial credit about half the time and some groups of answers differ), 4 steps of 2 tasks with 4 answers each, at most 40 tokens an answer. Its budget is 5 cents and the runner cannot pass it; at the published prices it should cost well under a cent, and it costs cents at the very most. The adapter it saves expires after an hour.
 
