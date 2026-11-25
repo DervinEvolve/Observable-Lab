@@ -250,7 +250,7 @@ export class TranscriptPanel {
         }
 
         .transcript-toggle-btn .toggle-arrow {
-          font-size: 10px;
+          font-size: 13px;
           transition: transform 0.2s ease;
         }
 

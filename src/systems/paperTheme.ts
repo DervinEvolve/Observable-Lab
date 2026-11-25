@@ -36,8 +36,11 @@
 //   danger    on raised                7.71  (brass is a fill; put ink on it)
 //   danger    on danger-bg             6.46
 //
-// Not in the theme on purpose: a pressed state (the chat has none; on paper use
-// --paper-sunk with a --paper-ink border, as hover does) and a dark mode.
+//   ok        on surface            3.05  working    on surface            3.02
+//   blocked   on surface            3.00  (status marks; each carries an ink-2 ring at 7:1)
+//
+// Not in the theme on purpose: a dark mode. A pressed state exists for quiet buttons only (sunk paper with an
+// inset ink line).
 
 /** Every role token, in the order they appear on :root. Values are what the chat has always used. */
 export const PAPER_TOKENS: Readonly<Record<string, string>> = Object.freeze({
@@ -57,6 +60,9 @@ export const PAPER_TOKENS: Readonly<Record<string, string>> = Object.freeze({
   '--paper-danger': '#8E2F2A', // errors and conflicts only
   '--paper-danger-bg': '#F6E1DC', // error band
   '--paper-bar': '#8B7B66', // the "before" bar of a gauge
+  '--paper-ok': '#699838', // status mark: healthy. 3:1 or more on surface and raised; always drawn with an ink ring
+  '--paper-working': '#B58237', // status mark: working
+  '--paper-blocked': '#D76C6C', // status mark: blocked
   '--paper-raised-veil': 'rgba(251,249,244,0.94)', // round floating buttons over the room
   '--paper-shadow': '0 10px 36px rgba(60,42,20,0.28)', // an open panel
   '--paper-shadow-soft': '0 2px 12px rgba(60,42,20,0.18)', // a floating button
@@ -110,7 +116,8 @@ export const paperHeading = (sel: string, sizePx = 17): string =>
 /** Quiet button: raised paper, thin line. Hover washes to sunk and darkens the edge. */
 export const paperQuietButton = (sel: string): string =>
   `${sel} { background: var(--paper-raised); border: 1px solid var(--paper-line); border-radius: var(--paper-radius); font-weight: 600; cursor: pointer; color: var(--paper-ink); }\n` +
-  `${sel.split(',').map(s => `${s.trim()}:hover`).join(', ')} { background: var(--paper-sunk); border-color: var(--paper-ink); }`
+  `${sel.split(',').map(s => `${s.trim()}:hover`).join(', ')} { background: var(--paper-sunk); border-color: var(--paper-ink); }\n` +
+  `${sel.split(',').map(s => `${s.trim()}:active:not(:disabled)`).join(', ')} { background: var(--paper-sunk); box-shadow: inset 0 0 0 1px var(--paper-ink); }`
 
 /** Primary button: brass fill, brass edge, ink label. One per view. */
 export const paperPrimaryButton = (sel: string): string =>
@@ -144,3 +151,13 @@ export const paperScrollbar = (sel: string): string =>
   `${sel}::-webkit-scrollbar { width: 10px; height: 10px; }\n` +
   `${sel}::-webkit-scrollbar-track { background: var(--paper-sunk); }\n` +
   `${sel}::-webkit-scrollbar-thumb { background: var(--paper-line); border-radius: 5px; border: 2px solid var(--paper-sunk); }`
+
+/** Marks for the knowledge graph's node types and model providers. They are small marks, never text:
+ *  each is drawn with an ink ring (and the panel darkens them where one sits on its own). */
+export const PAPER_NODE_MARKS: Readonly<Record<string, string>> = Object.freeze({
+  model: '#E8E4D9', epoch: '#B5A642', capability: '#7CB342', constraint: '#64B5F6', behavior: '#FFB74D',
+  conflict: '#E57373', note: '#C9B79C', source: '#8FC1FF', code: '#B39DDB', turn: '#78C8FF',
+})
+export const PAPER_PROVIDER_MARKS: Readonly<Record<string, string>> = Object.freeze({
+  google: '#4285F4', deepseek: '#10A37F', anthropic: '#D97706', openai: '#9C8CF0', 'x-ai': '#1DA1F2', 'z-ai': '#B0BEC5', cohere: '#E91E63',
+})

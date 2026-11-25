@@ -19,13 +19,8 @@ interface GraphData { nodes: GNode[]; edges: GEdge[]; clusters: GCluster[]; epoc
 
 interface Body { id: string; x: number; y: number; vx: number; vy: number; r: number; cluster: NodeType; isCluster: boolean; node?: GNode; count?: number }
 
-const TYPE_COLOR: Record<NodeType, string> = {
-  model: '#E8E4D9', epoch: '#B5A642', capability: '#7CB342', constraint: '#64B5F6', behavior: '#FFB74D',
-  conflict: '#E57373', note: '#C9B79C', source: '#8FC1FF', code: '#B39DDB', turn: '#78C8FF',
-}
-const PROVIDER_COLOR: Record<string, string> = {
-  google: '#4285F4', deepseek: '#10A37F', anthropic: '#D97706', openai: '#9C8CF0', 'x-ai': '#1DA1F2', 'z-ai': '#B0BEC5', cohere: '#E91E63',
-}
+const TYPE_COLOR = PAPER_NODE_MARKS as Record<NodeType, string>
+const PROVIDER_COLOR = PAPER_PROVIDER_MARKS as Record<string, string>
 const KIND_TEXT: Record<string, [string, string]> = {
   // [as seen from the source, as seen from the target]
   played: ['played a role in', 'had a role played by'], proposed: ['proposed', 'proposed by'], changed: ['changed', 'changed by'],
@@ -35,7 +30,7 @@ const KIND_TEXT: Record<string, [string, string]> = {
   said: ['said', 'said by'], said_in: ['said in', 'what was said'],
 }
 import { PROVIDER_LOGOS } from '../shared/types'
-import { installPaperTheme, paperFocusRing, paperPrimaryButton, paperQuietButton } from './paperTheme'
+import { PAPER_NODE_MARKS, PAPER_PROVIDER_MARKS, installPaperTheme, paperFocusRing, paperPrimaryButton, paperQuietButton } from './paperTheme'
 
 const REFRESH_MS = 120_000
 const HOP_MS = 750 // one hop of a recall replay
@@ -235,8 +230,9 @@ export class KnowledgeGraphPanel {
       #kg-overlay .kg-kinds { flex-wrap: wrap; gap: 6px; }
       #kg-overlay .kg-kinds button { display: inline-flex; align-items: center; min-height: 32px; padding: 0 12px; border-radius: 22px; font-size: 0.8125rem; }
       ${paperQuietButton('#kg-overlay .kg-kinds button')}
-      #kg-overlay .kg-kinds button { font-weight: 400; }
-      #kg-overlay .kg-kinds button[aria-pressed="true"], #kg-overlay .kg-kinds button[aria-pressed="true"]:hover { background: var(--paper-brass); border-color: var(--paper-brass-edge); }
+      #kg-overlay .kg-kinds button { font-weight: 400; border-radius: 22px; }
+      #kg-overlay .kg-kinds button[aria-pressed="true"] { background: var(--paper-brass); border-color: var(--paper-brass-edge); }
+      #kg-overlay .kg-kinds button[aria-pressed="true"]:hover { background: var(--paper-brass); border-color: var(--paper-ink); }
       /* Fingers need 44 px to land on, and a 16 px field so iOS does not zoom the page on focus. */
       @media (pointer: coarse) {
         #kg-overlay .kg-zoom button, #kg-overlay .kg-actions button, #kg-overlay .kg-js, #kg-overlay .kg-recall button.kg-play, #kg-overlay .kg-close { min-width: 44px; min-height: 44px; }
@@ -818,8 +814,8 @@ export class KnowledgeGraphPanel {
     for (const { a, b, n, conflict } of bundle.values()) {
       const p = this.anchor(a), q = this.anchor(b)
       const [x1, y1] = this.toScreen(p.x, p.y), [x2, y2] = this.toScreen(q.x, q.y)
-      // At rest the lines are drawn at 3:1 on the paper (ink 0.5, danger 0.6); with a node in focus the rest fall back to a wash.
-      ctx.strokeStyle = conflict > n / 2 ? cssRgba(P.danger, focus ? 0.1 : 0.6) : cssRgba(P.ink, focus ? 0.08 : 0.5)
+      // At rest the lines are drawn at 3:1 on the paper (ink 0.6, danger 0.7); with a node in focus the rest fall back to a wash.
+      ctx.strokeStyle = conflict > n / 2 ? cssRgba(P.danger, focus ? 0.1 : 0.7) : cssRgba(P.ink, focus ? 0.08 : 0.6)
       ctx.lineWidth = Math.min(10, 1 + Math.log2(n + 1) * 1.2) * dpr
       ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke()
     }
@@ -918,7 +914,7 @@ export class KnowledgeGraphPanel {
         const tries = Math.abs(dx) > Math.abs(dy) * 1.2 ? [dx > 0 ? right : left, dy > 0 ? below : above] : [dy >= 0 ? below : above, dx > 0 ? right : left]
         box = tries.find(c => clear(c, 'model') && !logos.some(d => d.id !== w.b.id && touches(c, d)))
       } else box = free(below) ? below : null
-      if (box) label(t, box, (box.x0 + box.x1) / 2, size, 500, w.on ? cssRgba(P.ink) : cssRgba(P.ink, 0.5), backing)
+      if (box) label(t, box, (box.x0 + box.x1) / 2, size, 500, w.on ? cssRgba(P.ink) : cssRgba(P.ink2), backing)
     }
     const inFocus = wanted.find(w => w.b.id === focus && !w.b.isCluster)
     if (inFocus) {
@@ -987,7 +983,7 @@ export class KnowledgeGraphPanel {
       const past = x < 0 ? right : x > W ? left : null
       const tries = past ? (showing >= 16 * dpr ? [past, below, above] : [past]) : this.tight && y < mid ? [above, below, right, left] : [below, above, right, left]
       const box = tries.find(c => clear(c, b.cluster))
-      const fill = on ? cssRgba(P.ink) : cssRgba(P.ink, 0.5)
+      const fill = on ? cssRgba(P.ink) : cssRgba(P.ink2)
       if (box) { label(text, box, (box.x0 + box.x1) / 2, size, 650, fill, backing); continue }
       const n = String(b.count ?? ''), s = 13 * fs * dpr
       ctx.font = `650 ${s}px ${FONT}`

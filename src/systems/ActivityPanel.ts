@@ -199,7 +199,7 @@ export class ActivityPanel {
         #activity-panel .act-title { line-height: 1.25; }
         ${paperHeading('#activity-panel .act-title', 16)}
         #activity-panel .act-sub { color: var(--paper-ink-2); font-size: 13px; line-height: 1.3; }
-        #activity-panel .act-nav button { padding: 3px 8px; font-size: 11px; }
+        #activity-panel .act-nav button { padding: 3px 8px; font-size: 13px; line-height: 1.2; }
         ${paperQuietButton('#activity-panel .act-nav button')}
         #activity-panel .act-nav button { border-radius: var(--paper-radius-sm); }
         #activity-panel .act-nav button:disabled { opacity: 0.55; cursor: default; }

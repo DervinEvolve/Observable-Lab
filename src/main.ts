@@ -2322,7 +2322,7 @@ class ObservableLab {
     `
 
     button.addEventListener('mouseenter', () => {
-      button.style.transform = 'translateY(-2px)'
+      if (!window.matchMedia?.('(prefers-reduced-motion: reduce)')?.matches) button.style.transform = 'translateY(-2px)'
       button.style.boxShadow = 'var(--paper-shadow-lift)'
       button.style.borderColor = 'var(--paper-ink)'
     })
@@ -2356,7 +2356,8 @@ class ObservableLab {
           console.log('Commentator:', result.commentator)
 
           button.innerHTML = '✅ Done!'
-          button.style.background = 'var(--paper-brass)'
+          button.style.background = 'var(--paper-sunk)'
+          button.style.borderColor = 'var(--paper-ink)'
 
           setTimeout(() => {
             button.innerHTML = '🧪 Run Epoch'

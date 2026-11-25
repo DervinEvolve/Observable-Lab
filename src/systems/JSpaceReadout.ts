@@ -31,7 +31,7 @@ export class JSpaceReadout {
       ${paperFocusRing('#jspace-readout')}
       #jspace-readout button:focus-visible { outline: 2px solid var(--paper-focus); outline-offset: 2px; }
       #jspace-readout .js-body { overflow: auto; overscroll-behavior: contain; padding: 4px 16px 16px; }
-      #jspace-readout .js-section { margin: 12px 0 6px; font: 600 13px/1.2 var(--paper-mono); letter-spacing: 0.6px; text-transform: uppercase; color: var(--paper-ink-2); }
+      #jspace-readout .js-section { margin: 12px 0 6px; font: 700 15px/1.2 var(--paper-serif); color: var(--paper-ink); }
       #jspace-readout .js-chips { display: flex; flex-wrap: wrap; gap: 6px; }
       #jspace-readout .js-chips span { font: 500 13.5px/1 var(--paper-mono); padding: 6px 8px; border-radius: 7px; background: var(--paper-sunk); border: 1px solid var(--paper-hair); color: var(--paper-ink); }
       #jspace-readout .js-said { font-size: 18px; line-height: 1.45; color: var(--paper-ink); }

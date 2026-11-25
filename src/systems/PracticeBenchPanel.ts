@@ -116,8 +116,8 @@ export class PracticeBenchPanel {
       #practice-bench-panel .pb-close:hover { color: var(--paper-ink); background: var(--paper-sunk); }
       ${paperFocusRing('#practice-bench-panel')}
       #practice-bench-panel .pb-body { overflow-y: auto; padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 12px; }
-      #practice-bench-panel h3 { margin: 0 0 4px; letter-spacing: 0.04em; text-transform: uppercase; }
-      ${paperHeading('#practice-bench-panel h3', 13)}
+      #practice-bench-panel h3 { margin: 0 0 4px; }
+      ${paperHeading('#practice-bench-panel h3', 15)}
       #practice-bench-panel p { margin: 0; }
       #practice-bench-panel ul { margin: 0; padding-left: 16px; }
       #practice-bench-panel li { margin: 2px 0; }

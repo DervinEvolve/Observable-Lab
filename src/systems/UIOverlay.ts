@@ -165,7 +165,7 @@ export class UIOverlay {
 
         .label-name {
           font-weight: 600;
-          font-size: 10px;
+          font-size: 13px;
           color: var(--paper-ink);
           letter-spacing: -0.2px;
           white-space: nowrap;
@@ -173,21 +173,21 @@ export class UIOverlay {
 
         /* The model accent stays as the small dot above the name; text is ink. */
         .label-role {
-          font-size: 7px;
+          font-size: 13px;
           color: var(--paper-ink-2);
           text-transform: uppercase;
-          letter-spacing: 0.8px;
+          letter-spacing: 0.4px;
           font-weight: 500;
         }
 
         .label-status {
-          font-size: 6px;
+          font-size: 13px;
           color: var(--paper-ink-2);
           margin-top: 2px;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
-          max-width: 80px;
+          max-width: 120px;
           opacity: 0;
           max-height: 0;
           transition: opacity 0.3s ease, max-height 0.3s ease;
@@ -217,11 +217,11 @@ export class UIOverlay {
           display: block;
           margin: 5px auto 0;
           padding: 3px 10px;
-          font-size: 11px;
+          font-size: 13px;
           font-weight: 700;
-          letter-spacing: 0.4px;
+          letter-spacing: 0.2px;
           font-family: var(--paper-mono);
-          line-height: 12px;
+          line-height: 14px;
           color: var(--paper-ink);
           border: 1px solid var(--paper-line);
           border-radius: 999px;
@@ -267,7 +267,7 @@ export class UIOverlay {
         .scientist-label.drone-mini .label-task {
           max-width: 170px;
           margin-top: 2px;
-          font-size: 9px;
+          font-size: 13px;
           line-height: 1.3;
           font-weight: 500;
           color: var(--paper-ink-2);
@@ -496,7 +496,7 @@ export class UIOverlay {
           .gh-btn, .gh-tip { transition: none; }
           .gh-btn:hover, .gh-btn.tip-open { transform: none; }
           .label-indicator, .scientist-label.focused .label-indicator,
-          .agent-speech-indicator, #live-status .live-caret { animation: none; }
+          #live-status .live-caret { animation: none; }
         }
 
         #github-commit-badge {
@@ -715,7 +715,7 @@ export class UIOverlay {
         }
 
         .info-toggle-arrow {
-          font-size: 8px;
+          font-size: 13px;
           transition: transform 0.2s ease;
         }
 
@@ -971,15 +971,9 @@ export class UIOverlay {
         .agent-speech-indicator {
           width: 8px;
           height: 8px;
-          background: var(--paper-brass);
-          box-shadow: 0 0 0 1px var(--paper-brass-edge);
+          background: var(--paper-ink-2);
+          box-shadow: 0 0 0 1px var(--paper-line);
           border-radius: 50%;
-          animation: agent-pulse 2s ease-in-out infinite;
-        }
-
-        @keyframes agent-pulse {
-          0%, 100% { opacity: 0.5; transform: scale(1); }
-          50% { opacity: 1; transform: scale(1.2); }
         }
 
         .agent-speech-text {
@@ -1815,11 +1809,11 @@ export class UIOverlay {
     // Determine color based on stability
     let color: string
     if (this.stabilityScore > 0.6) {
-      color = '#7cb342' // green
+      color = 'var(--paper-ok)'
     } else if (this.stabilityScore > 0.3) {
-      color = '#ffb74d' // yellow/orange
+      color = 'var(--paper-working)'
     } else {
-      color = '#e57373' // red
+      color = 'var(--paper-blocked)'
     }
 
     let dots = ''
