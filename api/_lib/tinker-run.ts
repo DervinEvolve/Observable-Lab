@@ -32,9 +32,9 @@ import {
 } from './tinker.js'
 import { findTinkerCall, pollTinkerJob, startTinkerJob, tinkerJobBody, waitForTinkerJob, type TinkerPoll } from './tinker-client.js'
 import {
-  claimAdapterName, dataOrigin, shownName, finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend, setRunDatasetSource,
-  settleTinkerSpend,
-  type TinkerRunRow,
+  ORIGIN_VISITORS, claimAdapterName, dataOrigin, fromVisitorOffers, shownName, finishTinkerRun, markTinkerRunStarted, openTinkerRun, openTinkerRuns, reserveTinkerSpend,
+  setRunDatasetSource, settleTinkerSpend,
+  type TinkerRunRow, type VisitorOffersRecord,
 } from './tinker-store.js'
 import { datasetRecordLine, readDatasetRecord, type TinkerDatasetRecord } from './datasets.js'
 import { tinkerRlStatus } from './tinker-rl.js'
@@ -80,6 +80,22 @@ async function recordNameRefusal(ctx: TinkerRunContext, slug: string, reason: st
   })
 }
 
+/** What the request summary says the examples were read from, for a run on visitor conversations. */
+const VISITOR_SOURCE = 'conversations visitors offered'
+
+/** How many visitor conversations a run used, from its stored source; the example count when the source does not say. */
+function visitorConversations(row: TinkerRunRow): number {
+  const n = row.dataset_source?.conversations_used
+  return typeof n === 'number' && Number.isInteger(n) && n >= 0 ? n : row.dataset_examples
+}
+
+/** Asks the runner for no samples (its job body is built by tinkerJobBody, which always asks for some). */
+export function noSamples(body: Record<string, unknown>): Record<string, unknown> {
+  const train = body.train
+  if (train && typeof train === 'object' && !Array.isArray(train)) (train as Record<string, unknown>).samples = 0
+  return body
+}
+
 /** A lost runner whose result never came: nothing measured. */
 function lostResult(reason: string): TinkerRunResult {
   return { ...normalizeTinkerResult(null), status: 'failed', reason }
@@ -105,7 +121,12 @@ export function adapterExpiry(openedAt: string, ttlSeconds: number, now: Date = 
  * closed the same run first (it did all of this already).
  */
 async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state: 'done' | 'failed' }>): Promise<TinkerOutcome | null> {
-  const result = poll.state === 'done' ? normalizeTinkerResult(poll.result) : lostResult(`the runner was lost: ${poll.error}`)
+  const answered = poll.state === 'done' ? normalizeTinkerResult(poll.result) : lostResult(`the runner was lost: ${poll.error}`)
+  // A run on conversations visitors offered keeps no samples: the runner's
+  // held out prompts are visitor text, and samples reach the public record
+  // (spec 2.7). The job asked for none; any that came back are dropped here.
+  const visitors = fromVisitorOffers(row)
+  const result: TinkerRunResult = visitors ? { ...answered, samples: [] } : answered
   // Usage is known when the runner answered in its own words (ok, refused, error).
   const usageKnown = poll.state === 'done' && result.status !== 'failed'
   const costUsd = usageKnown ? tinkerCostUsd(row.base_model, result.tokens) : row.reserved_usd
@@ -138,10 +159,15 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
   const described = describeTinkerRun(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName)
   // The origin label, while labels are on: every run says where its examples came from.
   const origin = tinkerOriginFlag() ? dataOrigin(row) : null
-  const line = `${source ? `${described}; examples: ${datasetRecordLine(source)}, read by the lab` : described}${origin ? `; data origin: ${origin}` : ''}`
+  // The visitor label is shown whatever LAB_TINKER_ORIGIN_LABELS says (spec 2.7).
+  const visitorOrigin = !origin && visitors ? dataOrigin(row) : null
+  const examplesLine = source ? `; examples: ${datasetRecordLine(source)}, read by the lab`
+    : visitors ? `; examples: ${visitorConversations(row)} conversations ${ORIGIN_VISITORS}, read by the lab` : ''
+  const line = `${described}${examplesLine}${origin ? `; data origin: ${origin}` : ''}${visitorOrigin ? `; data origin: ${visitorOrigin}` : ''}`
   await recordToolRun({
     experimentId: row.experiment_id, epoch: row.epoch, model: row.model, tool: TINKER_TOOL,
-    requestSummary: tinkerRequestSummary(row.base_model, row.dataset_examples, row.purpose, displayName, source ? `${source.repo}@${source.sha.slice(0, 12)}` : null),
+    requestSummary: tinkerRequestSummary(row.base_model, row.dataset_examples, row.purpose, displayName,
+      source ? `${source.repo}@${source.sha.slice(0, 12)}` : visitors ? VISITOR_SOURCE : null),
     status, durationMs: result.wall_seconds === null ? null : result.wall_seconds * 1000, costUsd, outputTail: line,
     detail: {
       ...(result.status === 'ok' ? { adapter: `lab/${row.slug}`, sampler_path: result.sampler_path, expires_at: expiresAt } : {}),
@@ -149,7 +175,11 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
       ...(result.status === 'ok' && result.external_path ? { external_path: result.external_path } : {}),
       ...(result.status === 'ok' && result.export_error ? { export_error: result.export_error } : {}),
       base_model: row.base_model,
-      dataset: { sha256: row.dataset_sha256, examples: row.dataset_examples, bytes: row.dataset_bytes, ...(source ? { source } : {}), ...(origin ? { origin } : {}) },
+      dataset: {
+        sha256: row.dataset_sha256, examples: row.dataset_examples, bytes: row.dataset_bytes,
+        ...(source ? { source } : visitors && row.dataset_source ? { source: row.dataset_source } : {}),
+        ...(origin ? { origin } : {}), ...(visitorOrigin ? { origin: visitorOrigin } : {}),
+      },
       settings: row.settings,
       measured: {
         by: 'the lab, on examples it held out and the model could not choose',
@@ -180,8 +210,16 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
  * caps are checked here. A refusal is returned as `skipped` with its reason
  * for the caller to store.
  */
-export async function runTinkerTrain(ctx: TinkerRunContext, request: TinkerRequest, opts: { maxWaitMs?: number; pollMs?: number; dataset?: TinkerDatasetRecord } = {}): Promise<TinkerOutcome> {
+export async function runTinkerTrain(
+  ctx: TinkerRunContext, request: TinkerRequest,
+  opts: { maxWaitMs?: number; pollMs?: number; dataset?: TinkerDatasetRecord; offers?: VisitorOffersRecord } = {},
+): Promise<TinkerOutcome> {
   const skipped = (reason: string): TinkerOutcome => ({ tool: TINKER_TOOL, status: 'skipped', summary: reason })
+  // A run reads its examples from one place: inline, a shelf dataset, or conversations visitors offered.
+  if (opts.dataset && opts.offers) return skipped('a run reads one source of examples, and this one named a dataset and visitor conversations')
+  // Where the examples came from, stored on the row before anything is sent to the runner.
+  const source = (opts.dataset ?? opts.offers ?? null) as Record<string, unknown> | null
+  const sourceName = opts.dataset ? `${opts.dataset.repo}@${opts.dataset.sha.slice(0, 12)}` : opts.offers ? VISITOR_SOURCE : null
   const estimate = estimateTinkerRun(request)
   const runCap = tinkerRunUsd()
   if (estimate.max_cost_usd > runCap) {
@@ -214,14 +252,14 @@ export async function runTinkerTrain(ctx: TinkerRunContext, request: TinkerReque
     return skipped('this epoch already has a training run')
   }
 
-  // Rows the lab read from a public dataset (datasets.ts): where they came
-  // from goes on the run's row before anything is sent to the runner. A run
-  // whose source cannot be stored is not started: its record would not say
-  // what it was trained on.
-  if (opts.dataset) {
+  // Rows the lab read from a public dataset (datasets.ts), or conversations
+  // visitors offered: where they came from goes on the run's row before
+  // anything is sent to the runner. A run whose source cannot be stored is
+  // not started: its record would not say what it was trained on.
+  if (source) {
     try {
-      await setRunDatasetSource(row.id, opts.dataset as unknown as Record<string, unknown>)
-      row = { ...row, dataset_source: opts.dataset as unknown as Record<string, unknown> }
+      await setRunDatasetSource(row.id, source)
+      row = { ...row, dataset_source: source }
     } catch (e) {
       console.warn('[tinker] could not store the dataset source:', e instanceof Error ? e.message : e)
       const reason = 'the lab could not store where the examples came from, so nothing was started'
@@ -247,10 +285,14 @@ export async function runTinkerTrain(ctx: TinkerRunContext, request: TinkerReque
     if (refused) await recordNameRefusal(ctx, row.slug, refused)
   }
 
-  let started = await startTinkerJob(tinkerJobBody(request, {
+  const body = tinkerJobBody(request, {
     splitSalt, budgetUsd: reservation.usd, label: `epoch ${ctx.epochNumber} ${row.slug}`, runId: row.slug,
     ...(tinkerKeepFlag() ? { exportWeights: true } : {}),
-  }))
+  })
+  // No samples for a run on visitor text: the runner would sample its held
+  // out prompts, which are visitor messages, into the public record (spec 2.7).
+  if (opts.offers) noSamples(body)
+  let started = await startTinkerJob(body)
   if (!started.ok && started.unconfirmed) {
     // The answer was lost or came from a gateway. The runner keeps the call
     // it started under the run's name, so it is asked once before giving up.
@@ -273,8 +315,8 @@ export async function runTinkerTrain(ctx: TinkerRunContext, request: TinkerReque
     if (closed) await settleTinkerSpend(reservation, 0)
     await recordToolRun({
       experimentId: ctx.experimentId, epoch: ctx.epochNumber, model: ctx.executorModelId, tool: TINKER_TOOL,
-      requestSummary: tinkerRequestSummary(request.base_model, request.examples.length, request.purpose, null, opts.dataset ? `${opts.dataset.repo}@${opts.dataset.sha.slice(0, 12)}` : null), status: 'error', outputTail: `not started: ${started.error}`,
-      detail: { base_model: request.base_model, dataset: { sha256: request.dataset_sha256, examples: request.examples.length, bytes: request.dataset_bytes, ...(opts.dataset ? { source: opts.dataset } : {}) }, reason: started.error },
+      requestSummary: tinkerRequestSummary(request.base_model, request.examples.length, request.purpose, null, sourceName), status: 'error', outputTail: `not started: ${started.error}`,
+      detail: { base_model: request.base_model, dataset: { sha256: request.dataset_sha256, examples: request.examples.length, bytes: request.dataset_bytes, ...(source ? { source } : {}) }, reason: started.error },
     })
     return { tool: TINKER_TOOL, status: 'error', summary: `${name(ctx.executorModelId)}'s Tinker training was not started: ${started.error}` }
   }

@@ -20,7 +20,9 @@ import { liveModelStatus, type LiveModelStatus } from './live-model.js'
 import { liveTrainedStatus, tinkerKeepStatus, tinkerStatus } from './tinker.js'
 import { tinkerRlPerDay, tinkerRlStatus } from './tinker-rl.js'
 
-export const TOOL_NAMES = ['subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'tinker_rl', 'keep_adapter', 'datasets'] as const
+export const TOOL_NAMES = [
+  'subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'tinker_rl', 'keep_adapter', 'datasets', 'tinker_tutor',
+] as const
 export type ToolName = (typeof TOOL_NAMES)[number]
 
 /** Per-epoch limits. Not tunable: one of each kind per epoch at most. */
@@ -247,8 +249,15 @@ export function toolConfig(): ToolConfig {
             : 'neither GPU jobs nor Tinker training is on, so nothing could read a dataset',
       intEnv('LAB_DATASETS_PER_DAY', 2, 0, 20),
     ),
+    // The Socratic lesson (tinker-tutor.ts). A stub until it is built: always
+    // off, so the models are never told of it and planTools treats the key
+    // as an unknown tool, as it always did.
+    tinker_tutor: status(false, TINKER_TUTOR_NOT_BUILT, intEnv('LAB_TINKER_TUTOR_PER_DAY', 1, 0, 5)),
   }
 }
+
+/** Why the Socratic lesson is off while it is a stub. */
+export const TINKER_TUTOR_NOT_BUILT = 'not built yet'
 
 /**
  * The lab model endpoint (live-model.ts). It is not a tool the Executor asks

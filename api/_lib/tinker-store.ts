@@ -162,6 +162,21 @@ export function ensureTinkerExtras(): Promise<void> {
         )
       `
       await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_tinker_keeps_epoch ON tinker_keeps(experiment_id, epoch) WHERE epoch IS NOT NULL`
+      // The Socratic lesson (kind 'tutor'): what was asked, as public data, on
+      // the run row, and the hashes of every lesson's questions, so a held
+      // back question of an earlier lesson cannot be asked again. This file is
+      // the only one that alters tinker_runs.
+      await sql`ALTER TABLE tinker_runs ADD COLUMN IF NOT EXISTS lesson JSONB`
+      await sql`
+        CREATE TABLE IF NOT EXISTS tutor_held_hashes (
+          hash TEXT NOT NULL,
+          held_back BOOLEAN NOT NULL,
+          topic TEXT NOT NULL,
+          lesson_slug TEXT NOT NULL,
+          created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+          PRIMARY KEY (hash, lesson_slug)
+        )
+      `
     })().catch(e => {
       extrasReady = null
       throw e
@@ -258,7 +273,7 @@ export interface TinkerRunRow {
   finished_at: string | null
   /** The name its author gave the adapter, when names were on and the name was free. */
   display_name: string | null
-  /** 'rl' for a Tinker RL run (tinker-rl.ts). Null for a training run. */
+  /** 'rl' for a Tinker RL run (tinker-rl.ts), 'tutor' for a Socratic lesson. Null for a training run. */
   kind: string | null
   /** The latest progress record of an RL run, as the lab stored it. */
   progress: Record<string, unknown> | null
@@ -269,7 +284,14 @@ export interface TinkerRunRow {
    * (datasets.ts): the repository, commit, file, columns and row counts.
    */
   dataset_source?: Record<string, unknown>
+  /** Only on a Socratic lesson (kind 'tutor'): the public record of what was asked. */
+  lesson?: Record<string, unknown>
 }
+
+/** The kind of a Socratic lesson's run row. */
+export const TINKER_KIND_TUTOR = 'tutor' as const
+/** The status of a lesson's run row while the lesson is open. collectTinkerRuns never reads it. */
+export const TINKER_STATUS_LESSON = 'lesson' as const
 
 function json(v: unknown): Record<string, unknown> | null {
   if (v && typeof v === 'object' && !Array.isArray(v)) return v as Record<string, unknown>
@@ -316,6 +338,7 @@ function runRow(row: Record<string, unknown>): TinkerRunRow {
     progress: json(row.progress),
     rl: json(row.rl),
     ...(json(row.dataset_source) ? { dataset_source: json(row.dataset_source) as Record<string, unknown> } : {}),
+    ...(json(row.lesson) ? { lesson: json(row.lesson) as Record<string, unknown> } : {}),
   }
 }
 
@@ -406,6 +429,60 @@ export async function openTinkerRlRun(params: {
       ${sanitizeOutput(params.request.purpose).slice(0, 200)}, ${params.request.dataset_sha256}, ${params.request.tasks.length},
       ${params.request.dataset_bytes}, ${JSON.stringify(params.request.settings)}, ${params.splitSalt}, ${'reserved'},
       ${params.spendDay}, ${usd(params.reservedUsd)}, ${'rl'}, ${JSON.stringify(params.record)}
+    )
+    ON CONFLICT (experiment_id, epoch) DO NOTHING
+    RETURNING *
+  `
+  return r.rows[0] ? runRow(r.rows[0] as Record<string, unknown>) : null
+}
+
+/**
+ * What a Socratic lesson's run row is opened from. Plain fields only, so
+ * tinker-tutor.ts can pass its own request type here without this file
+ * importing it.
+ */
+export interface TinkerTutorRunRequest {
+  base_model: string
+  purpose?: string | null
+  /** SHA-256 of JSON.stringify({ topic, subskills }) as read. */
+  dataset_sha256: string
+  /** Bytes of question text in the lesson. */
+  dataset_bytes: number
+  /** The training settings of the lesson, stored as they are. */
+  settings: object
+}
+
+/**
+ * Opens the one run an epoch may have, for a Socratic lesson. The same table
+ * and the same rule as openTinkerRun (an epoch has one run of any kind): null
+ * means the epoch already has one. The row has kind 'tutor' and status
+ * 'lesson' while the lesson is open, so collectTinkerRuns never reads it.
+ * `dataset_examples` starts at 0: it is the number of training examples,
+ * known only once the lesson has made them. `lesson` is the public record of
+ * what was asked.
+ */
+export async function openTinkerTutorRun(params: {
+  experimentId: string
+  epoch: number
+  model: string
+  assignedModel: string
+  slug: string
+  request: TinkerTutorRunRequest
+  lesson: object
+  splitSalt: string
+  spendDay: string
+  reservedUsd: number
+}): Promise<TinkerRunRow | null> {
+  await ensureTinkerExtras()
+  const r = await sql`
+    INSERT INTO tinker_runs (
+      experiment_id, epoch, model, assigned_model, slug, base_model, purpose, dataset_sha256, dataset_examples, dataset_bytes,
+      settings, split_salt, status, spend_day, reserved_usd, kind, lesson
+    ) VALUES (
+      ${params.experimentId}, ${params.epoch}, ${params.model}, ${params.assignedModel}, ${params.slug}, ${params.request.base_model},
+      ${sanitizeOutput(params.request.purpose ?? '').slice(0, 200) || null}, ${params.request.dataset_sha256}, ${0},
+      ${params.request.dataset_bytes}, ${JSON.stringify(params.request.settings)}, ${params.splitSalt}, ${TINKER_STATUS_LESSON},
+      ${params.spendDay}, ${usd(params.reservedUsd)}, ${TINKER_KIND_TUTOR}, ${JSON.stringify(params.lesson)}
     )
     ON CONFLICT (experiment_id, epoch) DO NOTHING
     RETURNING *
@@ -589,13 +666,14 @@ export async function openTinkerRuns(opts: { createTables?: boolean } = {}): Pro
  * started, or the runner refused it before training). A run that is still
  * training counts from the moment it is opened, which is why this is read
  * from tinker_runs and not from tool_runs, where a run appears only once its
- * result has been collected.
+ * result has been collected. Only training runs (kind is empty) are
+ * counted: Tinker RL runs and Socratic lessons have limits of their own.
  */
 export async function tinkerRunsToday(now: Date = new Date()): Promise<number> {
   await ensureTinkerTables()
   const r = await sql`
     SELECT COUNT(*) AS n FROM tinker_runs
-    WHERE spend_day = ${utcDay(now)} AND (status IN ('reserved', 'running', 'ok') OR COALESCE(cost_usd, 0) > 0) AND kind IS DISTINCT FROM 'rl'
+    WHERE spend_day = ${utcDay(now)} AND (status IN ('reserved', 'running', 'ok') OR COALESCE(cost_usd, 0) > 0) AND kind IS NULL
   `
   return Number(r.rows[0]?.n) || 0
 }
@@ -631,8 +709,15 @@ export interface TrainedAdapter {
   holdout_loss_after: number | null
   created_at: string
   expires_at: string | null
-  /** Present, and 'rl', only for an adapter made by Tinker RL: its examples are tasks, and its scores are rubric scores, not losses. */
-  kind?: 'rl'
+  /**
+   * Present, and 'rl', only for an adapter made by Tinker RL: its examples are tasks, and its scores are rubric scores, not losses.
+   * 'tutor' for an adapter made by a Socratic lesson: it has a skill map.
+   */
+  kind?: 'rl' | 'tutor'
+  /** Only for a Socratic lesson's adapter: pass bands by subskill, counted by the lab on questions held back from teaching. */
+  skill_map?: TutorSkillMap
+  /** Present, and true, only for an adapter trained on conversations visitors offered. */
+  from_visitors?: true
   /** For an RL adapter: the mean rubric score on the held-out tasks, measured by the lab, before and after. Higher is better. */
   rl_score_before?: number | null
   rl_score_after?: number | null
@@ -656,10 +741,80 @@ export interface TrainedAdapter {
 
 const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : null)
 
+/** One subskill's answers in one test: how many passed of how many sampled, and the pass band 0 to 5 (spec 1.6). */
+export interface Cell { passed: number; total: number; band: number }
+
+/** A lesson adapter's skill map as the chat shelf shows it. */
+export interface TutorSkillMap {
+  topic: string
+  teacher_name: string
+  rows: Array<{ name: string; before: Cell | null; after: Cell | null }>
+  seen_only: boolean
+}
+
+const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
+
+/** A stored cell, or null when it is not a well formed one. */
+export function readCell(raw: unknown): Cell | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const c = raw as Record<string, unknown>
+  const passed = count(c.passed)
+  const total = count(c.total)
+  const band = count(c.band)
+  if (passed === null || total === null || band === null || total === 0 || passed > total || band > 5) return null
+  return { passed, total, band }
+}
+
+/** At most this many rows of a skill map are read from a stored result (TUTOR_SUBSKILLS.max). */
+const SKILL_MAP_ROWS = 10
+
+/**
+ * The skill map of a lesson's stored result. The contract with the lesson
+ * worker (tinker-tutor-run.ts): `result.topic` and `result.teacher_model`
+ * are strings, `result.skill_map` is an array of `{ name, before, after }`
+ * with cells as above, and `result.flags.seen_only` is a boolean. Anything
+ * else is left out; null when there is no topic or no row.
+ */
+export function readTutorSkillMap(result: Record<string, unknown>): TutorSkillMap | null {
+  const topic = typeof result.topic === 'string' ? sanitizeOutput(result.topic).slice(0, 48) : ''
+  if (!topic || !Array.isArray(result.skill_map)) return null
+  const rows: TutorSkillMap['rows'] = []
+  for (const raw of result.skill_map.slice(0, SKILL_MAP_ROWS)) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue
+    const r = raw as Record<string, unknown>
+    const name = typeof r.name === 'string' ? sanitizeOutput(r.name).slice(0, 40) : ''
+    if (name) rows.push({ name, before: readCell(r.before), after: readCell(r.after) })
+  }
+  if (!rows.length) return null
+  const teacher = typeof result.teacher_model === 'string' ? result.teacher_model : ''
+  const flags = result.flags && typeof result.flags === 'object' && !Array.isArray(result.flags) ? result.flags as Record<string, unknown> : {}
+  return {
+    topic,
+    teacher_name: teacher ? modelDisplayName(teacher) || teacher.split('/').pop() || teacher : '',
+    rows,
+    seen_only: flags.seen_only === true,
+  }
+}
+
+/**
+ * Where a lesson's held-out losses are read from: the last training leg of
+ * its stored result (`result.training`, one entry a round, normalizeTinkerResult
+ * fields). Any other run's result is its own training leg.
+ */
+function trainingLeg(row: TinkerRunRow, result: Record<string, unknown>): Record<string, unknown> {
+  if (row.kind !== TINKER_KIND_TUTOR) return result
+  const legs = Array.isArray(result.training) ? result.training : []
+  const last = legs[legs.length - 1]
+  return last && typeof last === 'object' && !Array.isArray(last) ? last as Record<string, unknown> : {}
+}
+
 export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): TrainedAdapter {
   const result = row.result ?? {}
+  const leg = trainingLeg(row, result)
   const name = shownName(row)
   const kept = keep && keep.status === 'kept' ? keep : null
+  const skillMap = row.kind === TINKER_KIND_TUTOR ? readTutorSkillMap(result) : null
+  const visitors = fromVisitorOffers(row)
   return {
     slug: row.slug,
     model_id: `lab/${row.slug}`,
@@ -669,17 +824,20 @@ export function publicAdapter(row: TinkerRunRow, keep: KeepRow | null = null): T
     author_name: modelDisplayName(row.model) || row.model.split('/').pop() || row.model,
     purpose: row.purpose ? sanitizeOutput(row.purpose).slice(0, 200) : null,
     examples: row.dataset_examples,
-    holdout_examples: num(result.n_holdout),
-    holdout_loss_before: num(result.holdout_loss_before),
-    holdout_loss_after: num(result.holdout_loss_after),
+    holdout_examples: num(leg.n_holdout),
+    holdout_loss_before: num(leg.holdout_loss_before),
+    holdout_loss_after: num(leg.holdout_loss_after),
     created_at: row.created_at,
     expires_at: row.expires_at,
     // The fields below exist only for an adapter that has a name or is marked
     // to keep, so a lab that uses neither sends exactly what it always sent.
     ...(row.kind === 'rl' ? { kind: 'rl' as const, rl_score_before: num(result.score_before), rl_score_after: num(result.score_after) } : {}),
+    ...(row.kind === TINKER_KIND_TUTOR ? { kind: TINKER_KIND_TUTOR, ...(skillMap ? { skill_map: skillMap } : {}) } : {}),
     ...(name ? { name } : {}),
     ...(dataFrom(row) ? { data_from: dataFrom(row) as string } : {}),
-    ...(tinkerOriginFlag() ? { origin: dataOrigin(row) } : {}),
+    // The visitor label is shown whatever LAB_TINKER_ORIGIN_LABELS says (spec 2.7).
+    ...(tinkerOriginFlag() || visitors ? { origin: dataOrigin(row) } : {}),
+    ...(visitors ? { from_visitors: true as const } : {}),
     ...(kept ? {
       kept: true as const,
       ...(kept.kept_at ? { kept_at: kept.kept_at } : {}),
@@ -700,6 +858,40 @@ export function dataFrom(row: Pick<TinkerRunRow, 'dataset_source'>): string | nu
 export const ORIGIN_MODELS = 'written by the models'
 /** The start of the label for examples the lab read from a shelf dataset. */
 export const ORIGIN_DATASET = 'public dataset'
+/** The label for examples the lab read from conversations visitors offered (visitor-offers.ts re-exports it). */
+export const ORIGIN_VISITORS = 'written by visitors'
+
+/**
+ * What a run on conversations visitors offered stores as its dataset source
+ * (spec 2.7). Counts only, never text. visitor-offers.ts builds it and may
+ * re-export this type under the same name.
+ */
+export interface VisitorOffersRecord {
+  kind: 'visitor_offers'
+  /** "lab/<slug>" when only conversations with that adapter were asked for, else null. */
+  adapter: string | null
+  limit: number
+  conversations_used: number
+  /** Conversations cut to their first 12 messages. */
+  shortened: number
+  left_out: { too_long: number; duplicate: number }
+  /** How many UTC days the conversations used came from. */
+  days: number
+  /** Whether a system message, written by the model, was put before every conversation. */
+  system: boolean
+  order: 'chosen by a hash the lab made up for this run'
+  /** SHA-256 of the examples sent: identifies the set without revealing it. */
+  sha256: string
+}
+
+/**
+ * Was this run trained on conversations visitors offered? Read from the kind
+ * of the stored source alone, so a record that no longer reads as a whole
+ * one is still treated as visitor text (no samples, the visitor label).
+ */
+export function fromVisitorOffers(row: Pick<TinkerRunRow, 'dataset_source'>): boolean {
+  return row.dataset_source?.kind === 'visitor_offers'
+}
 
 /**
  * Where a run's training examples came from, as a label. A run has a stored
@@ -715,6 +907,10 @@ export const ORIGIN_DATASET = 'public dataset'
  */
 export function dataOrigin(row: Pick<TinkerRunRow, 'dataset_source'>): string {
   if (!row.dataset_source) return ORIGIN_MODELS
+  if (fromVisitorOffers(row)) {
+    const adapter = typeof row.dataset_source.adapter === 'string' ? row.dataset_source.adapter.replace(/^lab\//, '') : ''
+    return `${ORIGIN_VISITORS}${isAdapterSlug(adapter) ? ` in chats with lab/${adapter}` : ''}`
+  }
   // A stored source that no longer reads as a repository and a commit is still a dataset.
   return `${ORIGIN_DATASET} ${dataFrom(row) ?? '(its stored source cannot be read)'}`
 }
@@ -763,6 +959,9 @@ export function summarizeOrigins(rows: (Pick<TinkerRunRow, 'dataset_source' | 's
     if (!reachedRunner(row)) continue
     // A Tinker RL run is scored with a rubric, not a loss: its scores are another unit and have their own record.
     if (row.kind === 'rl') continue
+    // A run on conversations visitors offered is neither origin. The public
+    // summary gets its own row for it when the wiring lands (spec 2.7).
+    if (fromVisitorOffers(row)) continue
     const g = row.dataset_source ? groups.dataset : groups.models
     g.runs += 1
     if (row.dataset_source) {
@@ -843,6 +1042,12 @@ export interface AdapterTarget {
    * (trained-chat.ts) can leave such an adapter out without trusting it.
    */
   from_dataset?: true
+  /**
+   * Present, and true, only when the run's examples were conversations
+   * visitors offered (dataset_source.kind 'visitor_offers'). Such a run is
+   * not marked from_dataset: the visitor chat has a switch of its own for it.
+   */
+  from_visitors?: true
 }
 
 function target(row: TinkerRunRow, now: Date, keep: KeepRow | null = null): AdapterTarget | null {
@@ -850,7 +1055,7 @@ function target(row: TinkerRunRow, now: Date, keep: KeepRow | null = null): Adap
   if (!row.expires_at || !(new Date(row.expires_at).getTime() > now.getTime())) return null
   return {
     adapter: publicAdapter(row, keep), sampler_path: row.sampler_path, experiment_id: row.experiment_id,
-    ...(row.dataset_source ? { from_dataset: true as const } : {}),
+    ...(fromVisitorOffers(row) ? { from_visitors: true as const } : row.dataset_source ? { from_dataset: true as const } : {}),
   }
 }
 

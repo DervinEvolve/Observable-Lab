@@ -59,8 +59,11 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
   // tool, a "dataset" on a GPU job is an extra field left alone, and a
   // "dataset" on a training request is an unknown field, all as they always were.
   const datasetsOn = config.datasets.enabled && config.datasets.per_day > 0
+  // The Socratic lesson (tinker-tutor.ts): while it is off its key is an unknown tool, as it was before it existed.
+  const tutorOn = config.tinker_tutor.enabled && config.tinker_tutor.per_day > 0
   for (const key of Object.keys(req)) {
     const known = (TOOL_NAMES as readonly string[]).includes(key) && (key !== KEEP_TOOL || keepOn) && (key !== DATASETS_TOOL || datasetsOn)
+      && (key !== 'tinker_tutor' || tutorOn)
     if (!known) plan.ignored.push({ tool: key.replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 40) || '_', reason: 'unknown tool' })
   }
   const off = (tool: (typeof TOOL_NAMES)[number]) => {

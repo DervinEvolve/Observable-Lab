@@ -635,8 +635,8 @@ class FakeDb {
     }
     if (text.startsWith('SELECT COUNT(*) AS n FROM tinker_runs WHERE spend_day = ?')) {
       const rlOnly = text.includes("AND kind = 'rl'")
-      assert.ok(rlOnly || text.includes("kind IS DISTINCT FROM 'rl'"), 'the count must say which kind it counts')
-      const counted = this.tinkerRuns.filter(r => r.spend_day === v[0] && (['reserved', 'running', 'ok'].includes(r.status) || Number(r.cost_usd) > 0) && (rlOnly ? r.kind === 'rl' : r.kind !== 'rl'))
+      assert.ok(rlOnly || text.includes('AND kind IS NULL'), 'the count must say which kind it counts')
+      const counted = this.tinkerRuns.filter(r => r.spend_day === v[0] && (['reserved', 'running', 'ok'].includes(r.status) || Number(r.cost_usd) > 0) && (rlOnly ? r.kind === 'rl' : (r.kind ?? null) === null))
       return { rows: [{ n: counted.length }] }
     }
     if (text.startsWith('UPDATE tinker_runs SET name_key = NULL')) return { rows: [] }

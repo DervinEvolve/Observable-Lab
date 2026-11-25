@@ -529,3 +529,175 @@ export const PATINA_LEVELS: Record<string, PatinaLevel> = {
   aged: { brassRoughness: 0.6, woodRoughness: 0.9, dustParticles: true, wearSpots: true },
   rich_patina: { brassRoughness: 0.65, woodRoughness: 0.9, brassColorShift: 0x9a8b3c, dustParticles: true, wearSpots: true },
 }
+
+// ============================================
+// The Socratic lesson (tinker_tutor) and conversations visitors offer
+// ============================================
+// The JSON the server sends, written once here for the room (the skill map
+// chart, the lesson panel, the chat panel). The client never imports api/:
+// these mirror what api/_lib/tinker-tutor-public.ts, tinker-store.ts
+// (publicAdapter) and the visitor offer routes answer.
+
+// One subskill's answers in one test: how many passed of how many sampled,
+// and the pass band 0 to 5 computed from that share alone. Not a mastery level.
+export interface Cell {
+  passed: number
+  total: number
+  band: number
+}
+
+// GET /api/experiment, field `tutor_lesson`: present while the tool is on or a lesson exists.
+export interface TutorLesson {
+  enabled: boolean
+  off_reason?: string
+  lesson: PublicLesson | null
+}
+
+export interface PublicLessonSubskill {
+  name: string
+  before: Cell | null // only when every held back answer of that test is graded
+  after: Cell | null
+  seen_before: { passed: number; total: number } | null // practice questions, never shown as a band
+  seen_after: { passed: number; total: number } | null
+  seen_only: boolean
+  got_worse: boolean
+}
+
+export interface PublicLessonExchange {
+  subskill: string
+  question: string
+  wrong: string
+  guide: string
+  reply: string
+  answer: string
+  passed: boolean
+}
+
+export interface PublicLesson {
+  slug: string
+  adapter: string
+  kind: 'tutor'
+  epoch: number
+  author_model: string
+  author_name: string
+  teacher_model: string
+  teacher_name: string
+  base_model: string
+  topic: string
+  purpose: string | null
+  name?: string
+  status: 'running' | 'ok' | 'ended' | 'failed' | 'error' // an open lesson is shown as 'running'
+  stage: 'diagnostic' | 'teaching' | 'training' | 'retest' | 'closing' | 'done'
+  round: number
+  rounds: number
+  live: boolean // open, and progress.updated_at within 15 minutes
+  questions: { practice: number; held_back: number; samples: number }
+  subskills: PublicLessonSubskill[]
+  overall: { before: Cell | null; after: Cell | null }
+  progress: { graded: number; to_grade: number; taught: number; to_teach: number; seq: number; updated_at: string } | null
+  teaching: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number; leaked: number; not_taught: number; teacher_calls: number } | null
+  examples: { kept: number; guided: number; answer: number; explained: number; left_out: number; total: number } | null
+  training: { steps_done: number | null; steps_planned: number | null; holdout_loss_before: number | null; holdout_loss_after: number | null } | null
+  flags: {
+    seen_only: boolean
+    too_easy: boolean
+    unanswered: number
+    cut_short_before: boolean
+    rubric_literal: string[]
+    shared_literals: string[]
+    within_noise: boolean
+    reasons: string[]
+  }
+  exchanges: PublicLessonExchange[] // at most 3, each text cut to 300
+  cost: { tinker_estimated_usd: number | null; tinker_max_usd: number; teacher_usd: number; teacher_max_usd: number; basis: string }
+  measured_by: 'counted by the lab, with rules a model wrote, on questions held back from teaching'
+  origin: 'written by the models'
+  talk?: string // 'lab/<slug>' while the adapter is alive and the chat is on
+  created_at: string
+  finished_at: string | null
+  reason: string | null
+}
+
+// GET /api/experiment/lesson?slug=<slug>: the whole record of one lesson.
+export interface LessonRecord extends PublicLesson {
+  rubrics: string[][] // one list of rule lines a subskill
+}
+
+// GET /api/experiment/lesson?slug=<slug>&subskill=<i>: that subskill's questions.
+export interface LessonQuestions {
+  questions: Array<{
+    held_back: boolean
+    prompt: string // cut to 400
+    answers: {
+      before: Array<{ text: string; passed: boolean }> // text cut to 300
+      after: Array<{ text: string; passed: boolean }>
+    }
+    turns: Array<{ kind: 'guide' | 'explain'; state: string; teacher: string; reply: string; answer: string; passed: boolean }>
+  }>
+}
+
+// A lesson adapter on the chat shelf (publicAdapter, kind 'tutor').
+export interface TutorSkillMap {
+  topic: string
+  teacher_name: string
+  rows: Array<{ name: string; before: Cell | null; after: Cell | null }>
+  seen_only: boolean
+}
+
+// GET /api/experiment/trained-chat, field `offers`: present only while visitor offers are on.
+export interface TrainedChatOffers {
+  enabled: true
+  keep_days: number
+  per_day: number
+  public_text: false
+}
+
+// POST /api/experiment/chat-offer: an offer. Exactly these keys.
+export interface ChatOfferBody {
+  adapter: string
+  messages: Array<{ role: 'user' | 'assistant'; content: string }>
+  receipt: string
+}
+
+// POST /api/experiment/chat-offer: taking an offer back. Exactly this key.
+export interface ChatWithdrawBody {
+  withdraw: string
+}
+
+// 201: the offer was stored. The code is shown once and never kept by the page.
+export interface ChatOfferStored {
+  offered: true
+  code: string // XXXX-XXXX-XXXX
+  kept_until: string
+  message: string
+}
+
+// 200: the offer was taken back and its text deleted.
+export interface ChatWithdrawn {
+  withdrawn: true
+  trained_on: boolean
+  message: string
+}
+
+export type ChatOfferScreen = 'email' | 'number' | 'link' | 'handle' | 'short' | 'repeat' | 'echo'
+
+// Every refusal of the offer route. `message` is plain text, written with textContent.
+export type ChatOfferRefusal =
+  | { error: 'invalid_request'; message: string } // 400
+  | { error: 'not_verified'; message: string } // 403
+  | { error: 'gone'; message: string } // 404
+  | { error: 'unknown_code'; message?: string } // 404, taking back
+  | { error: 'already_offered'; message: string } // 409
+  | { error: 'screened'; reason: ChatOfferScreen; message: string } // 422, nothing was kept
+  | { error: 'day' | 'full' | 'adapter_day'; message: string } // 429
+  | { error: 'off' | 'unavailable'; message: string } // 503
+
+// GET /api/experiment, field `visitor_offers`: counts only, never text.
+export interface VisitorOffersCounts {
+  enabled: boolean
+  stored: number
+  offered_today: number
+  trained_on: number
+  taken_back: number
+  read_by_owner: number
+}
