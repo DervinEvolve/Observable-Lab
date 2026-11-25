@@ -606,6 +606,11 @@ export interface PublicLesson {
     cut_short_before: boolean
     rubric_literal: string[]
     shared_literals: string[]
+    /**
+     * Per subskill: how many of its held back questions expect a value that a practice question also expects, or that
+     * a rubric gives as a fixed value. The lab accepts such a lesson and flags it. Absent in older records: empty.
+     */
+    shared_answers: Array<{ name: string; shared: number; of: number }>
     within_noise: boolean
     reasons: string[]
     /** Fewer answers were cut off by the token limit or empty after training than before. Absent in older records: false. */

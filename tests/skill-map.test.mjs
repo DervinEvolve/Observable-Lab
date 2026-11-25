@@ -882,3 +882,34 @@ test('a reply or an answer the token limit cut off in teaching is marked in the 
     p.close()
   }, { questions: turnQuestions })
 })
+
+test('held back questions that share an answer with practice are carried on the record, said once in the panel, and noted on the chart only when nothing above it is', async () => {
+  const sentence = 'Units: 2 of 3 held back questions expect a value that a practice question also expects, or that a rubric gives as a fixed value, so passing them may be recall of a taught answer'
+  const flagged = over => finished({ flags: { ...finished().flags, seen_only: false, rubric_literal: [], shared_answers: [{ name: 'Units', shared: 2, of: 3 }], reasons: [sentence], ...over } })
+  // the record is read strictly where it is present, and an older record without the field has none
+  assert.deepEqual(state(flagged()).lesson.flags.shared_answers, [{ name: 'Units', shared: 2, of: 3 }])
+  assert.deepEqual(state(finished()).lesson.flags.shared_answers, [], 'an older record has no such field')
+  assert.deepEqual(state(flagged({ shared_answers: 'yes' })).lesson.flags.shared_answers, [])
+  assert.deepEqual(state(flagged({ shared_answers: [{ name: 'Units', shared: 4, of: 3 }, { name: 'Checking', shared: 0, of: 3 }, { name: 7, shared: 1, of: 3 }, null, { name: 'Carrying digits', shared: 1, of: 3 }] })).lesson.flags.shared_answers, [{ name: 'Carrying digits', shared: 1, of: 3 }])
+  // the chart's one line: it stands alone, and every other note comes before it
+  const NOTE = 'Flag: some held back questions share an answer with practice.'
+  assert.equal(view(flagged()).flagNote, NOTE)
+  assert.equal(view(flagged({ cut_off_fell: true })).flagNote, 'Flag: fewer answers were cut off after training.')
+  assert.equal(view(flagged({ within_noise: true })).flagNote, 'Within noise: the change is smaller than one pass band.')
+  assert.equal(view(flagged({ cut_short_before: true })).flagNote, 'Flag: many answers were cut off by the token limit.')
+  assert.equal(view(flagged({ seen_only: true })).flagNote, 'Flag: better only on questions seen in teaching.')
+  assert.equal(view(finished({ flags: { ...finished().flags, seen_only: false } })).flagNote, null)
+  assert.ok(NOTE.length <= 'Flag: better only on questions seen in teaching, and cut off answers.'.length, 'no longer than the longest note the paper already holds')
+  assert.equal(/[–—]/.test(NOTE), false)
+  // the panel prints the server's reason once, as a sentence
+  await withPage(async ({ body, fetchStub, settle }) => {
+    const p = new LessonPanel(() => {}, { fetch: fetchStub })
+    p.setLesson(state(flagged()), false)
+    p.show()
+    await settle()
+    const all = box(body).children.find(c => c.id === 'lesson-panel').textContent
+    assert.ok(all.includes(`${sentence}.`))
+    assert.equal(all.split('recall of a taught answer').length - 1, 1, 'the sentence is shown once')
+    p.close()
+  }, { record: { ...flagged(), rubrics: [[], [], [], []] } })
+})

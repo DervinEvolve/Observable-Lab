@@ -416,7 +416,7 @@ export class LessonPanel {
     }
 
     // 2. flags
-    // The server's reasons are complete: the rubric_literal and shared_literals sentences are among them.
+    // The server's reasons are complete: the rubric_literal, shared_literals and shared_answers sentences are among them, each once.
     const noticed: string[] = l.flags.reasons.map(sentence)
     if (noticed.length) {
       const flag = el('div', 'lp-flag')

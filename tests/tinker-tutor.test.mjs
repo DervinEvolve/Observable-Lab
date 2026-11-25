@@ -654,7 +654,7 @@ test('a good request is read with its defaults, fingerprinted, and flagged where
   assert.equal(r.topic, 'Code words')
   assert.match(r.dataset_sha256, /^[0-9a-f]{64}$/)
   assert.equal(r.dataset_sha256, read(lessonRaw()).dataset_sha256)
-  assert.deepEqual(r.flags, { rubric_literal: [], shared_literals: [] })
+  assert.deepEqual(r.flags, { rubric_literal: [], shared_literals: [], shared_answers: [] })
   // a rubric of fixed phrases, one of which a held back question also holds
   const literal = lessonRaw()
   literal.subskills[2].rubric = { rules: [{ type: 'contains', weight: 1, any: ['amber'] }] }
@@ -729,7 +729,7 @@ test('a name is a field only while names are on', () => {
   assert.equal(read(lessonRaw({ name: 'Code Tutor' })).name, 'Code Tutor')
 })
 
-test('a held back question that nearly copies a practice question, or expects a value the teacher is shown, is refused at its boundary', () => {
+test('a held back question that nearly copies a practice question by its words is refused at its boundary; one that expects a value a practice question also expects is accepted and flagged', () => {
   // Jaccard 0.69 passes, 0.70 refuses: 100 words in all, 69 or 70 shared.
   const shared = n => Array.from({ length: n }, (_, k) => `w${k}`)
   const withJaccard = both => {
@@ -743,18 +743,29 @@ test('a held back question that nearly copies a practice question, or expects a 
   assert.ok(Math.abs(tutor.jaccard(withJaccard(69).subskills[0].practice[0].prompt, withJaccard(69).subskills[0].held_back[0].prompt) - 0.69) < 1e-9)
   read(withJaccard(69))
   assert.match(refused(withJaccard(70)), /subskills\[0\]\.held_back\[0\] is nearly the same as practice\[0\]/)
-  // check 7: a held back expected value equal to one the teacher is shown
+  // a held back expected value equal to a practice question's: accepted, and counted for its subskill
   const shown = lessonRaw()
   shown.subskills[1].held_back[2].expected = shown.subskills[1].practice[0].expected
-  assert.match(refused(shown), /subskills\[1\]\.held_back\[2\] expects a value the teacher is shown/)
+  assert.deepEqual(read(shown).flags.shared_answers, [{ name: 'Codes 1', shared: 1, of: 3 }])
+  // equal to a fixed value a rubric carries: counted too
   const literal = lessonRaw()
   literal.subskills[1].rubric = { rules: [{ type: 'exact_match', weight: 0.5, from: 'expected', scope: 'last_line' }, { type: 'not_contains', weight: 0.5, any: ['h12codey'] }] }
-  assert.match(refused(literal), /subskills\[1\]\.held_back\[2\] expects a value the teacher is shown/)
-  // a short value (under 3 characters) is not compared
+  assert.deepEqual(read(literal).flags.shared_answers, [{ name: 'Codes 1', shared: 1, of: 3 }])
+  // one rule for short and long values: a value of 2 characters is compared like any other
   const short = lessonRaw()
   short.subskills[1].practice[0].expected = 'ab'
   short.subskills[1].held_back[0].expected = 'ab'
-  read(short)
+  assert.deepEqual(read(short).flags.shared_answers, [{ name: 'Codes 1', shared: 1, of: 3 }])
+  // a data entry no rule reads is not an answer and is not counted
+  const unread = lessonRaw()
+  unread.subskills[1].practice[0].data = { note: 'same words' }
+  unread.subskills[1].held_back[0].data = { note: 'same words' }
+  assert.deepEqual(read(unread).flags.shared_answers, [])
+  // a data entry a rule reads is one
+  const readData = lessonRaw()
+  readData.subskills[1].rubric = { rules: [{ type: 'exact_match', weight: 0.5, from: 'expected', scope: 'last_line' }, { type: 'contains', weight: 0.5, from: 'data.unit' }] }
+  for (const [k, t] of [...readData.subskills[1].practice, ...readData.subskills[1].held_back].entries()) t.data = { unit: k === 0 || k === 5 ? 'furlongs' : `unit${k}x` }
+  assert.deepEqual(read(readData).flags.shared_answers, [{ name: 'Codes 1', shared: 1, of: 3 }])
 })
 
 // ===========================================================================
@@ -809,6 +820,9 @@ test('the flags at their thresholds', () => {
   assert.equal(same.within_noise, true)
   assert.ok(same.reasons.includes('Codes 1: every rule checks a fixed phrase, so a gain may be the phrase'))
   assert.ok(same.reasons.includes('Codes 2: a rule value appears in a held back question'))
+  // a request stored before the lab counted shared answers has no such field: it reads as none
+  assert.deepEqual(same.shared_answers, [])
+  assert.equal(same.reasons.some(r => /recall of a taught answer/.test(r)), false)
   // a cell only when every answer of that phase is graded
   const partial = marks.filter(m => !(m.phase === 'before' && m.subskill === 0 && m.held_back && m.sample === 1))
   assert.equal(tutor.phaseMap(request, partial, 'before').held[0], null)
@@ -1779,7 +1793,7 @@ test('two lessons asked at the same moment cannot both take the last place of th
   assert.equal(lab.slots.get(store.utcDay()), 1, 'this epoch already has a run: the second place was given back')
 })
 
-test('a held back question cannot reach the teacher through another subskill: checks 6 and 7 look at every subskill', () => {
+test('a held back question cannot reach the teacher through another subskill: the near copy check and the shared answer count look at every subskill', () => {
   const q = (prompt, expected) => ({ prompt, expected })
   const rub = { rules: [{ type: 'exact_match', from: 'expected', weight: 1, scope: 'last_line' }] }
   const mk = (name, practice, held) => ({ name, rubric: rub, practice, held_back: held })
@@ -1793,8 +1807,9 @@ test('a held back question cannot reach the teacher through another subskill: ch
     mk('Delta', [q('Spell cat backwards.', 'tac'), q('Spell dog backwards.', 'god'), q('Spell rat backwards.', 'tar')],
       [q('Reverse the letters of pin.', 'nip'), q('Reverse the letters of top.', 'pot'), q('Reverse the letters of bat.', 'tab')]),
   ]
-  // check 7 across subskills: Alpha's held back question expects 391, which Beta's practice question shows the teacher
-  assert.equal(refused({ topic: 'Arithmetic', subskills: subs() }), 'subskills[0].held_back[0] expects a value the teacher is shown for subskills[1]')
+  // across subskills: Alpha's three held back questions expect 391, 399 and 377, which Beta's practice questions also expect.
+  // The lesson is accepted, and the count is on its flags.
+  assert.deepEqual(read({ topic: 'Arithmetic', subskills: subs() }).flags.shared_answers, [{ name: 'Alpha', shared: 3, of: 3 }])
   // check 6 across subskills: a held back question that nearly repeats another subskill's practice question
   const copy = subs()
   copy[1].practice = [q('Compute 101 minus 70. Reply with the number only.', '31'), q('Please multiply nineteen by twenty-one and state the product as digits.', '1399'), q('Please multiply thirteen by twenty-nine and state the product as digits.', '1377')]
@@ -2097,7 +2112,7 @@ test('when a second round fails in its retest, the public record shows the round
   assert.deepEqual(held2.answers.after.map(a => a.passed), [false, false])
 })
 
-test('the held back checks see through a comma, an invisible character and a number written another way, and the note says what they do not catch', () => {
+test('the held back checks see through a comma, an invisible character and a number written another way, and the note says what they do and do not do', () => {
   const q = (prompt, expected, data) => ({ prompt, ...(expected !== undefined ? { expected } : {}), ...(data ? { data } : {}) })
   const rub = { rules: [{ type: 'exact_match', from: 'expected', weight: 1, scope: 'last_line' }] }
   const base = () => lessonRaw()
@@ -2117,13 +2132,15 @@ test('the held back checks see through a comma, an invisible character and a num
       held_back: [0, 1, 2].map(j => q(`How many ${word(s * 9 + j + 80)} beads are in the ${word(s * 9 + j + 120)} jar?`, s === 0 && j === 0 ? held : String(900 + s * 30 + j * 7))),
     })),
   })
-  assert.ok('request' in tutor.normalizeTinkerTutorRequest(numbers('901')), 'a value of its own is accepted')
-  assert.equal(refused(numbers('500.0')), 'subskills[0].held_back[0] expects a value the teacher is shown')
-  assert.equal(refused(numbers('0500')), 'subskills[0].held_back[0] expects a value the teacher is shown')
+  assert.deepEqual(read(numbers('901')).flags.shared_answers, [], 'a value of its own shares nothing')
+  assert.deepEqual(read(numbers('500.0')).flags.shared_answers, [{ name: 'Sums 0', shared: 1, of: 3 }])
+  assert.deepEqual(read(numbers('0500')).flags.shared_answers, [{ name: 'Sums 0', shared: 1, of: 3 }])
   // what the note tells the models about these checks is what they do
   const note = tutor.tinkerTutorNote({ perDay: 1, teacherUsd: 1 })
-  assert.match(note, /a held back question is refused when its words are nearly the same as those of a practice question of any subskill, or when its "expected" or one of its "data" values, of 3 characters or more, is the same text or the same number as a value the teacher is shown; a reworded question, a shorter value, a value that is only part of a shown value, or a value that only appears inside a practice prompt is not caught\./)
-  assert.doesNotMatch(note, /nearly repeats a practice question of any subskill, or expects a value the teacher is shown, is refused/)
+  assert.ok(note.includes('a held back question is refused when its words are nearly the same as those of a practice question of any subskill; a reworded question is not caught. A held back question that expects a value a practice question of any subskill also expects (a value the rules read from "expected" or "data", the same text after normalising or the same number, of any length), or a value a rubric gives as a fixed value, is accepted and flagged on the record with the count for its subskill, because the adapter may pass it by recalling a taught answer; that is a limit of the measure. A value that is only part of another value, or that only appears inside a practice prompt, is not counted.'))
+  assert.doesNotMatch(note, /expects a value the teacher is shown/)
+  assert.doesNotMatch(note, /3 characters or more/)
+  assert.doesNotMatch(note, /shorter value/)
 })
 
 test('a regex rule whose pattern is a fixed text is a fixed phrase: flagged, and kept out of guiding questions', () => {
@@ -2198,4 +2215,136 @@ test('the shelf\'s skill map keeps "many cut off" and "fewer cut off after train
   assert.deepEqual([many.cut_short, many.cut_off_fell], [true, true])
   const none = store.readTutorSkillMap(result({}))
   assert.deepEqual([none.cut_short, none.cut_off_fell], [false, false])
+})
+
+// ===========================================================================
+// Shared answers: accepted and flagged, never refused
+// ===========================================================================
+const sq = (prompt, expected, data) => ({ prompt, ...(expected !== undefined ? { expected } : {}), ...(data ? { data } : {}) })
+const LAST_LINE = { rules: [{ type: 'exact_match', weight: 1, from: 'expected', scope: 'last_line' }] }
+const LABEL = { rules: [{ type: 'exact_match', weight: 1, from: 'expected' }] }
+/** Lessons a model would plausibly write, whose answers come from a small set or coincide by chance (the second check's cases). */
+const SMALL_SET = {
+  sentiment: () => ({ topic: 'Sentiment of short reviews', subskills: [
+    ['Product reviews', ['The kettle broke after two days.', 'Best headphones I have owned.', 'The strap snapped on the first walk.'], ['The lamp is bright and well made.', 'Arrived cracked and the seller never replied.', 'Does exactly what the box says.']],
+    ['Restaurant reviews', ['The soup was cold and the waiter was rude.', 'We will come back for the dumplings.', 'Forty minutes for a salad.'], ['The bread alone is worth the trip.', 'My fish was raw in the middle.', 'Friendly staff and a fair bill.']],
+    ['Film reviews', ['I checked my watch six times.', 'The last act had the whole room in tears of joy.', 'A plot with more holes than a sieve.'], ['I would watch it again tonight.', 'Two hours I will not get back.', 'The lead actor carries every scene.']],
+    ['Hotel reviews', ['The room smelled of smoke.', 'Spotless and quiet, with a view of the bay.', 'The lift was out of order all week.'], ['Check in took two minutes and the bed was perfect.', 'Thin walls and a broken shower.', 'Breakfast was the best part of our trip.']],
+  ].map(([name, p, h]) => ({
+    name, rubric: structuredClone(LABEL),
+    practice: p.map((r, j) => sq(`Label as positive or negative. One word. Review: ${r}`, ['negative', 'positive', 'negative'][j])),
+    held_back: h.map((r, j) => sq(`Positive or negative? One word. Review: ${r}`, ['positive', 'negative', 'positive'][j])),
+  })) }),
+  yesNo: () => ({ topic: 'Simple deduction', subskills: ['Modus ponens', 'Modus tollens', 'Chains', 'Invalid forms'].map((name, s) => ({
+    name, rubric: structuredClone(LABEL),
+    practice: [0, 1, 2].map(j => sq(`${name} practice ${j + 1}: every ${['glip', 'tarn', 'wob', 'fenn'][s]} is a ${['zorb', 'kell', 'dax'][j]}; item ${s}${j} is a ${['glip', 'tarn', 'wob', 'fenn'][s]}. Is it a ${['zorb', 'kell', 'dax'][j]}? Answer yes or no.`, s === 3 ? 'no' : 'yes')),
+    held_back: [0, 1, 2].map(j => sq(`${name} check ${j + 1}: all ${['murr', 'pell', 'siv', 'quon'][s]}s are ${['hobs', 'yents', 'ruls'][j]} and thing ${s}${j} is one of the ${['murr', 'pell', 'siv', 'quon'][s]}s. Must it be among the ${['hobs', 'yents', 'ruls'][j]}? Answer yes or no.`, s === 3 ? 'no' : 'yes')),
+  })) }),
+  partsOfSpeech: () => ({ topic: 'Parts of speech', subskills: [['Nouns in context', 'noun'], ['Verbs in context', 'verb'], ['Adjectives in context', 'adjective'], ['Adverbs in context', 'adverb']].map(([name, label], s) => ({
+    name, rubric: structuredClone(LABEL),
+    practice: [['river', 'sing', 'bright', 'slowly'], ['garden', 'build', 'narrow', 'often'], ['window', 'carry', 'quiet', 'never']].map((ws, j) => sq(`In sentence ${s}${j} about a ${ws[0]}, what part of speech is the word "${ws[s]}"? One word.`, label)),
+    held_back: [['bridge', 'climb', 'heavy', 'gently'], ['ladder', 'whisper', 'ancient', 'rarely'], ['harbour', 'gather', 'brittle', 'always']].map((ws, j) => sq(`Read phrase ${s}${j} that mentions a ${ws[0]}. Which part of speech is "${ws[s]}" there? One word.`, label)),
+  })) }),
+  // The number within 2% and the unit named: every number is its own, the unit names are shared. The last Volume question has a unit of its own.
+  units: () => {
+    const conv = { rules: [{ type: 'number_close', weight: 0.7, from: 'expected', tolerance: 0.02, relative: true }, { type: 'contains', weight: 0.3, from: 'data.unit' }] }
+    return { topic: 'Unit conversion', subskills: [
+      ['Length', [['Convert 10 inches to centimetres.', '25.4', 'cm'], ['Convert 3 miles to kilometres.', '4.83', 'km'], ['Convert 6 feet to metres.', '1.83', 'metres']],
+        [['How many centimetres is 4 inches?', '10.16', 'cm'], ['How long is 26.2 miles in kilometres?', '42.16', 'km'], ['A 30 foot pole is how many metres?', '9.14', 'metres']]],
+      ['Mass', [['Convert 5 pounds to kilograms.', '2.27', 'kg'], ['Convert 12 ounces to grams.', '340.2', 'grams'], ['Convert 2 stone to kilograms.', '12.7', 'kg']],
+        [['How many kilograms is 150 pounds?', '68.04', 'kg'], ['How many grams is 3 ounces?', '85.05', 'grams'], ['A 10 stone person weighs how many kilograms?', '63.5', 'kg']]],
+      ['Temperature', [['Convert 68 degrees Fahrenheit to Celsius.', '20', 'Celsius'], ['Convert 100 degrees Celsius to Fahrenheit.', '212', 'Fahrenheit'], ['Convert 50 degrees Fahrenheit to Celsius.', '10', 'Celsius']],
+        [['What is 86 degrees Fahrenheit in Celsius?', '30', 'Celsius'], ['What is 37 degrees Celsius in Fahrenheit?', '98.6', 'Fahrenheit'], ['What is 14 degrees Fahrenheit in Celsius?', '-10', 'Celsius']]],
+      ['Volume', [['Convert 2 US gallons to litres.', '7.57', 'litres'], ['Convert 500 millilitres to US cups.', '2.11', 'cups'], ['Convert 3 pints to litres.', '1.42', 'litres']],
+        [['How many litres is 15 US gallons?', '56.78', 'litres'], ['How many US cups is 1 litre?', '4.23', 'cups'], ['How many fluid ounces is 1 litre?', '33.81', 'fluid ounces']]],
+    ].map(([name, p, h]) => ({ name, rubric: structuredClone(conv), practice: p.map(([t, n, u]) => sq(t, n, { unit: u })), held_back: h.map(([t, n, u]) => sq(t, n, { unit: u })) })) }
+  },
+  // Two numbers that happen to be equal across subskills: 144 (a held back sum, a practice product) and 152 (a held back product, a practice sum).
+  arithmetic: () => ({ topic: 'Mental arithmetic', subskills: [
+    ['Addition', [['What is 47 + 38? Put only the number on the last line.', '85'], ['Add 56 and 79. Put only the number on the last line.', '135'], ['Compute 64 + 88. Put only the number on the last line.', '152']],
+      [['A shelf has 39 books and another has 45. How many books in all? Number on the last line.', '84'], ['Find the sum of 77 and 67. Number on the last line.', '144'], ['What do 58 and 96 make together? Number on the last line.', '154']]],
+    ['Subtraction', [['What is 93 - 47? Put only the number on the last line.', '46'], ['Subtract 28 from 71. Put only the number on the last line.', '43'], ['Compute 150 - 61. Put only the number on the last line.', '89']],
+      [['A jar had 82 beans and 37 were eaten. How many are left? Number on the last line.', '45'], ['Take 59 away from 200. Number on the last line.', '141'], ['How much larger is 121 than 68? Number on the last line.', '53']]],
+    ['Multiplication', [['What is 12 * 12? Put only the number on the last line.', '144'], ['Multiply 15 by 9. Put only the number on the last line.', '135'], ['Compute 23 * 4. Put only the number on the last line.', '92']],
+      [['Six boxes hold 25 pens each. How many pens? Number on the last line.', '150'], ['Find the product of 14 and 11. Number on the last line.', '154'], ['What is 8 times 19? Number on the last line.', '152']]],
+    ['Division', [['What is 96 / 8? Put only the number on the last line.', '12'], ['Divide 135 by 9. Put only the number on the last line.', '15'], ['Compute 84 / 6. Put only the number on the last line.', '14']],
+      [['Share 143 sweets among 11 children. How many each? Number on the last line.', '13'], ['How many 25s are in 150? Number on the last line.', '6'], ['What is 91 divided by 13? Number on the last line.', '7']]],
+  ].map(([name, p, h]) => ({ name, rubric: structuredClone(LAST_LINE), practice: p.map(([t, a]) => sq(t, a)), held_back: h.map(([t, a]) => sq(t, a)) })) }),
+  capitals: () => ({ topic: 'World capitals', subskills: [
+    ['Europe', [['Portugal', 'Lisbon'], ['Norway', 'Oslo'], ['Hungary', 'Budapest']], [['Finland', 'Helsinki'], ['Austria', 'Vienna'], ['Poland', 'Warsaw']]],
+    ['Asia', [['Japan', 'Tokyo'], ['Thailand', 'Bangkok'], ['Mongolia', 'Ulaanbaatar']], [['Vietnam', 'Hanoi'], ['Nepal', 'Kathmandu'], ['South Korea', 'Seoul']]],
+    ['Africa', [['Kenya', 'Nairobi'], ['Ghana', 'Accra'], ['Egypt', 'Cairo']], [['Senegal', 'Dakar'], ['Uganda', 'Kampala'], ['Ethiopia', 'Addis Ababa']]],
+    ['Americas', [['Peru', 'Lima'], ['Canada', 'Ottawa'], ['Chile', 'Santiago']], [['Cuba', 'Havana'], ['Colombia', 'Bogota'], ['Uruguay', 'Montevideo']]],
+  ].map(([name, p, h]) => ({ name, rubric: structuredClone(LAST_LINE), practice: p.map(([c, a]) => sq(`What is the capital of ${c}? Put the city on the last line.`, a)), held_back: h.map(([c, a]) => sq(`Name the capital city of ${c}. Put the city on the last line.`, a)) })) }),
+}
+
+test('a lesson whose held back answers are also practice answers is accepted, and the count of such questions is flagged for each subskill', () => {
+  const all = names => names.map(name => ({ name, shared: 3, of: 3 }))
+  // labels, yes and no, parts of speech: every held back answer is one the practice questions also have
+  assert.deepEqual(read(SMALL_SET.sentiment()).flags.shared_answers, all(['Product reviews', 'Restaurant reviews', 'Film reviews', 'Hotel reviews']))
+  assert.deepEqual(read(SMALL_SET.partsOfSpeech()).flags.shared_answers, all(['Nouns in context', 'Verbs in context', 'Adjectives in context', 'Adverbs in context']))
+  // "yes" (3 characters) and "no" (2 characters) are treated alike
+  const yesNo = read(SMALL_SET.yesNo()).flags.shared_answers
+  assert.deepEqual(yesNo, all(['Modus ponens', 'Modus tollens', 'Chains', 'Invalid forms']))
+  assert.deepEqual(yesNo.find(e => e.name === 'Invalid forms'), yesNo.map(e => ({ ...e, name: 'Invalid forms' }))[0], 'the "no" subskill counts as the "yes" ones do')
+  // unit names a rule reads from data are shared; the numbers are not. One Volume question names a unit of its own.
+  assert.deepEqual(read(SMALL_SET.units()).flags.shared_answers, [{ name: 'Length', shared: 3, of: 3 }, { name: 'Mass', shared: 3, of: 3 }, { name: 'Temperature', shared: 3, of: 3 }, { name: 'Volume', shared: 2, of: 3 }])
+  // two numbers that happen to be equal across subskills: one held back question each, and only in the subskills that hold them
+  assert.deepEqual(read(SMALL_SET.arithmetic()).flags.shared_answers, [{ name: 'Addition', shared: 1, of: 3 }, { name: 'Multiplication', shared: 1, of: 3 }])
+  // nothing shared: the field is there and empty
+  assert.deepEqual(read(SMALL_SET.capitals()).flags.shared_answers, [])
+  assert.deepEqual(read(lessonRaw()).flags.shared_answers, [])
+  // a near copy by words is still refused, whatever its answer
+  const copy = SMALL_SET.capitals()
+  copy.subskills[1].held_back[0] = sq('What is the capital of Portugal? Put the city on the last line please.', 'Porto')
+  assert.equal(refused(copy), 'subskills[1].held_back[0] is nearly the same as subskills[0].practice[0]')
+  // the helper counts a question once, however many practice questions share its answer
+  assert.deepEqual(tutor.sharedAnswers(read(SMALL_SET.yesNo()).subskills), yesNo)
+})
+
+test('shared answers reach the flags, the tool run line and the public record once each, and a request stored without the field still summarises', async () => {
+  // one reason a subskill, in the form of the other reasons, singular and plural
+  assert.equal(tutor.sharedAnswersReason({ name: 'Units', shared: 3, of: 6 }), 'Units: 3 of 6 held back questions expect a value that a practice question also expects, or that a rubric gives as a fixed value, so passing them may be recall of a taught answer')
+  assert.equal(tutor.sharedAnswersReason({ name: 'Units', shared: 1, of: 6 }), 'Units: 1 of 6 held back question expects a value that a practice question also expects, or that a rubric gives as a fixed value, so passing it may be recall of a taught answer')
+  // stored flags are read strictly: no field, or anything that is not a count, is none
+  assert.deepEqual(tutor.sharedAnswersOf({ rubric_literal: [], shared_literals: [] }), [])
+  assert.deepEqual(tutor.sharedAnswersOf(null), [])
+  assert.deepEqual(tutor.sharedAnswersOf({ shared_answers: 'yes' }), [])
+  assert.deepEqual(tutor.sharedAnswersOf({ shared_answers: [{ name: 'A', shared: 2, of: 3 }, { name: 'B', shared: 0, of: 3 }, { name: 'C', shared: 4, of: 3 }, { name: 5, shared: 1, of: 3 }, null, { name: 'D', shared: 1.5, of: 3 }] }), [{ name: 'A', shared: 2, of: 3 }])
+
+  // a whole lesson in which two held back questions of Codes 1 and one of Codes 3 expect a practice answer
+  const raw = lessonRaw()
+  raw.subskills[1].held_back[0].expected = raw.subskills[1].practice[0].expected
+  raw.subskills[1].held_back[2].expected = raw.subskills[0].practice[1].expected
+  raw.subskills[3].held_back[1].expected = raw.subskills[2].practice[2].expected
+  const want = [{ name: 'Codes 1', shared: 2, of: 3 }, { name: 'Codes 3', shared: 1, of: 3 }]
+  const sentences = want.map(tutor.sharedAnswersReason)
+  const { out, request } = await runLesson({}, raw)
+  assert.equal(out.status, 'ok', out.summary)
+  assert.deepEqual(request.flags.shared_answers, want)
+  const once = (list, s) => list.filter(r => r === s).length
+  const stored = theRun().result.flags
+  assert.deepEqual(stored.shared_answers, want)
+  for (const s of sentences) assert.equal(once(stored.reasons, s), 1, s)
+  const line = lab.toolRuns.find(r => r.tool === 'tinker_tutor').output_tail
+  for (const s of sentences) assert.equal(line.split(s).length - 1, 1, 'the tool run line says it once')
+  tutorPublic.resetTutorLessonCache()
+  let lesson = (await tutorPublic.tutorLesson()).lesson
+  assert.deepEqual(lesson.flags.shared_answers, want)
+  for (const s of sentences) assert.equal(once(lesson.flags.reasons, s), 1, s)
+  // the run row's own record of the request carries the flag as the request does
+  assert.deepEqual((typeof theRun().lesson === 'string' ? JSON.parse(theRun().lesson) : theRun().lesson).flags.shared_answers, want)
+  // the Reviewer is told the counts
+  const facts = tutor.tinkerTutorReviewFacts(request, TEACHER).line
+  assert.ok(facts.includes('A held back question whose words are nearly the same as those of a practice question is refused; a reworded question is not caught. A held back question that expects a value a practice question also expects, or that a rubric gives as a fixed value, is accepted and flagged on the record, because the adapter may pass it by recalling a taught answer; that is a limit of the measure. The lab\'s count of such held back questions in this lesson: Codes 1 2 of 3, Codes 3 1 of 3.'))
+  assert.ok(tutor.tinkerTutorReviewFacts(read(lessonRaw()), TEACHER).line.includes('that is a limit of the measure. The lab counted no such held back question in this lesson.'))
+
+  // a lesson stored before the lab counted this: its request has no such field, and it still summarises, with none
+  delete theLesson().request.flags.shared_answers
+  tutorPublic.resetTutorLessonCache()
+  lesson = (await tutorPublic.tutorLesson()).lesson
+  assert.deepEqual(lesson.flags.shared_answers, [])
+  assert.equal(lesson.flags.reasons.some(r => /recall of a taught answer/.test(r)), false)
+  assert.deepEqual(lesson.overall, theRun().result.overall)
+  assert.ok(tutor.tinkerTutorReviewFacts(theLesson().request, TEACHER).line.includes('The lab counted no such held back question in this lesson.'))
 })

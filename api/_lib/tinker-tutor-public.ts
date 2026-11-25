@@ -49,6 +49,8 @@ export interface PublicLesson {
   training: { steps_done: number | null; steps_planned: number | null; holdout_loss_before: number | null; holdout_loss_after: number | null } | null
   flags: {
     seen_only: boolean; too_easy: boolean; unanswered: number; cut_short_before: boolean; rubric_literal: string[]; shared_literals: string[]; within_noise: boolean; reasons: string[]
+    /** Per subskill: held back questions that expect a value a practice question also expects, or that a rubric gives as a fixed value. Empty for a lesson stored before the lab counted this. */
+    shared_answers: Array<{ name: string; shared: number; of: number }>
     cut_off_fell: boolean; cut_off: { before: CutOff | null; after: CutOff | null }
   }
   exchanges: Array<{ subskill: string; question: string; wrong: string; guide: string; reply: string; answer: string; passed: boolean }>
@@ -141,6 +143,7 @@ export function publicLesson(run: TinkerRunRow, lesson: LessonRow | null, answer
     flags: {
       seen_only: summary.flags.seen_only, too_easy: summary.flags.too_easy, unanswered: summary.flags.unanswered, cut_short_before: summary.flags.cut_short_before,
       rubric_literal: summary.flags.rubric_literal.map(n => publicCut(n, 40)), shared_literals: summary.flags.shared_literals.map(n => publicCut(n, 40)),
+      shared_answers: summary.flags.shared_answers.slice(0, TUTOR_SUBSKILLS.max).map(e => ({ name: publicCut(e.name, 40), shared: e.shared, of: e.of })),
       within_noise: summary.flags.within_noise, reasons: summary.flags.reasons.slice(0, 20).map(r => publicCut(r, 300)),
       cut_off_fell: summary.flags.cut_off_fell, cut_off: summary.flags.cut_off,
     },

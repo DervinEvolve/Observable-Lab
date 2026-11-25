@@ -170,6 +170,7 @@ function readLessonStrict(rawIn: unknown): PublicLesson {
       cut_short_before: flag(f.cut_short_before),
       rubric_literal: names(f.rubric_literal, 40),
       shared_literals: names(f.shared_literals, 40),
+      shared_answers: readSharedAnswers(f.shared_answers),
       within_noise: flag(f.within_noise),
       reasons: names(f.reasons, 300),
       cut_off_fell: f.cut_off_fell === true,
@@ -368,6 +369,22 @@ function readCutOff(raw: unknown): { before: CutOffCount | null; after: CutOffCo
   return { before: one(o.before), after: one(o.after) }
 }
 
+/**
+ * Per subskill, the held back questions that expect a value a practice question also expects (the lab accepts such a
+ * lesson and flags it). A record made before the lab counted this has no such field, and anything malformed is left out: empty.
+ */
+function readSharedAnswers(raw: unknown): PublicLesson['flags']['shared_answers'] {
+  if (!Array.isArray(raw)) return []
+  const out: PublicLesson['flags']['shared_answers'] = []
+  for (const v of raw.slice(0, MAX_SUBSKILLS)) {
+    if (!isObject(v)) continue
+    const name = plain(v.name, 40), of = whole(v.of, 1, 1000)
+    const shared = of === null ? null : whole(v.shared, 1, of)
+    if (name !== null && of !== null && shared !== null) out.push({ name, shared, of })
+  }
+  return out
+}
+
 /** The finished chart's corner note: the flags a visitor most needs, in one line (every reason is in the panel). */
 export function flagNoteOf(l: Pick<PublicLesson, 'flags'>): string | null {
   // One line on the paper, so the two together are said shortly; the panel has every reason in full.
@@ -381,6 +398,8 @@ export function flagNoteOf(l: Pick<PublicLesson, 'flags'>): string | null {
   if (many) return 'Flag: many answers were cut off by the token limit.'
   if (l.flags.within_noise) return 'Within noise: the change is smaller than one pass band.'
   if (fell) return 'Flag: fewer answers were cut off after training.'
+  // Last, so it never takes the place of a note above: the lab accepted held back questions that expect a value a practice question also expects.
+  if (l.flags.shared_answers.length) return 'Flag: some held back questions share an answer with practice.'
   return null
 }
 
