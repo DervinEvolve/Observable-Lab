@@ -295,19 +295,25 @@ export async function pruneOffers(now: Date = new Date()): Promise<number> {
 
 /**
  * Setting the text to NULL leaves the old row version, text included, in the
- * table's file until Postgres vacuums it, and on a small table autovacuum can
- * wait a long time (50 dead rows plus a fifth of the table). So the hourly
- * prune vacuums the table itself: text taken back, deleted or expired is out
- * of the table file within the hour. The database's own history (write ahead
- * log, point in time restore) is not touched by this. Never throws: a
- * database that refuses the statement is logged with a fixed line.
+ * table's file. A plain VACUUM only marks that space as free: the bytes stay
+ * readable in the file until a later row happens to be written over them
+ * (measured on PostgreSQL 16: the text of 10 of 12 deleted conversations was
+ * still in the file after it). So the hourly prune runs VACUUM FULL, which
+ * writes the table's live rows into a new file and drops the old one: text
+ * taken back, deleted or expired is not in the table's file after it (0 of
+ * 12 in the same measurement). It holds an exclusive lock on this one small
+ * table while it runs, so an offer or a take back made in that moment waits
+ * for it. The database's own history (write ahead log, point in time restore,
+ * the blocks of the dropped file until the storage reuses them) is not
+ * touched by this. Never throws: a database that refuses the statement is
+ * logged with a fixed line.
  */
 export async function vacuumOffers(): Promise<boolean> {
   try {
-    await sql`VACUUM visitor_offers`
+    await sql`VACUUM FULL visitor_offers`
     return true
   } catch {
-    console.warn('[visitor-offers] could not vacuum the offers table; deleted text stays in its file until the database vacuums it')
+    console.warn('[visitor-offers] could not rewrite the offers table; deleted text stays in its file until new rows are written over it')
     return false
   }
 }

@@ -80,13 +80,36 @@ export function visitorAdaptersFlag(): boolean {
 export const RECEIPT_SECRET_MIN_CHARS = 32
 
 /**
- * LAB_OPERATOR_SECRET when the owner's read and delete route would open with
- * it (requireBearer in auth.ts asks for 32 characters), or ''. CRON_SECRET is
- * not looked at: it does not open that route.
+ * A value the owner can send back in an Authorization header by copying it:
+ * visible ASCII characters, with spaces only inside. requireBearer compares
+ * the header with the stored value as it is. A space, a tab or a line break
+ * at the end of the stored value is dropped from a header on the way (or
+ * cannot be sent at all), and a character outside ASCII arrives as other
+ * characters, so such a secret answers 401 to every request (checked over
+ * real HTTP). A space at the start opens only for a header that carries that
+ * extra space after "Bearer ", which a copied value does not.
+ */
+const SENDABLE_SECRET = /^[\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?$/
+
+/**
+ * Why LAB_OPERATOR_SECRET does not open the owner's read and delete route, or
+ * null when it does: requireBearer (auth.ts) asks for 32 characters and then
+ * compares the stored value, untrimmed, with what the owner sends.
+ */
+function ownerSecretProblem(): string | null {
+  const secret = process.env.LAB_OPERATOR_SECRET || ''
+  if (secret.length < RECEIPT_SECRET_MIN_CHARS) return `LAB_OPERATOR_SECRET is not set with at least ${RECEIPT_SECRET_MIN_CHARS} characters`
+  if (!SENDABLE_SECRET.test(secret)) return 'LAB_OPERATOR_SECRET is stored with a space or a line break at an end, or with a character a request header cannot carry'
+  return null
+}
+
+/**
+ * LAB_OPERATOR_SECRET when the owner's read and delete route opens with it,
+ * exactly as stored, or ''. CRON_SECRET is not looked at: it does not open
+ * that route.
  */
 function ownerSecret(): string {
-  const secret = (process.env.LAB_OPERATOR_SECRET || '').trim()
-  return secret.length >= RECEIPT_SECRET_MIN_CHARS ? secret : ''
+  return ownerSecretProblem() === null ? process.env.LAB_OPERATOR_SECRET || '' : ''
 }
 
 /**
@@ -119,7 +142,8 @@ export function visitorOffersStatus(opts: { models?: boolean } = {}): TinkerStat
   if (!visitorOffersFlag()) return { enabled: false, off_reason: 'LAB_ENABLE_VISITOR_OFFERS is off' }
   const chat = trainedChatStatus()
   if (!chat.enabled) return { enabled: false, off_reason: `the visitor chat is off (${chat.off_reason ?? 'unknown'})` }
-  if (!ownerSecret()) return { enabled: false, off_reason: `LAB_OPERATOR_SECRET is not set with at least ${RECEIPT_SECRET_MIN_CHARS} characters, so the owner could not read or delete an offer and no receipt can be issued` }
+  const secretProblem = ownerSecretProblem()
+  if (secretProblem) return { enabled: false, off_reason: `${secretProblem}, so the owner could not read or delete an offer and no receipt can be issued` }
   if (opts.models) {
     const tinker = tinkerStatus()
     if (!tinker.enabled) return { enabled: false, off_reason: `Tinker training is off (${tinker.off_reason ?? 'unknown'})` }

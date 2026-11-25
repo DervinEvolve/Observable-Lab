@@ -100,7 +100,8 @@ class OfferDb extends FakeDb {
       return { rows: [] }
     }
     const ids = csv => new Set(String(csv).split(','))
-    if (text === 'VACUUM visitor_offers') { this.vacuums = (this.vacuums ?? 0) + 1; if (this.failVacuum) throw new Error('VACUUM cannot run here'); return { rows: [] } }
+    // A plain VACUUM frees the space of deleted text and leaves its bytes in the table's file; only VACUUM FULL rewrites the file without them.
+    if (text === 'VACUUM FULL visitor_offers') { this.vacuums = (this.vacuums ?? 0) + 1; if (this.failVacuum) throw new Error('VACUUM cannot run here'); return { rows: [] } }
     if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW()") return { rows: [{ n: String(this.offers.filter(o => this.live(o)).length) }] }
     if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_slug = ?") return { rows: [{ n: String(this.offers.filter(o => this.live(o) && o.adapter_slug === v[0]).length) }] }
     if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL") return { rows: [{ n: String(this.usable().length) }] }
@@ -318,6 +319,9 @@ test('no receipt key without LAB_OPERATOR_SECRET: never from CRON_SECRET or POST
   assert.equal(keyFn.includes('process.env'), false, 'the key is made from the owner\'s secret and reads nothing else')
   const secretFn = source.slice(source.indexOf('function ownerSecret()'), source.indexOf('function receiptKey()'))
   assert.deepEqual(secretFn.match(/process\.env\.[A-Z_]+/g), ['process.env.LAB_OPERATOR_SECRET'])
+  // nor does the check of whether that secret opens the owner's route read anything else
+  const problemFn = source.slice(source.indexOf('function ownerSecretProblem()'), source.indexOf('function ownerSecret()'))
+  assert.deepEqual(problemFn.match(/process\.env\.[A-Z_]+/g), ['process.env.LAB_OPERATOR_SECRET'])
 })
 
 // ---------------------------------------------------------------------------
@@ -1116,19 +1120,22 @@ test('an offer past its expires_at is not counted, read, claimed or returned, ev
   assert.equal(await offerStore.pruneOffers(), 14)
 })
 
-test('the hourly prune vacuums the offers table, so deleted text leaves the table file, and a database that refuses does not stop it', async () => {
+test('the hourly prune rewrites the offers table with VACUUM FULL, the statement that takes deleted text out of the table file, and a database that refuses does not stop it', async () => {
   lab.seedOffer({})
   lab.offers[0].expires_at = '2026-01-01T00:00:00.000Z'
   assert.equal(await offerStore.pruneOffers(new Date('2026-06-01T00:00:00Z')), 1)
   assert.equal(lab.vacuums, 1)
-  assert.equal(lab.statements.at(-1).text, 'VACUUM visitor_offers')
+  // On PostgreSQL 16 a plain VACUUM left the text of 10 of 12 deleted conversations in the table's file; VACUUM FULL left 0 of 12.
+  assert.equal(lab.statements.at(-1).text, 'VACUUM FULL visitor_offers')
+  const source = readFileSync(join(root, 'api/_lib/visitor-offers-store.ts'), 'utf8')
+  assert.deepEqual(source.match(/await sql`VACUUM[^`]*`/g), ['await sql`VACUUM FULL visitor_offers`'], 'the one vacuum statement the code sends')
   lab.failVacuum = true
   lab.seedOffer({})
   lab.offers[1].expires_at = '2026-01-01T00:00:00.000Z'
   logs = []
   assert.equal(await offerStore.pruneOffers(new Date('2026-06-01T00:00:00Z')), 1, 'the expiry is still reported')
   assert.equal(await offerStore.vacuumOffers(), false)
-  assert.ok(logs.some(l => l === '[visitor-offers] could not vacuum the offers table; deleted text stays in its file until the database vacuums it'), logs.join(' | '))
+  assert.ok(logs.some(l => l === '[visitor-offers] could not rewrite the offers table; deleted text stays in its file until new rows are written over it'), logs.join(' | '))
 })
 
 test('a table made before the size columns were dropped loses them when the tables are made ready', () => {
@@ -1170,7 +1177,7 @@ test('a reply cut at its limit never ends in half a character, and broken text i
 test('offers and the receipt key need LAB_OPERATOR_SECRET at full length, as the bearer check of the owner\'s route does', () => {
   enableChat()
   const reason = 'LAB_OPERATOR_SECRET is not set with at least 32 characters, so the owner could not read or delete an offer and no receipt can be issued'
-  for (const short of ['', 'abc', 'x'.repeat(31), ` ${'x'.repeat(31)} `]) {
+  for (const short of ['', 'abc', 'x'.repeat(31), ` ${'x'.repeat(29)} `]) {
     process.env.LAB_OPERATOR_SECRET = short
     assert.equal(offers.issueReceipt(SLUG, convo('s')), null, `a ${short.length} character secret makes no receipt`)
     // a usable scheduler secret does not stand in for it: that secret does not open the owner's route
@@ -1249,6 +1256,47 @@ test('with only CRON_SECRET set offers are off everywhere: nothing is stored or 
   assert.deepEqual((await chat({}, { method: 'GET' })).body.offers, { enabled: true, keep_days: 180, per_day: 3, public_text: false })
   assert.equal((await owner({ action: 'read' }, { auth: `Bearer ${'y'.repeat(32)}` })).code, 200)
   assert.equal((await offer(signed(convo('now on')))).code, 201)
+})
+
+test('a LAB_OPERATOR_SECRET the owner could not send back keeps offers off: stored with a line break or a space at an end, or with a character a header cannot carry', async () => {
+  enableChat()
+  lab.addAdapter({ slug: SLUG })
+  globalThis.fetch = fakeTinker()
+  // a conversation the lab signed while the owner's secret was a usable one
+  const signedEarlier = signed(convo('never stored'))
+  const good = 'z'.repeat(32)
+  const reason = 'LAB_OPERATOR_SECRET is stored with a space or a line break at an end, or with a character a request header cannot carry, so the owner could not read or delete an offer and no receipt can be issued'
+  // 32 real characters, stored with something the owner's request cannot carry back
+  const unsendable = [`${good}\n`, `${good}\r\n`, `${good} `, ` ${good}`, `${good}\t`, ` ${'x'.repeat(31)} `, `${'z'.repeat(31)}é`, `${'z'.repeat(16)}\u0007${'z'.repeat(16)}`, `${'z'.repeat(16)}\n${'z'.repeat(16)}`, ' '.repeat(32)]
+  for (const stored of unsendable) {
+    const label = JSON.stringify(stored)
+    process.env.LAB_OPERATOR_SECRET = stored
+    assert.deepEqual(offers.visitorOffersStatus(), { enabled: false, off_reason: reason }, label)
+    assert.deepEqual(offers.visitorOffersStatus({ models: true }), { enabled: false, off_reason: reason }, label)
+    assert.equal(offers.issueReceipt(SLUG, convo('s')), null, label)
+    // why: the owner's route compares the header with the stored value as it is, and a header arrives without its outer spaces and line breaks
+    if (stored.trim() !== stored && stored.trim().length >= 32) assert.equal((await owner({ action: 'read' }, { auth: `Bearer ${stored.trim()}` })).code, 401, label)
+    // the chat shows no Offer button and gives no receipt, and the offer route refuses before the database
+    assert.equal('offers' in (await chat({}, { method: 'GET' })).body, false, label)
+    const reply = await chat({ adapter: SLUG, messages: [{ role: 'user', content: 'Tell me about quince jelly' }] }, { ip: freshIp() })
+    assert.equal(reply.code, 200, label)
+    assert.equal('receipt' in reply.body, false, label)
+    const statements = lab.statements.length
+    const res = await offer(signedEarlier)
+    assert.equal(res.code, 503, label)
+    assert.equal(res.body.error, 'off', label)
+    assert.equal(lab.statements.length, statements, `${label}: no statement was sent`)
+    assert.equal(lab.offers.length, 0, label)
+    assert.equal(await offerStore.offersCountForPrompt(true), null, label)
+  }
+  // the same 32 characters stored as they are, or a secret with a space inside it: the route opens and offers are on
+  for (const stored of [good, `${'z'.repeat(16)} ${'z'.repeat(16)}`]) {
+    process.env.LAB_OPERATOR_SECRET = stored
+    assert.equal(offers.visitorOffersStatus().enabled, true, JSON.stringify(stored))
+    assert.ok(offers.issueReceipt(SLUG, convo('s')))
+    assert.equal((await owner({ action: 'read' }, { auth: `Bearer ${stored}` })).code, 200)
+  }
+  assert.equal((await offer(signed(convo('stored now')))).code, 201)
 })
 
 test('the visitor note reaches the models through one gate, which is shut while offers or training are off', async () => {
