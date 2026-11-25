@@ -2042,7 +2042,7 @@ test('a lesson adapter carries its skill map and the losses of its last training
   const adapter = store.publicAdapter(row)
   assert.equal(adapter.kind, 'tutor')
   assert.deepEqual(adapter.skill_map, {
-    topic: 'Unit conversion', teacher_name: 'Grok 4.7', seen_only: true, within_noise: false, cut_short: false,
+    topic: 'Unit conversion', teacher_name: 'Grok 4.7', seen_only: true, within_noise: false, cut_short: false, cut_off_fell: false,
     rows: [
       { name: 'Metres to feet', before: cell(2, 6, 2), after: cell(5, 6, 4) },
       { name: 'Litres to gallons', before: cell(1, 6, 1), after: null },
@@ -2210,7 +2210,7 @@ class OffersTable {
   constructor(rows) { this.rows = rows }
   handle(text, v) {
     if (/^(CREATE|ALTER)\b/.test(text) && text.includes('visitor_offers')) return { rows: [] }
-    if (text.startsWith('SELECT id, day FROM visitor_offers WHERE status = \'stored\' AND adapter_from_visitors = FALSE AND messages IS NOT NULL')) {
+    if (text.startsWith('SELECT id, day FROM visitor_offers WHERE status = \'stored\' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL')) {
       return { rows: this.rows.filter(r => r.status === 'stored' && !r.adapter_from_visitors && r.messages).map(r => ({ id: r.id, day: r.day })) }
     }
     if (text.startsWith('UPDATE visitor_offers SET used_in = used_in || to_jsonb(?::text)')) {
@@ -2412,4 +2412,77 @@ test('the measure note is one sentence list, the same on the lesson panel (which
   enableTinker({ TINKER_API_KEY: TINKER_KEY })
   const facts = tutor.tinkerTutorReviewFacts(tutor.normalizeTinkerTutorRequest(lessonAsk()).request, 'x-ai/grok-4.7')
   assert.ok(facts.line.endsWith(TUTOR_MEASURE_NOTE))
+})
+
+// ---------------------------------------------------------------------------
+// The second review: runs on visitor conversations
+// ---------------------------------------------------------------------------
+test('a run on visitor conversations keeps none of the runner\'s free text: not the early stop note, the export error or the stage', async () => {
+  enableOffers()
+  withOffers(offerRows())
+  const sent = []
+  const quoted = SAID(7)[1]
+  globalThis.fetch = fakeRunner(sent, [{ status: 'done', result: runnerOk({
+    stage: `near "${SAID(3)[0].slice(0, 20)}"`, stopped_early: `stopped near "${quoted}"`, export_error: `could not serialize "${SAID(5)[0]}"`,
+  }) }])
+  await deliver(toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig()))
+  const run = lab.tinkerRuns[0]
+  assert.equal(run.status, 'ok')
+  const kept = JSON.stringify({ run, toolRuns: lab.toolRuns })
+  assert.equal(kept.includes('Lancashire'), false, 'no visitor text in the run row or the tool run')
+  const result = typeof run.result === 'string' ? JSON.parse(run.result) : run.result
+  assert.equal(result.stopped_early, runs.VISITOR_RUN_STOPPED)
+  const detail = lab.toolRuns.at(-1).detail
+  assert.equal((typeof detail === 'string' ? JSON.parse(detail) : detail).export_error, runs.VISITOR_EXPORT_FAILED)
+  assert.equal(result.stage, null)
+  assert.match(lab.toolRuns.at(-1).output_tail, /stopped early: it stopped before its last step; the runner's note is not shown for runs on visitor conversations/)
+
+  // The runner's own limit sentences and stage names pass through, and so does everything on a run that is not on offers.
+  const plain = { status: 'ok', stage: 'train', reason: null, n_train: 18, n_holdout: 2, steps_planned: 6, steps_done: 4, holdout_loss_before: 2, holdout_loss_after: 1,
+    train_loss_first: 3, train_loss_last: 1, tokens: { train: 1, eval: 1, sample_prompt: 1, sample_completion: 1 }, sampler_path: SAMPLER, ttl_seconds: 1, samples: [{ prompt: 'p', completion: 'c' }], wall_seconds: 1 }
+  for (const stop of ['the step limit of 400', 'the time limit of 2400 s for training', 'the budget: one more step would pass the $0.2500 set aside']) {
+    const out = runs.visitorRunResult({ ...plain, stopped_early: stop })
+    assert.equal(out.stopped_early, stop)
+    assert.equal(out.stage, 'train')
+    assert.deepEqual(out.samples, [])
+    assert.equal('export_error' in out, false)
+  }
+  assert.equal(runs.visitorRunResult({ ...plain, stopped_early: null }).stopped_early, null)
+  assert.equal(runs.visitorRunResult({ ...plain, status: 'error', reason: `tokenizer error near "${quoted}"` }).reason, runs.VISITOR_RUN_FAILED)
+})
+
+test('the adapter list the models read, and the facts a keep request gives the Reviewer, label an adapter trained on visitor conversations', async () => {
+  enableOffers({ LAB_ENABLE_TINKER_KEEP: 'true' })
+  withOffers(offerRows())
+  globalThis.fetch = fakeRunner([], [{ status: 'done', result: runnerOk() }])
+  await deliver(toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig()))
+  const run = lab.tinkerRuns[0]
+  assert.equal(run.status, 'ok')
+  const keep = await load('api/_lib/tinker-keep.js')
+  const inner = db.handler
+  db.handler = (text, values) => (text.includes('tinker_keeps') ? { rows: [] } : inner(text, values))
+  const context = await keep.adaptersContext()
+  assert.match(context, new RegExp(`lab/${run.slug}: trained in epoch \\d+ by [^,]+ on 20 examples made from conversations written by visitors, base model`), context)
+  const facts = await keep.keepReviewFacts({ slug: run.slug, reason: 'it answers well' }, { modelId: 'openai/gpt-6-astra' })
+  assert.match(facts.line, /on 20 examples made from conversations written by visitors/)
+})
+
+test('the Executor\'s field list shows the visitor_offers form only while offers are on for the models, and the note names "dataset" only while datasets are on', () => {
+  enableTinker()
+  const off = prompts.executorToolsSection(toolsConfig.toolConfig())
+  assert.doesNotMatch(off, /visitor_offers/)
+  enableOffers()
+  const config = toolsConfig.toolConfig()
+  const section = prompts.executorToolsSection(config)
+  assert.match(section, /A Tinker training request takes exactly the fields shown/)
+  assert.match(section, /In place of "examples", a Tinker training request may name conversations visitors offered to the lab: "visitor_offers": \{ "adapter": "an adapter id \(optional\)", "limit": 10 to 500 \(optional, 200 when left out\), "system": "text of yours put before every conversation as a system message, at most 2000 bytes \(optional\)" \}\. A request gives one source of examples only\./)
+  // what the paragraph shows is what the reader takes
+  assert.deepEqual(toolRequests.planTools({ tinker_train: offersAsk({ visitor_offers: { limit: 20, system: 'Answer briefly.' } }) }, config).ignored, [])
+  // with the datasets tool off, "dataset" is not a field, and the visitor note does not offer it
+  assert.equal(config.datasets.enabled && config.datasets.per_day > 0, false)
+  const lines = prompts.toolLines(config, { visitorOffers: 12 })
+  assert.match(lines, /Give one of "examples" and "visitor_offers"\./)
+  assert.doesNotMatch(lines, /Give one of "examples", "dataset" and "visitor_offers"/)
+  const withDataset = toolRequests.planTools({ tinker_train: { purpose: 'p', dataset: { repo: 'org/name', user_column: 'q', assistant_column: 'a' } } }, config)
+  assert.deepEqual(withDataset.ignored, [{ tool: 'tinker_train', reason: 'unknown field: dataset' }])
 })

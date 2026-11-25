@@ -56,6 +56,9 @@ export function ensureOfferTables(): Promise<void> {
           expires_at TIMESTAMP WITH TIME ZONE NOT NULL
         )
       `
+      // A table made before the size columns were dropped still has them, NOT NULL: no insert writes them any more.
+      await sql`ALTER TABLE visitor_offers DROP COLUMN IF EXISTS turns`
+      await sql`ALTER TABLE visitor_offers DROP COLUMN IF EXISTS chars`
       await sql`CREATE INDEX IF NOT EXISTS idx_visitor_offers_live ON visitor_offers(status, adapter_slug, day)`
       await sql`CREATE UNIQUE INDEX IF NOT EXISTS idx_visitor_offers_prompt ON visitor_offers(adapter_slug, first_user_sha256) WHERE status = 'stored'`
       // The day caps of all offers and of one adapter: a count a day and nothing else, so no row records when an offer came.
@@ -70,12 +73,17 @@ export function ensureOfferTables(): Promise<void> {
 
 const num = (v: unknown) => Number(v) || 0
 
-/** How many offers are stored (not taken back, deleted or expired) now. */
+/**
+ * How many offers are stored (not taken back, deleted or expired) now. An
+ * offer past its expires_at is not counted, read or claimed, whether or not
+ * the hourly prune has reached it yet: every read below carries the same
+ * condition.
+ */
 export async function storedOfferCount(adapter: string | null = null): Promise<number> {
   await ensureOfferTables()
   const r = adapter
-    ? await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_slug = ${adapter}`
-    : await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored'`
+    ? await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_slug = ${adapter}`
+    : await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW()`
   return num(r.rows[0]?.n)
 }
 
@@ -87,9 +95,21 @@ export async function storedOfferCount(adapter: string | null = null): Promise<n
 export async function usableOfferCount(adapter: string | null = null): Promise<number> {
   await ensureOfferTables()
   const r = adapter
-    ? await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL AND adapter_slug = ${adapter}`
-    : await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL`
+    ? await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL AND adapter_slug = ${adapter}`
+    : await sql`SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL`
   return num(r.rows[0]?.n)
+}
+
+/**
+ * The count of usable offers the epoch runner puts in the models' tools list,
+ * or null when the visitor note is not to be added: while Tinker training is
+ * off for the models (`trainOn` false), while offers are off for the models
+ * (then the database is not read at all), or when the count cannot be read.
+ * This is the one gate of that note.
+ */
+export async function offersCountForPrompt(trainOn: boolean): Promise<number | null> {
+  if (!trainOn || !visitorOffersStatus({ models: true }).enabled) return null
+  return usableOfferCount().catch(() => null)
 }
 
 export interface NewOffer {
@@ -168,8 +188,8 @@ export async function readOffersForRun(asked: TinkerOffersRequest, salt: string,
   await ensureOfferTables()
   const adapter = asked.visitor_offers.adapter
   const found = adapter
-    ? await sql`SELECT id, day FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL AND adapter_slug = ${adapter}`
-    : await sql`SELECT id, day FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL`
+    ? await sql`SELECT id, day FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL AND adapter_slug = ${adapter}`
+    : await sql`SELECT id, day FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL`
   const candidates = asRows(found.rows)
     .map(r => ({ id: String(r.id), day: String(r.day), key: offerOrderKey(salt, String(r.id)) }))
     .sort((a, b) => (a.key < b.key ? -1 : a.key > b.key ? 1 : 0))
@@ -178,7 +198,7 @@ export async function readOffersForRun(asked: TinkerOffersRequest, salt: string,
 
   const claimed = await sql`
     UPDATE visitor_offers SET used_in = used_in || to_jsonb(${claim}::text)
-    WHERE id::text = ANY(string_to_array(${chosen.join(',')}, ',')) AND status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL
+    WHERE id::text = ANY(string_to_array(${chosen.join(',')}, ',')) AND status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL
     RETURNING id, day, messages
   `
   const order = new Map(chosen.map((id, i) => [id, i]))
@@ -235,7 +255,7 @@ export async function offersCounts(now: Date = new Date(), opts: { createTables?
   if (opts.createTables !== false) await ensureOfferTables()
   const r = await sql`
     SELECT
-      COUNT(*) FILTER (WHERE status = 'stored') AS stored,
+      COUNT(*) FILTER (WHERE status = 'stored' AND expires_at > NOW()) AS stored,
       COUNT(*) FILTER (WHERE day = ${utcDay(now)}) AS offered_today,
       COUNT(*) FILTER (WHERE used_in <> '[]'::jsonb) AS trained_on,
       COUNT(*) FILTER (WHERE status = 'withdrawn') AS taken_back,
@@ -265,10 +285,30 @@ export async function pruneOffers(now: Date = new Date()): Promise<number> {
     `
     // The day caps are needed for today only; yesterday's is kept for a day as the rate rows are.
     await sql`DELETE FROM visitor_offer_caps WHERE day < ${utcDay(new Date(now.getTime() - 2 * 86_400_000))}`
+    await vacuumOffers()
     return r.rows.length
   } catch {
     console.warn('[visitor-offers] could not expire old offers')
     return 0
+  }
+}
+
+/**
+ * Setting the text to NULL leaves the old row version, text included, in the
+ * table's file until Postgres vacuums it, and on a small table autovacuum can
+ * wait a long time (50 dead rows plus a fifth of the table). So the hourly
+ * prune vacuums the table itself: text taken back, deleted or expired is out
+ * of the table file within the hour. The database's own history (write ahead
+ * log, point in time restore) is not touched by this. Never throws: a
+ * database that refuses the statement is logged with a fixed line.
+ */
+export async function vacuumOffers(): Promise<boolean> {
+  try {
+    await sql`VACUUM visitor_offers`
+    return true
+  } catch {
+    console.warn('[visitor-offers] could not vacuum the offers table; deleted text stays in its file until the database vacuums it')
+    return false
   }
 }
 
@@ -304,7 +344,7 @@ export async function ownerReadOffers(opts: { limit: number; beforeDay: string |
     UPDATE visitor_offers SET read_at = COALESCE(read_at, NOW())
     WHERE id IN (
       SELECT id FROM visitor_offers
-      WHERE messages IS NOT NULL AND (${before} = '' OR day < ${before})
+      WHERE messages IS NOT NULL AND expires_at > NOW() AND (${before} = '' OR day < ${before})
       ORDER BY day DESC, id DESC
       LIMIT ${opts.limit}
     )

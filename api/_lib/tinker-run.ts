@@ -133,11 +133,9 @@ async function completeRun(row: TinkerRunRow, poll: Extract<TinkerPoll, { state:
   // held out prompts are visitor text, and samples reach the public record
   // (spec 2.7). The job asked for none; any that came back are dropped here.
   const visitors = fromVisitorOffers(row)
-  // Nor does it keep the runner's own words about a failure: an exception
-  // message could quote an input message, and the reason is public.
-  const result: TinkerRunResult = visitors
-    ? { ...answered, samples: [], ...(answered.status !== 'ok' && answered.reason ? { reason: VISITOR_RUN_FAILED } : {}) }
-    : answered
+  // Nor does it keep the runner's own words: an exception message could
+  // quote an input message, and these fields are public (visitorRunResult).
+  const result: TinkerRunResult = visitors ? visitorRunResult(answered) : answered
   // Usage is known when the runner answered in its own words (ok, refused, error).
   const usageKnown = poll.state === 'done' && result.status !== 'failed'
   const costUsd = usageKnown ? tinkerCostUsd(row.base_model, result.tokens) : row.reserved_usd
@@ -359,6 +357,34 @@ export async function runTinkerTrain(
 
 /** The public reason of a failed run on visitor conversations: a fixed sentence, never the runner's own words. */
 export const VISITOR_RUN_FAILED = 'the runner failed; its message is not shown for runs on visitor conversations'
+/** What stands in for the runner's note on an early stop, and for its export error, on such a run, when the text is not one the runner is known to write. */
+export const VISITOR_RUN_STOPPED = 'it stopped before its last step; the runner\'s note is not shown for runs on visitor conversations'
+export const VISITOR_EXPORT_FAILED = 'the weights were not exported; the runner\'s message is not shown for runs on visitor conversations'
+
+/** The stage names the runner writes (modal/tinker_jobs.py). */
+const RUNNER_STAGES = ['input', 'client', 'tokens', 'budget', 'baseline', 'train', 'measure', 'save', 'export', 'sample']
+/** The sentences the runner writes when it stops a job early: its own limits, with numbers only. */
+const RUNNER_STOPS = [/^the step limit of \d+$/, /^the time limit of \d+ s for training$/, /^the budget: one more step would pass the \$\d+(?:\.\d+)? set aside$/]
+
+/**
+ * A runner's answer for a run on conversations visitors offered, with every
+ * free text field of the runner held to what the lab knows it writes: no
+ * samples (the held out prompts are visitor text), a fixed reason for a
+ * failure, a fixed sentence for an export error, the early stop note only
+ * when it is one of the runner's own limit sentences, and the stage only
+ * when it is one of the runner's stage names. Numbers pass through.
+ */
+export function visitorRunResult(answered: TinkerRunResult): TinkerRunResult {
+  const { export_error: exportError, ...rest } = answered
+  return {
+    ...rest,
+    samples: [],
+    stage: rest.stage && RUNNER_STAGES.includes(rest.stage) ? rest.stage : null,
+    stopped_early: rest.stopped_early ? (RUNNER_STOPS.some(p => p.test(rest.stopped_early as string)) ? rest.stopped_early : VISITOR_RUN_STOPPED) : null,
+    ...(rest.status !== 'ok' && rest.reason ? { reason: VISITOR_RUN_FAILED } : {}),
+    ...(exportError ? { export_error: VISITOR_EXPORT_FAILED } : {}),
+  }
+}
 
 /** A run still marked as going this long after it was opened is given up as lost. */
 export const TINKER_LOST_AFTER_MS = (TINKER_RUN_TIMEOUT_S + 900) * 1000

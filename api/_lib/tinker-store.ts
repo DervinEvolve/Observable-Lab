@@ -753,8 +753,10 @@ export interface TutorSkillMap {
   seen_only: boolean
   /** The overall change from before to after is smaller than one pass band. */
   within_noise: boolean
-  /** Many untrained answers were cut off by the token limit or empty, or fewer were after training: a gain may be shorter answers. */
+  /** Many untrained answers were cut off by the token limit or came back empty: a gain may be shorter answers. */
   cut_short: boolean
+  /** Fewer answers were cut off or empty after training than before, whether or not there were many: part of a gain may be shorter answers. */
+  cut_off_fell: boolean
 }
 
 const count = (v: unknown) => (typeof v === 'number' && Number.isInteger(v) && v >= 0 ? v : null)
@@ -799,7 +801,8 @@ export function readTutorSkillMap(result: Record<string, unknown>): TutorSkillMa
     rows,
     seen_only: flags.seen_only === true,
     within_noise: flags.within_noise === true,
-    cut_short: flags.cut_short_before === true || flags.cut_off_fell === true,
+    cut_short: flags.cut_short_before === true,
+    cut_off_fell: flags.cut_off_fell === true,
   }
 }
 

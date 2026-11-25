@@ -23,7 +23,7 @@ import {
   TUTOR_ANSWER_TOKENS, TUTOR_GUIDING_TURNS, TUTOR_HELD_BACK, TUTOR_NAME_MAX, TUTOR_PRACTICE, TUTOR_ROUNDS, TUTOR_SUBSKILLS, TUTOR_TOPIC_MAX,
   tinkerTutorNote, tutorTeacherModelSetting, tutorTeacherUsd,
 } from './tinker-tutor.js'
-import { visitorOffersNote } from './visitor-offers.js'
+import { OFFERS_MAX_SYSTEM_BYTES, OFFERS_RUN_LIMIT, visitorOffersNote, visitorOffersStatus } from './visitor-offers.js'
 import { DATASETS_DEFAULT_ROWS, DATASETS_MAX_SYSTEM_BYTES, datasetRunCeiling, datasetsNote, type TinkerDatasetRequest } from './datasets.js'
 import { MAX_PARTS, MAX_TRIANGLES, FIXED_TRIANGLES, TUBE_RADIAL_SEGMENTS, MATERIALS, PLACEMENTS, SHAPES } from './exhibits.js'
 
@@ -104,7 +104,7 @@ export function toolLines(config: ToolConfig = toolConfig(), extras: ToolLineExt
     })}`)
     // Conversations visitors offered, as a source of examples: only while
     // offers are on for the models (the runner reads the count and passes it).
-    if (typeof extras.visitorOffers === 'number') lines.push(`- ${visitorOffersNote({ total: extras.visitorOffers })}`)
+    if (typeof extras.visitorOffers === 'number') lines.push(`- ${visitorOffersNote({ total: extras.visitorOffers, datasets: on('datasets') })}`)
   }
   if (on('tinker_rl')) {
     // What it does and where its limits are, nothing about which tasks or what to reward.
@@ -200,6 +200,10 @@ At most ${MAX_TRIANGLES} triangles in all, counted per copy as: ${tri}, tube ${T
   }
   if (on('tinker_train') && on('datasets')) {
     text += `\nIn place of "examples", a Tinker training request may name a dataset that is already on the lab's shelf: "dataset": { "repo": "org/name" or "org/name@<commit>", "file": "the path of one data file (needed when the dataset holds more than one file with rows)", "user_column": "the column for the user turn", "assistant_column": "the column for the assistant turn", "system": "text of yours put before every row as a system message, at most ${DATASETS_MAX_SYSTEM_BYTES} bytes (optional)", "limit": ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} rows (optional, ${DATASETS_DEFAULT_ROWS} when left out) }. Give "examples" or "dataset", never both; the other fields are the same. The dataset must have been fetched in an earlier epoch or asked for in this same answer; one that is not on the shelf refuses the run, with the reason stored. The files, rows and column names of a fetched dataset are in the stored record of its fetch.`
+  }
+  if (on('tinker_train') && visitorOffersStatus({ models: true }).enabled) {
+    // Only while offers are on for the models: otherwise "exactly the fields shown" above would be untrue for a field that is accepted.
+    text += `\nIn place of "examples", a Tinker training request may name conversations visitors offered to the lab: "visitor_offers": { "adapter": "an adapter id (optional)", "limit": ${OFFERS_RUN_LIMIT.min} to ${OFFERS_RUN_LIMIT.max} (optional, ${OFFERS_RUN_LIMIT.fallback} when left out), "system": "text of yours put before every conversation as a system message, at most ${OFFERS_MAX_SYSTEM_BYTES} bytes (optional)" }. A request gives one source of examples only.`
   }
   if (on('tinker_rl')) {
     text += `\nA Tinker RL request takes exactly the fields shown: any other field, a value out of range, a malformed task or rule, or a rule that reads "expected" or "data.<name>" from a task that has none refuses the whole request. Rule fields: ${RULE_FIELDS}. A task's prompt is shown to the model as one user message. Settings left out get rank 16, learning_rate ${RL_LEARNING_RATE.fallback}, group_size ${RL_GROUP_SIZE.fallback}, steps ${RL_STEPS.fallback}, tasks_per_step ${RL_TASKS_PER_STEP.fallback}, max_completion_tokens ${RL_COMPLETION_TOKENS.fallback} and loss ${RL_LOSSES[0]}. An epoch has one Tinker run, so this and tinker_train cannot both be asked for. Nothing runs without the Reviewer's approval.`

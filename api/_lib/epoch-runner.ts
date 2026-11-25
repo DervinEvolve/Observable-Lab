@@ -48,8 +48,8 @@ import { prepareExhibit } from './exhibits.js'
 import { adaptersContext, keepReviewFacts } from './tinker-keep.js'
 import { tinkerTutorReviewFacts } from './tinker-tutor.js'
 import { teacherModelFor } from './tinker-tutor-run.js'
-import { visitorOffersReviewFacts, visitorOffersStatus, type TinkerOffersRequest } from './visitor-offers.js'
-import { usableOfferCount } from './visitor-offers-store.js'
+import { visitorOffersReviewFacts, type TinkerOffersRequest } from './visitor-offers.js'
+import { offersCountForPrompt, usableOfferCount } from './visitor-offers-store.js'
 import { tinkerRunUsd } from './tinker.js'
 import {
   alreadyRan, recentToolContext, recordIgnored, runSideTools,
@@ -343,7 +343,7 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
   // Read from the table, like the adapters below; if it cannot be read the
   // note is left out.
   const trainOn = (() => { const c = toolConfig().tinker_train; return c.enabled && c.per_day > 0 })()
-  const visitorOffers = trainOn && visitorOffersStatus({ models: true }).enabled ? await usableOfferCount().catch(() => null) : null
+  const visitorOffers = await offersCountForPrompt(trainOn)
   let sharedContext = getSharedContext(epochNumber, specBefore, recentEpochs, undefined, visitorOffers === null ? {} : { visitorOffers })
 
   // The lab notebook — durable memory across epochs and role rotations.

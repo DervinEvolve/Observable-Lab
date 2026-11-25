@@ -80,6 +80,16 @@ export const TRAINED_CHAT_MAX_TURNS = 8
 /** Tokens in one reply, and the characters of it that are returned. */
 export const TRAINED_CHAT_MAX_TOKENS = 200
 export const TRAINED_CHAT_MAX_REPLY_CHARS = 1200
+
+/**
+ * The first `max` characters of a text, never ending in half a character: a
+ * cut in the middle of an emoji would leave a lone surrogate, which a
+ * database refuses to store as JSON.
+ */
+export function cutWhole(text: string, max: number): string {
+  const cut = text.slice(0, max)
+  return /[\ud800-\udbff]$/.test(cut) ? cut.slice(0, -1) : cut
+}
 export const TRAINED_CHAT_TEMPERATURE = 0.7
 /** Messages one visitor (an address and a browser string) may send: in a ten minute window, and in a UTC day. */
 export const TRAINED_CHAT_PER_WINDOW = 10
@@ -460,7 +470,7 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
   if (untrained) await record(untrained, untrainedCost, { model: base, status: k => `base_${k}`, chars: chat.baseChars })
 
   const cleaned = (answer: Extract<TinkerChatResult, { ok: true }>) => ({
-    reply: sanitizeOutput(answer.content).trim().slice(0, TRAINED_CHAT_MAX_REPLY_CHARS) || '(the model gave an empty reply)',
+    reply: cutWhole(sanitizeOutput(answer.content).trim(), TRAINED_CHAT_MAX_REPLY_CHARS) || '(the model gave an empty reply)',
     cut_short: answer.finishReason === 'length',
   })
   const turnsLeft = Math.max(0, TRAINED_CHAT_MAX_TURNS - chat.turns)

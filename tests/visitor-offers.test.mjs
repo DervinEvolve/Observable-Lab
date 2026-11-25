@@ -72,8 +72,13 @@ class OfferDb extends FakeDb {
     return id
   }
 
+  /** Stored and not past its expires_at (NOW() in the statements). */
+  live(o) {
+    return o.status === 'stored' && Date.parse(o.expires_at) > Date.now()
+  }
+
   usable(adapter) {
-    return this.offers.filter(o => o.status === 'stored' && !o.adapter_from_visitors && o.messages !== null && (adapter === undefined || o.adapter_slug === adapter))
+    return this.offers.filter(o => this.live(o) && !o.adapter_from_visitors && o.messages !== null && (adapter === undefined || o.adapter_slug === adapter))
   }
 
   handle(text, v) {
@@ -95,10 +100,11 @@ class OfferDb extends FakeDb {
       return { rows: [] }
     }
     const ids = csv => new Set(String(csv).split(','))
-    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored'") return { rows: [{ n: String(this.offers.filter(o => o.status === 'stored').length) }] }
-    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_slug = ?") return { rows: [{ n: String(this.offers.filter(o => o.status === 'stored' && o.adapter_slug === v[0]).length) }] }
-    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL") return { rows: [{ n: String(this.usable().length) }] }
-    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL AND adapter_slug = ?") return { rows: [{ n: String(this.usable(v[0]).length) }] }
+    if (text === 'VACUUM visitor_offers') { this.vacuums = (this.vacuums ?? 0) + 1; if (this.failVacuum) throw new Error('VACUUM cannot run here'); return { rows: [] } }
+    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW()") return { rows: [{ n: String(this.offers.filter(o => this.live(o)).length) }] }
+    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_slug = ?") return { rows: [{ n: String(this.offers.filter(o => this.live(o) && o.adapter_slug === v[0]).length) }] }
+    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL") return { rows: [{ n: String(this.usable().length) }] }
+    if (text === "SELECT COUNT(*) AS n FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL AND adapter_slug = ?") return { rows: [{ n: String(this.usable(v[0]).length) }] }
     if (text.startsWith('INSERT INTO visitor_offers (day, adapter_slug, base_model, messages, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at) VALUES')) {
       this.offerInserts.push({ text, values: v })
       const [day, adapter_slug, base_model, messages, transcript_sha256, code_sha256, status, screen_v, first_user_sha256, adapter_from_visitors, expires_at] = v
@@ -118,10 +124,10 @@ class OfferDb extends FakeDb {
       if (o.status === 'stored') o.status = 'withdrawn'
       return { rows: [{ used_in: [...o.used_in] }] }
     }
-    if (text.startsWith("SELECT id, day FROM visitor_offers WHERE status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL")) {
+    if (text.startsWith("SELECT id, day FROM visitor_offers WHERE status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL")) {
       return { rows: this.usable(text.endsWith('adapter_slug = ?') ? v[0] : undefined).map(o => ({ id: o.id, day: o.day })) }
     }
-    if (text.startsWith("UPDATE visitor_offers SET used_in = used_in || to_jsonb(?::text) WHERE id::text = ANY(string_to_array(?, ',')) AND status = 'stored' AND adapter_from_visitors = FALSE AND messages IS NOT NULL RETURNING id, day, messages")) {
+    if (text.startsWith("UPDATE visitor_offers SET used_in = used_in || to_jsonb(?::text) WHERE id::text = ANY(string_to_array(?, ',')) AND status = 'stored' AND expires_at > NOW() AND adapter_from_visitors = FALSE AND messages IS NOT NULL RETURNING id, day, messages")) {
       const want = ids(v[1])
       const rows = []
       for (const o of this.usable()) {
@@ -144,9 +150,9 @@ class OfferDb extends FakeDb {
       for (const o of this.offers) if (o.used_in.includes(v[2])) o.used_in = [...o.used_in.filter(x => x !== v[0]), v[1]]
       return { rows: [] }
     }
-    if (text.startsWith('SELECT COUNT(*) FILTER')) {
+    if (text.startsWith("SELECT COUNT(*) FILTER (WHERE status = 'stored' AND expires_at > NOW()) AS stored")) {
       return { rows: [{
-        stored: this.offers.filter(o => o.status === 'stored').length, offered_today: this.offers.filter(o => o.day === v[0]).length,
+        stored: this.offers.filter(o => this.live(o)).length, offered_today: this.offers.filter(o => o.day === v[0]).length,
         trained_on: this.offers.filter(o => o.used_in.length).length, taken_back: this.offers.filter(o => o.status === 'withdrawn').length,
         read_by_owner: this.offers.filter(o => o.read_at).length,
       }] }
@@ -156,9 +162,9 @@ class OfferDb extends FakeDb {
       for (const o of this.offers) if (o.status === 'stored' && new Date(o.expires_at) < new Date(v[0])) { o.messages = null; o.status = 'expired'; forget(o); rows.push({ id: o.id }) }
       return { rows }
     }
-    if (text.startsWith('UPDATE visitor_offers SET read_at = COALESCE(read_at, NOW()) WHERE id IN ( SELECT id FROM visitor_offers WHERE messages IS NOT NULL')) {
+    if (text.startsWith('UPDATE visitor_offers SET read_at = COALESCE(read_at, NOW()) WHERE id IN ( SELECT id FROM visitor_offers WHERE messages IS NOT NULL AND expires_at > NOW() AND')) {
       const [before, , limit] = v
-      const pick = this.offers.filter(o => o.messages !== null && (before === '' || o.day < before))
+      const pick = this.offers.filter(o => o.messages !== null && Date.parse(o.expires_at) > Date.now() && (before === '' || o.day < before))
         .sort((a, b) => (a.day === b.day ? (a.id < b.id ? 1 : -1) : a.day < b.day ? 1 : -1)).slice(0, limit)
       for (const o of pick) o.read_at ??= new Date().toISOString()
       return { rows: pick.map(o => ({ ...o })) }
@@ -1004,4 +1010,217 @@ test('take back codes: 12 characters of Crockford base32, read leniently, hashed
   assert.equal(offers.readOfferCode('ABCD-EFGH-JKMU'), null)
   assert.equal(offers.readOfferCode('ABCD-EFGH'), null)
   assert.equal(offers.codeSha256('ABCDEFGHJKMN').length, 64)
+})
+
+// ---------------------------------------------------------------------------
+// The second review
+// ---------------------------------------------------------------------------
+
+test('the screening leaves ordinary lists of numbers, sums, dates, versions and lines of code alone', () => {
+  const pair = (user, reply) => offers.screenOffer([{ role: 'user', content: user }, { role: 'assistant', content: reply }])
+  // Each of these was refused as a phone number, a link or a user name by the wider patterns.
+  const harmless = [
+    ['Give me four key dates in English history please', 'Key dates: 1066, 1215, 1492, 1776.'],
+    ['Just the year ranges of the two world wars please', '1914-1918, 1939-1945.'],
+    ['Just the three coffee prices in a row please', '$2.50, $3.25, $3.95'],
+    ['What does a small house cost in that town', 'About $1,250,000.00 for a small house there.'],
+    ['Give me three bus times for the evening please', '18:05, 18:35, 19:05'],
+    ['What was the score of that long tennis final', 'It went 6-4, 3-6, 7-6, 4-6, 6-3.'],
+    ['Can you count from one to ten in digits for me', '1 2 3 4 5 6 7 8 9 10'],
+    ['What are the first Fibonacci numbers in the sequence', '1, 1, 2, 3, 5, 8, 13, 21, 34'],
+    ['What is seven times each of the numbers one to five', '7, 14, 21, 28, 35'],
+    ['Can you add 123 and 456 for me and show it', '123 + 456 = 579'],
+    ['What is pi to eight decimal places please', 'Pi is about 3.14159265.'],
+    ['How fast does light travel in a vacuum exactly', 'Light travels at 299,792,458 metres per second.'],
+    ['How many people live on the planet now roughly', 'Roughly 8,200,000,000 people.'],
+    ['When exactly is the next solstice in UTC time', 'It is at 2026-12-21 20:50 UTC.'],
+    ['Which Chrome build is the stable one this week', 'Chrome 131.0.6778.86 is the stable build.'],
+    ['How do I write a list of numbers in JavaScript', 'const xs = [1, 2, 3, 4, 5, 6, 7, 8, 9]'],
+    ['And the same warm orange at half opacity please', 'Use rgba(255, 140, 0, 0.5).'],
+    ['Where is London on the map in coordinates', 'London is at about 51.5074, -0.1278.'],
+    ['Roll a six sided die ten times for me please', '4 2 6 1 3 5 2 6 1 4'],
+    ['How do I get the last item of an array in JavaScript', 'Use array.at(-1) to get the last item.'],
+    ['How do I log a message in Python with the logging module', 'Call logging.info("started") after basicConfig.'],
+    ['How do I find where an element is on the page', 'Read rect.top and rect.left from getBoundingClientRect().'],
+    ['How do I read a line from the keyboard in Java', 'Use new Scanner(System.in) and call nextLine().'],
+    ['Which import do I need for files in Java', 'You need import java.io.File at the top.'],
+    ['Which files does a small C++ project usually have', 'Usually main.cc, util.cc and a Makefile.'],
+    ['How do I run a Perl script from the shell', 'Type perl script.pl in the shell.'],
+    ['Is it fine to water tomatoes every day in summer', 'Yes.It is fine in hot weather.No need to worry.'],
+    ['How do I check a value is true in a chai test', 'Write expect(value).to.be.true in the test.'],
+    ['How do I make a method that needs no instance in Python', 'Put @staticmethod on the line above the def.'],
+    ['What does the Override annotation do in Java', 'Writing @Override makes the compiler check the method.'],
+    ['How do I change styles for small screens in CSS', 'Use @media (max-width: 600px) { ... }.'],
+    // and these passed before and still do
+    ['How long did the two world wars last, with the years?', 'The first ran 1914-1918 and the second 1939-1945.'],
+    ['What is the date of the next solstice this year', 'The solstice is on 2026-12-21.'],
+    ['Which Python and Node versions are current now', 'Python 3.13.1 and Node 22.11.0 are current.'],
+    ['What does the at sign mean in an email address', 'The @ sign separates the name from the host.'],
+  ]
+  for (const [user, reply] of harmless) assert.deepEqual(pair(user, reply), { ok: true }, reply)
+})
+
+test('the screening also finds addresses, numbers, links and names written around the first patterns', () => {
+  const one = text => offers.screenOffer([{ role: 'user', content: `My friend said to pass this on to you today: ${text} and that is all` }, { role: 'assistant', content: 'Thanks for telling me, I will keep that in mind while we talk about the garden.' }])
+  const cases = {
+    email: ['john at example dot com', 'john(at)example(dot)com', 'john [at] example [dot] org', 'john{at}example.org', 'иван@почта.рф',
+      // characters that print nothing and are not format characters: a variation selector, a combining grapheme joiner, a Hangul filler
+      'john@example️.org', 'john@example͏.org', 'john@exampleㅤ.org'],
+    number: ['ring 555    123    4567', 'ring 555 -- 123 -- 4567', 'ring ٠٥٥٥١٢٣٤٥٦٧', 'ring ९८७६५४३२१०',
+      'ring 555️123️4567', 'ring 0171 2345678', 'ring 06 12 34 56 78', 'ring 090-1234-5678', 'ring 555.123.4567', 'the address 192.168.100.200 is mine'],
+    link: ['t.me/johnsmith', 'x.com/johnsmith', 'linktr.ee/john', 'see example dot com', 'see example[.]com', 'see example。com', 'see john.github.io', 'it runs at 10.0.0.5:8080'],
+    handle: ['me.@johnsmith', '@@johnsmith', 'I am @ジョン there', 'find u/johnsmith there'],
+  }
+  for (const [reason, list] of Object.entries(cases)) {
+    for (const text of list) assert.deepEqual(one(text), { ok: false, reason }, text)
+  }
+  assert.equal(offers.OFFER_SCREEN_VERSION, 2, 'the patterns changed, so offers carry a new screening version')
+  // The helpers on their own.
+  assert.equal(offers.screenText('５５５ ٥٥٥ a​b️'), '555 555 ab')
+  assert.equal(offers.hasLongNumber('3.14159265'), false)
+  assert.equal(offers.hasLongNumber('1 2 3 4 5 6 7 8 9 10'), false)
+  assert.equal(offers.hasLongNumber('555 123 4567'), true)
+})
+
+test('an offer past its expires_at is not counted, read, claimed or returned, even before the hourly prune has run', async () => {
+  enableChat({ LAB_OPERATOR_SECRET: OPERATOR })
+  for (let i = 0; i < 14; i++) lab.seedOffer({ day: `2026-11-${String(10 + (i % 7)).padStart(2, '0')}` })
+  assert.equal(await offerStore.storedOfferCount(), 14)
+  assert.equal(await offerStore.usableOfferCount(), 14)
+  // The kept days ran out three days ago and no tick has pruned yet.
+  for (const o of lab.offers) o.expires_at = new Date(Date.now() - 3 * 86_400_000).toISOString()
+  assert.equal(await offerStore.storedOfferCount(), 0)
+  assert.equal(await offerStore.storedOfferCount(SLUG), 0)
+  assert.equal(await offerStore.usableOfferCount(), 0)
+  assert.equal((await offerStore.offersCounts()).stored, 0)
+  const run = await offerStore.readOffersForRun({ purpose: 'p', base_model: BASE, settings: tinker.readSettings({}).settings, visitor_offers: { adapter: null, limit: 12 } }, 'salt', 'claim-1', [BASE])
+  assert.equal(run.ok, false)
+  assert.equal(lab.offers.every(o => o.used_in.length === 0), true, 'no expired text was claimed')
+  const read = await owner({ action: 'read', limit: 50 })
+  assert.equal(read.code, 200)
+  assert.deepEqual(read.body.offers, [])
+  assert.equal(lab.offers.every(o => o.read_at === null), true)
+  // every statement that reads or counts carries the condition
+  const source = readFileSync(join(root, 'api/_lib/visitor-offers-store.ts'), 'utf8')
+  assert.equal(source.match(/expires_at > NOW\(\)/g).length, 9)
+  // the prune then expires them
+  assert.equal(await offerStore.pruneOffers(), 14)
+})
+
+test('the hourly prune vacuums the offers table, so deleted text leaves the table file, and a database that refuses does not stop it', async () => {
+  lab.seedOffer({})
+  lab.offers[0].expires_at = '2026-01-01T00:00:00.000Z'
+  assert.equal(await offerStore.pruneOffers(new Date('2026-06-01T00:00:00Z')), 1)
+  assert.equal(lab.vacuums, 1)
+  assert.equal(lab.statements.at(-1).text, 'VACUUM visitor_offers')
+  lab.failVacuum = true
+  lab.seedOffer({})
+  lab.offers[1].expires_at = '2026-01-01T00:00:00.000Z'
+  logs = []
+  assert.equal(await offerStore.pruneOffers(new Date('2026-06-01T00:00:00Z')), 1, 'the expiry is still reported')
+  assert.equal(await offerStore.vacuumOffers(), false)
+  assert.ok(logs.some(l => l === '[visitor-offers] could not vacuum the offers table; deleted text stays in its file until the database vacuums it'), logs.join(' | '))
+})
+
+test('a table made before the size columns were dropped loses them when the tables are made ready', () => {
+  const source = readFileSync(join(root, 'api/_lib/visitor-offers-store.ts'), 'utf8')
+  const ensure = source.slice(source.indexOf('export function ensureOfferTables'), source.indexOf('const num ='))
+  assert.match(ensure, /ALTER TABLE visitor_offers DROP COLUMN IF EXISTS turns/)
+  assert.match(ensure, /ALTER TABLE visitor_offers DROP COLUMN IF EXISTS chars/)
+  assert.ok(ensure.indexOf('CREATE TABLE IF NOT EXISTS visitor_offers') < ensure.indexOf('DROP COLUMN IF EXISTS turns'))
+})
+
+test('a reply cut at its limit never ends in half a character, and broken text is refused before anything is counted', async () => {
+  assert.equal(trainedChat.cutWhole(`${'a'.repeat(1199)}\u{1F600}`, 1200), 'a'.repeat(1199))
+  assert.equal(trainedChat.cutWhole(`${'a'.repeat(1198)}\u{1F600}`, 1200), `${'a'.repeat(1198)}\u{1F600}`)
+  assert.equal(trainedChat.cutWhole('short', 1200), 'short')
+  enableChat()
+  lab.addAdapter({ slug: SLUG })
+  // The model's reply is 1199 letters and then an emoji: the cut at 1200 characters falls inside the emoji.
+  const words = Array.from({ length: 240 }, (_, i) => `w${String(i).padStart(3, '0')}`).join(' ')
+  const long = `${words.slice(0, 1199)}\u{1F600} and more text after it`
+  globalThis.fetch = fakeTinker([], () => completion({ content: long }))
+  const talk = await converse(SLUG, ['Tell me a long story about marmalade and oranges please'])
+  const reply = talk.answers[0].reply
+  assert.equal(reply.length, 1199)
+  assert.equal(/[\ud800-\udbff]$/.test(reply), false, 'no lone surrogate at the end')
+  assert.ok(talk.receipt)
+  const stored = await offer({ adapter: SLUG, messages: talk.messages, receipt: talk.receipt })
+  assert.equal(stored.code, 201, JSON.stringify(stored.body))
+  // A conversation with half a character in it (as an older reply could have) is refused as a bad request, and nothing is counted.
+  const broken = [{ role: 'user', content: 'Tell me about growing tomatoes on a balcony' }, { role: 'assistant', content: `Tomatoes like sun and a deep pot\ud83d` }]
+  const counted = JSON.stringify([...lab.rate.entries()])
+  const caps = JSON.stringify([...(lab.caps ?? new Map()).entries()])
+  const res = await offer({ adapter: SLUG, messages: broken, receipt: offers.issueReceipt(SLUG, broken) }, { ip: freshIp() })
+  assert.equal(res.code, 400)
+  assert.deepEqual(res.body, { error: 'invalid_request', message: 'This conversation has broken text in it and cannot be offered.' })
+  assert.equal(JSON.stringify([...lab.rate.entries()]), counted)
+  assert.equal(JSON.stringify([...(lab.caps ?? new Map()).entries()]), caps)
+})
+
+test('a receipt key needs a secret of full length, as the bearer check does', () => {
+  enableChat()
+  delete process.env.CRON_SECRET
+  for (const short of ['abc', 'x'.repeat(31)]) {
+    process.env.LAB_OPERATOR_SECRET = short
+    assert.equal(offers.issueReceipt(SLUG, convo('s')), null, `a ${short.length} character secret makes no receipt`)
+    assert.deepEqual(offers.visitorOffersStatus(), { enabled: false, off_reason: 'neither LAB_OPERATOR_SECRET nor CRON_SECRET is set with at least 32 characters, so no receipt can be issued' })
+  }
+  process.env.LAB_OPERATOR_SECRET = 'x'.repeat(32)
+  assert.equal(offers.visitorOffersStatus().enabled, true)
+  // a short operator secret does not hide a usable scheduler secret
+  process.env.LAB_OPERATOR_SECRET = 'abc'
+  process.env.CRON_SECRET = CRON
+  assert.equal(offers.visitorOffersStatus().enabled, true)
+  assert.equal(offers.RECEIPT_SECRET_MIN_CHARS, 32)
+})
+
+test('the visitor note reaches the models through one gate, which is shut while offers or training are off', async () => {
+  for (let i = 0; i < 3; i++) lab.seedOffer({})
+  enableChat()
+  // offers on for visitors, Tinker training off for the models: no count, and the database is not read
+  let before = lab.statements.length
+  assert.equal(await offerStore.offersCountForPrompt(true), null)
+  assert.equal(lab.statements.length, before)
+  Object.assign(process.env, { LAB_ENABLE_TINKER: 'true', TINKER_JOBS_START_URL: 'https://lab--oblab-tinker-start.modal.example/', TINKER_JOBS_STATUS_URL: 'https://lab--oblab-tinker-status.modal.example/', TINKER_JOBS_TOKEN: 'test-only-tinker-jobs-token-000000000000' })
+  assert.equal(offers.visitorOffersStatus({ models: true }).enabled, true, offers.visitorOffersStatus({ models: true }).off_reason)
+  assert.equal(await offerStore.offersCountForPrompt(true), 3)
+  assert.equal(await offerStore.offersCountForPrompt(false), null, 'the training tool is off or at 0 a day')
+  process.env.LAB_ENABLE_VISITOR_OFFERS = 'false'
+  before = lab.statements.length
+  assert.equal(await offerStore.offersCountForPrompt(true), null)
+  assert.equal(lab.statements.length, before, 'switched off: the offers table is not read')
+  delete process.env.LAB_ENABLE_VISITOR_OFFERS
+  lab.failOffers = true
+  assert.equal(await offerStore.offersCountForPrompt(true), null, 'a count that cannot be read leaves the note out')
+  // the epoch runner asks this function and nothing else
+  const runner = readFileSync(join(root, 'api/_lib/epoch-runner.ts'), 'utf8')
+  assert.match(runner, /const visitorOffers = await offersCountForPrompt\(trainOn\)\n/)
+  assert.equal(runner.match(/usableOfferCount\(/g).length, 1, 'the only other read is the Reviewer fact for a request that names offers')
+  assert.doesNotMatch(runner, /visitorOffersStatus/)
+})
+
+test('the note and the Reviewer facts say what the checks are and that they can miss, and name "dataset" only while datasets are on', () => {
+  const said = /automatic pattern checks refused conversations with an email address, a phone number, a long number, a user name or a link written in a usual form; the checks can miss some and cannot find names or street addresses\./
+  const note = offers.visitorOffersNote({ total: 4 })
+  assert.match(note, said)
+  assert.doesNotMatch(note, /only automatic checks were made/)
+  assert.match(note, /Give one of "examples" and "visitor_offers"\./)
+  assert.doesNotMatch(note, /"dataset"/)
+  assert.match(offers.visitorOffersNote({ total: 4, datasets: true }), /Give one of "examples", "dataset" and "visitor_offers"\./)
+  const facts = offers.visitorOffersReviewFacts({ purpose: 'p', base_model: BASE, settings: tinker.readSettings({}).settings, visitor_offers: { adapter: null, limit: 40 } }, { stored: 9, runCapUsd: 2 }).line
+  assert.match(facts, said)
+  assert.doesNotMatch(facts, /only automatic checks were made/)
+})
+
+test('every claim on the server\'s list is, word for word, part of the consent sheet the page shows', () => {
+  const sheet = readFileSync(join(root, 'src/systems/chatOffer.ts'), 'utf8')
+  const paragraphs = sheet.slice(sheet.indexOf('export const CONSENT_PARAGRAPHS'), sheet.indexOf('export const OFFER_CLAIMS'))
+  for (const { claim } of offers.OFFER_CLAIMS) {
+    const asWritten = claim.replace('{keep_days}', '${days}').replaceAll('\'', '\\\'')
+    assert.ok(paragraphs.includes(asWritten), `not a sentence of the sheet: ${claim}`)
+  }
+  // The hashes that refuse a second offer of the same conversation are bookkeeping: no sentence of the sheet is about them.
+  assert.deepEqual([...offers.OFFER_BOOKKEEPING_COLUMNS], ['id', 'transcript_sha256', 'first_user_sha256'])
+  assert.equal(offers.OFFER_CLAIMS.some(c => c.claim === offers.OFFER_MESSAGES.already_offered), false)
 })

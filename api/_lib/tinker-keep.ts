@@ -615,7 +615,9 @@ function adapterFacts(a: TrainedAdapter): string {
     ? `LAB-MEASURED held-out loss ${a.holdout_loss_before.toFixed(4)} before training, ${a.holdout_loss_after.toFixed(4)} after${a.holdout_examples ? `, on ${a.holdout_examples} held-out examples` : ''}`
     : 'no held-out score recorded'
   const kept = a.kept ? `, KEPT by ${a.kept_by ?? 'someone'}` : ''
-  return `${a.model_id}${a.name ? ` "${a.name}"` : ''}: trained in epoch ${a.epoch} by ${a.author_name} on ${a.examples} examples, base model ${a.base_model}; ${loss}; ${a.expires_at ? `alive until ${a.expires_at.slice(0, 10)}` : 'no expiry recorded'}${kept}`
+  // The consent sheet says a model trained on offered conversations is labelled as such: the models and the Reviewer read the label too.
+  const data = a.from_visitors ? `${a.examples} examples made from conversations written by visitors` : `${a.examples} examples`
+  return `${a.model_id}${a.name ? ` "${a.name}"` : ''}: trained in epoch ${a.epoch} by ${a.author_name} on ${data}, base model ${a.base_model}; ${loss}; ${a.expires_at ? `alive until ${a.expires_at.slice(0, 10)}` : 'no expiry recorded'}${kept}`
 }
 
 /**

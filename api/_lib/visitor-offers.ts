@@ -57,7 +57,7 @@ export function visitorOffersFlag(): boolean {
 /**
  * May the visitor chat answer with an adapter trained on conversations
  * visitors offered? Off unless LAB_TRAINED_CHAT_VISITOR_ADAPTERS is exactly
- * "true", like the dataset switch: nobody has read that text.
+ * "true", like the dataset switch: no model read that text and nobody reviewed it.
  */
 export function visitorAdaptersFlag(): boolean {
   return (process.env.LAB_TRAINED_CHAT_VISITOR_ADAPTERS || '').trim().toLowerCase() === 'true'
@@ -65,14 +65,23 @@ export function visitorAdaptersFlag(): boolean {
 
 /**
  * The key receipts are signed with, or null when this server has neither
- * operator secret. There is deliberately no POSTGRES_URL fallback (unlike the
+ * operator secret at its full length. There is deliberately no POSTGRES_URL fallback (unlike the
  * chat's visitor hashes): a leaked database URL must not forge receipts.
  */
 function receiptKey(): Buffer | null {
-  const secret = (process.env.LAB_OPERATOR_SECRET || '').trim() || (process.env.CRON_SECRET || '').trim()
+  const usable = (v: string | undefined) => ((v || '').trim().length >= RECEIPT_SECRET_MIN_CHARS ? (v as string).trim() : '')
+  const secret = usable(process.env.LAB_OPERATOR_SECRET) || usable(process.env.CRON_SECRET)
   if (!secret) return null
   return createHash('sha256').update(`visitor-offer|${secret}`, 'utf8').digest()
 }
+
+/**
+ * The shortest secret a receipt key is made from: the length requireBearer
+ * (auth.ts) asks of the same secrets. Every chat reply hands the visitor a
+ * receipt made with this key, so a guess of the secret can be tested against
+ * one receipt without asking the server: the secret has to be long and random.
+ */
+export const RECEIPT_SECRET_MIN_CHARS = 32
 
 /**
  * Are offers on? The switch, the visitor chat (no chat, no button), and a
@@ -86,7 +95,7 @@ export function visitorOffersStatus(opts: { models?: boolean } = {}): TinkerStat
   if (!visitorOffersFlag()) return { enabled: false, off_reason: 'LAB_ENABLE_VISITOR_OFFERS is off' }
   const chat = trainedChatStatus()
   if (!chat.enabled) return { enabled: false, off_reason: `the visitor chat is off (${chat.off_reason ?? 'unknown'})` }
-  if (!receiptKey()) return { enabled: false, off_reason: 'neither LAB_OPERATOR_SECRET nor CRON_SECRET is set, so no receipt can be issued' }
+  if (!receiptKey()) return { enabled: false, off_reason: `neither LAB_OPERATOR_SECRET nor CRON_SECRET is set with at least ${RECEIPT_SECRET_MIN_CHARS} characters, so no receipt can be issued` }
   if (opts.models) {
     const tinker = tinkerStatus()
     if (!tinker.enabled) return { enabled: false, off_reason: `Tinker training is off (${tinker.off_reason ?? 'unknown'})` }
@@ -115,7 +124,7 @@ export const OFFERS_HARD_MAX = 20_000
 export const DEFAULT_OFFERS_DAYS = 180
 export const OFFERS_DAYS = { min: 30, max: 365 } as const
 /** The version of the screening below, stored on every offer. */
-export const OFFER_SCREEN_VERSION = 1
+export const OFFER_SCREEN_VERSION = 2
 /** A training request that names offers. */
 export const OFFERS_RUN_LIMIT = { min: TINKER_MIN_EXAMPLES, max: 500, fallback: 200 } as const
 export const OFFERS_MAX_SYSTEM_BYTES = 2000
@@ -247,20 +256,91 @@ export function codeSha256(code: string): string {
 export type ScreenReason = 'email' | 'number' | 'link' | 'handle' | 'short' | 'repeat' | 'echo'
 export type ScreenResult = { ok: true } | { ok: false; reason: ScreenReason }
 
-const EMAIL = /[A-Za-z0-9._%+-]+\s?(?:@|\(at\)|\[at\])\s?[A-Za-z0-9.-]+\.[A-Za-z]{2,}/i
+/** An address written with an at sign, or with the at sign written out in brackets, in any script. */
+const EMAIL = /[\p{L}\p{N}._%+-]+\s?(?:@|\(at\)|\[at\]|\{at\})\s?[\p{L}\p{N}.-]+\.\p{L}{2,}/iu
+/** An address with both the at sign and the dot written out: "name at host dot org", "name(at)host(dot)org". */
+const EMAIL_WORDS = /[\p{L}\p{N}._%+-]+\s*(?:\(at\)|\[at\]|\{at\}|\sat\s)\s*[\p{L}\p{N}-]+\s*(?:\(dot\)|\[dot\]|\{dot\}|\sdot\s)\s*\p{L}{2,}/iu
+
 /**
- * Nine or more digits, with up to three characters that are neither letters
- * nor digits between any two: "(555) 123-4567", "555 - 123 - 4567",
- * "555/123/4567", card and id numbers. A price ("12.50") or a year does not
- * reach nine digits.
+ * A run of digit groups with only spaces, brackets, dots, slashes or hyphens
+ * (at most four in a row) between them: how one number is written out. A
+ * comma, a colon, an operator or a letter ends the run, so a list of years,
+ * prices or scores, a sum and a time are separate numbers.
  */
-const NUMBER = /(?:\d[^\p{L}\d]{0,3}){8}\d/u
+const DIGIT_RUN = /\d(?:[\s().\/-]{0,4}\d)+/g
+/** A date written as one: 2026-12-21, 21/12/2026, 21.12.26. Taken out before the digit runs are read. */
+const DATE = /\b(?:\d{4}-\d{2}-\d{2}|\d{1,2}[\/.]\d{1,2}[\/.](?:\d{4}|\d{2}))\b/g
+
+/**
+ * Nine or more digits written as one number: "(555) 123-4567",
+ * "555 - 123 - 4567", "555/123/4567", "+44 (0) 20 7946 0958", card and id
+ * numbers. Not counted: a number with a decimal point (3.14159265), a
+ * version (131.0.6778.86: dots only, with a one digit part, and not shaped
+ * like an IPv4 address), digits counted out one at a time ("1 2 3 4 5 6 7 8 9
+ * 10"), and a date. A price or a year does not reach nine digits.
+ */
+export function hasLongNumber(text: string): boolean {
+  for (const m of text.replace(DATE, ' date ').matchAll(DIGIT_RUN)) {
+    const run = m[0]
+    const groups = run.split(/\D+/)
+    if (groups.join('').length < 9) continue
+    if (/^\d+\.\d+$/.test(run)) continue
+    if (/^[\d.]+$/.test(run) && groups.some(g => g.length === 1) && !(groups.length === 4 && groups.every(g => Number(g) <= 255))) continue
+    if (groups.length >= 4 && groups.filter(g => g.length === 1).length >= groups.length - 1) continue
+    return true
+  }
+  return false
+}
+
 const LINK = /\b(?:https?:\/\/|www\.)\S+/i
-const DOMAIN = /\b[a-z0-9-]{2,}\.(?:com|org|net|edu|gov|io|ai|co|dev|app|info|biz|me|ly|gg|xyz|site|online|tech|store|blog|link|page|live|news|top|club|tv|fm|to|cc|eu|uk|de|fr|nl|be|at|ch|es|it|pt|se|no|dk|fi|pl|cz|ie|ru|ua|cn|jp|kr|in|au|nz|ca|us|mx|br|ar|za)\b/i
-/** An @ name, after anything that is not a letter, a digit, an underscore or a dot (so "twitter:@name" too, and not an email). */
-const HANDLE = /(?:^|[^\w.@])@[A-Za-z0-9_]{3,}/
-/** Characters that print nothing (zero width spaces and joiners, and other format characters): removed before screening. */
-const INVISIBLE = /\p{Cf}/gu
+/** An IPv4 address with a port: where something is served. */
+const HOST_PORT = /\b(?:\d{1,3}\.){3}\d{1,3}:\d{2,5}\b/
+/**
+ * A bare domain: a name, a dot and an ending from this list, written in lower
+ * case, with nothing that makes it part of code after it (no "(", no further
+ * ".name") and no dot or letter before it. Endings that are also everyday or
+ * code words (info, top, in, at, it, to, be, me, cc, pl and the like) are not
+ * on the list: "logging.info(", "rect.top" and "Yes.It" are not links. Such a
+ * domain is still found with a path after it (DOMAIN_PATH).
+ */
+const DOMAIN = /(?<![\p{L}\p{N}_.-])[A-Za-z0-9-]{2,}(?:\.[A-Za-z0-9-]{2,})*\.(?:com|org|net|edu|gov|io|ai|co|dev|app|ly|gg|xyz|tv|fm|eu|uk|de|fr|nl|ch|es|pt|se|dk|fi|cz|ie|ru|ua|cn|jp|kr|au|nz|ca|us|mx|br|ar|za)(?![\p{L}\p{N}_(]|\.\p{L})/u
+/** Any name.ending with a path after it: t.me/name, x.com/name, linktr.ee/name. */
+const DOMAIN_PATH = /(?<![\p{L}\p{N}_.\/-])[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)*\.\p{L}{2,}\/[\p{L}\p{N}_@~-]/u
+/** A domain with its dot written out: "example dot com", "example[.]com". */
+const DOMAIN_WORDS = /\b[a-z0-9-]{2,}\s*(?:\[dot\]|\(dot\)|\{dot\}|\[\.\]|\(\.\)|\sdot\s)\s*(?:com|org|net|io|co|me|info)\b/i
+/** An @ name in any script, after anything that is not a letter, a digit or an underscore (so "twitter:@name" too, and not an email); or a u/name. */
+const HANDLE = /(?:^|[^\p{L}\p{N}_])@([\p{L}\p{N}_]{3,})|(?:^|[^\p{L}\p{N}_\/])u\/[A-Za-z0-9_-]{3,}/gu
+/** Words that follow an @ in code (CSS rules, Python decorators, Java and other annotations, doc tags): not user names. */
+const CODE_AT = new Set([
+  'media', 'import', 'font', 'keyframes', 'supports', 'charset', 'layer', 'container', 'page', 'namespace',
+  'staticmethod', 'classmethod', 'property', 'dataclass', 'abstractmethod', 'pytest', 'functools', 'app', 'click',
+  'override', 'deprecated', 'test', 'suppresswarnings', 'functionalinterface', 'nullable', 'nonnull', 'autowired', 'bean', 'entity', 'component', 'injectable', 'input', 'output',
+  'param', 'params', 'return', 'returns', 'throws', 'type', 'types', 'see', 'example', 'interface', 'implementation', 'end',
+])
+function hasHandle(text: string): boolean {
+  for (const m of text.matchAll(HANDLE)) if (m[1] === undefined || !CODE_AT.has(m[1].toLowerCase())) return true
+  return false
+}
+/**
+ * Characters that print nothing: format characters (zero width spaces and
+ * joiners, soft hyphens), marks that only attach to another character
+ * (variation selectors, the combining grapheme joiner, keycap marks) and the
+ * blank Hangul fillers. Removed before screening.
+ */
+const INVISIBLE = /[\p{Cf}\p{Mn}\p{Me}ᅟᅠㅤﾠ]/gu
+/** Full stops of other scripts, read as a dot. */
+const OTHER_DOTS = /[。．｡]/g
+/** A decimal digit of any script as 0 to 9: each script's ten digits are in a row, so the place in that row is the value. */
+function asciiDigit(d: string): string {
+  const cp = d.codePointAt(0) as number
+  let start = cp
+  while (cp - start < 60 && /\p{Nd}/u.test(String.fromCodePoint(start - 1))) start--
+  return String((cp - start) % 10)
+}
+/** The text as the screening reads it: NFKC, nothing invisible, one kind of dot and one kind of digit. */
+export function screenText(text: string): string {
+  return text.normalize('NFKC').replace(INVISIBLE, '').replace(OTHER_DOTS, '.').replace(/[^\x00-\x7f]/gu, c => (/\p{Nd}/u.test(c) ? asciiDigit(c) : c))
+}
 /** One character, other than white space, 40 or more times in a row. */
 const RUN = /(\S)\1{39,}/u
 export const SCREEN_SHORT_CHARS = 12
@@ -287,13 +367,13 @@ function jaccard(a: Set<string>, b: Set<string>): number {
  * meaning: it cannot see a name, an address written in words, or abuse.
  */
 export function screenOffer(messages: readonly OfferMessage[]): ScreenResult {
-  // NFKC first, then every format character out: a zero width space must not split an address or a number.
-  const all = messages.map(m => ({ role: m.role, text: m.content.normalize('NFKC').replace(INVISIBLE, '') }))
+  // NFKC first, then everything invisible out: a zero width space or a variation selector must not split an address or a number.
+  const all = messages.map(m => ({ role: m.role, text: screenText(m.content) }))
   for (const [reason, test] of [
-    ['email', (t: string) => EMAIL.test(t)],
-    ['number', (t: string) => NUMBER.test(t)],
-    ['link', (t: string) => LINK.test(t) || DOMAIN.test(t)],
-    ['handle', (t: string) => HANDLE.test(t)],
+    ['email', (t: string) => EMAIL.test(t) || EMAIL_WORDS.test(t)],
+    ['number', hasLongNumber],
+    ['link', (t: string) => LINK.test(t) || HOST_PORT.test(t) || DOMAIN.test(t) || DOMAIN_PATH.test(t) || DOMAIN_WORDS.test(t)],
+    ['handle', hasHandle],
   ] as const) {
     if (all.some(m => test(m.text))) return { ok: false, reason }
   }
@@ -347,9 +427,12 @@ export const OFFER_MESSAGES = {
 /**
  * The claims of the consent sheet (spec 2.2), each with the stored column it
  * relies on. "no address" relies on the absence of any column that could
- * hold one, so it names none. A test checks that every column of the
+ * hold one, so it names none. The sheet's own sentences are in the page's
+ * code (src/systems/chatOffer.ts, CONSENT_PARAGRAPHS); this is the server's
+ * map from those words to columns. A test checks that every column of the
  * visitor_offers table is accounted for here or in OFFER_BOOKKEEPING_COLUMNS,
- * and that every claim names real columns.
+ * that every claim names real columns, and that every claim here is, word for
+ * word, part of a sentence of the sheet.
  */
 export const OFFER_CLAIMS: ReadonlyArray<{ claim: string; columns: readonly string[] }> = [
   { claim: 'the lab stores this conversation: your messages, the model\'s replies', columns: ['messages'] },
@@ -360,11 +443,14 @@ export const OFFER_CLAIMS: ReadonlyArray<{ claim: string; columns: readonly stri
   { claim: 'You can take it back with a code you get after offering.', columns: ['code_sha256', 'status'] },
   { claim: 'If a model has already trained on it', columns: ['used_in'] },
   { claim: 'The lab\'s owner can read it.', columns: ['read_at'] },
-  { claim: 'The lab checks for email addresses, phone numbers, long numbers, links and user names', columns: ['screen_v'] },
-  { claim: 'This conversation was already offered.', columns: ['transcript_sha256', 'first_user_sha256'] },
+  { claim: 'The lab checks automatically for email addresses, phone numbers, long numbers, links and user names', columns: ['screen_v'] },
 ]
-/** Columns that hold no claim of their own: the row's id. */
-export const OFFER_BOOKKEEPING_COLUMNS: readonly string[] = ['id']
+/**
+ * Columns no sentence of the sheet is about: the row's id, and the two hashes
+ * of the text that refuse a second offer of the same conversation (they are
+ * overwritten when the text is taken back, deleted or expires).
+ */
+export const OFFER_BOOKKEEPING_COLUMNS: readonly string[] = ['id', 'transcript_sha256', 'first_user_sha256']
 
 // ---------------------------------------------------------------------------
 // Reading an offer, or a take back
@@ -406,8 +492,14 @@ export function readOfferRequest(raw: unknown): OfferRequest | ChatRefusal {
   const read = readChatMessages(list, OFFER_ORDER)
   if (!read.ok) return read
   const messages = read.messages.map(m => ({ role: m.role as 'user' | 'assistant', content: m.content }))
+  // Half a character (a lone surrogate) or a NUL cannot be stored as JSON: refused here, before anything is counted.
+  if (messages.some(m => BROKEN_TEXT.test(m.content))) return bad('This conversation has broken text in it and cannot be offered.')
   return { ok: true, kind: 'offer', adapter: req.adapter, messages, turns: messages.length / 2, chars: read.chars, receipt: req.receipt }
 }
+
+/** A surrogate with no partner (half a character), or a NUL. */
+// eslint-disable-next-line no-control-regex
+const BROKEN_TEXT = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]|\u0000/
 
 // ---------------------------------------------------------------------------
 // A training request that names offers (spec 2.7)
@@ -652,9 +744,11 @@ export function offersToTinkerRequest(asked: TinkerOffersRequest, offers: readon
  * models and Tinker training is on (the caller checks). An ability and its
  * limits. `total` is how many offers the lab holds now.
  */
-export function visitorOffersNote(opts: { total: number }): string {
+export function visitorOffersNote(opts: { total: number; datasets?: boolean }): string {
   const total = Math.max(0, Math.floor(opts.total))
-  return `Visitor conversations: a visitor of the room may offer a chat they had with a trained adapter to the lab. The lab holds ${total} of them now. A Tinker training request may name them instead of writing its examples: "visitor_offers": { "adapter" (optional, an adapter id), "limit" ${OFFERS_RUN_LIMIT.min} to ${OFFERS_RUN_LIMIT.max}, "system" (optional text, at most ${OFFERS_MAX_SYSTEM_BYTES} bytes) }. Give one of "examples", "dataset" and "visitor_offers". The lab's own code reads them, not yours, and you never see their text. No model reads them and nobody reviewed them: only automatic checks were made (no email addresses, phone numbers, long numbers, user names or links). The lab's owner can read them through an operator route, and each read is counted in the public record. Each conversation is one example, its first ${offerExampleMessages(false) / 2} turns at most (${offerExampleMessages(true) / 2} with a system text), and only its last reply is trained on. The lab picks which ones, at most a quarter from any one day. Conversations had with an adapter that was itself trained on visitor conversations are never used. The run then goes on like any other: the same limits, cost estimate, caps and held out slice. Its record says how many conversations were used and nothing of what they said. Everything trained from them is labelled "${ORIGIN_VISITORS}", and such an adapter is not offered in the visitor chat unless the owner allows it.`
+  // "dataset" is a field of a training request only while the datasets tool is on: named here only then.
+  const sources = opts.datasets ? 'Give one of "examples", "dataset" and "visitor_offers".' : 'Give one of "examples" and "visitor_offers".'
+  return `Visitor conversations: a visitor of the room may offer a chat they had with a trained adapter to the lab. The lab holds ${total} of them now. A Tinker training request may name them instead of writing its examples: "visitor_offers": { "adapter" (optional, an adapter id), "limit" ${OFFERS_RUN_LIMIT.min} to ${OFFERS_RUN_LIMIT.max}, "system" (optional text, at most ${OFFERS_MAX_SYSTEM_BYTES} bytes) }. ${sources} The lab's own code reads them, not yours, and you never see their text. No model reads them and nobody reviewed them: automatic pattern checks refused conversations with an email address, a phone number, a long number, a user name or a link written in a usual form; the checks can miss some and cannot find names or street addresses. The lab's owner can read them through an operator route, and each read is counted in the public record. Each conversation is one example, its first ${offerExampleMessages(false) / 2} turns at most (${offerExampleMessages(true) / 2} with a system text), and only its last reply is trained on. The lab picks which ones, at most a quarter from any one day. Conversations had with an adapter that was itself trained on visitor conversations are never used. The run then goes on like any other: the same limits, cost estimate, caps and held out slice. Its record says how many conversations were used and nothing of what they said. Everything trained from them is labelled "${ORIGIN_VISITORS}", and such an adapter is not offered in the visitor chat unless the owner allows it.`
 }
 
 /**
@@ -668,6 +762,6 @@ export function visitorOffersReviewFacts(request: TinkerOffersRequest, opts: { s
   const s = request.settings
   const systemText = o.system ? ` A system text the Executor wrote (${Buffer.byteLength(o.system, 'utf8')} bytes) is put before every conversation.` : ''
   return {
-    line: `a LoRA fine-tune of ${request.base_model} on up to ${o.limit} conversations that visitors of the room offered to the lab${o.adapter ? ` in chats with lab/${o.adapter}` : ''}. The text is not in the Executor's answer: neither you nor the Executor has read it, nobody reviewed it, and only automatic checks were made on it (no email addresses, phone numbers, long numbers, user names or links). The lab holds ${Math.max(0, Math.floor(opts.stored))} such conversations now. If you approve, the lab's own code reads them, makes one example of each (at most a quarter from any one day), and checks the result exactly as it checks inline examples.${systemText} Settings: rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epochs, batch size ${s.batch_size}. The lab's estimate, from published prices, of the most these limits would let it cost is ${usdText(ceiling)} (a run may cost at most ${usdText(opts.runCapUsd)}). Everything trained from them is labelled "${ORIGIN_VISITORS}".`,
+    line: `a LoRA fine-tune of ${request.base_model} on up to ${o.limit} conversations that visitors of the room offered to the lab${o.adapter ? ` in chats with lab/${o.adapter}` : ''}. The text is not in the Executor's answer: neither you nor the Executor has read it, and nobody reviewed it: automatic pattern checks refused conversations with an email address, a phone number, a long number, a user name or a link written in a usual form; the checks can miss some and cannot find names or street addresses. The lab holds ${Math.max(0, Math.floor(opts.stored))} such conversations now. If you approve, the lab's own code reads them, makes one example of each (at most a quarter from any one day), and checks the result exactly as it checks inline examples.${systemText} Settings: rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epochs, batch size ${s.batch_size}. The lab's estimate, from published prices, of the most these limits would let it cost is ${usdText(ceiling)} (a run may cost at most ${usdText(opts.runCapUsd)}). Everything trained from them is labelled "${ORIGIN_VISITORS}".`,
   }
 }
