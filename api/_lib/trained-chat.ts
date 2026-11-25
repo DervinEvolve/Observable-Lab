@@ -35,6 +35,21 @@
  * LAB_TRAINED_CHAT_DATASET_ADAPTERS=true. When that is set and one is
  * listed, the notice beside the chat says so.
  *
+ * An adapter trained on conversations visitors offered (visitor-offers.ts)
+ * is held out the same way, by its own switch,
+ * LAB_TRAINED_CHAT_VISITOR_ADAPTERS=true, and the notice says so when one is
+ * listed.
+ *
+ * Offers (LAB_ENABLE_VISITOR_OFFERS, on unless false, 0, off or no, and only
+ * with a receipt key): every reply the adapter gives carries a receipt, an
+ * HMAC over the conversation up to that reply, issued only when the
+ * conversation before it carried a valid one (or there was none before it).
+ * The browser sends the last receipt back with the next message. A visitor
+ * may then offer the conversation (api/experiment/chat-offer.ts). Nothing is
+ * stored to do this. While offers are off the answers are exactly what they
+ * were before offers existed: no offers block, no receipts, and "receipt" is
+ * refused as an unknown key.
+ *
  * Compare (LAB_ENABLE_TRAINED_CHAT_COMPARE, on unless false, 0, off or no)
  * asks the untrained base model the same question beside the adapter, so a
  * visitor can see what training changed. It uses the same caps twice as
@@ -55,6 +70,7 @@ import {
   addressHash, countVisitorMessage, getAdapter, listAdapters, pruneVisitorCounts, recordTrainedChatCall, reserveTinkerSpend, settleTinkerSpend,
   utcDay, visitorHash, type AdapterTarget, type Reservation,
 } from './tinker-store.js'
+import { RECEIPT_MAX_CHARS, issueReceipt, offersBlock, verifyReceipt, visitorAdaptersFlag, visitorOffersStatus } from './visitor-offers.js'
 
 export const TRAINED_CHAT_PURPOSE = 'trained_chat'
 /** One message a visitor writes, in characters. */
@@ -86,14 +102,28 @@ export const TRAINED_CHAT_TIMEOUT_MS = 45_000
 export const TRAINED_CHAT_NOTICE = 'Small models trained by the lab\'s AI models. Replies are not reviewed.'
 /** Shown instead while the list holds an adapter trained on a public dataset (only with LAB_TRAINED_CHAT_DATASET_ADAPTERS on). */
 export const TRAINED_CHAT_NOTICE_DATASETS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on data the models wrote, and some on rows of a public dataset that nobody at the lab has read. Replies are not reviewed.'
+/** Shown instead while the list holds an adapter trained on conversations visitors offered (only with LAB_TRAINED_CHAT_VISITOR_ADAPTERS on). */
+export const TRAINED_CHAT_NOTICE_VISITORS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on conversations written by visitors that nobody at the lab has read. Replies are not reviewed.'
+/** Shown instead while the list holds both kinds. */
+export const TRAINED_CHAT_NOTICE_DATASETS_VISITORS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on rows of a public dataset, and some on conversations written by visitors, that nobody at the lab has read. Replies are not reviewed.'
 
 /**
  * May the visitor chat answer with this adapter? One trained on data a model
  * wrote into its answer: yes, as ever (the Reviewer saw that data). One
- * trained on rows of a public dataset: only when the owner has said so.
+ * trained on rows of a public dataset, or on conversations visitors offered:
+ * only when the owner has said so, each by its own switch.
  */
-export function chatOffers(target: Pick<AdapterTarget, 'from_dataset'>): boolean {
-  return !target.from_dataset || trainedChatDatasetAdaptersFlag()
+export function chatOffers(target: Pick<AdapterTarget, 'from_dataset' | 'from_visitors'>): boolean {
+  return (!target.from_dataset || trainedChatDatasetAdaptersFlag()) && (!target.from_visitors || visitorAdaptersFlag())
+}
+
+/** The notice for the adapters on the list. */
+export function chatNotice(offered: readonly Pick<AdapterTarget, 'from_dataset' | 'from_visitors'>[]): string {
+  const datasets = offered.some(t => t.from_dataset)
+  const visitors = offered.some(t => t.from_visitors)
+  if (datasets && visitors) return TRAINED_CHAT_NOTICE_DATASETS_VISITORS
+  if (visitors) return TRAINED_CHAT_NOTICE_VISITORS
+  return datasets ? TRAINED_CHAT_NOTICE_DATASETS : TRAINED_CHAT_NOTICE
 }
 
 const MESSAGES = {
@@ -134,10 +164,42 @@ export interface ChatRequest {
    * (or paid for) again, and the retry counts as one message. Null otherwise.
    */
   only: 'trained' | 'untrained' | null
+  /** The receipt of the conversation before this message. Present only while offers are on and one was sent. */
+  receipt?: string
 }
 
 // eslint-disable-next-line no-control-regex
 const stripControls = (text: string) => text.replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '')
+
+const ORDER_CHAT = 'Messages must alternate "user" and "assistant", starting and ending with "user".'
+
+/**
+ * Reads and cleans a list of chat messages: user and assistant in turn from
+ * the visitor, each with some text, a visitor message at most 500 characters
+ * and a reply at most 1200, control characters removed. The caller checks
+ * the length of the list and how it ends. `order` is what a refusal says
+ * when the roles are out of turn. Used by readChatRequest and by the offer
+ * route (visitor-offers.ts), so an offer holds exactly what the chat accepts.
+ */
+export function readChatMessages(list: readonly unknown[], order: string = ORDER_CHAT): { ok: true; messages: TinkerChatMessage[]; chars: number } | ChatRefusal {
+  const bad = (message: string, error = 'invalid_request'): ChatRefusal => ({ ok: false, status: 400, error, message })
+  const messages: TinkerChatMessage[] = []
+  let chars = 0
+  for (const [i, m] of list.entries()) {
+    const o = m && typeof m === 'object' && !Array.isArray(m) ? m as Record<string, unknown> : null
+    const role = i % 2 === 0 ? 'user' : 'assistant'
+    if (!o || Object.keys(o).some(k => k !== 'role' && k !== 'content') || o.role !== role) return bad(order)
+    if (typeof o.content !== 'string' || !o.content.trim()) return bad('Every message needs some text.')
+    const limit = role === 'user' ? TRAINED_CHAT_MAX_MESSAGE_CHARS : TRAINED_CHAT_MAX_REPLY_CHARS
+    if (o.content.length > limit) {
+      return bad(role === 'user' ? `A message may be at most ${TRAINED_CHAT_MAX_MESSAGE_CHARS} characters.` : 'An earlier reply in the conversation is longer than a reply can be.', 'too_long')
+    }
+    const content = stripControls(o.content)
+    chars += content.length
+    messages.push({ role, content })
+  }
+  return { ok: true, messages, chars }
+}
 
 /**
  * Reads what a visitor's browser sent. Strict: an object with "adapter" and
@@ -149,38 +211,33 @@ export function readChatRequest(raw: unknown): ChatRequest | ChatRefusal {
   const bad = (message: string, error = 'invalid_request'): ChatRefusal => ({ ok: false, status: 400, error, message })
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad('Send a JSON object with "adapter" and "messages".')
   const req = raw as Record<string, unknown>
-  if (Object.keys(req).some(k => k !== 'adapter' && k !== 'messages' && k !== 'compare' && k !== 'base_replies' && k !== 'only')) {
-    return bad('Only "adapter", "messages", "compare", "base_replies" and "only" are accepted.')
+  // "receipt" is a key only while offers are on. While they are off it is an
+  // unknown key like any other, and refuses the request as it always did.
+  const offers = visitorOffersStatus().enabled
+  if (Object.keys(req).some(k => k !== 'adapter' && k !== 'messages' && k !== 'compare' && k !== 'base_replies' && k !== 'only' && !(offers && k === 'receipt'))) {
+    return bad(offers
+      ? 'Only "adapter", "messages", "compare", "base_replies", "only" and "receipt" are accepted.'
+      : 'Only "adapter", "messages", "compare", "base_replies" and "only" are accepted.')
   }
   if (!isAdapterSlug(req.adapter)) return bad('"adapter" must be the name of a trained model from the list.')
   const list = req.messages
   if (!Array.isArray(list) || list.length === 0) return bad('"messages" must be a non-empty list.')
   if (list.length > TRAINED_CHAT_MAX_TURNS * 2 - 1) return { ok: false, status: 400, error: 'turns', message: MESSAGES.turns }
-  const messages: TinkerChatMessage[] = []
-  let chars = 0
-  for (const [i, m] of list.entries()) {
-    const o = m && typeof m === 'object' && !Array.isArray(m) ? m as Record<string, unknown> : null
-    const role = i % 2 === 0 ? 'user' : 'assistant'
-    if (!o || Object.keys(o).some(k => k !== 'role' && k !== 'content') || o.role !== role) {
-      return bad('Messages must alternate "user" and "assistant", starting and ending with "user".')
-    }
-    if (typeof o.content !== 'string' || !o.content.trim()) return bad('Every message needs some text.')
-    const limit = role === 'user' ? TRAINED_CHAT_MAX_MESSAGE_CHARS : TRAINED_CHAT_MAX_REPLY_CHARS
-    if (o.content.length > limit) {
-      return bad(role === 'user' ? `A message may be at most ${TRAINED_CHAT_MAX_MESSAGE_CHARS} characters.` : 'An earlier reply in the conversation is longer than a reply can be.', 'too_long')
-    }
-    const content = stripControls(o.content)
-    chars += content.length
-    messages.push({ role, content })
-  }
-  if (messages.length % 2 !== 1) return bad('Messages must alternate "user" and "assistant", starting and ending with "user".')
+  const read = readChatMessages(list)
+  if (!read.ok) return read
+  const { messages, chars } = read
+  if (messages.length % 2 !== 1) return bad(ORDER_CHAT)
   const turns = (messages.length + 1) / 2
+  if ('receipt' in req && (typeof req.receipt !== 'string' || !req.receipt || req.receipt.length > RECEIPT_MAX_CHARS)) {
+    return bad('receipt must be the receipt the chat gave.')
+  }
+  const receipt = typeof req.receipt === 'string' ? { receipt: req.receipt } : {}
 
   if ('compare' in req && typeof req.compare !== 'boolean') return bad('compare must be true or false.')
   if (req.compare !== true) {
     if ('base_replies' in req) return bad('base_replies is only accepted with compare.')
     if ('only' in req) return bad('only is accepted with compare.')
-    return { ok: true, adapter: req.adapter, messages, turns, chars, compare: false, baseMessages: [], baseChars: 0, only: null }
+    return { ok: true, adapter: req.adapter, messages, turns, chars, compare: false, baseMessages: [], baseChars: 0, only: null, ...receipt }
   }
   if ('only' in req && req.only !== 'trained' && req.only !== 'untrained') return bad('only must be "trained" or "untrained".')
   const only = req.only === 'trained' || req.only === 'untrained' ? req.only : null
@@ -203,28 +260,28 @@ export function readChatRequest(raw: unknown): ChatRequest | ChatRefusal {
     baseMessages.push({ role: 'assistant', content })
     baseChars += content.length
   }
-  return { ok: true, adapter: req.adapter, messages, turns, chars, compare: true, baseMessages, baseChars, only }
+  return { ok: true, adapter: req.adapter, messages, turns, chars, compare: true, baseMessages, baseChars, only, ...receipt }
 }
 
-function header(req: VercelRequest, name: string): string {
+export function header(req: VercelRequest, name: string): string {
   const v = req.headers?.[name]
   return typeof v === 'string' ? v : Array.isArray(v) && typeof v[0] === 'string' ? v[0] : ''
 }
 
 /** The visitor's address as the platform reports it. Used for the hash only; never stored or logged. */
-function visitorAddress(req: VercelRequest): string {
+export function visitorAddress(req: VercelRequest): string {
   const real = header(req, 'x-real-ip').trim()
   if (real) return real.slice(0, 80)
   return header(req, 'x-forwarded-for').split(',')[0].trim().slice(0, 80) || 'unknown'
 }
 
-function sentAsJson(req: VercelRequest): boolean {
+export function sentAsJson(req: VercelRequest): boolean {
   // application/json only. A page on another site cannot send that from a
   // visitor's browser without a preflight, which this route does not answer.
   return header(req, 'content-type').split(';')[0].trim().toLowerCase() === 'application/json'
 }
 
-function readBody(req: VercelRequest): unknown {
+export function readBody(req: VercelRequest): unknown {
   const body = (req as { body?: unknown }).body
   if (typeof body === 'string') return JSON.parse(body)
   if (Buffer.isBuffer(body)) return JSON.parse(body.toString('utf8'))
@@ -245,8 +302,10 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
     try {
       const offered = (await listAdapters()).filter(chatOffers)
       const adapters = offered.map(t => t.adapter)
-      const notice = offered.some(t => t.from_dataset) ? TRAINED_CHAT_NOTICE_DATASETS : TRAINED_CHAT_NOTICE
-      return res.status(200).json({ enabled: true, adapters, limits: chatLimits(), notice, compare_enabled: trainedChatCompareFlag() })
+      const notice = chatNotice(offered)
+      // The offers block is there only while offers are on, so with them off this answer is what it always was.
+      const offers = visitorOffersStatus().enabled ? { offers: offersBlock() } : {}
+      return res.status(200).json({ enabled: true, adapters, limits: chatLimits(), notice, compare_enabled: trainedChatCompareFlag(), ...offers })
     } catch (e) {
       console.warn('[trained-chat] could not list adapters:', e instanceof Error ? e.message : e)
       return res.status(200).json({ enabled: true, adapters: [], limits: chatLimits(), notice: TRAINED_CHAT_NOTICE, unavailable: true })
@@ -405,22 +464,40 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
     cut_short: answer.finishReason === 'length',
   })
   const turnsLeft = Math.max(0, TRAINED_CHAT_MAX_TURNS - chat.turns)
+  // A receipt for the trained reply, only while offers are on, and only when
+  // the conversation before it is proven too: it is the first turn, or the
+  // receipt sent for the conversation before this message verifies. So a
+  // receipt exists only for a conversation whose every reply this endpoint
+  // gave, in order. With offers off no key is added to the answer.
+  const offersOn = visitorOffersStatus().enabled
+  const receiptFor = (reply: string): { receipt?: string } => {
+    if (!offersOn) return {}
+    const chained = chat.turns === 1 || (chat.receipt !== undefined && verifyReceipt(chat.receipt, chat.adapter, chat.messages.slice(0, -1), now))
+    if (!chained) return {}
+    const receipt = issueReceipt(chat.adapter, [...chat.messages, { role: 'assistant', content: reply }], now)
+    return receipt ? { receipt } : {}
+  }
+  const withReceipt = (answer: Extract<TinkerChatResult, { ok: true }>) => {
+    const out = cleaned(answer)
+    return { ...out, ...receiptFor(out.reply) }
+  }
 
   if (!chat.compare) {
     if (!trained || !trained.answer.ok) return say(res, trained && !trained.answer.ok && trained.answer.kind === 'timeout' ? 504 : 502, 'busy', MESSAGES.busy)
-    return res.status(200).json({ adapter: target.adapter.slug, ...cleaned(trained.answer), turns_left: turnsLeft })
+    return res.status(200).json({ adapter: target.adapter.slug, ...withReceipt(trained.answer), turns_left: turnsLeft })
   }
   const answers = [trained?.answer, untrained?.answer].filter((a): a is TinkerChatResult => a !== undefined)
   if (answers.every(a => !a.ok)) {
     return say(res, answers.every(a => !a.ok && (a as { kind?: string }).kind === 'timeout') ? 504 : 502, 'busy', untrained && !trained ? MESSAGES.baseBusy : MESSAGES.busy)
   }
-  const side = (answer: TinkerChatResult | undefined, message: string) => !answer
+  // Only the trained side can carry a receipt: the untrained reply is never part of an offer.
+  const side = (answer: TinkerChatResult | undefined, message: string, trainedSide: boolean) => !answer
     ? { ok: false as const, error: 'skipped', message: 'This side was not asked again.' }
     : answer.ok
-    ? { ok: true as const, ...cleaned(answer) }
+    ? { ok: true as const, ...(trainedSide ? withReceipt(answer) : cleaned(answer)) }
     : { ok: false as const, error: 'busy', message }
   return res.status(200).json({
     adapter: target.adapter.slug, compare: true, base_model: base,
-    trained: side(trained?.answer, MESSAGES.busy), untrained: side(untrained?.answer, MESSAGES.baseBusy), turns_left: turnsLeft,
+    trained: side(trained?.answer, MESSAGES.busy, true), untrained: side(untrained?.answer, MESSAGES.baseBusy, false), turns_left: turnsLeft,
   })
 }
