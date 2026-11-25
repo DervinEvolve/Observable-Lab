@@ -213,9 +213,14 @@ export function publicCut(v: unknown, maxBytes: number): string {
   return cutBytes(oneLine(v), maxBytes)
 }
 
-/** Word set of a prompt, for the near copy check. */
+/**
+ * Word set of a prompt, for the near copy check. Characters that do not show
+ * (format characters such as a zero width space) are dropped and punctuation
+ * splits words, so the same question with a comma added, or with an invisible
+ * character inside a word, has the same words.
+ */
 function words(s: string): Set<string> {
-  return new Set(normaliseText(s).split(' ').filter(Boolean))
+  return new Set(normaliseText(s.replace(/\p{Cf}/gu, '')).split(/[\s\p{P}]+/u).filter(Boolean))
 }
 
 /** Word-set Jaccard similarity of two prompts after normaliseText. */
@@ -294,12 +299,36 @@ export function maxTutorExamples(practice: number, rounds: number): number {
   return practice + taught + (rounds === 2 ? 2 * taught : 0)
 }
 
-/** Literal values a rule carries of its own: its value, any and all. */
+/**
+ * The fixed text a regex_match pattern asks for, when the pattern is nothing
+ * else: no class, group, alternation, quantifier, anchor or wildcard in it
+ * (an escaped punctuation character counts as that character). Null for any
+ * other pattern.
+ */
+export function patternLiteral(pattern: string): string | null {
+  let out = ''
+  for (let i = 0; i < pattern.length; i++) {
+    const c = pattern[i]
+    if (c === '\\') {
+      const next = pattern[++i]
+      if (next === undefined || /[A-Za-z0-9]/.test(next)) return null // \d, \w, \s and the like
+      out += next
+    } else if ('[](){}|*+?.^$'.includes(c)) return null
+    else out += c
+  }
+  return out.trim() ? out : null
+}
+
+/** Literal values a rule carries of its own: its value, any and all, and a regex_match pattern that is a fixed text. */
 export function ruleLiterals(rule: RubricRule): string[] {
   const out: string[] = []
   if (!rule.from && rule.value !== undefined) out.push(String(rule.value))
   for (const v of rule.any ?? []) out.push(v)
   for (const v of rule.all ?? []) out.push(v)
+  if (rule.type === 'regex_match' && typeof rule.pattern === 'string') {
+    const fixed = patternLiteral(rule.pattern)
+    if (fixed !== null) out.push(fixed)
+  }
   return out
 }
 
@@ -340,16 +369,28 @@ export function leaks(text: string, targets: string[]): boolean {
   return targets.some(t => n.includes(t))
 }
 
+/**
+ * The forms a value is compared in (check 7), for a value of at least 3
+ * characters after normaliseText: its normalised text, and, when it is a plain
+ * number, the number itself, so "579.0" and "579" are the same value.
+ */
+function valueForms(v: string): string[] {
+  const n = normaliseText(v)
+  if (n.length < 3) return []
+  const plain = /^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(n) ? Number(n) : NaN
+  return Number.isFinite(plain) ? [n, `number:${plain}`] : [n]
+}
+
 /** Values a held back question carries (expected, and every data value), normalised, at least 3 characters. */
 function heldValues(task: RubricTask): string[] {
   const raw = [...(task.expected !== undefined ? [task.expected] : []), ...Object.values(task.data ?? {}).map(String)]
-  return raw.map(v => normaliseText(v)).filter(v => v.length >= 3)
+  return raw.flatMap(valueForms)
 }
 
 /** Values the teacher is shown for a subskill: the rubric's literals and every expected and data value of its practice questions. */
 function shownValues(subskill: Pick<TutorSubskill, 'rubric' | 'practice'>): Set<string> {
   const raw = [...rubricLiterals(subskill.rubric), ...subskill.practice.flatMap(t => [...(t.expected !== undefined ? [t.expected] : []), ...Object.values(t.data ?? {}).map(String)])]
-  return new Set(raw.map(v => normaliseText(v)).filter(v => v.length >= 3))
+  return new Set(raw.flatMap(valueForms))
 }
 
 /** Every rule checks a fixed text of its own: no rule reads the question's expected or data. */
@@ -1185,7 +1226,7 @@ export function tinkerTutorNote(opts: { perDay: number; teacherUsd: number; teac
     ? ` You may give the adapter a display name with "name": ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters, only letters, digits, spaces, hyphens, apostrophes and dots; a name that is refused is left off with the reason stored and the lesson goes on.`
     : ''
   const chat = opts.chat ? ' While the adapter is alive it can be talked to in the room\'s trained chat.' : ''
-  return `Socratic lesson: as Executor you may ask for one lesson for an open-weight model on Tinker, a training service. LoRA only. The base model is one of: ${models}. You write the lesson into your answer as data, and no code: a topic, and ${TUTOR_SUBSKILLS.min} to ${TUTOR_SUBSKILLS.max} subskills. Each subskill has a name, a rubric, ${TUTOR_PRACTICE.min} to ${TUTOR_PRACTICE.max} practice questions and ${TUTOR_HELD_BACK.min} to ${TUTOR_HELD_BACK.max} held back questions, each { "prompt" (text, at most 1500 bytes), optionally "expected" and "data" }, at most ${TUTOR_MAX_BYTES} bytes of text in all, no two questions alike. A rubric is 1 to ${RUBRIC_MAX_RULES} rules, ${RUBRIC_MENU}. An answer passes when it satisfies every rule; a rubric that an empty answer passes is refused. The lab's own code then does all of this: it asks the untrained model every question ${TUTOR_SAMPLES} times and grades each answer; for at most ${TUTOR_MAX_TAUGHT} practice questions it got wrong, a teacher model (${teacher}) is asked for one guiding question at a time, the small model replies and answers again, and the lab grades it, for at most ${TUTOR_GUIDING_TURNS.max} guiding questions a question ("guiding_turns"), after which the teacher is asked for a short explanation and an answer that must itself pass the rubric; one adapter is trained on those exchanges; then every question is asked again. The teacher's calls never contain the text of a held back question and carry no context of yours; a held back question that nearly repeats a practice question of any subskill, or expects a value the teacher is shown, is refused. A pass band 0 to 5 for each subskill is computed by the lab from the share of held back answers that passed, before and after; the lab counts the passes, you and the teacher do not report them. A gain on practice questions with little gain on held back ones is flagged, and so are rubrics whose every rule is a fixed phrase. Settings are bounded: rank ${TINKER_RANKS.join(', ')}, learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}, as for Tinker training; max_answer_tokens ${TUTOR_ANSWER_TOKENS.min} to ${TUTOR_ANSWER_TOKENS.max} (the limit counts every token the small model writes, which for a base model that thinks before it answers may include that thinking; an answer the limit cut off is graded as it stands, and the record counts such answers in every test); guiding_turns ${TUTOR_GUIDING_TURNS.min} or ${TUTOR_GUIDING_TURNS.max}; rounds ${TUTOR_ROUNDS.min} or ${TUTOR_ROUNDS.max} (a second round teaches what the first adapter still misses and trains again from the base model). A request that breaks any of this is refused whole, with the reason stored. The lesson needs the Reviewer's approval and runs after the epoch, over up to a few hours. The lab estimates the most its Tinker use could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC); the teacher's calls may cost at most $${opts.teacherUsd.toFixed(2)} a lesson; at most ${opts.perDay} a day; an epoch has one Tinker run of any kind; all inside the lab's daily spending cap. The lesson, every graded answer, the teacher's questions, both skill maps, the flags and the costs are public, as is the record the lab's models read as memory; a held back question with the same text (after normalising) as a held back question of an earlier lesson is refused. The adapter is kept for ${tinkerTtlDays()} days and then expires.${chat}${named}`
+  return `Socratic lesson: as Executor you may ask for one lesson for an open-weight model on Tinker, a training service. LoRA only. The base model is one of: ${models}. You write the lesson into your answer as data, and no code: a topic, and ${TUTOR_SUBSKILLS.min} to ${TUTOR_SUBSKILLS.max} subskills. Each subskill has a name, a rubric, ${TUTOR_PRACTICE.min} to ${TUTOR_PRACTICE.max} practice questions and ${TUTOR_HELD_BACK.min} to ${TUTOR_HELD_BACK.max} held back questions, each { "prompt" (text, at most 1500 bytes), optionally "expected" and "data" }, at most ${TUTOR_MAX_BYTES} bytes of text in all, no two questions alike. A rubric is 1 to ${RUBRIC_MAX_RULES} rules, ${RUBRIC_MENU}. An answer passes when it satisfies every rule; a rubric that an empty answer passes is refused. The lab's own code then does all of this: it asks the untrained model every question ${TUTOR_SAMPLES} times and grades each answer; for at most ${TUTOR_MAX_TAUGHT} practice questions it got wrong, a teacher model (${teacher}) is asked for one guiding question at a time, the small model replies and answers again, and the lab grades it, for at most ${TUTOR_GUIDING_TURNS.max} guiding questions a question ("guiding_turns"), after which the teacher is asked for a short explanation and an answer that must itself pass the rubric; one adapter is trained on those exchanges; then every question is asked again. The teacher's calls never contain the text of a held back question and carry no context of yours; a held back question is refused when its words are nearly the same as those of a practice question of any subskill, or when its "expected" or one of its "data" values, of 3 characters or more, is the same text or the same number as a value the teacher is shown; a reworded question, a shorter value, a value that is only part of a shown value, or a value that only appears inside a practice prompt is not caught. A pass band 0 to 5 for each subskill is computed by the lab from the share of held back answers that passed, before and after; the lab counts the passes, you and the teacher do not report them. A gain on practice questions with little gain on held back ones is flagged, and so are rubrics whose every rule is a fixed phrase (a value of its own, or a pattern that is a fixed text). Settings are bounded: rank ${TINKER_RANKS.join(', ')}, learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}, as for Tinker training; max_answer_tokens ${TUTOR_ANSWER_TOKENS.min} to ${TUTOR_ANSWER_TOKENS.max} (the limit counts every token the small model writes, which for a base model that thinks before it answers may include that thinking; an answer the limit cut off is graded as it stands, and the record counts the answers the service reports as cut off or that used the whole limit, in every test and in teaching; a reply to a guiding question may be at most ${TUTOR_REPLY_TOKENS} tokens); guiding_turns ${TUTOR_GUIDING_TURNS.min} or ${TUTOR_GUIDING_TURNS.max}; rounds ${TUTOR_ROUNDS.min} or ${TUTOR_ROUNDS.max} (a second round teaches what the first adapter still misses and trains again from the base model). A request that breaks any of this is refused whole, with the reason stored. The lesson needs the Reviewer's approval and runs after the epoch, over up to a few hours. The lab estimates the most its Tinker use could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC); the teacher's calls may cost at most $${opts.teacherUsd.toFixed(2)} a lesson; at most ${opts.perDay} a day; an epoch has one Tinker run of any kind; all inside the lab's daily spending cap. The lesson, every graded answer, the teacher's questions, both skill maps, the flags and the costs are public, as is the record the lab's models read as memory; a held back question with the same text (after normalising) as a held back question of an earlier lesson is refused. The adapter is kept for ${tinkerTtlDays()} days and then expires.${chat}${named}`
 }
 
 /** What the Reviewer is told about a lesson: its size, its rubrics in words, its settings, the teacher, and the most it could cost. */

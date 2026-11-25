@@ -166,6 +166,10 @@ class FakeDb {
     if (this.dead) throw new Error('killed')
     if (this.writes >= this.killAfterWrites) { this.dead = true; throw new Error('killed') }
     this.statements.push({ text, values: v })
+    // A test may make the write of an answer row take a while, as a real database does.
+    if (this.answerDelayMs && text.startsWith('INSERT INTO tutor_answers')) {
+      return new Promise(r => setTimeout(r, this.answerDelayMs())).then(() => { const out = this.answer(text, v); this.writes++; return out })
+    }
     const out = this.answer(text, v)
     if (/^(INSERT INTO tutor_answers|UPDATE tutor_turns SET state|WITH t AS|UPDATE tutor_lessons SET train|INSERT INTO tutor_turns|WITH closed AS|UPDATE tutor_lessons SET stage = 'closing')/.test(text)) this.writes++
     return out
@@ -186,6 +190,9 @@ class FakeDb {
       const [experiment_id, epoch, model, tool, request_summary, status, exit_code, duration_ms, cost_usd, output_tail, detail] = v
       this.toolRuns.push({ experiment_id, epoch, model, tool, request_summary, status, exit_code, duration_ms, cost_usd, output_tail, detail: detail ? JSON.parse(detail) : null })
       return { rows: [] }
+    }
+    if (text.startsWith('SELECT DISTINCT tool FROM tool_runs WHERE experiment_id = ? AND epoch = ?')) {
+      return { rows: [...new Set(this.toolRuns.filter(r => r.experiment_id === v[0] && r.epoch === v[1]).map(r => r.tool))].map(tool => ({ tool })) }
     }
     if (text.startsWith('INSERT INTO trained_chat_rate')) {
       const key = `${v[0]}|${v[1]}`
@@ -259,13 +266,41 @@ class FakeDb {
       return { rows: [{ n: counted.length }] }
     }
     // ---- the lessons-per-day places ----
-    if (text.startsWith('INSERT INTO tutor_day_slots (day, n) VALUES (?, 1) ON CONFLICT (day) DO UPDATE SET n = tutor_day_slots.n + 1 WHERE tutor_day_slots.n < ? RETURNING n')) {
+    if (text.startsWith('INSERT INTO tutor_day_slots (day, n, taken_at) VALUES (?, 1, ?) ON CONFLICT (day) DO UPDATE SET n = tutor_day_slots.n + 1, taken_at = EXCLUDED.taken_at WHERE tutor_day_slots.n < ? RETURNING n')) {
       this.slots ??= new Map()
+      this.slotTaken ??= new Map()
       const n = this.slots.get(v[0])
-      if (n === undefined) { this.slots.set(v[0], 1); return { rows: [{ n: 1 }] } }
-      if (!(n < v[1])) return { rows: [] }
+      if (n === undefined) { this.slots.set(v[0], 1); this.slotTaken.set(v[0], v[1]); return { rows: [{ n: 1 }] } }
+      if (!(n < v[2])) return { rows: [] }
       this.slots.set(v[0], n + 1)
+      this.slotTaken.set(v[0], v[1])
       return { rows: [{ n: n + 1 }] }
+    }
+    // ---- the repair of what a request that died while opening a lesson left behind ----
+    if (text.startsWith("WITH orphan AS ( UPDATE tinker_runs r SET status = 'failed', reason = ?, cost_usd = 0, finished_at = ?")) {
+      assert.ok(text.includes("WHERE r.kind = 'tutor' AND r.status = 'lesson' AND r.created_at < ?") && text.includes('NOT EXISTS (SELECT 1 FROM tutor_lessons l WHERE l.run_id = r.id)'), 'only a lesson run with no lesson row, old enough, is closed')
+      assert.ok(text.includes('UPDATE tinker_spend_days d SET reserved_usd = GREATEST(0, d.reserved_usd - s.reserved)'), 'its money set aside is given back in the same statement')
+      const [reason, now, cutoff] = v
+      let n = 0
+      for (const r of this.tinkerRuns) {
+        if (r.kind !== 'tutor' || r.status !== 'lesson' || !(Date.parse(r.created_at) < Date.parse(cutoff)) || this.lesson(r.id)) continue
+        Object.assign(r, { status: 'failed', reason, cost_usd: 0, finished_at: now })
+        const d = this.spendDays.get(`${r.spend_day}|all`)
+        if (d) d.reserved_usd = Math.max(0, d.reserved_usd - num(r.reserved_usd))
+        n++
+      }
+      return { rows: [{ n }] }
+    }
+    if (text.startsWith('UPDATE tutor_day_slots s SET n = c.n FROM (SELECT d.day, (SELECT COUNT(*) FROM tutor_lessons l WHERE l.spend_day = d.day) AS n FROM tutor_day_slots d) c')) {
+      assert.ok(text.includes('WHERE s.day = c.day AND s.n > c.n AND s.day >= ? AND (s.taken_at IS NULL OR s.taken_at < ?)'), 'a place is given back only when it is old enough')
+      const [since, cutoff] = v
+      const rows = []
+      for (const [day, n] of this.slots ?? []) {
+        const lessons = this.lessons.filter(l => l.spend_day === day).length
+        const taken = this.slotTaken?.get(day)
+        if (n > lessons && day >= since && (!taken || Date.parse(taken) < Date.parse(cutoff))) { this.slots.set(day, lessons); rows.push({ day }) }
+      }
+      return { rows }
     }
     if (text.startsWith('UPDATE tutor_day_slots SET n = GREATEST(0, n - 1) WHERE day = ?')) {
       this.slots ??= new Map()
@@ -376,9 +411,9 @@ class FakeDb {
       return { rows: [{ turn }] }
     }
     if (text.startsWith('UPDATE tutor_turns SET state = ?, student_reply = ?')) {
-      const [state, student_reply, student_answer, score, passed, too_long, attempts, fail, cost, run_id, round, subskill, question, turn] = v
+      const [state, student_reply, student_answer, score, passed, too_long, attempts, fail, cost, reply_cut_short, answer_cut_short, run_id, round, subskill, question, turn] = v
       const t = this.turns.get([run_id, round, subskill, question, turn].join('|'))
-      if (t) Object.assign(t, { state, student_reply, student_answer, score, passed, too_long, attempts, fail, cost_usd: t.cost_usd + cost })
+      if (t) Object.assign(t, { state, student_reply, student_answer, score, passed, too_long, attempts, fail, cost_usd: t.cost_usd + cost, reply_cut_short, answer_cut_short })
       return { rows: [] }
     }
     if (text.startsWith('WITH t AS ( UPDATE tutor_turns SET state = ?, teacher_text = ?')) {
@@ -400,6 +435,8 @@ class FakeDb {
       const l = this.lesson(run_id)
       l.teacher_usd = num(l.teacher_usd) + num(t.teacher_cost_usd)
       l.teacher_calls += 1
+      assert.ok(text.includes('ledger AS ( INSERT INTO model_calls') && text.includes("'estimate'") && text.includes('FROM l JOIN t ON t.run_id = l.run_id WHERE t.teacher_cost_usd > 0'), 'a lost call goes on the ledger in the statement that settles it')
+      if (num(t.teacher_cost_usd) > 0) this.modelCalls.push({ experiment_id: l.experiment_id, epoch_number: l.epoch, purpose: 'tinker_tutor', model_id: l.teacher_model, assigned_model_id: l.teacher_model, cost_usd: num(t.teacher_cost_usd), cost_source: 'estimate', created_at: new Date() })
       return { rows: [{ teacher_usd: l.teacher_usd }] }
     }
     throw new Error(`unexpected query: ${text.slice(0, 160)}`)
@@ -1341,6 +1378,8 @@ test('a slice killed after any call and run again repeats no stored call and dou
     assert.equal(theLesson().teacher_reserved_usd, 0)
     const counted = [...lab.turns.values()].filter(t => t.state !== 'calling').length
     assert.equal(theLesson().teacher_calls, counted, `kill after write ${k}: teacher calls counted`)
+    assert.equal(lab.turns.size - counted, 0, `kill after write ${k}: a turn was left marked as sent`)
+    assert.ok(num(theLesson().teacher_usd) <= num(theLesson().teacher_cap_usd) + 1e-9, `kill after write ${k}: the teacher passed its cap`)
     assert.ok(theLesson().teacher_calls <= cleanTeacher + 1)
     assert.ok(net.student.length <= cleanStudent)
   }
@@ -1814,4 +1853,349 @@ test('a fall in cut off answers short of the share flag is flagged on its own', 
   assert.equal(flags.cut_short_before, false)
   assert.equal(flags.cut_off_fell, true)
   assert.ok(flags.reasons.some(r => r.startsWith('fewer answers were cut off by the token limit or came back empty after training (5 of 48 before, 0 of 48 after)')), flags.reasons.join(' | '))
+})
+
+// ===========================================================================
+// The second review: money
+// ===========================================================================
+const freshLab = () => { lab = new FakeDb(); db.handler = (text, values) => lab.handle(text, values); openrouter.resetModelCatalog(); process.env = { ...BASE_ENV } }
+const jsonResponse = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+
+test('a finished student call stays counted until its row is stored: with a slow database a test near the money set aside still stays within it', async () => {
+  // The training job used (nearly) its whole budget, every student request fails once (charged its worst case), and the
+  // answer rows take 1 to 6 ms to write: the other calls of the test make their money check during that write.
+  const usedUp = start => ({ train: Math.floor((start.train.budget_usd - 0.0005) / 0.737e-6), eval: 0, sample_prompt: 0, sample_completion: 0 })
+  for (let seed = 1; seed <= 6; seed++) {
+    freshLab()
+    configure()
+    let s = seed
+    const rnd = () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648
+    lab.answerDelayMs = () => 1 + Math.floor(rnd() * 6)
+    const net = makeNet({ byteTokens: true, runnerTokens: usedUp })
+    globalThis.fetch = flaky(net, 1)
+    await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+    await untilDone(60)
+    const run = theRun()
+    assert.equal(theLesson().stage, 'done', `seed ${seed}`)
+    assert.ok(num(theLesson().train[0]?.cost_usd) > 0.8 * num(run.reserved_usd), `seed ${seed}: the job should have used most of the money set aside`)
+    assert.ok(num(run.cost_usd) <= num(run.reserved_usd) + 1e-9, `seed ${seed}: measured ${run.cost_usd}, set aside ${run.reserved_usd}`)
+    assert.ok(lab.spend('all').spent_usd <= num(run.reserved_usd) + 1e-9, `seed ${seed}`)
+  }
+})
+
+test('a training job that reports more use than its budget stops the round with its own reason, and the record says so', async () => {
+  const big = () => ({ train: 3_000_000, eval: 100_000, sample_prompt: 600, sample_completion: 300 })
+  const { net } = await runLesson({ runnerTokens: big })
+  await untilDone(10)
+  const leg = theLesson().train[0]
+  assert.equal(leg.state, 'failed')
+  assert.equal(leg.over_budget, true)
+  assert.ok(leg.cost_usd > leg.budget_usd, 'the reported cost is kept as reported')
+  assert.match(leg.reason, /^the training job reported more use than its budget \(\$\d+\.\d+ against \$0\.\d+\), so its adapter was not tested$/)
+  assert.equal(theRun().status, 'failed')
+  assert.match(theRun().reason, /^training failed: the training job reported more use than its budget/)
+  assert.equal(theRun().result.training[0].over_budget, true)
+  // no retest call was sent for an adapter the lab did not pay for within its budget
+  assert.equal(net.student.filter(b => String(b.model).startsWith('tinker://')).length, 0)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+  assert.ok(Math.abs(lab.spend('all').spent_usd - num(theRun().cost_usd)) < 1e-9)
+})
+
+test('a student call reported at more than the most it could cost stops the test, or teaching, at once', async () => {
+  // In the first test: every answer reports 60000 completion tokens, far above the answer limit.
+  configure()
+  let net = makeNet()
+  let over = () => true
+  const wrap = inner => async (url, options = {}) => {
+    const res = await inner(url, options)
+    if (String(url) !== tinkerChat.TINKER_CHAT_URL || !res.ok) return res
+    const sent = JSON.parse(options.body)
+    if (!over(sent)) return res
+    const body = await res.json()
+    body.usage = { prompt_tokens: 40, completion_tokens: 60_000 }
+    return jsonResponse(body)
+  }
+  globalThis.fetch = wrap(net.fetch)
+  await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+  assert.equal(theRun().status, 'failed')
+  assert.match(theRun().reason, /^a call to the small model was reported at more than the lab's estimate of the most it could cost \(\$0\.\d+ against \$0\.\d+\), so the test stopped there$/)
+  assert.ok(net.student.length <= tutor.TUTOR_STUDENT_CONCURRENCY, `${net.student.length} calls were sent: only the ones already in flight may finish`)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+
+  // In teaching: only a reply (a call with a dialogue) is over-reported.
+  freshLab()
+  configure()
+  net = makeNet()
+  over = sent => sent.messages.length > 1
+  globalThis.fetch = wrap(net.fetch)
+  await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+  await untilDone(10)
+  assert.match(theLesson().stop_reason, /^a call to the small model was reported at more than the lab's estimate of the most it could cost .* so teaching stopped$/)
+  assert.equal(net.student.filter(b => b.messages.length > 1).length, 1, 'no second teaching call was sent')
+})
+
+test('a teacher call marked as sent by a request that died is settled at the start of the next slice, on the lesson and on the ledger, even when teaching has stopped', async () => {
+  configure()
+  const net = makeNet()
+  const inner = net.fetch
+  let died = false
+  globalThis.fetch = async (url, options = {}) => {
+    // sent, answered, and the request dies before the answer is stored
+    if (String(url) === OR_CHAT && !died) { died = true; const res = await inner(url, options); lab.dead = true; net.alive = false; return res }
+    return inner(url, options)
+  }
+  await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 }).catch(() => null)
+  const l = theLesson()
+  lab.dead = false
+  net.alive = true
+  const calling = turnsOf().filter(t => t.state === 'calling')
+  assert.equal(calling.length, 1)
+  const worst = calling[0].teacher_cost_usd
+  assert.ok(worst > 0)
+  assert.equal(l.teacher_usd, 0)
+  // the next slices come more than 3 hours after the lesson opened: teaching has stopped and never reaches that turn
+  let t = 0
+  while (l.stage !== 'done' && t < 20) { t++; await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + 3 * 3600_000 + t * 15 * 60_000), pollMs: 1 }) }
+  assert.equal(l.stage, 'done')
+  assert.equal(turnsOf().filter(t => t.state === 'calling').length, 0, 'no turn is left marked as sent')
+  assert.ok(Math.abs(l.teacher_usd - worst) < 1e-12, 'the lost call is counted at the most it could have cost')
+  assert.equal(l.teacher_calls, 1)
+  assert.deepEqual(theRun().result.teacher, { calls: 1, usd: Math.round(worst * 1e6) / 1e6 })
+  const ledger = lab.modelCalls.filter(c => c.model_id === TEACHER)
+  assert.deepEqual(ledger.map(c => [c.cost_source, c.cost_usd, c.purpose]), [['estimate', worst, 'tinker_tutor']], 'the daily budget counts it')
+})
+
+test('a lost teacher call is settled before a new one is reserved, so a deferred miss cannot take the teacher past its cap', async () => {
+  // Every call is billed at exactly the most the lab computes for it. The first reply fails once (that miss is deferred),
+  // and the request dies during the second teacher call. The cap has room for 3 calls and a bit.
+  configure({ LAB_TUTOR_TEACHER_USD: '0.014' })
+  const pricing = (await openrouter.getModelCapabilities(TEACHER).catch(() => null))?.pricing
+  const teacher = body => {
+    const bytes = body.messages.reduce((a, m) => a + Buffer.byteLength(m.content), 0)
+    const worst = tutor.teacherWorstUsd(bytes, pricing)
+    const guide = body.messages[0].content.startsWith(tutor.TUTOR_GUIDE_SYSTEM)
+    const content = guide ? { question: 'Which part of your answer for this item went wrong?' } : { explanation: 'The code is spelled from the words.', answer: 'wrong answer' }
+    return jsonResponse({ model: TEACHER, choices: [{ message: { content: JSON.stringify(content) }, finish_reason: 'stop' }], usage: { cost: worst, prompt_tokens: 500, completion_tokens: 800 } })
+  }
+  const net = makeNet({ teacher, knowsBase: q => q.j === 0, plan: {} })
+  const inner = net.fetch
+  let failedReply = false, died = false, teacherCalls = 0
+  globalThis.fetch = async (url, options = {}) => {
+    const u = String(url)
+    if (u === tinkerChat.TINKER_CHAT_URL && JSON.parse(options.body).messages.length > 1 && !failedReply) { failedReply = true; return jsonResponse({ error: { message: 'busy' } }, 503) }
+    if (u === OR_CHAT && ++teacherCalls === 2 && !died) { died = true; const res = await inner(url, options); lab.dead = true; net.alive = false; return res }
+    return inner(url, options)
+  }
+  await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 }).catch(() => null)
+  lab.dead = false
+  net.alive = true
+  let t = 0
+  while (theLesson().stage !== 'done' && t < 30) { t++; await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + t * 15 * 60_000), pollMs: 1 }) }
+  const l = theLesson()
+  assert.equal(l.stage, 'done')
+  assert.ok(num(l.teacher_usd) <= num(l.teacher_cap_usd) + 1e-9, `teacher ${l.teacher_usd} against a cap of ${l.teacher_cap_usd}`)
+  assert.equal(turnsOf().filter(x => x.state === 'calling').length, 0)
+  const ledger = lab.modelCalls.filter(c => c.model_id === TEACHER).reduce((a, c) => a + num(c.cost_usd), 0)
+  assert.ok(Math.abs(ledger - num(l.teacher_usd)) < 1e-9, `the ledger holds ${ledger} and the lesson ${l.teacher_usd}`)
+})
+
+test('what a request that dies while opening a lesson leaves behind is repaired by the next slices once it is old enough', async () => {
+  // k counts the statements of the opening that ran before the request died:
+  // 2 = after the day's place was taken, 4 = after the Tinker money was set aside, 5 = after the run row was written.
+  for (const k of [2, 5]) {
+    freshLab()
+    configure({ LAB_TINKER_TUTOR_PER_DAY: '1' })
+    globalThis.fetch = makeNet().fetch
+    let n = 0, dead = false
+    const base = lab.handle.bind(lab)
+    lab.handle = (text, v) => { if (dead) throw new Error('killed'); const r = base(text, v); if (!/^(CREATE|ALTER)\b/.test(text) && ++n === k) dead = true; return r }
+    const first = await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+    assert.equal(first.status, 'skipped', `k=${k}`)
+    dead = false
+    n = -1e9
+    const day = store.utcDay()
+    assert.equal(lab.slots.get(day), 1, `k=${k}: the place is taken and nothing gave it back`)
+    assert.equal(lab.lessons.length, 0)
+    // a slice a minute later touches nothing: the request that opened it could still be alive
+    await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + 60_000), pollMs: 1 })
+    assert.equal(lab.slots.get(day), 1, `k=${k}: too early to repair`)
+    if (k === 5) assert.equal(theRun().status, 'lesson')
+    // after the longest a request can live, the place is given back, and a run row with no lesson is closed at no cost
+    await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + tutor.TUTOR_LEASE_MS + 60_000), pollMs: 1 })
+    assert.equal(lab.slots.get(day), 0, `k=${k}: the place was given back`)
+    if (k === 5) {
+      assert.equal(theRun().status, 'failed')
+      assert.match(theRun().reason, /^the lesson was never opened/)
+      assert.equal(theRun().cost_usd, 0)
+      assert.equal(lab.spend('all').reserved_usd, 0, 'the Tinker money it set aside was given back')
+      assert.equal(await tutorRun.tutorRunsToday(), 0)
+    }
+    // another experiment's epoch gets a lesson the same day
+    const other = { ...CTX, experimentId: '22222222-2222-4222-8222-222222222222' }
+    const again = await tutorRun.runTinkerTutor(other, read(lessonRaw()), { deadlineAt: Date.now() })
+    assert.equal(again.status, 'started', `k=${k}: ${again.summary}`)
+    // and a lesson that did open keeps its place through the repair
+    await tutorRun.advanceTutorLessons({ deadlineAt: Date.now(), now: new Date(Date.now() + 2 * tutor.TUTOR_LEASE_MS), pollMs: 1 })
+    assert.equal(lab.slots.get(day), 1, `k=${k}: an open lesson keeps its place`)
+  }
+})
+
+test('a slice that dies in any of the three statements after the close still leaves one tool run row and one ledger row', async () => {
+  for (const position of [1, 2, 3]) {
+    freshLab()
+    let after = 0
+    const orig = lab.handle.bind(lab)
+    lab.handle = (text, v) => {
+      if (after > 0 && --after === 0) { lab.dead = true; throw new Error('killed') }
+      const out = orig(text, v)
+      if (text.startsWith('WITH closed AS') && out.rows?.length) after = position
+      return out
+    }
+    await runLesson().catch(() => null)
+    assert.equal(theRun().status, 'ok', `position ${position}`)
+    const before = lab.toolRuns.filter(r => r.tool === 'tinker_tutor').length
+    lab.dead = false
+    await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + 15 * 60_000), pollMs: 1 })
+    await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + 30 * 60_000), pollMs: 1 })
+    assert.equal(theLesson().stage, 'done', `position ${position}`)
+    const rows = lab.toolRuns.filter(r => r.tool === 'tinker_tutor')
+    assert.equal(rows.length, 1, `position ${position}: ${before} row(s) when the request died, ${rows.length} after the next slices`)
+    assert.equal(rows[0].status, 'ok')
+    assert.match(rows[0].output_tail, /^COUNTED BY THE LAB, with rules a model wrote: held back answers passed: \d+ of 24 before, \d+ of 24 after/)
+    assert.ok(Math.abs(rows[0].cost_usd - (num(theRun().cost_usd) + num(theLesson().teacher_usd))) < 1e-9)
+    assert.equal(rows[0].detail.adapter, `lab/${theRun().slug}`)
+    assert.equal(lab.modelCalls.filter(c => c.model_id === 'tool/tinker_tutor').length, 1)
+    assert.equal(lab.closes, 1)
+  }
+})
+
+// ===========================================================================
+// The second review: what the record and the note say
+// ===========================================================================
+test('when a second round fails in its retest, the public record shows the round that stands, as the stored result does', async () => {
+  // Round 1's adapter passes two of three held back questions. Round 2's adapter is never answered for half of its retest.
+  const knowsAdapter = (q, path) => (path === SAMPLER ? (q.held ? q.j <= 1 : q.j !== 2) : true)
+  const studentFails = (q, body) => body.model === SAMPLER2 && body.messages.length === 1 && q.s <= 1
+  const { out } = await runLesson({ knowsAdapter, studentFails }, lessonRaw({ settings: { rounds: 2 } }))
+  await untilDone(20)
+  assert.equal(theRun().status, 'ok', out.summary)
+  assert.equal(theRun().result.rounds_done, 1)
+  assert.match(theRun().reason, /^round 2 did not finish/)
+  assert.ok([...lab.answers.values()].some(a => a.phase === 'after2'), 'round 2 left answers behind')
+  const stored = theRun().result
+  tutorPublic.resetTutorLessonCache()
+  const lesson = (await tutorPublic.tutorLesson()).lesson
+  assert.deepEqual(lesson.overall, stored.overall, 'the chart and the panel read the same counts as the stored result')
+  assert.deepEqual(lesson.subskills.map(s => [s.before, s.after]), stored.skill_map.map(s => [s.before, s.after]))
+  assert.equal(lesson.flags.unanswered, stored.flags.unanswered)
+  assert.deepEqual(lesson.flags.reasons, stored.flags.reasons)
+  assert.equal(tutorPublic.standingRound(theRun()), 1)
+  assert.equal(tutorPublic.standingRound({ status: 'lesson', result: null }), null)
+  // the lesson route shows round 1's answers as the trained model's: h?2 is not passed by the adapter that stands
+  const qs = await tutorPublic.lessonQuestionsBySlug(theRun().slug, 2)
+  const held2 = qs.questions.filter(q => q.held_back)[2]
+  assert.deepEqual(held2.answers.after.map(a => a.passed), [false, false])
+})
+
+test('the held back checks see through a comma, an invisible character and a number written another way, and the note says what they do not catch', () => {
+  const q = (prompt, expected, data) => ({ prompt, ...(expected !== undefined ? { expected } : {}), ...(data ? { data } : {}) })
+  const rub = { rules: [{ type: 'exact_match', from: 'expected', weight: 1, scope: 'last_line' }] }
+  const base = () => lessonRaw()
+  // the same question with ", exactly" added
+  let raw = base()
+  raw.subskills[0].held_back[0] = q(raw.subskills[0].practice[0].prompt.replace('. Give it', ', exactly. Give it'), 'h00codey')
+  assert.equal(refused(raw), 'subskills[0].held_back[0] is nearly the same as practice[0]')
+  // the same question with a zero width space inside two words
+  raw = base()
+  raw.subskills[0].held_back[0] = q(raw.subskills[0].practice[0].prompt.replace('code', 'co​de').replace('line', 'li​ne'), 'h00codey')
+  assert.equal(refused(raw), 'subskills[0].held_back[0] is nearly the same as practice[0]')
+  // a number written another way is the same value
+  const numbers = held => ({
+    topic: 'Sums', subskills: [0, 1, 2, 3].map(s => ({
+      name: `Sums ${s}`, rubric: structuredClone(rub),
+      practice: [0, 1, 2].map(j => q(`Add the ${word(s * 9 + j)} pile to the ${word(s * 9 + j + 40)} pile and give the total.`, String(500 + s * 30 + j * 7))),
+      held_back: [0, 1, 2].map(j => q(`How many ${word(s * 9 + j + 80)} beads are in the ${word(s * 9 + j + 120)} jar?`, s === 0 && j === 0 ? held : String(900 + s * 30 + j * 7))),
+    })),
+  })
+  assert.ok('request' in tutor.normalizeTinkerTutorRequest(numbers('901')), 'a value of its own is accepted')
+  assert.equal(refused(numbers('500.0')), 'subskills[0].held_back[0] expects a value the teacher is shown')
+  assert.equal(refused(numbers('0500')), 'subskills[0].held_back[0] expects a value the teacher is shown')
+  // what the note tells the models about these checks is what they do
+  const note = tutor.tinkerTutorNote({ perDay: 1, teacherUsd: 1 })
+  assert.match(note, /a held back question is refused when its words are nearly the same as those of a practice question of any subskill, or when its "expected" or one of its "data" values, of 3 characters or more, is the same text or the same number as a value the teacher is shown; a reworded question, a shorter value, a value that is only part of a shown value, or a value that only appears inside a practice prompt is not caught\./)
+  assert.doesNotMatch(note, /nearly repeats a practice question of any subskill, or expects a value the teacher is shown, is refused/)
+})
+
+test('a regex rule whose pattern is a fixed text is a fixed phrase: flagged, and kept out of guiding questions', () => {
+  assert.equal(tutor.patternLiteral('Lisbon'), 'Lisbon')
+  assert.equal(tutor.patternLiteral('St\\. Ives'), 'St. Ives')
+  for (const p of ['Lisb(on|oa)', '[Ll]isbon', 'Lisbon?', '\\d+', 'Lis.on', '^Lisbon$', '   ']) assert.equal(tutor.patternLiteral(p), null, p)
+  const rubricFixed = { rules: [{ type: 'regex_match', weight: 1, pattern: 'Lisbon' }] }
+  const raw = lessonRaw()
+  raw.subskills[0] = {
+    name: 'Europe', rubric: rubricFixed,
+    practice: [0, 1, 2].map(j => ({ prompt: `Which ${word(j + 300)} city on the Tagus is the capital of Portugal?` })),
+    held_back: [0, 1, 2].map(j => ({ prompt: `Name the ${word(j + 340)} seat of the Portuguese government.` })),
+  }
+  const request = read(raw)
+  assert.deepEqual(request.flags.rubric_literal, ['Europe'])
+  assert.equal(tutor.rubricIsLiteral(rubricFixed), true)
+  assert.equal(tutor.rubricIsLiteral({ rules: [{ type: 'regex_match', weight: 1, pattern: '[A-Z][a-z]+' }] }), false)
+  const targets = tutor.leakTargets(request.subskills[0].rubric, request.subskills[0].practice[0])
+  assert.deepEqual(targets, ['lisbon'])
+  const guide = tutor.readGuide({ question: 'Is the city you want Lisbon, on the Tagus?' }, targets)
+  assert.equal(guide.ok, false, 'a guiding question that names the answer is not sent to the student')
+})
+
+test('an answer that used the whole token limit is counted as cut off even when the service does not say so, in the tests and in teaching', async () => {
+  // The untrained model writes its thinking first and runs into the limit; the endpoint ends each such answer with "stop".
+  configure()
+  const net = makeNet()
+  const inner = net.fetch
+  const wholeLimit = (body, content) => jsonResponse({ choices: [{ message: { content }, finish_reason: 'stop' }], usage: { prompt_tokens: 40, completion_tokens: body.max_completion_tokens } })
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === tinkerChat.TINKER_CHAT_URL) {
+      const body = JSON.parse(options.body)
+      if (!String(body.model).startsWith('tinker://')) {
+        net.student.push(body)
+        return wholeLimit(body, 'Let me think about the words one at a time. The first word is')
+      }
+    }
+    return inner(url, options)
+  }
+  const out = await runLessonWith()
+  assert.equal(out.status, 'ok', out.summary)
+  const flags = theRun().result.flags
+  assert.deepEqual(flags.cut_off.before, { cut: 48, empty: 0, graded: 48 })
+  assert.equal(flags.cut_short_before, true)
+  assert.ok(flags.reasons.some(r => /cut off by the token limit or came back empty \(48 of 48\)/.test(r)), flags.reasons.join(' | '))
+  // teaching: every reply and every answer again of the small model ran into its limit too
+  const guided = turnsOf().filter(t => t.kind === 'guide' && t.student_reply)
+  assert.ok(guided.length > 0 && guided.every(t => t.reply_cut_short === true), 'replies are stored as cut off')
+  assert.ok(guided.filter(t => t.student_answer).every(t => t.answer_cut_short === true), 'answers again are stored as cut off')
+  assert.equal(theRun().result.teaching.cut_off, guided.length)
+  assert.match(lab.toolRuns.find(r => r.tool === 'tinker_tutor').output_tail, new RegExp(`\\(in ${guided.length} turns of teaching the token limit cut off the small model's reply or answer\\)`))
+  tutorPublic.resetTutorLessonCache()
+  assert.equal((await tutorPublic.tutorLesson()).lesson.teaching.cut_off, guided.length)
+  const qs = await tutorPublic.lessonQuestionsBySlug(theRun().slug, guided[0].subskill)
+  const shown = qs.questions.flatMap(q => q.turns).filter(t => t.kind === 'guide' && t.reply)
+  assert.ok(shown.length > 0 && shown.every(t => t.reply_cut_short === true && t.answer_cut_short === true), JSON.stringify(shown[0]))
+  // an answer under the limit is not marked
+  assert.equal([...lab.answers.values()].filter(a => a.phase === 'after1' && a.cut_short).length, 0)
+  // and the note states the limit of a reply and what is counted
+  const note = tutor.tinkerTutorNote({ perDay: 1, teacherUsd: 1 })
+  assert.match(note, /the record counts the answers the service reports as cut off or that used the whole limit, in every test and in teaching; a reply to a guiding question may be at most 160 tokens\)/)
+})
+async function runLessonWith() {
+  return tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+}
+
+test('the shelf\'s skill map keeps "many cut off" and "fewer cut off after training" apart', () => {
+  const result = flags => ({ topic: 'Sums', teacher_model: TEACHER, skill_map: [{ name: 'Carrying', before: { passed: 2, total: 6, band: 2 }, after: { passed: 3, total: 6, band: 3 } }], flags })
+  const fell = store.readTutorSkillMap(result({ cut_off_fell: true }))
+  assert.deepEqual([fell.cut_short, fell.cut_off_fell], [false, true], 'one answer fewer is not "many"')
+  const many = store.readTutorSkillMap(result({ cut_short_before: true, cut_off_fell: true }))
+  assert.deepEqual([many.cut_short, many.cut_off_fell], [true, true])
+  const none = store.readTutorSkillMap(result({}))
+  assert.deepEqual([none.cut_short, none.cut_off_fell], [false, false])
 })

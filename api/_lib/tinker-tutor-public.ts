@@ -44,7 +44,7 @@ export interface PublicLesson {
   subskills: Array<{ name: string; before: Cell | null; after: Cell | null; seen_before: Count | null; seen_after: Count | null; seen_only: boolean; got_worse: boolean }>
   overall: { before: Cell | null; after: Cell | null }
   progress: { graded: number; to_grade: number; taught: number; to_teach: number; seq: number; updated_at: string } | null
-  teaching: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number; leaked: number; not_taught: number; teacher_calls: number } | null
+  teaching: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number; leaked: number; not_taught: number; teacher_calls: number; cut_off: number } | null
   examples: { kept: number; guided: number; answer: number; explained: number; left_out: number; total: number } | null
   training: { steps_done: number | null; steps_planned: number | null; holdout_loss_before: number | null; holdout_loss_after: number | null } | null
   flags: {
@@ -56,6 +56,8 @@ export interface PublicLesson {
   measured_by: typeof TUTOR_MEASURED_BY
   origin: typeof ORIGIN_MODELS
   talk?: string
+  /** Until when the trained adapter is kept, for a lesson that closed ok with one. */
+  kept_until?: string
   created_at: string
   finished_at: string | null
   reason: string | null
@@ -71,11 +73,24 @@ export interface LessonQuestions {
     prompt: string
     /** cut_short: the token limit cut the answer off; empty: it came back with no text. Both are graded as they stand. */
     answers: { before: Array<{ text: string; passed: boolean; cut_short: boolean; empty: boolean }>; after: Array<{ text: string; passed: boolean; cut_short: boolean; empty: boolean }> }
-    turns: Array<{ kind: 'guide' | 'explain'; state: string; teacher: string; reply: string; answer: string; passed: boolean }>
+    /** reply_cut_short and answer_cut_short: the token limit cut the small model's reply to a guiding question, or its answer again, off. */
+    turns: Array<{ kind: 'guide' | 'explain'; state: string; teacher: string; reply: string; answer: string; passed: boolean; reply_cut_short: boolean; answer_cut_short: boolean }>
   }>
 }
 
 const num = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) ? v : null)
+
+/**
+ * The round whose test stands for a lesson that has closed, as its stored
+ * result says (rounds_done): when a second round failed in its retest, round
+ * 1's adapter stands and round 2's partial answers are not the lesson's
+ * "after". Null while the lesson is open, or when no round finished.
+ */
+export function standingRound(run: Pick<TinkerRunRow, 'status' | 'result'>): number | null {
+  if (run.status === 'lesson') return null
+  const done = run.result?.rounds_done
+  return done === 1 || done === 2 ? done : null
+}
 const STATUSES = ['ok', 'ended', 'failed', 'error'] as const
 const STAGES = ['diagnostic', 'teaching', 'training', 'retest', 'closing', 'done'] as const
 
@@ -84,7 +99,7 @@ export function publicLesson(run: TinkerRunRow, lesson: LessonRow | null, answer
   const request: TinkerTutorRequest | null = lesson?.request ?? null
   if (!request || !Array.isArray(request.subskills)) return null
   const open = run.status === 'lesson'
-  const summary = summarizeLesson(request, answers, turns, { train: lesson?.train ?? [], teacher_calls: lesson?.teacher_calls ?? 0 })
+  const summary = summarizeLesson(request, answers, turns, { train: lesson?.train ?? [], teacher_calls: lesson?.teacher_calls ?? 0 }, standingRound(run))
   const stage = open ? (STAGES as readonly string[]).includes(lesson?.stage ?? '') ? lesson!.stage : 'diagnostic' : 'done'
   const status = open ? 'running' : (STATUSES as readonly string[]).includes(run.status) ? run.status as PublicLesson['status'] : 'failed'
   const p = lesson?.progress
@@ -140,6 +155,7 @@ export function publicLesson(run: TinkerRunRow, lesson: LessonRow | null, answer
     measured_by: TUTOR_MEASURED_BY,
     origin: ORIGIN_MODELS,
     ...(alive && chatOn ? { talk: `lab/${run.slug}` } : {}),
+    ...(run.status === 'ok' && run.expires_at ? { kept_until: run.expires_at } : {}),
     created_at: run.created_at,
     finished_at: run.finished_at,
     reason: run.reason ? publicCut(run.reason, 300) : null,
@@ -227,7 +243,8 @@ export async function lessonQuestionsBySlug(slug: string, subskill: number): Pro
   if (!s || !Number.isInteger(subskill) || subskill < 0) return 'bad_index'
   const answers = await subskillAnswers(run.id, subskill)
   const turns = (await loadTurns(run.id)).filter(t => t.subskill === subskill)
-  const afterPhase = ['after2', 'after1'].find(p => answers.some(a => a.phase === p)) ?? 'after1'
+  const stands = standingRound(run)
+  const afterPhase = stands ? `after${stands}` : ['after2', 'after1'].find(p => answers.some(a => a.phase === p)) ?? 'after1'
   const answersOf = (held: boolean, q: number, phase: string) => answers
     .filter(a => a.phase === phase && a.held_back === held && a.question === q && (a.status === 'ok' || a.status === 'no_answer'))
     .sort((a, b) => a.sample - b.sample)
@@ -250,6 +267,7 @@ export async function lessonQuestionsBySlug(slug: string, subskill: number): Pro
           reply: publicCut(t.student_reply ?? '', 300),
           answer: publicCut((t.kind === 'explain' ? t.teacher_answer : t.student_answer) ?? '', 300),
           passed: t.passed,
+          reply_cut_short: t.reply_cut_short === true, answer_cut_short: t.kind === 'guide' && t.answer_cut_short === true,
         })),
       })
     }

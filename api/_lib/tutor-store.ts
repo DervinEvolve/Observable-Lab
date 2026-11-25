@@ -64,6 +64,8 @@ export function ensureTutorTables(): Promise<void> {
       await sql`CREATE INDEX IF NOT EXISTS idx_tutor_lessons_open ON tutor_lessons(stage, created_at)`
       // The lessons-per-day limit, held by one conditional statement (two experiments' epochs can run at the same time).
       await sql`CREATE TABLE IF NOT EXISTS tutor_day_slots (day TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0)`
+      // When a place was last taken: a place whose lesson never got a row is given back only after its request cannot be alive any more.
+      await sql`ALTER TABLE tutor_day_slots ADD COLUMN IF NOT EXISTS taken_at TIMESTAMP WITH TIME ZONE`
       await sql`
         CREATE TABLE IF NOT EXISTS tutor_answers (
           run_id UUID NOT NULL,
@@ -110,6 +112,9 @@ export function ensureTutorTables(): Promise<void> {
           PRIMARY KEY (run_id, round, subskill, question, turn)
         )
       `
+      // Whether the token limit cut off the small model's reply to a guiding question, or its answer again.
+      await sql`ALTER TABLE tutor_turns ADD COLUMN IF NOT EXISTS reply_cut_short BOOLEAN NOT NULL DEFAULT FALSE`
+      await sql`ALTER TABLE tutor_turns ADD COLUMN IF NOT EXISTS answer_cut_short BOOLEAN NOT NULL DEFAULT FALSE`
     })().catch(e => {
       ready = null
       throw e
@@ -157,6 +162,8 @@ export interface TrainLeg {
   cost_usd: number | null
   usage_known: boolean
   reason?: string | null
+  /** The job reported more use than its budget: its cost is kept as reported and the round stopped there. */
+  over_budget?: boolean
 }
 
 export interface LessonProgress { graded: number; to_grade: number; taught: number; to_teach: number; seq: number; updated_at: string }
@@ -277,6 +284,9 @@ export interface TurnRow {
   attempts: number
   fail: string | null
   cost_usd: number
+  /** The token limit cut off the small model's reply to the guiding question (TUTOR_REPLY_TOKENS), or its answer again (max_answer_tokens). */
+  reply_cut_short?: boolean
+  answer_cut_short?: boolean
 }
 
 export function turnRow(r: Record<string, unknown>): TurnRow {
@@ -298,6 +308,8 @@ export function turnRow(r: Record<string, unknown>): TurnRow {
     attempts: Number(r.attempts) || 0,
     fail: r.fail ? String(r.fail) : null,
     cost_usd: num(r.cost_usd),
+    ...(r.reply_cut_short === true ? { reply_cut_short: true } : {}),
+    ...(r.answer_cut_short === true ? { answer_cut_short: true } : {}),
   }
 }
 
@@ -421,7 +433,8 @@ export async function saveTurnStudent(runId: string, t: TurnRow, callCostUsd: nu
   await sql`
     UPDATE tutor_turns
     SET state = ${t.state}, student_reply = ${t.student_reply}, student_answer = ${t.student_answer}, score = ${t.score}, passed = ${t.passed},
-      too_long = ${t.too_long}, attempts = ${t.attempts}, fail = ${t.fail}, cost_usd = cost_usd + ${usd(callCostUsd)}
+      too_long = ${t.too_long}, attempts = ${t.attempts}, fail = ${t.fail}, cost_usd = cost_usd + ${usd(callCostUsd)},
+      reply_cut_short = ${t.reply_cut_short === true}, answer_cut_short = ${t.answer_cut_short === true}
     WHERE run_id = ${runId} AND round = ${t.round} AND subskill = ${t.subskill} AND question = ${t.question} AND turn = ${t.turn}
   `
 }
@@ -482,19 +495,32 @@ export async function settleTeacher(runId: string, t: TurnRow, worstUsd: number,
 /**
  * A teacher call that was marked as sent by a slice that died before it was
  * settled. It may have been sent and billed, so it is never sent again: the
- * turn is used up and counted at the most it could have cost.
+ * turn is used up and counted at the most it could have cost, on the lesson
+ * and, in the same statement, on the lab's spend ledger (as an estimate), so
+ * the daily budget counts it too. The request that died may have written the
+ * call's real cost to the ledger before it died; then the ledger holds both.
  */
 export async function settleLostTeacherCall(runId: string, t: Pick<TurnRow, 'round' | 'subskill' | 'question' | 'turn'>): Promise<boolean> {
+  await ensureSpendTable()
   const r = await sql`
     WITH t AS (
       UPDATE tutor_turns SET state = 'no_question', fail = 'lost'
       WHERE run_id = ${runId} AND round = ${t.round} AND subskill = ${t.subskill} AND question = ${t.question} AND turn = ${t.turn} AND state = 'calling'
       RETURNING run_id, teacher_cost_usd
+    ),
+    l AS (
+      UPDATE tutor_lessons
+      SET teacher_usd = teacher_usd + COALESCE((SELECT SUM(teacher_cost_usd) FROM t), 0), teacher_calls = teacher_calls + 1
+      WHERE run_id IN (SELECT run_id FROM t)
+      RETURNING run_id, teacher_usd, teacher_model, experiment_id, epoch, budget_scope
+    ),
+    ledger AS (
+      INSERT INTO model_calls (experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens, reasoning_tokens, budget_scope)
+      SELECT l.experiment_id, l.epoch, 'tinker_tutor', l.teacher_model, l.teacher_model, t.teacher_cost_usd, 'estimate', 0, 0, 0, CASE WHEN l.budget_scope = 'research' THEN 'research' ELSE NULL END
+      FROM l JOIN t ON t.run_id = l.run_id WHERE t.teacher_cost_usd > 0
+      RETURNING id
     )
-    UPDATE tutor_lessons
-    SET teacher_usd = teacher_usd + COALESCE((SELECT SUM(teacher_cost_usd) FROM t), 0), teacher_calls = teacher_calls + 1
-    WHERE run_id IN (SELECT run_id FROM t)
-    RETURNING teacher_usd
+    SELECT teacher_usd FROM l
   `
   return Boolean(r.rows[0])
 }
@@ -643,11 +669,53 @@ export async function takeTutorDaySlot(now: Date, perDay: number): Promise<boole
   if (!(perDay >= 1)) return false
   await ensureTutorTables()
   const r = await sql`
-    INSERT INTO tutor_day_slots (day, n) VALUES (${utcDay(now)}, 1)
-    ON CONFLICT (day) DO UPDATE SET n = tutor_day_slots.n + 1 WHERE tutor_day_slots.n < ${perDay}
+    INSERT INTO tutor_day_slots (day, n, taken_at) VALUES (${utcDay(now)}, 1, ${now.toISOString()})
+    ON CONFLICT (day) DO UPDATE SET n = tutor_day_slots.n + 1, taken_at = EXCLUDED.taken_at WHERE tutor_day_slots.n < ${perDay}
     RETURNING n
   `
   return r.rows.length > 0
+}
+
+/**
+ * Repairs what a request that died while a lesson was being opened left
+ * behind (the place, the run row and the lesson row are separate statements).
+ * Only looks at what is older than `cutoff`, so a request that is still
+ * opening a lesson is never touched. Two statements:
+ *
+ *   a run row of a lesson still in status 'lesson' with no lesson row is
+ *   closed as failed at no cost, and the Tinker money it set aside is given
+ *   back under the day it was reserved;
+ *
+ *   a day whose places taken are more than its lessons (rows in
+ *   tutor_lessons for that day) gives the difference back.
+ *
+ * Never creates a table: with none, the caller treats the error as nothing
+ * to repair. Returns how many run rows and places were repaired.
+ */
+export async function repairLessonOpenings(now: Date, cutoff: Date, reason: string): Promise<{ runs: number; places: number }> {
+  const orphans = await sql`
+    WITH orphan AS (
+      UPDATE tinker_runs r SET status = 'failed', reason = ${reason}, cost_usd = 0, finished_at = ${now.toISOString()}
+      WHERE r.kind = 'tutor' AND r.status = 'lesson' AND r.created_at < ${cutoff.toISOString()}
+        AND NOT EXISTS (SELECT 1 FROM tutor_lessons l WHERE l.run_id = r.id)
+      RETURNING r.spend_day, r.reserved_usd
+    ),
+    settled AS (
+      UPDATE tinker_spend_days d SET reserved_usd = GREATEST(0, d.reserved_usd - s.reserved)
+      FROM (SELECT spend_day, SUM(reserved_usd) AS reserved FROM orphan GROUP BY spend_day) s
+      WHERE d.day = s.spend_day AND d.scope = 'all'
+      RETURNING d.day
+    )
+    SELECT COUNT(*) AS n FROM orphan
+  `
+  const places = await sql`
+    UPDATE tutor_day_slots s SET n = c.n
+    FROM (SELECT d.day, (SELECT COUNT(*) FROM tutor_lessons l WHERE l.spend_day = d.day) AS n FROM tutor_day_slots d) c
+    WHERE s.day = c.day AND s.n > c.n AND s.day >= ${utcDay(new Date(now.getTime() - 86_400_000))}
+      AND (s.taken_at IS NULL OR s.taken_at < ${cutoff.toISOString()})
+    RETURNING s.day
+  `
+  return { runs: Number(orphans.rows[0]?.n) || 0, places: places.rows.length }
 }
 
 /** Gives a place back: the lesson was refused before any call was sent. */
