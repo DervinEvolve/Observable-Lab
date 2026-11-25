@@ -493,7 +493,7 @@ It starts a run under a made-up name, sends the same start a second time, asks f
 | `LAB_ENABLE_TINKER` | false | The training tool. Only the exact value `true` turns it on, and only with the three settings below. |
 | `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL` | none | The two URLs Modal printed in step 3. https only. |
 | `TINKER_JOBS_TOKEN` | none | The `JOBS_TOKEN` from step 2. Sensitive. |
-| `LAB_TINKER_BASE_MODELS` | `Qwen/Qwen3.5-4B` | Comma separated, from `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.6-35B-A3B`. Anything else is left out; a list with nothing usable turns the tool off. |
+| `LAB_TINKER_BASE_MODELS` | `Qwen/Qwen3.5-4B` | Comma separated, from `Qwen/Qwen3.5-4B`, `Qwen/Qwen3.5-9B`, `Qwen/Qwen3.6-35B-A3B`, `thinkingmachines/Inkling-2-Mini`. Anything else is left out; a list with nothing usable turns the tool off. The last one needs its own steps first: [Adding Inkling 2 Mini](#adding-inkling-2-mini-as-a-base-model). |
 | `LAB_TINKER_RUN_USD` | 2 | The most one run may cost, by the estimate. Never more than 5. |
 | `LAB_TINKER_DAILY_USD` | 10 | The most all Tinker use may cost per UTC day, by the estimate: runs, adapter calls through the lab model endpoint, and visitor chat. Never more than 50. |
 | `LAB_TINKER_PER_DAY` | 2 | Runs per UTC day, 0 to 10. |
@@ -525,6 +525,80 @@ I turn them on one at a time: `LAB_ENABLE_TINKER` first, then the two chat switc
 **Turning it off.** Set `LAB_ENABLE_TINKER` to anything but `true` and redeploy: the models are no longer told about it and requests are ignored, so nothing new starts. I leave `TINKER_JOBS_START_URL`, `TINKER_JOBS_STATUS_URL` and `TINKER_JOBS_TOKEN` in place for at least an hour after that. A run already training carries on at Modal, and while those three are set the tick keeps collecting it: it only asks the runner about runs that were already started and closes their rows, so the run's record is written, its estimated cost reaches `model_calls` and the daily budget, and a finished adapter is recorded. This also covers a run whose experiment has been archived or replaced in the meantime. `SELECT count(*) FROM tinker_runs WHERE status IN ('reserved', 'running')` says when nothing is open any more; after that the three values can go too. If I remove them while a run is open and the switch is off, that run stays open and its cost is in Tinker's billing only, so I do not do that. (With the switch still on and the runner's address gone, an open run is closed after about an hour at the whole amount set aside.)
 
 `LAB_ENABLE_TRAINED_CHAT` and `LAB_ENABLE_LIVE_TRAINED` turn off the same way: the panel's button disappears and pages stop calling the chat route, the chat route answers 503, and the lab model endpoint refuses `lab/` models like any unknown model. To stop everything at once, delete `TINKER_API_KEY` in Vercel and the `oblab-tinker-auth` secret in Modal, or revoke the key in the Tinker console. `modal app stop oblab-tinker` takes the runner down. Adapters expire by themselves; `tinker checkpoint list` and `tinker checkpoint delete` (or the console) remove them sooner.
+
+## Adding Inkling 2 Mini as a base model
+
+Inkling 2 Mini (`thinkingmachines/Inkling-2-Mini`, Thinking Machines, released 20 November 2026) is a looped transformer: a mixture of experts with 26.4B parameters, 5.4B active per token, a 64K context, and Tinker type "Hybrid + Vision". It is one more entry on the list of base models for both Tinker training and Tinker RL. The code knows it, but nothing changes until I add it to `LAB_TINKER_BASE_MODELS`: the default list is still `Qwen/Qwen3.5-4B` alone, and the models are told no more than the list they have. Nothing in the prompts says to use it.
+
+| Base model | Train | Sample | Prefill | Chat format the runner uses | Tinker type |
+|---|---|---|---|---|---|
+| `Qwen/Qwen3.5-4B` (default) | $0.737 | $1.005 | $0.33 | `qwen3_5_disable_thinking` | Hybrid + Vision, dense |
+| `Qwen/Qwen3.5-9B` | $1.463 | $0.807 | $0.30 | `qwen3_5_disable_thinking` | Hybrid + Vision, dense |
+| `Qwen/Qwen3.6-35B-A3B` | $1.177 | $1.335 | $0.45 | `qwen3_5_disable_thinking` | Hybrid + Vision, MoE |
+| `thinkingmachines/Inkling-2-Mini` | $0.75 | $0.50 | $0.15 | `tml_v0` at thinking effort 0.0 | Hybrid + Vision, MoE |
+
+Dollars per million tokens, read from `https://tinker-docs.thinkingmachines.ai/tinker/models.json` on 25 November 2026. I re-read all four rows that day and the three Qwen rows still matched, so the table date in `api/_lib/tinker.ts` is now 25 November. Two other Inkling 2 Mini entries are in Tinker's table and are deliberately not in the lab's: the 256K-context one (`...:peft:262144`, train $1.50) and a free-tier one (`...:peft:65536:free`). An id that is not exactly `thinkingmachines/Inkling-2-Mini` is left out of the list and refused in a request. The cached prefill price ($0.015) is not used: estimates apply the full prefill price, so they err high.
+
+**The chat format, and what I found.** Tinker's cookbook has one renderer for the Inkling models, `tml_v0` (`TmlV0Renderer`, from the `tml-renderers` package). It has no "disable thinking" variant like the Qwen ones. It conditions the model on a "thinking effort", a number from 0.0 up to but not including 1.0, and renders it as a system message before the first non-system message. Without a number it uses 0.9, "high". Tinker's thinking-effort page names 0.0 "none" and says that it conditions the model toward no reasoning and is not a hard guarantee. The runner uses 0.0 for training and for sampling, the closest thing to the Qwen setting. Two details matter and are handled in `modal/tinker_jobs.py`:
+
+- The cookbook's generic data helper (the one the runner uses) renders every training example at the default 0.9. If the runner trained at 0.9 and sampled at 0.0, or the other way round, the model would be asked at a prefix it never saw trained. The runner wraps the renderer (`FixedEffortRenderer`) so that training examples and sampling prompts both carry 0.0.
+- The renderer needs the cookbook's own tokenizer for Inkling models, not the training client's Hugging Face one, which it refuses. The runner uses the cookbook's `get_tokenizer` for this model only; the Qwen path is as it was. The cookbook release the runner used before (0.6.1) mapped Inkling 2 Mini to the tokenizer of the first Inkling and would have trained on wrong tokens. 0.7.1 (20 November) maps it to the Inkling 2 tokenizer, so the pin is now `tinker-cookbook==0.7.1`.
+
+The chat on kept adapters and the "compare with untrained" call ask Tinker's OpenAI-compatible endpoint for an answer without reasoning. For Qwen that is `"reasoning_effort": false`. A Thinking Machines model takes a level name or a number, and a boolean it does not take is an HTTP 400, so for Inkling the lab sends `"reasoning_effort": "none"` (0.0, the same level it trained at).
+
+**Steps, in this order.** Each one costs nothing or a few cents, and each can stop me before the next.
+
+1. Redeploy the runner. It is the same file; `render_check` is a new function in it, so this is needed even if the app is already deployed:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py
+```
+
+2. Check the chat format first. No Tinker call, no key, no cost. It renders one made-up conversation the way the runner trains and samples it and prints the prompt it built and six checks (the effort really goes into the prompt; the sampling prompt is the start of the training example token for token; training weighs nothing the prompt already holds, and nothing but the answer):
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py render --model thinkingmachines/Inkling-2-Mini
+```
+
+What I expect: six lines that start with `ok` and `render: all checks passed`. A renderer or tokenizer that is wrong for the model fails here with the check that broke, and the next two commands refuse to start a paid run when it fails. I also read the printed prompt: it should hold a thinking-effort message and end where the assistant answers.
+
+3. The tiny training smoke on this model. Same 20 made-up examples as step 4 of Tinker training, the budget is still 5 cents, and at Inkling's prices it costs well under one cent:
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py --model thinkingmachines/Inkling-2-Mini
+```
+
+For this model the smoke also judges the result, because the examples all answer in one form (`The lab code for <colour> is OL-nnn.`): the held-out loss must fall, and every sampled answer must hold `OL-`. If the format were wrong (reasoning trained in, or sampled at another effort than trained) the answers would be thinking text or empty and it prints `FAIL`. It ends with `train thinkingmachines/Inkling-2-Mini: all as expected` and exits 0.
+
+4. The RL smoke on this model (a few cents at most, capped at 5 cents):
+
+```
+uv run --no-project --python 3.12 --with-requirements requirements-runner.txt python modal/tinker_smoke.py rl --model thinkingmachines/Inkling-2-Mini
+```
+
+It runs the format check first. `keep` and `endpoints` take `--model` too. `TINKER_SMOKE_MODEL=thinkingmachines/Inkling-2-Mini` in the environment does the same as the option, and the option wins. Without either, every check runs on `Qwen/Qwen3.5-4B` as before. A model that is not in the table above stops the script before anything is called.
+
+5. The chat call on Inkling. Same as "What I expect" in step 4 of Tinker training, with the adapter path from step 3 and `"reasoning_effort": "none"` in place of `false`. For the comparison, ask the base model by its id:
+
+```
+read -s TINKER_API_KEY
+curl -sS https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1/chat/completions \
+  -H "Authorization: Bearer $TINKER_API_KEY" -H "Content-Type: application/json" \
+  -d '{"model": "thinkingmachines/Inkling-2-Mini", "messages": [{"role": "user", "content": "Say hello."}], "max_completion_tokens": 20, "reasoning_effort": "none"}'
+unset TINKER_API_KEY
+```
+
+6. In Vercel, set `LAB_TINKER_BASE_MODELS` for Production to the value below and redeploy. This is the only step that lets a model choose it:
+
+```
+Qwen/Qwen3.5-4B,thinkingmachines/Inkling-2-Mini
+```
+
+To take it off again, set the variable back to `Qwen/Qwen3.5-4B` (or remove it) and redeploy. An adapter already trained on Inkling 2 Mini stays listed until it expires; its record keeps its base model, and the chat cost for it is still estimated at Inkling's prices.
+
+**What a run on it costs.** At the same text sizes it is close to `Qwen/Qwen3.5-4B`, since training is the larger part and both are about $0.74 to $0.75 per million tokens: 200 two-line examples for 2 epochs set aside about 6 cents, a full 120000 bytes in a few hundred examples for 3 epochs about $0.39, and the most the limits allow at all, 2000 examples of 12 very short messages for 3 epochs, about $1.01, under the $2 a run may cost. Sampling and prefill are cheaper than on `Qwen/Qwen3.5-4B`, so a chat call costs less. All of these are estimates, as everywhere in Tinker.
+
+**Not checked from the development machine, and so what these steps are the first real test of.** It cannot reach Tinker or Modal. What was checked: the runner imports on Python 3.9 and its tests pass with a stand-in for Tinker; the cookbook 0.7.1 and `tml-renderers` 0.4.2 sources were read, not run; the prices, the renderer name and the effort levels are from Tinker's published table and documentation. What was not: that the image builds with `tinker-cookbook==0.7.1` beside `tinker==0.39.1` and `transformers==5.23.0`; that `render_check` passes on the real tokenizer (the six checks are the test of that); that the model learns the made-up codes at effort 0.0; that Tinker's endpoint takes `"reasoning_effort": "none"` for an adapter and for the base id; and the save with a time to live and the sampling for this model. Keeping an adapter as a PEFT copy (`LAB_ENABLE_TINKER_KEEP`) reads the base model's repository on Hugging Face and converts with the cookbook's own `build_lora_adapter`; whether that works for Inkling 2 Mini is not known. If it does not, the keep fails with a reason in its record and the adapter stays on Tinker until it expires. I run `python modal/tinker_smoke.py keep --model thinkingmachines/Inkling-2-Mini` (same command prefix as above) once before I rely on it.
 
 ## Tinker RL
 

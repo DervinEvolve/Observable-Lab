@@ -43,19 +43,25 @@ export interface TinkerPrice {
 }
 
 /** The day these prices were copied from https://tinker-docs.thinkingmachines.ai/tinker/models.json. */
-export const TINKER_PRICE_TABLE_DATE = '2026-11-18'
+export const TINKER_PRICE_TABLE_DATE = '2026-11-25'
 
 /**
- * The base models the lab knows a price and a chat format for. All three are
+ * The base models the lab knows a price and a chat format for. All four are
  * current chat models that can answer without reasoning first ("Hybrid" in
  * Tinker's table); none is marked as retiring. LAB_TINKER_BASE_MODELS can
  * only choose among these: a model with no price here cannot be estimated,
- * so it cannot be allowed. The runner on Modal has the same three ids.
+ * so it cannot be allowed. The runner on Modal has the same four ids.
+ *
+ * Inkling 2 Mini is the 64K-context entry of Tinker's table. Its 256K variant
+ * ("...:peft:262144") trains at twice the price and is not listed here, so it
+ * cannot be chosen. Its free-tier entry is not listed either: the free tier
+ * has its own limits, and these estimates are for the paid price.
  */
 export const TINKER_PRICES: Readonly<Record<string, TinkerPrice>> = {
   'Qwen/Qwen3.5-4B': { train: 0.737, sample: 1.005, prefill: 0.33 },
   'Qwen/Qwen3.5-9B': { train: 1.463, sample: 0.807, prefill: 0.30 },
   'Qwen/Qwen3.6-35B-A3B': { train: 1.177, sample: 1.335, prefill: 0.45 },
+  'thinkingmachines/Inkling-2-Mini': { train: 0.75, sample: 0.50, prefill: 0.15 },
 }
 
 /** The cheapest of them to train, and the one Tinker's own first tutorial uses. */

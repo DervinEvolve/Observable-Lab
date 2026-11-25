@@ -256,7 +256,121 @@ class CheckJobTests(unittest.TestCase):
         self.assertEqual((M.MAX_EXAMPLES, M.MAX_STEPS, M.HARD_RUN_USD), (2000, 600, 5.0))
         self.assertEqual((M.TRAIN_WALL_S, M.RUN_TIMEOUT_S), (1800, 2700))
         self.assertLess(M.TRAIN_WALL_S, M.RUN_TIMEOUT_S)
-        self.assertEqual(sorted(M.RENDERERS), ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-35B-A3B"])
+        self.assertEqual(sorted(M.RENDERERS), ["Qwen/Qwen3.5-4B", "Qwen/Qwen3.5-9B", "Qwen/Qwen3.6-35B-A3B", "thinkingmachines/Inkling-2-Mini"])
+
+    def test_inkling_2_mini_is_accepted_with_the_one_renderer_tinker_documents_and_nothing_near_it_is(self):
+        mini = "thinkingmachines/Inkling-2-Mini"
+        self.assertEqual(M.RENDERERS[mini], "tml_v0")
+        self.assertIsNone(M.check_job(job(base_model=mini, prices={"train": 0.75, "sample": 0.50, "prefill": 0.15})))
+        # Its 256K variant, its free tier, its bigger sibling, the first Inkling and a made-up one are all refused.
+        for other in (mini + ":peft:262144", mini + ":peft:65536:free", "thinkingmachines/Inkling-2-Small", "thinkingmachines/Inkling",
+                      "thinkingmachines/Inkling-Small", "thinkingmachines/inkling-2-mini", mini + " ", "Qwen/Qwen3.6-27B"):
+            self.assertIn("base_model", M.check_job(job(base_model=other)) or "", other)
+
+    def test_a_renderer_that_takes_a_thinking_effort_is_trained_and_sampled_at_none(self):
+        self.assertEqual(M.RENDER_EFFORT, {"tml_v0": 0.0})
+        # Every renderer is either one without a thinking block (Qwen) or has an effort, so none is left on a default of high.
+        for model, name in M.RENDERERS.items():
+            self.assertTrue(name in M.RENDER_EFFORT or name.endswith("_disable_thinking"), model)
+
+    def test_a_run_on_inkling_2_mini_is_costed_at_its_own_prices(self):
+        prices = {"train": 0.75, "sample": 0.50, "prefill": 0.15}
+        result, deps, _ = run(job(base_model="thinkingmachines/Inkling-2-Mini", prices=prices))
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["tokens"], {"train": 720, "eval": 80, "sample_prompt": 20, "sample_completion": 14})
+        self.assertAlmostEqual(M.cost_usd(result["tokens"], prices), (720 + 80) * 0.75 / 1e6 + 20 * 0.15 / 1e6 + 14 * 0.50 / 1e6, places=9)
+        # The same tokens cost more under a made-up higher price, so the prices sent with the job are the ones used.
+        self.assertGreater(M.cost_usd(result["tokens"], PRICES), M.cost_usd(result["tokens"], prices))
+
+
+class RenderCheckTests(unittest.TestCase):
+    """judge_render: what a correct renderer passes and what a wrong one fails. Token lists stand in for the real tokenizer."""
+
+    decode = staticmethod(lambda ids: "".join(chr(i) for i in ids))
+
+    def good(self):
+        prompt = [1, 2, 3, 4]
+        other = [1, 2, 9, 4]
+        answer = [ord(c) for c in M.RENDER_CHECK_ANSWER]
+        example = prompt + answer + [5]
+        weights = [0.0] * len(prompt) + [0.1] * (len(answer) + 1)
+        return prompt, other, example, weights
+
+    def failed(self, prompt, other, example, weights):
+        return [c["what"] for c in M.judge_render(prompt, other, example, weights, self.decode) if not c["ok"]]
+
+    def test_a_renderer_that_renders_prompt_and_example_alike_passes_every_check(self):
+        self.assertEqual(self.failed(*self.good()), [])
+
+    def test_an_effort_that_is_not_sent_fails(self):
+        prompt, _, example, weights = self.good()
+        self.assertEqual(self.failed(prompt, list(prompt), example, weights), ["a different effort gives a different prompt, so the effort is really sent"])
+
+    def test_training_data_rendered_in_another_format_than_the_prompt_fails(self):
+        prompt, other, example, weights = self.good()
+        example = [7] + example[1:]  # the example opens differently from the prompt
+        self.assertIn("the generation prompt is the start of the training example, token for token", self.failed(prompt, other, example, weights))
+
+    def test_weights_that_reach_into_the_prompt_fail(self):
+        prompt, other, example, weights = self.good()
+        weights = [0.0, 0.0, 0.1] + weights[3:]
+        self.assertIn("training weighs nothing the sampling prompt already holds", self.failed(prompt, other, example, weights))
+
+    def test_training_on_something_other_than_the_answer_fails(self):
+        prompt, other, example, weights = self.good()
+        example = prompt + [ord(c) for c in "Let me think about this for a long while before I say anything at all. " * 3]
+        weights = [0.0] * len(prompt) + [0.1] * (len(example) - len(prompt))
+        failed = self.failed(prompt, other, example, weights)
+        self.assertIn("the weighted tokens are the answer", failed)
+        self.assertIn("the weights cover the answer and no more than a little format after it", failed)
+
+    def test_an_example_with_no_weight_at_all_fails(self):
+        prompt, other, example, weights = self.good()
+        self.assertTrue(self.failed(prompt, other, example, [0.0] * len(example)))
+
+
+class FixedEffortTests(unittest.TestCase):
+    """FixedEffortRenderer is a class, which load() leaves out, so it is taken from the tree by itself."""
+
+    @classmethod
+    def setUpClass(cls):
+        node = next(n for n in ast.parse(SOURCE).body if isinstance(n, ast.ClassDef) and n.name == "FixedEffortRenderer")
+        namespace = {}
+        exec(compile(ast.Module(body=[node], type_ignores=[]), "modal/tinker_jobs.py", "exec"), namespace)
+        cls.Fixed = namespace["FixedEffortRenderer"]
+
+    class Inner:
+        tokenizer = "the tokenizer"
+
+        def __init__(self):
+            self.calls = []
+
+        def build_generation_prompt(self, messages, role="assistant", prefill=None, effort=0.9):
+            self.calls.append(("prompt", effort))
+            return "prompt"
+
+        def build_supervised_example(self, messages, train_on_what=None, effort=0.9):
+            self.calls.append(("example", effort, train_on_what))
+            return "example"
+
+        def get_stop_sequences(self):
+            return [99]
+
+    def test_the_effort_is_supplied_to_the_prompt_and_to_the_training_example(self):
+        inner = self.Inner()
+        renderer = self.Fixed(inner, 0.0)
+        renderer.build_generation_prompt([{"role": "user", "content": "x"}])
+        renderer.build_supervised_example([], train_on_what="last")
+        self.assertEqual(inner.calls, [("prompt", 0.0), ("example", 0.0, "last")])
+
+    def test_an_effort_named_by_the_caller_wins_and_the_rest_passes_through(self):
+        inner = self.Inner()
+        renderer = self.Fixed(inner, 0.0)
+        renderer.build_generation_prompt([], effort=0.9)
+        self.assertEqual(inner.calls, [("prompt", 0.9)])
+        self.assertEqual((renderer.get_stop_sequences(), renderer.tokenizer, renderer.effort), ([99], "the tokenizer", 0.0))
+        with self.assertRaises(AttributeError):
+            renderer.not_a_thing
 
 
 class RunTests(unittest.TestCase):
@@ -523,7 +637,7 @@ class DeployShapeTests(unittest.TestCase):
         web_image = SOURCE[SOURCE.index("web_image = "):SOURCE.index("# Pure parts")]
         self.assertIn('"fastapi==', train_image)
         self.assertIn('"fastapi[standard]==', web_image)
-        for pin in ('"tinker==0.39.1"', '"tinker-cookbook==0.6.1"', '"torch==2.15.0"'):
+        for pin in ('"tinker==0.39.1"', '"tinker-cookbook==0.7.1"', '"tml-renderers==0.4.2"', '"torch==2.15.0"'):
             self.assertIn(pin, train_image)
         self.assertNotIn("tinker", web_image)
 
@@ -536,6 +650,7 @@ class DeployShapeTests(unittest.TestCase):
         # `train` and `train_rl` train; `keeper` sets a checkpoint's time to live and copies its weights. The two web endpoints never have the key.
         self.assertEqual(secrets, {
             "train": ["oblab-tinker-auth"], "train_rl": ["oblab-tinker-auth"], "keeper": ["oblab-tinker-auth"],
+            "render_check": [],  # renders a made-up conversation: no Tinker call, no key
             "start": ["oblab-tinker-jobs-auth"], "status": ["oblab-tinker-jobs-auth"],
         })
         # The key is named only where error text is scrubbed of it; it is never put in a result or printed.

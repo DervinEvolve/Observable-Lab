@@ -42,7 +42,7 @@ const FAMILY_WORDS = [
  * written as two ("x AI", "o 3").
  */
 const WHOLE_WORDS = [
-  'sonnet', 'opus', 'haiku', 'fable', 'astra', 'glm', 'kimi', 'phi', 'ernie', 'gemma', 'cohere', 'codex', 'tinker', 'xai', 'o1', 'o3', 'o4',
+  'sonnet', 'opus', 'haiku', 'fable', 'astra', 'glm', 'kimi', 'phi', 'ernie', 'gemma', 'cohere', 'codex', 'tinker', 'inkling', 'xai', 'o1', 'o3', 'o4',
 ] as const
 
 /** What makers write after a model's name and number: "o3-mini", "Phi-4-mini", "GLM-4-Plus". */

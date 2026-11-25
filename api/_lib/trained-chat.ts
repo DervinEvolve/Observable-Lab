@@ -356,7 +356,7 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
     return { answer, ms: Date.now() - t0 }
   }
   const trainedInput = {
-    samplerPath: target.sampler_path, messages: chat.messages, maxTokens: TRAINED_CHAT_MAX_TOKENS,
+    samplerPath: target.sampler_path, adapterBase: base, messages: chat.messages, maxTokens: TRAINED_CHAT_MAX_TOKENS,
     temperature: TRAINED_CHAT_TEMPERATURE, timeoutMs: TRAINED_CHAT_TIMEOUT_MS,
   }
   // callTinkerChat never throws, so one side failing cannot lose the other's answer.

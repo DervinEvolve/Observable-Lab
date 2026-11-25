@@ -14,9 +14,11 @@
  * The model named in the request is the adapter's checkpoint path. Tinker
  * runs it on the base model it was trained on. For the visitor chat's
  * comparison it is instead the base model's own id (a priced one), asking for
- * the same model without the adapter. "reasoning_effort": false
- * asks that base model to answer directly, which is how the adapter was
- * trained (the runner trains without the thinking block).
+ * the same model without the adapter. "reasoning_effort" asks that base model
+ * to answer directly, which is how the adapter was trained (the runner trains
+ * without the thinking block): false for the Qwen models, and "none" for the
+ * Thinking Machines models, which take a level or a number and answer a
+ * boolean with HTTP 400 (tinkerReasoningEffort).
  */
 import { sanitizeOutput } from './sprites.js'
 import { isSamplerPath, TINKER_PRICES } from './tinker.js'
@@ -34,6 +36,13 @@ export interface TinkerChatInput {
    * Only a model with a price in TINKER_PRICES is sent.
    */
   baseModel?: string
+  /**
+   * With samplerPath: the base model the adapter was trained on, from the
+   * lab's record. It decides only how the call asks for a direct answer
+   * (tinkerReasoningEffort), because the checkpoint path does not say. When
+   * left out the Qwen form is sent, which a Thinking Machines model refuses.
+   */
+  adapterBase?: string
   messages: TinkerChatMessage[]
   maxTokens: number
   temperature?: number
@@ -89,6 +98,17 @@ function neverConnected(e: unknown): boolean {
   return false
 }
 
+/**
+ * How a call asks for an answer without a reasoning phase. Tinker's
+ * OpenAI-compatible endpoint takes true or false for the hybrid Qwen models,
+ * and for a Thinking Machines model (Inkling) a level name or a number from 0
+ * to 0.99, where "none" is 0.0, the level the runner trains and samples at.
+ * A value the model does not take gets HTTP 400.
+ */
+export function tinkerReasoningEffort(baseModel: string | undefined): false | 'none' {
+  return typeof baseModel === 'string' && Object.hasOwn(TINKER_PRICES, baseModel) && baseModel.startsWith('thinkingmachines/') ? 'none' : false
+}
+
 /** The body sent to Tinker for one call. Exported so a test can see exactly what leaves. */
 export function tinkerChatBody(input: TinkerChatInput): Record<string, unknown> {
   return {
@@ -96,7 +116,7 @@ export function tinkerChatBody(input: TinkerChatInput): Record<string, unknown> 
     messages: input.messages.map(m => ({ role: m.role, content: m.content })),
     max_completion_tokens: Math.max(1, Math.floor(input.maxTokens)),
     ...(typeof input.temperature === 'number' ? { temperature: input.temperature } : {}),
-    reasoning_effort: false,
+    reasoning_effort: tinkerReasoningEffort(input.baseModel ?? input.adapterBase),
   }
 }
 

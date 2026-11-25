@@ -699,7 +699,7 @@ test('a name is read strictly: a small alphabet, 2 to 40 characters, no web addr
     'Gemini 4', 'DeepSeek V4 Pro', 'Claude Fable 5.2', 'GPT-6 Astra', 'Grok 4.7', 'claude-sonnet-5.5', 'gemini 3.8 flash', 'North', 'GLM 5.3',
     'gpt-6-astra', 'grok-4.7', 'deepseek-v4-pro-0813', 'north-mini-code',
     'GPT', 'gpt 7', 'G P T Five', 'ChatGPT', 'Claude', 'claude jr', 'C1aude', 'CIaude', 'Cl4ude', 'Gemini Two', 'Gernini', 'G3mini', 'Grok', 'Gr0k', 'DeepSeek', 'Deep Seek', 'D33pSeek',
-    'Llama', 'L1ama', 'Qwen', 'Q-w-e-n', 'Qvven', 'Mistral', 'OpenAI Finch', 'Anthropic', 'Google Bird', 'Opus', 'Sonnet 9', 'Haiku', 'Fable', 'Astra', 'Kimi', 'Phi', 'Gemma', 'Codex', 'Tinker', 'o3 Mini',
+    'Llama', 'L1ama', 'Qwen', 'Q-w-e-n', 'Qvven', 'Mistral', 'OpenAI Finch', 'Anthropic', 'Google Bird', 'Opus', 'Sonnet 9', 'Haiku', 'Fable', 'Astra', 'Kimi', 'Phi', 'Gemma', 'Codex', 'Tinker', 'o3 Mini', 'Inkling', 'Inkling 2 Mini', 'inkling-2-mini', 'Inkling2', 'Inkling 2 Small', 'Thinking Machines', '1nkling',
     // i, l and 1 pass for one another in either direction and in either case, in the name and in the real name alike.
     'GEMlNI', 'Gemlni', 'Gem1ni', 'Gemin1', 'Gem1ni 4', 'OPENAl', 'OPENA1', '0penAl', 'MlSTRAL', 'NVlDlA', 'NV1DIA', 'Ciaude', 'C1AUDE', 'Anthropl c', 'Copi1ot', 'Kiml', 'Ph1', 'Halku',
     // The maker of a panel model that has no family word of its own, as a word or as the provider id writes it.
@@ -718,7 +718,7 @@ test('a name is read strictly: a small alphabet, 2 to 40 characters, no web addr
   // Dots between letters are refused before that, as a web address would be.
   assert.ok('error' in names.readAdapterName('G.P.T. Five'))
   // A short model name is refused as a word, not as a few letters inside another word.
-  for (const fine of ['Octopus', 'Philosopher', 'Sophia', 'Bonnet', 'Stable Quill', 'Fables', 'Tinkerbell', 'Northern Finch', 'North Star', 'Glow Worm', 'Max Allen', 'Hexalith']) {
+  for (const fine of ['Octopus', 'Philosopher', 'Sophia', 'Bonnet', 'Stable Quill', 'Fables', 'Tinkerbell', 'Inklings', 'Inkwell', 'Northern Finch', 'North Star', 'Glow Worm', 'Max Allen', 'Hexalith']) {
     assert.ok('name' in names.readAdapterName(fine), fine)
   }
   // Two names are the same name whatever their case, separators or look-alike characters.
@@ -1468,7 +1468,7 @@ test('the documents state the switches, the limits and the owner\'s steps as the
   assert.ok(ops.includes(`the project now has ${routes.length};`), `OPERATIONS.md should say the project has ${routes.length} functions`)
   // The smoke test prints as many checks as the document says to expect.
   const smoke = readFileSync(join(root, 'modal', 'tinker_smoke.py'), 'utf8')
-  const keepCheck = smoke.slice(smoke.indexOf('def keep() -> int:'), smoke.indexOf('if __name__ == "__main__":'))
+  const keepCheck = smoke.slice(smoke.indexOf('def keep(model: str = DEFAULT_MODEL) -> int:'), smoke.indexOf('def choose_model('))
   assert.equal((keepCheck.match(/^    expect\(/gm) || []).length, 7)
   assert.ok(ops.includes('seven lines that start with `ok`'))
 })

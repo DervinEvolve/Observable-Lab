@@ -606,6 +606,120 @@ test('the estimate counts every epoch, two held-out passes over the largest exam
   assert.equal(tinker.tinkerCostUsd('unknown/model', { train: 5, eval: 5, sample_prompt: 5, sample_completion: 5 }), 0)
 })
 
+// ===========================================================================
+// Inkling 2 Mini, a base model the owner may add to the list
+// ===========================================================================
+const MINI = 'thinkingmachines/Inkling-2-Mini'
+
+test('Inkling 2 Mini is priced from Tinker\'s table, its other variants are not, and the default list is unchanged', () => {
+  // Per million tokens, from https://tinker-docs.thinkingmachines.ai/tinker/models.json on 25 November 2026: train $0.75, sample $0.50, prefill $0.15.
+  assert.deepEqual(tinker.TINKER_PRICES[MINI], { train: 0.75, sample: 0.50, prefill: 0.15 })
+  assert.equal(tinker.TINKER_PRICE_TABLE_DATE, '2026-11-25')
+  for (const other of [`${MINI}:peft:262144`, `${MINI}:peft:65536:free`, 'thinkingmachines/Inkling-2-Small', 'thinkingmachines/Inkling', 'thinkingmachines/Inkling-Small']) {
+    assert.equal(Object.hasOwn(tinker.TINKER_PRICES, other), false, other)
+  }
+  // Nothing changes until the owner names it: with no list set the only model is still Qwen/Qwen3.5-4B.
+  delete process.env.LAB_TINKER_BASE_MODELS
+  assert.deepEqual(tinker.DEFAULT_TINKER_BASE_MODELS, ['Qwen/Qwen3.5-4B'])
+  assert.deepEqual(tinker.tinkerBaseModels(), { models: ['Qwen/Qwen3.5-4B'], dropped: 0, unusable: false })
+})
+
+test('LAB_TINKER_BASE_MODELS accepts Inkling 2 Mini beside Qwen, in either order, and leaves out its look-alikes', () => {
+  try {
+    process.env.LAB_TINKER_BASE_MODELS = `Qwen/Qwen3.5-4B,${MINI}`
+    assert.deepEqual(tinker.tinkerBaseModels(), { models: ['Qwen/Qwen3.5-4B', MINI], dropped: 0, unusable: false })
+    process.env.LAB_TINKER_BASE_MODELS = ` ${MINI} , Qwen/Qwen3.5-4B, ${MINI}`
+    assert.deepEqual(tinker.tinkerBaseModels(), { models: [MINI, 'Qwen/Qwen3.5-4B'], dropped: 0, unusable: false })
+    process.env.LAB_TINKER_BASE_MODELS = `${MINI}:peft:262144,thinkingmachines/inkling-2-mini,thinkingmachines/Inkling-2-Small,${MINI}`
+    assert.deepEqual(tinker.tinkerBaseModels(), { models: [MINI], dropped: 3, unusable: false })
+    process.env.LAB_TINKER_BASE_MODELS = `${MINI}:peft:262144`
+    assert.equal(tinker.tinkerBaseModels().unusable, true)
+    // The models are told the list, so they see it only once the owner has added it.
+    process.env.LAB_TINKER_BASE_MODELS = `Qwen/Qwen3.5-4B,${MINI}`
+    assert.match(tinker.tinkerNote({ perDay: 2, liveTrained: false }), /The base model is one of: Qwen\/Qwen3\.5-4B, thinkingmachines\/Inkling-2-Mini\./)
+    delete process.env.LAB_TINKER_BASE_MODELS
+    assert.doesNotMatch(tinker.tinkerNote({ perDay: 2, liveTrained: false }), /Inkling/)
+  } finally { delete process.env.LAB_TINKER_BASE_MODELS }
+})
+
+test('a request for Inkling 2 Mini is accepted only while it is on the list, and an unknown id is refused whatever the list holds', () => {
+  const both = ['Qwen/Qwen3.5-4B', MINI]
+  const checked = tinker.normalizeTinkerRequest(ask({ base_model: MINI }), both)
+  assert.ok('request' in checked, checked.error)
+  assert.equal(checked.request.base_model, MINI)
+  // Not on the default list: refused with the list in the reason.
+  assert.match(refusal(ask({ base_model: MINI })), /base_model must be one of: Qwen\/Qwen3\.5-4B$/)
+  // Ids that are not exactly the priced one are refused even when the list holds the priced one.
+  for (const id of [`${MINI}:peft:262144`, 'thinkingmachines/Inkling-2-Small', 'thinkingmachines/inkling-2-mini', `${MINI} `, 'thinkingmachines/Inkling-3', 'made/up-model']) {
+    assert.match(refusal(ask({ base_model: id }), both), /base_model must be one of: Qwen\/Qwen3\.5-4B, thinkingmachines\/Inkling-2-Mini$/, id)
+  }
+})
+
+test('the estimate, the cap and the cost of a run on Inkling 2 Mini use its own prices', () => {
+  const request = tinker.normalizeTinkerRequest(ask({ base_model: MINI }), [MINI]).request
+  const e = tinker.estimateTinkerRun(request)
+  const price = tinker.TINKER_PRICES[MINI]
+  const sizes = request.examples.map(tinker.estimateExampleTokens).sort((a, b) => b - a)
+  const total = sizes.reduce((a, b) => a + b, 0)
+  const expected = 1.25 * ((total * 2 + 2 * (sizes[0] + sizes[1])) * price.train + 3 * (sizes[0] * price.prefill + 120 * price.sample)) / 1e6
+  assert.ok(Math.abs(e.max_cost_usd - expected) < 2e-6, `${e.max_cost_usd} vs ${expected}`)
+  // It is a different number from the Qwen run of the same data, since the prices differ.
+  assert.notEqual(e.max_cost_usd, tinker.estimateTinkerRun(ok(ask())).max_cost_usd)
+  // The most any request the limits allow can set aside stays under the 2 dollars a run may cost, on this model too.
+  const extreme = tinker.normalizeTinkerRequest({
+    base_model: MINI, settings: { epochs: 3, batch_size: 16 },
+    examples: Array.from({ length: 2000 }, (_, i) => ({ messages: Array.from({ length: 12 }, (_, j) => ({ role: j % 2 === 0 ? 'user' : 'assistant', content: j === 0 ? String(i).padStart(5, '0') : 'xxxxx' })) })),
+  }, [MINI])
+  assert.ok('request' in extreme, extreme.error)
+  const most = tinker.estimateTinkerRun(extreme.request).max_cost_usd
+  assert.ok(most > 0.5 && most < tinker.DEFAULT_TINKER_RUN_USD, `the largest amount that can be set aside is ${most}`)
+  // Measured tokens and a chat call are priced the same way.
+  assert.ok(Math.abs(tinker.tinkerCostUsd(MINI, { train: 1_000_000, eval: 0, sample_prompt: 0, sample_completion: 0 }) - 0.75) < 1e-9)
+  assert.ok(Math.abs(tinker.tinkerCostUsd(MINI, { train: 0, eval: 1_000_000, sample_prompt: 1_000_000, sample_completion: 1_000_000 }) - (0.75 + 0.15 + 0.50)) < 1e-9)
+  assert.ok(Math.abs(tinker.tinkerChatCostUsd(MINI, 1_000_000, 1_000_000) - (0.15 + 0.50)) < 1e-9)
+  const worst = tinker.tinkerChatWorstCaseUsd(MINI, [{ content: 'Hello' }], 200)
+  assert.ok(worst > 0 && worst < tinker.tinkerChatWorstCaseUsd('Qwen/Qwen3.5-4B', [{ content: 'Hello' }], 200), 'sampling is cheaper on Inkling 2 Mini than on Qwen3.5-4B')
+  assert.equal(tinker.tinkerCostUsd(`${MINI}:peft:262144`, { train: 5, eval: 5, sample_prompt: 5, sample_completion: 5 }), 0)
+})
+
+test('a chat call asks Inkling for no reasoning in the form it takes, and Qwen in the form it always did', async () => {
+  const messages = [{ role: 'user', content: 'Hi' }]
+  const body = input => tinkerChat.tinkerChatBody({ messages, maxTokens: 50, timeoutMs: 1000, ...input })
+  // Thinking Machines models take a level or a number: "none" is 0.0, the effort the runner trains at. A boolean is a 400.
+  assert.equal(body({ baseModel: MINI }).reasoning_effort, 'none')
+  assert.equal(body({ baseModel: MINI }).model, MINI)
+  assert.equal(body({ samplerPath: SAMPLER, adapterBase: MINI }).reasoning_effort, 'none')
+  assert.equal(body({ samplerPath: SAMPLER, adapterBase: MINI }).model, SAMPLER)
+  // Qwen, and a call that does not say the adapter's base model, keep the form they had.
+  assert.equal(body({ baseModel: BASE }).reasoning_effort, false)
+  assert.equal(body({ samplerPath: SAMPLER, adapterBase: BASE }).reasoning_effort, false)
+  assert.equal(body({ samplerPath: SAMPLER }).reasoning_effort, false)
+  // Only a priced id counts, so text that merely starts with the maker's name does not change what is sent.
+  assert.equal(body({ samplerPath: SAMPLER, adapterBase: 'thinkingmachines/Anything' }).reasoning_effort, false)
+  // A base model the lab does not price is still never sent.
+  const sent = []
+  const saved = { fetch: globalThis.fetch, key: process.env.TINKER_API_KEY }
+  process.env.TINKER_API_KEY = 'tml-test-only'
+  globalThis.fetch = async (...args) => { sent.push(args); throw new Error('no network in this test') }
+  try {
+    const answer = await tinkerChat.callTinkerChat({ baseModel: `${MINI}:peft:262144`, messages, maxTokens: 50, timeoutMs: 1000 })
+    assert.equal(answer.ok, false)
+    assert.equal(answer.maybeServed, false)
+    assert.equal(sent.length, 0)
+  } finally { globalThis.fetch = saved.fetch; if (saved.key === undefined) delete process.env.TINKER_API_KEY; else process.env.TINKER_API_KEY = saved.key }
+})
+
+test('the runner on Modal is given Inkling 2 Mini\'s prices and renderer, and the smoke test mirrors them', () => {
+  const runner = readFileSync(join(root, 'modal', 'tinker_jobs.py'), 'utf8')
+  assert.match(runner, /"thinkingmachines\/Inkling-2-Mini": "tml_v0",/)
+  assert.match(runner, /^RENDER_EFFORT = \{"tml_v0": 0\.0\}$/m)
+  // The runner is not given a price table; it is sent the prices of the job, which the server takes from TINKER_PRICES.
+  const request = tinker.normalizeTinkerRequest(ask({ base_model: MINI }), [MINI]).request
+  assert.deepEqual(tinker.TINKER_PRICES[request.base_model], { train: 0.75, sample: 0.5, prefill: 0.15 })
+  const smoke = readFileSync(join(root, 'modal', 'tinker_smoke.py'), 'utf8')
+  assert.match(smoke, /"thinkingmachines\/Inkling-2-Mini": \{"train": 0\.75, "sample": 0\.50, "prefill": 0\.15\}/)
+})
+
 test('the price table and the limits are the same on the lab server and in the runner on Modal', () => {
   const source = readFileSync(join(root, 'modal', 'tinker_jobs.py'), 'utf8')
   const constant = name => {
@@ -736,7 +850,7 @@ test('an approved run: the estimate is set aside, the runner is sent data and li
   assert.deepEqual([record.tool, record.status, record.model, record.epoch], ['tinker_train', 'ok', 'anthropic/claude-fable-5.2', 41])
   assert.equal(record.request_summary, `LoRA fine-tune of ${BASE} on 20 examples: a tiny test run`)
   assert.match(record.output_tail, /LAB-MEASURED held-out loss 2\.9531 before training, 1\.1042 after, on 2 examples the lab held out/)
-  assert.match(record.output_tail, /estimated cost \$0\.\d{4} \(token counts at Tinker's published prices of 2026-11-18, not a billed amount\)/)
+  assert.match(record.output_tail, /estimated cost \$0\.\d{4} \(token counts at Tinker's published prices of 2026-11-25, not a billed amount\)/)
   assert.equal(record.detail.adapter, `lab/${run.slug}`)
   assert.equal(record.detail.sampler_path, SAMPLER)
   assert.deepEqual(record.detail.dataset, { sha256: plan.tinker_train.dataset_sha256, examples: 20, bytes: plan.tinker_train.dataset_bytes })

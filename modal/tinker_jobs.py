@@ -108,14 +108,26 @@ from modal.exception import OutputExpiredError
 APP_NAME = "oblab-tinker"
 
 # The base models this runner will train, and the chat format each is trained
-# and sampled in: the cookbook's renderer without the thinking block, so the
-# adapter answers directly. The lab server has the same three ids with their
-# prices (api/_lib/tinker.ts). Any other base model is refused.
+# and sampled in. For the Qwen models it is the cookbook's renderer without
+# the thinking block, so the adapter answers directly. Inkling 2 Mini has one
+# renderer, "tml_v0", with no switch for thinking; it takes a thinking effort
+# from 0.0 to just under 1.0 instead (RENDER_EFFORT below). The lab server has
+# the same four ids with their prices (api/_lib/tinker.ts). Any other base
+# model is refused.
 RENDERERS = {
     "Qwen/Qwen3.5-4B": "qwen3_5_disable_thinking",
     "Qwen/Qwen3.5-9B": "qwen3_5_disable_thinking",
     "Qwen/Qwen3.6-35B-A3B": "qwen3_5_disable_thinking",
+    "thinkingmachines/Inkling-2-Mini": "tml_v0",
 }
+
+# Renderers that take a thinking effort, and the one the runner uses for both
+# training and sampling. 0.0 is the "none" level of Tinker's thinking-effort
+# page: the model is conditioned toward no reasoning (it is not a hard
+# guarantee). The cookbook's generic data builders render at its default of
+# 0.9, so the runner passes the effort itself (FixedEffortRenderer): training
+# and sampling must show the model the same prefix.
+RENDER_EFFORT = {"tml_v0": 0.0}
 
 # Limits. The lab server checks the same ones before it sends a request; these
 # are the ones that hold whatever it sends.
@@ -196,7 +208,7 @@ train_image = (
     .pip_install("torch==2.15.0", index_url="https://download.pytorch.org/whl/cpu")
     .pip_install(
         "tinker==0.39.1",
-        "tinker-cookbook==0.6.1",
+        "tinker-cookbook==0.7.1",
         "tml-renderers==0.4.2",
         "transformers==5.23.0",
         "numpy==2.4.6",
@@ -1823,6 +1835,59 @@ def run_core(job, make_deps, clock=time.time, log=print) -> dict:
         return done({"status": "error", "stage": state["stage"], "error": scrub(exc, secrets)})
 
 
+class FixedEffortRenderer:
+    """A cookbook renderer that takes a thinking effort (tml_v0) with the effort fixed.
+
+    The cookbook's supervised data helper calls build_supervised_example
+    without an effort, which renders at the default of 0.9. This wrapper
+    supplies the runner's effort unless a call names one, for the generation
+    prompt and the training example alike, and passes everything else
+    (stop sequences, parsing, the tokenizer) to the renderer it wraps.
+    """
+
+    def __init__(self, renderer, effort: float):
+        self._renderer = renderer
+        self.effort = effort
+
+    def build_generation_prompt(self, messages, *args, **kwargs):
+        kwargs.setdefault("effort", self.effort)
+        return self._renderer.build_generation_prompt(messages, *args, **kwargs)
+
+    def build_supervised_example(self, messages, *args, **kwargs):
+        kwargs.setdefault("effort", self.effort)
+        return self._renderer.build_supervised_example(messages, *args, **kwargs)
+
+    def __getattr__(self, name):
+        if name in ("_renderer", "effort"):
+            raise AttributeError(name)
+        return getattr(self._renderer, name)
+
+
+RENDER_CHECK_USER = "What is the lab code for the colour red?"
+RENDER_CHECK_ANSWER = "The lab code for red is OL-100."
+
+
+def judge_render(prompt, other_prompt, example, weights, decode) -> list:
+    """The checks of one renderer, from token lists. Returns [{"what", "ok"}]. Touches nothing.
+
+    `prompt`: the generation prompt for RENDER_CHECK_USER at the runner's
+    effort. `other_prompt`: the same at a different effort. `example` and
+    `weights`: the training example for the same question with RENDER_CHECK_ANSWER,
+    one weight per token. `decode`: token ids to text.
+    """
+    weighted = [i for i, w in enumerate(weights) if w > 0]
+    first = weighted[0] if weighted else -1
+    trained_text = decode([example[i] for i in weighted]) if weighted else ""
+    return [
+        {"what": "the generation prompt is not empty", "ok": len(prompt) > 0},
+        {"what": "a different effort gives a different prompt, so the effort is really sent", "ok": list(prompt) != list(other_prompt)},
+        {"what": "the generation prompt is the start of the training example, token for token", "ok": len(prompt) > 0 and list(example[:len(prompt)]) == list(prompt)},
+        {"what": "training weighs nothing the sampling prompt already holds", "ok": first >= len(prompt) > 0},
+        {"what": "the weighted tokens are the answer", "ok": RENDER_CHECK_ANSWER in trained_text},
+        {"what": "the weights cover the answer and no more than a little format after it", "ok": 0 < len(weighted) <= len(RENDER_CHECK_ANSWER) + 16},
+    ]
+
+
 # ---------------------------------------------------------------------------
 # The training service, as run_core uses it
 # ---------------------------------------------------------------------------
@@ -1832,7 +1897,7 @@ class TinkerDeps:
 
     def __init__(self, job: dict):
         import tinker
-        from tinker_cookbook.renderers import TrainOnWhat, get_renderer, get_text_content
+        from tinker_cookbook.renderers import TrainOnWhat, get_text_content
         from tinker_cookbook.supervised.data import conversation_to_datum
 
         self._tinker = tinker
@@ -1840,8 +1905,46 @@ class TinkerDeps:
         self._to_datum = conversation_to_datum
         self._text = get_text_content
         self._client = self.open_client(job)
-        self._renderer = get_renderer(RENDERERS[job["base_model"]], self.tokenizer())
+        self._renderer = self.open_renderer(job["base_model"], self.tokenizer)
         self._sampler = None
+
+    @staticmethod
+    def open_renderer(base_model: str, sdk_tokenizer):
+        """The chat format for a base model. `sdk_tokenizer` is a function that returns the training client's tokenizer.
+
+        A renderer that takes a thinking effort (Inkling) needs the cookbook's own tokenizer for the model, which
+        wraps tml-renderers; the client's tokenizer is a Hugging Face one and the renderer refuses it. The tokens
+        are the same ones either way. The Qwen renderers keep using the client's tokenizer, as they always did.
+        """
+        from tinker_cookbook.renderers import get_renderer
+
+        name = RENDERERS[base_model]
+        if name not in RENDER_EFFORT:
+            return get_renderer(name, sdk_tokenizer())
+        from tinker_cookbook.tokenizer_utils import get_tokenizer
+
+        return FixedEffortRenderer(get_renderer(name, get_tokenizer(base_model)), RENDER_EFFORT[name])
+
+    @staticmethod
+    def check_render(base_model: str) -> dict:
+        """Renders one made-up conversation for a base model and judges the result. No Tinker call, no key, no cost."""
+        from tinker_cookbook.renderers import TrainOnWhat
+
+        name = RENDERERS[base_model]
+        if name not in RENDER_EFFORT:
+            return {"status": "skipped", "renderer": name, "reason": "this renderer has no thinking effort to check"}
+        renderer = TinkerDeps.open_renderer(base_model, None)
+        question = [{"role": "user", "content": RENDER_CHECK_USER}]
+        prompt = renderer.build_generation_prompt(question)
+        other = renderer.build_generation_prompt(question, effort=0.9)
+        example, weights = renderer.build_supervised_example(
+            question + [{"role": "assistant", "content": RENDER_CHECK_ANSWER}], train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE)
+        decode = renderer.tokenizer.decode
+        checks = judge_render(prompt.to_ints(), other.to_ints(), example.to_ints(), [float(w) for w in weights.tolist()], decode)
+        return {
+            "status": "ok" if all(c["ok"] for c in checks) else "failed", "renderer": name, "effort": renderer.effort,
+            "prompt_tokens": int(prompt.length), "prompt_text": decode(prompt.to_ints()), "checks": checks,
+        }
 
     def open_client(self, job: dict):
         service = self._tinker.ServiceClient()
@@ -1903,13 +2006,24 @@ def train(job: dict) -> dict:
     return run_core(job, TinkerDeps)
 
 
+@app.function(image=train_image, timeout=300, retries=0, cpu=(1, 2), memory=(2048, 4096))
+def render_check(base_model: str) -> dict:
+    """Renders a made-up conversation in the chat format a base model is trained in and judges it. Makes no Tinker call and holds no key."""
+    if base_model not in RENDERERS:
+        return {"status": "refused", "reason": "base_model is not one this runner trains"}
+    try:
+        return TinkerDeps.check_render(base_model)
+    except Exception as error:  # noqa: BLE001
+        return {"status": "failed", "renderer": RENDERERS[base_model], "reason": "%s: %s" % (type(error).__name__, str(error)[:300])}
+
+
 class TinkerRlDeps:
     """Tinker behind the calls run_rl_core makes. The SDK reads TINKER_API_KEY from the environment itself."""
 
     def __init__(self, job: dict):
         import tinker
         import torch
-        from tinker_cookbook.renderers import get_renderer, get_text_content
+        from tinker_cookbook.renderers import get_text_content
 
         self._tinker = tinker
         self._torch = torch
@@ -1919,7 +2033,7 @@ class TinkerRlDeps:
             base_model=job["base_model"], rank=job["settings"]["rank"],
             user_metadata={"source": "observable-lab", "kind": "rl", "label": _short(job.get("label", ""), 80)},
         ).result(timeout=CALL_TIMEOUT_S)
-        self._renderer = get_renderer(RENDERERS[job["base_model"]], self._client.get_tokenizer())
+        self._renderer = TinkerDeps.open_renderer(job["base_model"], self._client.get_tokenizer)
         self._stop = self._renderer.get_stop_sequences()
 
     def secrets(self) -> list:

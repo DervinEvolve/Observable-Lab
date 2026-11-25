@@ -140,7 +140,7 @@ export async function runTrainedCall(res: VercelResponse, key: LiveKeyGrant, tar
   }
 
   const answer = await callTinkerChat({
-    samplerPath: target.sampler_path, messages: request.messages, maxTokens: request.maxTokens,
+    samplerPath: target.sampler_path, adapterBase: base, messages: request.messages, maxTokens: request.maxTokens,
     ...(request.temperature !== undefined ? { temperature: request.temperature } : {}), timeoutMs: LIVE_UPSTREAM_TIMEOUT_MS,
   })
   record.httpStatus = answer.httpStatus

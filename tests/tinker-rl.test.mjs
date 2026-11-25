@@ -873,3 +873,28 @@ test('the visitor chat lists an RL adapter with its rubric scores, higher is bet
   assert.match(d.origin, /Practice by Reward \(reinforcement learning\) on 20 tasks and a rubric written by Claude Fable 5\.2/)
   assert.ok(!d.score.includes('loss'))
 })
+
+// ===========================================================================
+// Inkling 2 Mini as a base model for RL, once the owner has added it to the list
+// ===========================================================================
+const MINI = 'thinkingmachines/Inkling-2-Mini'
+
+test('an RL request may name Inkling 2 Mini only while it is on the list, and is estimated at its prices', () => {
+  const both = ['Qwen/Qwen3.5-4B', MINI]
+  const read = rl.normalizeTinkerRlRequest(ask({ base_model: MINI }), both)
+  assert.ok('request' in read, read.error)
+  assert.equal(read.request.base_model, MINI)
+  // The default list does not hold it, and neither an unknown id nor a variant of it gets through a list that does.
+  assert.match(rl.normalizeTinkerRlRequest(ask({ base_model: MINI })).error, /base_model must be one of: Qwen\/Qwen3\.5-4B/)
+  for (const id of [`${MINI}:peft:262144`, 'thinkingmachines/Inkling-2-Small', 'made/up-model']) {
+    assert.match(rl.normalizeTinkerRlRequest(ask({ base_model: id }), both).error, /base_model must be one of/, id)
+  }
+  // The estimate is computed from the model's own prices, and the largest request still sits under the per-run cap.
+  const estimate = rl.estimateTinkerRl(read.request)
+  assert.notEqual(estimate.max_cost_usd, rl.estimateTinkerRl(ok(ask())).max_cost_usd)
+  const price = tinker.TINKER_PRICES[MINI]
+  assert.ok(estimate.max_cost_usd >= tinker.tinkerCostUsd(MINI, { train: 1, eval: 0, sample_prompt: 0, sample_completion: 0 }) && price.train === 0.75)
+  const biggest = rl.normalizeTinkerRlRequest(ask({ base_model: MINI, settings: { steps: 30, group_size: 16, tasks_per_step: 16, max_completion_tokens: 512 } }), both)
+  assert.ok('request' in biggest, biggest.error)
+  assert.ok(rl.estimateTinkerRl(biggest.request).max_cost_usd > 0)
+})
