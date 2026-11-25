@@ -1704,6 +1704,11 @@ export class UIOverlay {
           <button type="button" class="info-bench-button" id="info-bench-button">${this.benchFocused ? 'Back to the room' : 'Look at the bench'}</button>
         </p>
         <p class="info-description">
+          The framed sheet on the wall above the bench is the skill map of the newest Socratic lesson: a lab model teaches a small model by questions, and the lab counts which answers pass. Its small amber lamp is lit only while the stored record says the lesson is running. The same record, in text you can read, is in the lesson.
+          <br>
+          <button type="button" class="info-bench-button" id="info-lesson-button">Open the Lesson</button>
+        </p>
+        <p class="info-description">
           Click a scientist to see their current role.
         </p>
         <div class="info-seed">
@@ -1750,7 +1755,11 @@ export class UIOverlay {
     const toggle = this.infoPanelElement.querySelector('#info-about-toggle')
     toggle?.addEventListener('click', () => this.toggleInfoPanel())
     this.infoPanelElement.querySelector('#info-bench-button')?.addEventListener('click', () => this.onBenchButton())
+    this.infoPanelElement.querySelector('#info-lesson-button')?.addEventListener('click', () => this.onOpenLesson?.())
   }
+
+  /** Opens the lesson panel: the DOM way to the skill map's record, for keyboard and touch. Set by main.ts. */
+  public onOpenLesson: (() => void) | null = null
 
   /** Sets the view the "Look at the bench" button flies the camera to. */
   public setBenchView(view: { position: [number, number, number]; target: [number, number, number] }): void {

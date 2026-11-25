@@ -70,6 +70,17 @@ export function canOffer(turns: readonly OfferTurn[], receipt: string | null): b
 export const OFFER_BUTTON = 'Offer This Conversation to the Lab'
 export const OFFERED_BUTTON = 'Offered'
 export const OFFER_DISABLED_NOTE = 'Only a conversation the lab can verify can be offered.'
+export const OFFER_NOTE_EMPTY = 'Send a message first. Then you can offer the conversation.'
+export const OFFER_NOTE_WAITING = 'Wait for the reply. Then you can offer the conversation.'
+export const OFFER_NOTE_HALF = 'The trained model did not answer the last message, so this conversation cannot be offered.'
+
+/** Why the offer button is disabled, from what the panel holds: the first reason that applies. */
+export function offerDisabledNote(state: { turns: readonly OfferTurn[]; busy: boolean; halfPair: boolean }): string {
+  if (state.busy) return OFFER_NOTE_WAITING
+  if (!state.turns.length) return OFFER_NOTE_EMPTY
+  if (state.halfPair) return OFFER_NOTE_HALF
+  return OFFER_DISABLED_NOTE
+}
 export const OFFER_HEADING = 'Offer This Conversation'
 export const OFFER_SUBMIT = 'Offer It'
 export const OFFER_CANCEL = 'Not Now'
@@ -113,7 +124,7 @@ const claim = (text: string | ((keepDays: number) => string), columns: readonly 
 export const CONSENT_PARAGRAPHS: ReadonlyArray<readonly ConsentSentence[]> = [
   [
     claim('If you press Offer It, the lab stores this conversation: your messages, the model\'s replies, which model you talked to, and the day.', ['messages', 'adapter_slug', 'base_model', 'day']),
-    claim('It does not store your address or an account.', ['id', 'turns', 'chars', 'transcript_sha256', 'first_user_sha256', 'screen_v']),
+    claim('It does not store your address or an account.', ['id', 'transcript_sha256', 'first_user_sha256', 'screen_v']),
   ],
   [
     plain('The lab\'s AI models may choose to train a small model on it.'),
@@ -129,9 +140,10 @@ export const CONSENT_PARAGRAPHS: ReadonlyArray<readonly ConsentSentence[]> = [
     claim(days => `The lab keeps it for ${days} days, then deletes it.`, ['expires_at']),
     claim('You can take it back with a code you get after offering.', ['code_sha256']),
     plain('If a model has already trained on it, the stored text is still deleted, but that model cannot unlearn it, and copies in the training services may stay until they delete them.'),
+    plain('A model trained on it is listed with a hash of its whole training set, a code that identifies the set and shows none of its text.'),
   ],
   [
-    plain('The lab checks for email addresses, phone numbers, long numbers, links and user names, and refuses a conversation that has one. It cannot find names, street addresses or other private details, so do not write them.'),
+    plain('The lab checks automatically for email addresses, phone numbers, long numbers, links and user names, and refuses a conversation that has one. The checks can miss some. They cannot find names, street addresses or other private details, so do not write them.'),
   ],
   [plain('Offer only if you are 18 or older.')],
   [plain('Until you press Offer It, nothing you write here is kept.')],

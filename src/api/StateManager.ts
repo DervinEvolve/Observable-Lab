@@ -8,7 +8,23 @@ interface StateManagerOptions {
   idlePollingInterval?: number // ms between polls when idle
   activePollingInterval?: number // ms between polls during active epoch
   onStateUpdate?: StateUpdateCallback
+  /**
+   * Called when only a stored side record changed (the newest Socratic lesson,
+   * the newest Tinker RL practice run) and nothing that onStateUpdate watches.
+   * Those records move on their own cron, outside epochs.
+   */
+  onRecordUpdate?: StateUpdateCallback
   onError?: ErrorCallback
+}
+
+/** The side records that change outside epochs, as one string, so a change in any of them is seen. */
+export function sideRecordKey(state: unknown): string {
+  const s = (state ?? {}) as Record<string, unknown>
+  try {
+    return JSON.stringify([s.tutor_lesson ?? null, s.rl_practice ?? null])
+  } catch {
+    return ''
+  }
 }
 
 export class StateManager {
@@ -16,6 +32,7 @@ export class StateManager {
   private idlePollingInterval: number
   private activePollingInterval: number
   private onStateUpdate: StateUpdateCallback | null
+  private onRecordUpdate: StateUpdateCallback | null
   private onError: ErrorCallback | null
 
   private currentState: ExperimentState | null = null
@@ -27,6 +44,7 @@ export class StateManager {
     this.idlePollingInterval = options.idlePollingInterval || 15000 // 15 seconds
     this.activePollingInterval = options.activePollingInterval || 2500 // 2.5 seconds
     this.onStateUpdate = options.onStateUpdate || null
+    this.onRecordUpdate = options.onRecordUpdate || null
     this.onError = options.onError || null
   }
 
@@ -149,6 +167,9 @@ export class StateManager {
 
     if (hasChanged && this.onStateUpdate) {
       this.onStateUpdate(newState)
+    } else if (!hasChanged && previousState && this.onRecordUpdate && sideRecordKey(previousState) !== sideRecordKey(newState)) {
+      // A lesson or a practice run moved between epochs: only the views of those records are told.
+      this.onRecordUpdate(newState)
     }
 
     // Log epoch progress during active epoch (dev only)

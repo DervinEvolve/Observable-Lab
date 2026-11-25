@@ -595,6 +595,8 @@ class ObservableLab {
     this.lessonPanel = new LessonPanel(modelId => {
       this.trainedChat?.openWith(modelId.replace(/^lab\//, ''))
     })
+    // The About panel's "Open the Lesson" button: the same panel the chart opens, without aiming at the chart
+    this.uiOverlay.onOpenLesson = () => this.lessonPanel?.show()
     // The story box of the research loop's kept model lives in the same panel, with its own switch
     this.trainedChat.attachStory(onChange => new ResearchStoryBox(onChange))
     // A real reply to this visitor lights the tube at once; nothing else here does
@@ -607,6 +609,7 @@ class ObservableLab {
     // Initialize StateManager and start polling
     const stateManager = getStateManager({
       onStateUpdate: (state) => this.handleStateUpdate(state),
+      onRecordUpdate: (state) => this.applySideRecords(state),
       onError: (error) => console.error('State update error:', error),
     })
 
@@ -1162,6 +1165,21 @@ class ObservableLab {
     // operator client can call spritesService.initializeSprites() itself.
   }
 
+  /**
+   * The records that move outside epochs: the practice bench (the newest Tinker
+   * RL run) and the skill map and lesson panel (the newest Socratic lesson).
+   * Called on every state change, and by the state manager whenever only these
+   * records changed. Only what the state stored is shown (no record: dark and still).
+   */
+  private applySideRecords(state: ExperimentState): void {
+    const practice = parsePractice((state as unknown as { rl_practice?: unknown }).rl_practice)
+    this.practiceBench?.setPractice(practice, false)
+    this.practicePanel?.setPractice(practice, false)
+    const lesson = parseTutorLesson((state as unknown as { tutor_lesson?: unknown }).tutor_lesson)
+    this.skillMap?.setLesson(lesson, false)
+    this.lessonPanel?.setLesson(lesson, false)
+  }
+
   private handleStateUpdate(state: ExperimentState): void {
     // Real backend state is driving the lab now — stand down the local demo cycle.
     this.liveExperiment = true
@@ -1238,18 +1256,7 @@ class ObservableLab {
       this.speakingTube?.setChatOn(chatOn)
       this.speakingTube?.setActivity(chatOn ? parseChatActivity((state as unknown as { trained_chat_activity?: unknown }).trained_chat_activity) : null, false)
     }
-    // The practice bench: only what the state stored about the newest Tinker RL run (no record: dark and still)
-    {
-      const practice = parsePractice((state as unknown as { rl_practice?: unknown }).rl_practice)
-      this.practiceBench?.setPractice(practice, false)
-      this.practicePanel?.setPractice(practice, false)
-    }
-    // The skill map and the lesson panel: only what the state stored about the newest Socratic lesson
-    {
-      const lesson = parseTutorLesson((state as unknown as { tutor_lesson?: unknown }).tutor_lesson)
-      this.skillMap?.setLesson(lesson, false)
-      this.lessonPanel?.setLesson(lesson, false)
-    }
+    this.applySideRecords(state)
 
     if (extra.repos !== undefined) {
       const links = repoLinksFrom(extra.repos)

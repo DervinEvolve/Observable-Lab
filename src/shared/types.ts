@@ -607,6 +607,10 @@ export interface PublicLesson {
     shared_literals: string[]
     within_noise: boolean
     reasons: string[]
+    /** Fewer answers were cut off by the token limit or empty after training than before. Absent in older records: false. */
+    cut_off_fell: boolean
+    /** Answers of the test before and the test after that the token limit cut off, or that came back empty, of those graded. */
+    cut_off: { before: CutOffCount | null; after: CutOffCount | null }
   }
   exchanges: PublicLessonExchange[] // at most 3, each text cut to 300
   cost: { tinker_estimated_usd: number | null; tinker_max_usd: number; teacher_usd: number; teacher_max_usd: number; basis: string }
@@ -624,13 +628,19 @@ export interface LessonRecord extends PublicLesson {
 }
 
 // GET /api/experiment/lesson?slug=<slug>&subskill=<i>: that subskill's questions.
+/** Answers of one test that were cut off by the token limit, or came back empty, of the answers graded. */
+export interface CutOffCount { cut: number; empty: number; graded: number }
+
+/** One graded answer: cut_short when the token limit cut it off, empty when it came back with no text. Both are graded as they stand. */
+export interface LessonAnswer { text: string; passed: boolean; cut_short: boolean; empty: boolean }
+
 export interface LessonQuestions {
   questions: Array<{
     held_back: boolean
     prompt: string // cut to 400
     answers: {
-      before: Array<{ text: string; passed: boolean }> // text cut to 300
-      after: Array<{ text: string; passed: boolean }>
+      before: LessonAnswer[] // text cut to 300
+      after: LessonAnswer[]
     }
     turns: Array<{ kind: 'guide' | 'explain'; state: string; teacher: string; reply: string; answer: string; passed: boolean }>
   }>

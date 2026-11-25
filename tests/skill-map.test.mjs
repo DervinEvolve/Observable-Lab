@@ -28,6 +28,15 @@ for (const path of FILES) {
   mkdirSync(dirname(join(build, path)), { recursive: true })
   writeFileSync(join(build, path.replace(/\.ts$/, '.js')), output)
 }
+{
+  // The state manager reads import.meta.env (Vite); here it is empty.
+  const path = 'src/api/StateManager.ts'
+  const output = ts.transpileModule(readFileSync(join(root, path), 'utf8').replace(/import\.meta\.env\.DEV/g, 'false'), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
+  }).outputText
+  mkdirSync(dirname(join(build, path)), { recursive: true })
+  writeFileSync(join(build, path.replace(/\.ts$/, '.js')), output)
+}
 after(() => rmSync(build, { recursive: true, force: true }))
 const load = path => import(pathToFileURL(join(build, path)).href)
 const logic = await load('src/systems/skillMap.js')
@@ -69,7 +78,8 @@ const finished = (over = {}) => lesson({
   examples: { kept: 6, guided: 4, answer: 5, explained: 2, left_out: 1, total: 17 },
   training: { steps_done: 8, steps_planned: 8, holdout_loss_before: 2.4311, holdout_loss_after: 1.2087 },
   exchanges: [{ subskill: 'Units', question: 'Round 3.456 to one place.', wrong: '3.4', guide: 'Which digit decides?', reply: 'The 5.', answer: '3.5', passed: true }],
-  flags: { seen_only: true, too_easy: false, unanswered: 0, cut_short_before: false, rubric_literal: ['Units'], shared_literals: [], within_noise: false, reasons: ['it got better on questions used in teaching but hardly on held back ones'] },
+  // as the server sends it (tinker-tutor.ts tutorFlags): the literal-rubric sentence is one of the reasons
+  flags: { seen_only: true, too_easy: false, unanswered: 0, cut_short_before: false, rubric_literal: ['Units'], shared_literals: [], within_noise: false, reasons: ['it got better on questions used in teaching but hardly on held back ones', 'Units: every rule checks a fixed phrase, so a gain may be the phrase'] },
   cost: { tinker_estimated_usd: 0.04, tinker_max_usd: 0.31, teacher_usd: 0.07, teacher_max_usd: 1, basis: 'an estimate, not a billed amount' },
   ...over,
 })
@@ -446,6 +456,12 @@ test('the panel asks for nothing until it is opened, then reads the full record 
       'Tinker use: about $0.04, estimated from published prices. At most $0.31 was set aside.', "The teacher: $0.07, as OpenRouter reported it. The cap was $1.00.",
       'The teacher asked', 'It answered again', 'The teacher\'s questions and the replies were written by models. Nobody reviewed them.',
     ]) assert.ok(all.includes(want), want)
+    assert.equal(all.split('every rule checks a fixed phrase').length - 1, 1, 'each flag sentence is shown once')
+    // only the stage line is a live region: a redraw does not announce the whole record again
+    const status = body.all('.lp-status')
+    assert.equal(status.length, 1)
+    assert.equal(status[0].attrs['aria-live'], 'polite')
+    assert.equal(body.all('.lp-body')[0].attrs['aria-live'], undefined)
     assert.doesNotMatch(all, /[–—]/)
   })
 })
@@ -637,4 +653,66 @@ test('every visitor string is written in plain English: Title Case buttons, no e
   assert.equal(logic.CHART_FOOT, 'Held back questions only. Rules written by a model. Counted by the lab.')
   // every constant sentence ends in a full stop
   for (const s of [logic.NO_LESSON, logic.CHART_FOOT, logic.BANDS_NOTE, logic.TUTOR_MEASURE_NOTE]) assert.match(s, /\.$/)
+})
+
+test('a lesson that moves between epochs reaches the chart and the panel at the next poll', async () => {
+  const { StateManager } = await load('src/api/StateManager.js')
+  const base = { current_epoch: 41, epoch_in_progress: false, status: 'running', current_spec: { meta: { stability_score: 0.5 } } }
+  let answer = { ...base, tutor_lesson: { enabled: true, lesson: lesson({ stage: 'teaching', live: true }) } }
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => JSON.parse(JSON.stringify(answer)) })
+  try {
+    const states = [], records = []
+    const m = new StateManager({ onStateUpdate: s => states.push(s), onRecordUpdate: s => records.push(s) })
+    await m.fetchState()
+    assert.equal(states.length, 1)
+    // the same epoch, the same lesson: nothing is told
+    await m.fetchState()
+    assert.equal(states.length + records.length, 1)
+    // the same epoch, the lesson finished: the record views are told, the epoch views are not
+    answer = { ...base, tutor_lesson: { enabled: true, lesson: finished() } }
+    await m.fetchState()
+    assert.equal(states.length, 1)
+    assert.equal(records.length, 1)
+    const chart = state(records[0].tutor_lesson.lesson)
+    assert.equal(chart.lesson.status, 'ok')
+    assert.equal(logic.chartView(chart, false).lamp, false, 'a finished lesson leaves the lamp dark')
+    // a practice run moving is seen the same way
+    answer = { ...answer, rl_practice: { slug: 'x' } }
+    await m.fetchState()
+    assert.equal(records.length, 2)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+  // and main.ts sends those records to the chart and the panel
+  const main = read('src/main.ts')
+  assert.match(main, /onRecordUpdate: \(state\) => this\.applySideRecords\(state\)/)
+  assert.match(main, /private applySideRecords[\s\S]{0,800}this\.skillMap\?\.setLesson\(lesson, false\)[\s\S]{0,80}this\.lessonPanel\?\.setLesson\(lesson, false\)/)
+})
+
+test('a cut off or empty answer is marked as such, and the finished chart names cut offs and noise in its corner note', () => {
+  assert.equal(logic.answerMark({ passed: true, cut_short: false, empty: false }), 'Passed')
+  assert.equal(logic.answerMark({ passed: false, cut_short: true, empty: false }), 'Did not pass. Cut off by the token limit')
+  assert.equal(logic.answerMark({ passed: false, cut_short: false, empty: true }), 'Did not pass. No answer text')
+  assert.equal(logic.answerMark({ passed: false, cut_short: false, empty: false }), 'Did not pass')
+  const f = over => finished({ flags: { ...finished().flags, seen_only: false, ...over } })
+  assert.equal(view(f({ cut_short_before: true })).flagNote, 'Flag: many answers were cut off by the token limit.')
+  assert.equal(view(f({ seen_only: true, cut_off_fell: true })).flagNote, 'Flag: better only on questions seen in teaching, and cut off answers.')
+  assert.equal(view(f({ seen_only: true })).flagNote, 'Flag: better only on questions seen in teaching.')
+  assert.equal(view(f({ within_noise: true })).flagNote, 'Within noise: the change is smaller than one pass band.')
+  assert.equal(view(f({})).flagNote, null)
+  // the counts are read when present and left out when malformed
+  const read = state(f({ cut_off: { before: { cut: 3, empty: 1, graded: 48 }, after: { cut: 9, empty: 0, graded: 4 } } })).lesson.flags.cut_off
+  assert.deepEqual(read, { before: { cut: 3, empty: 1, graded: 48 }, after: null })
+  // the answers of a question say how each ended
+  const q = logic.readLessonQuestions({ questions: [{ held_back: true, prompt: 'p', answers: { before: [{ text: '', passed: false, cut_short: true, empty: false }], after: [] }, turns: [] }] })
+  assert.deepEqual(q.questions[0].answers.before[0], { text: '', passed: false, cut_short: true, empty: false })
+})
+
+test('the lesson can be opened from the page, not only by aiming at the chart: an About button that keyboard and touch reach', () => {
+  const ui = read('src/systems/UIOverlay.ts')
+  assert.match(ui, /<button type="button" class="info-bench-button" id="info-lesson-button">Open the Lesson<\/button>/)
+  assert.match(ui, /querySelector\('#info-lesson-button'\)\?\.addEventListener\('click', \(\) => this\.onOpenLesson\?\.\(\)\)/)
+  assert.match(ui, /The framed sheet on the wall above the bench is the skill map of the newest Socratic lesson/)
+  assert.match(read('src/main.ts'), /this\.uiOverlay\.onOpenLesson = \(\) => this\.lessonPanel\?\.show\(\)/)
 })

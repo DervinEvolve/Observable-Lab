@@ -61,7 +61,7 @@ import {
   paperPrimaryButton, paperQuietButton, paperShell, paperTag,
 } from './paperTheme'
 import {
-  OFFERED_BUTTON, OFFER_BUTTON, OFFER_CANCEL, OFFER_COPIED, OFFER_COPY, OFFER_COPY_FAILED, OFFER_DISABLED_NOTE, OFFER_DONE, OFFER_HEADING,
+  OFFERED_BUTTON, OFFER_BUTTON, OFFER_CANCEL, OFFER_COPIED, OFFER_COPY, OFFER_COPY_FAILED, OFFER_DISABLED_NOTE, OFFER_DONE, OFFER_HEADING, offerDisabledNote,
   OFFER_PREVIEW_LABEL, OFFER_SENDING, OFFER_SUBMIT, OFFER_TAKE_BACK, OFFER_TAKING_BACK, OFFER_THANKS, OFFER_UNREACHED, TAKE_BACK_BAD_CODE,
   TAKE_BACK_HEADING, TAKE_BACK_HELP, TAKE_BACK_LABEL, TAKE_BACK_OPEN, buildOfferBody, buildWithdrawBody, canOffer, consentParagraphs,
   normalizeCode, readOfferAnswer, readOffers, readReceipt, readWithdrawAnswer,
@@ -112,7 +112,7 @@ export interface TrainedAdapterView {
 /** One cell of a skill map: answers that passed of answers asked, and the pass band from 0 to 5. All counted by the lab. */
 export interface SkillCell { passed: number; total: number; band: number }
 export interface SkillRowView { name: string; before: SkillCell | null; after: SkillCell | null }
-export interface SkillMapView { topic: string; teacherName: string; rows: SkillRowView[]; seenOnly: boolean }
+export interface SkillMapView { topic: string; teacherName: string; rows: SkillRowView[]; seenOnly: boolean; withinNoise?: boolean; cutShort?: boolean }
 
 /** One sentence list, the same on every surface that shows a lesson (api/_lib/tinker-tutor.ts holds the same words; a test compares them). */
 export const TUTOR_MEASURE_NOTE = 'The lab counts which answers pass. The rules, the questions and the teaching text were written by models, and a model approved the rules. Nobody has checked that the rules measure the skill.'
@@ -177,7 +177,7 @@ export function readSkillMap(raw: unknown): SkillMapView | null {
     rows.push({ name, before: readSkillCell(r.before), after: readSkillCell(r.after) })
   }
   if (rows.length === 0) return null
-  return { topic, teacherName, rows, seenOnly: o.seen_only === true }
+  return { topic, teacherName, rows, seenOnly: o.seen_only === true, withinNoise: o.within_noise === true, cutShort: o.cut_short === true }
 }
 
 /** The adapters in a GET answer, strictly read: anything that is not a well formed adapter is left out. */
@@ -262,7 +262,7 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
       : a.kind === 'rl'
       ? `Epoch ${a.epoch}. Practice by Reward (reinforcement learning) on ${a.examples} tasks and a rubric written by ${a.authorName}. Base model ${a.baseModel}.`
       : a.fromVisitors
-      ? `Epoch ${a.epoch}. Trained on ${a.examples} conversations written by visitors, in a run ${a.authorName} asked for. Nobody at the lab has read them. Base model ${a.baseModel}.`
+      ? `Epoch ${a.epoch}. Trained on ${a.examples} conversations written by visitors, in a run ${a.authorName} asked for. No model read them and nobody reviewed them. The lab's owner can read them, and each read is counted. Base model ${a.baseModel}.`
       : a.dataFrom
       ? `Epoch ${a.epoch}. Trained on ${a.examples} rows of the public dataset ${a.dataFrom}, chosen by ${a.authorName}. Nobody at the lab has read those rows. Base model ${a.baseModel}.`
       : `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
@@ -303,8 +303,19 @@ export function skillSummary(map: SkillMapView | undefined): { more: boolean; ve
     bp += r.before.passed; bt += r.before.total; ap += r.after.passed; at += r.after.total
   }
   if (bt === 0 || at === 0) return null
+  const counts = `from ${bp} of ${bt} to ${ap} of ${at} answers passed`
+  // The lab marks a change smaller than one pass band as within noise: then the counts are shown with no verdict.
+  if (map.withinNoise) return { more: false, verdict: 'Within Noise', text: counts }
   const more = ap * bt > bp * at
-  return { more, verdict: more ? 'More Answers Passed' : 'Not More Answers Passed', text: `from ${bp} of ${bt} to ${ap} of ${at} answers passed` }
+  return { more, verdict: more ? 'More Answers Passed' : 'Not More Answers Passed', text: counts }
+}
+
+/** The flags a lesson adapter's card and details show, as the lab recorded them. */
+export function skillFlags(map: SkillMapView): string[] {
+  const out: string[] = []
+  if (map.seenOnly) out.push('Flag: better only on questions seen in teaching.')
+  if (map.cutShort) out.push('Flag: many answers were cut off by the token limit, so a gain may come from shorter answers.')
+  return out
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
@@ -1093,6 +1104,12 @@ export class TrainedChatPanel {
    * Before the list is read, the slug is kept and checked when it arrives.
    */
   openWith(slug: string): void {
+    // Neither the chat nor the story box is on: the panel is hidden, and opening it would leave the page inert.
+    // The choice is kept, and applied when the list arrives, as before the list was read.
+    if (!this.chatShown && this.story?.isShown() !== true) {
+      if (SLUG.test(slug)) this.pendingSlug = slug
+      return
+    }
     if (!this.isOpen) this.returnFocus = (document.activeElement as HTMLElement | null) ?? null
     const loaded = this.chatShown && this.loadState === 'ok'
     if (!SLUG.test(slug) || (loaded && !this.adapters.some(a => a.slug === slug))) {
@@ -1510,7 +1527,7 @@ export class TrainedChatPanel {
       verdict.append(el('span', 'tc-verdict-word', sum.verdict), el('span', undefined, sum.text))
       box.appendChild(verdict)
     }
-    if (map.seenOnly) box.appendChild(el('p', 'tc-skill-flag', 'Flag: better only on questions seen in teaching.'))
+    for (const flag of skillFlags(map)) box.appendChild(el('p', 'tc-skill-flag', flag))
     box.appendChild(el('p', 'tc-explain', `${TUTOR_BANDS_NOTE} ${TUTOR_MEASURE_NOTE}`))
     return box
   }
@@ -1601,7 +1618,7 @@ export class TrainedChatPanel {
     if (a.kind === 'tutor' && a.skillMap) {
       this.details.appendChild(el('p', undefined, `Taught by ${a.skillMap.teacherName}.`))
       for (const row of a.skillMap.rows) this.details.appendChild(el('p', undefined, skillSentence(row)))
-      if (a.skillMap.seenOnly) this.details.appendChild(el('p', undefined, 'Flag: better only on questions seen in teaching.'))
+      for (const flag of skillFlags(a.skillMap)) this.details.appendChild(el('p', undefined, flag))
       this.details.appendChild(el('p', undefined, `${TUTOR_BANDS_NOTE} ${TUTOR_MEASURE_NOTE}`))
     }
     this.refreshCompare()
@@ -1862,7 +1879,7 @@ export class TrainedChatPanel {
     this.offerButton.textContent = this.offered ? OFFERED_BUTTON : OFFER_BUTTON
     this.offerButton.disabled = this.offered || !ready
     this.offerNote.hidden = this.offered || ready
-    this.offerNote.textContent = OFFER_DISABLED_NOTE
+    this.offerNote.textContent = offerDisabledNote({ turns: this.turns, busy: this.busy, halfPair: this.halfPair })
   }
 
   /** Opens the sheet over the panel and moves focus to its heading. */
@@ -1985,6 +2002,8 @@ export class TrainedChatPanel {
     if (this.sheetAlert) this.sheetAlert.hidden = true
     this.setSheetBusy(true, go, OFFER_SUBMIT, OFFER_SENDING)
     const token = ++this.sheetToken
+    // The conversation this offer is for: if the visitor moved to another one meanwhile, the answer still shows its code, but marks nothing on the new one.
+    const conv = this.convId
     let answer: ReturnType<typeof readOfferAnswer>
     try {
       const res = await fetch(OFFER_API, {
@@ -1999,7 +2018,7 @@ export class TrainedChatPanel {
     if (token !== this.sheetToken || this.sheetMode !== 'offer') return
     this.sheetBusy = false
     if (answer.kind === 'stored') {
-      this.offered = true
+      if (conv === this.convId) this.offered = true
       this.offerCode = answer.code
       this.showStored(answer.code, answer.keptUntil, answer.message)
       this.refreshOffer()
@@ -2007,9 +2026,9 @@ export class TrainedChatPanel {
     }
     this.setSheetBusy(false, go, OFFER_SUBMIT, OFFER_SENDING)
     // The lab cannot verify this conversation any more: the button says so, and the receipt is let go.
-    if (answer.error === 'not_verified') this.receipt = null
+    if (answer.error === 'not_verified' && conv === this.convId) this.receipt = null
     // The lab already holds this conversation: it cannot be offered a second time.
-    if (answer.error === 'already_offered') this.offered = true
+    if (answer.error === 'already_offered' && conv === this.convId) this.offered = true
     this.showSheetAlert(answer.message)
     this.refreshOffer()
   }

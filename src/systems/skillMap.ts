@@ -1,4 +1,4 @@
-import type { Cell, LessonQuestions, LessonRecord, PublicLesson, PublicLessonExchange, PublicLessonSubskill, TutorLesson } from '../shared/types'
+import type { Cell, CutOffCount, LessonAnswer, LessonQuestions, LessonRecord, PublicLesson, PublicLessonExchange, PublicLessonSubskill, TutorLesson } from '../shared/types'
 import { NO_EXPERIMENT, plain } from './practiceBench'
 
 // The skill map chart (src/entities/SkillMapChart.ts) and the lesson panel
@@ -172,6 +172,8 @@ function readLessonStrict(rawIn: unknown): PublicLesson {
       shared_literals: names(f.shared_literals, 40),
       within_noise: flag(f.within_noise),
       reasons: names(f.reasons, 300),
+      cut_off_fell: f.cut_off_fell === true,
+      cut_off: readCutOff(f.cut_off),
     },
     exchanges,
     cost: {
@@ -233,9 +235,9 @@ export function readLessonQuestions(raw: unknown): LessonQuestions | null {
   try {
     const r = obj(raw)
     const list = Array.isArray(r.questions) && r.questions.length <= 50 ? (r.questions as unknown[]) : bad()
-    const answers = (v: unknown): Array<{ text: string; passed: boolean }> => {
+    const answers = (v: unknown): LessonAnswer[] => {
       if (!Array.isArray(v) || v.length > 10) return bad()
-      return v.map(a => { const x = obj(a); return { text: plain(x.text, 300) ?? '', passed: flag(x.passed) } })
+      return v.map(a => { const x = obj(a); return { text: plain(x.text, 300) ?? '', passed: flag(x.passed), cut_short: x.cut_short === true, empty: x.empty === true } })
     }
     return {
       questions: list.map(q => {
@@ -349,6 +351,38 @@ export interface ChartView {
 
 const DARK_VIEW = (title: string): ChartView => ({ mode: 'dark', title, byline: null, rows: [], stageLine: '', flagNote: null, lamp: false, key: `dark|${title}` })
 
+/** Cut off and empty answer counts of one test, or null when absent or malformed (older records have none). */
+function readCutOff(raw: unknown): { before: CutOffCount | null; after: CutOffCount | null } {
+  const one = (v: unknown): CutOffCount | null => {
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return null
+    const o = v as Record<string, unknown>
+    const cut = whole(o.cut, 0, 100000), empty = whole(o.empty, 0, 100000), graded = whole(o.graded, 1, 100000)
+    return cut !== null && empty !== null && graded !== null && cut + empty <= graded ? { cut, empty, graded } : null
+  }
+  const o = raw && typeof raw === 'object' && !Array.isArray(raw) ? raw as Record<string, unknown> : {}
+  return { before: one(o.before), after: one(o.after) }
+}
+
+/** The finished chart's corner note: the flags a visitor most needs, in one line (every reason is in the panel). */
+export function flagNoteOf(l: Pick<PublicLesson, 'flags'>): string | null {
+  // One line on the paper, so the two together are said shortly; the panel has every reason in full.
+  const seen = l.flags.seen_only
+  const cut = l.flags.cut_short_before || l.flags.cut_off_fell
+  if (seen && cut) return 'Flag: better only on questions seen in teaching, and cut off answers.'
+  if (seen) return 'Flag: better only on questions seen in teaching.'
+  if (cut) return 'Flag: many answers were cut off by the token limit.'
+  if (l.flags.within_noise) return 'Within noise: the change is smaller than one pass band.'
+  return null
+}
+
+/** How a graded answer is marked in the panel: passed, or did not pass with how it ended when the lab stored that. */
+export function answerMark(a: Pick<LessonAnswer, 'passed' | 'cut_short' | 'empty'>): string {
+  if (a.passed) return 'Passed'
+  if (a.cut_short) return 'Did not pass. Cut off by the token limit'
+  if (a.empty) return 'Did not pass. No answer text'
+  return 'Did not pass'
+}
+
 /** What the paper and the lamp show. No lesson, or no experiment connected: a blank sheet and a dark lamp. */
 export function chartView(state: TutorLessonState | null, simulation: boolean): ChartView {
   if (simulation) return DARK_VIEW(`${NO_EXPERIMENT}.`)
@@ -368,7 +402,7 @@ export function chartView(state: TutorLessonState | null, simulation: boolean): 
     byline: `Taught by ${l.teacher_name}. Epoch ${l.epoch}.`,
     rows,
     stageLine: stageLine(l),
-    flagNote: l.status === 'ok' && l.flags.seen_only ? 'Flag: better only on questions seen in teaching.' : null,
+    flagNote: l.status === 'ok' ? flagNoteOf(l) : null,
     lamp: l.status === 'running' && l.live,
     key: '',
   }

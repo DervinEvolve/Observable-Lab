@@ -3,6 +3,7 @@ import { installPaperTheme, paperFocusRing, paperHeader, paperHeading, paperPrim
 import { dollars } from './PracticeBenchPanel'
 import { NO_EXPERIMENT } from './practiceBench'
 import {
+  answerMark,
   BANDS_NOTE, NO_LESSON, TUTOR_MEASURE_NOTE, bandsText, cellText, headLine, readLessonQuestions, readLessonRecord, share, stageLine, withinNoise,
   type TutorLessonState,
 } from './skillMap'
@@ -65,6 +66,7 @@ export class LessonPanel {
   private container: HTMLDivElement
   private panel: HTMLDivElement
   private body: HTMLDivElement
+  private status: HTMLParagraphElement
   private isOpen = false
   private state: TutorLessonState | null = null
   private simulation = true
@@ -96,6 +98,7 @@ export class LessonPanel {
       #lesson-panel .lp-close { width: 44px; height: 44px; border: 0; background: transparent; color: var(--paper-ink-2); font-size: 24px; cursor: pointer; border-radius: var(--paper-radius-sm); }
       #lesson-panel .lp-close:hover { color: var(--paper-ink); background: var(--paper-sunk); }
       ${paperFocusRing('#lesson-panel')}
+      #lesson-panel .lp-status { position: absolute; width: 1px; height: 1px; margin: -1px; padding: 0; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0; }
       #lesson-panel .lp-body { overflow-y: auto; padding: 12px 16px 16px; display: flex; flex-direction: column; gap: 14px; }
       #lesson-panel h3 { margin: 0 0 4px; }
       ${paperHeading('#lesson-panel h3', 15)}
@@ -145,8 +148,11 @@ export class LessonPanel {
     close.addEventListener('click', () => this.close())
     head.appendChild(close)
     this.body = el('div', 'lp-body')
-    this.body.setAttribute('aria-live', 'polite')
-    this.panel.append(head, this.body)
+    // Only the stage line is announced when it changes; the record below is read at the visitor's pace.
+    this.status = el('p', 'lp-status')
+    this.status.setAttribute('role', 'status')
+    this.status.setAttribute('aria-live', 'polite')
+    this.panel.append(head, this.status, this.body)
     this.container.appendChild(this.panel)
     document.body.appendChild(this.container)
     this.render()
@@ -291,15 +297,15 @@ export class LessonPanel {
     return wrap
   }
 
-  private mark(passed: boolean): HTMLElement {
-    return el('span', 'lp-mark', passed ? 'Passed' : 'Did not pass')
+  private mark(a: { passed: boolean; cut_short?: boolean; empty?: boolean }): HTMLElement {
+    return el('span', 'lp-mark', answerMark({ passed: a.passed, cut_short: a.cut_short === true, empty: a.empty === true }))
   }
 
-  private answerLine(label: string, text: string, passed: boolean | null): HTMLElement {
+  private answerLine(label: string, text: string, passed: boolean | null, how: { cut_short?: boolean; empty?: boolean } = {}): HTMLElement {
     const line = el('div', passed === null ? 'lp-line' : `lp-line ${passed ? 'pass' : 'fail'}`)
     line.appendChild(el('span', 'lp-muted', `${label}: `))
     line.appendChild(document.createTextNode(text || '(empty)'))
-    if (passed !== null) { line.appendChild(document.createTextNode(' ')); line.appendChild(this.mark(passed)) }
+    if (passed !== null) { line.appendChild(document.createTextNode(' ')); line.appendChild(this.mark({ passed, ...how })) }
     return line
   }
 
@@ -320,8 +326,8 @@ export class LessonPanel {
       const wrap = el('div', 'lp-q')
       wrap.appendChild(el('div', 'lp-label', item.held_back ? 'Held back question' : 'Practice question'))
       wrap.appendChild(el('p', undefined, item.prompt))
-      item.answers.before.forEach((a, k) => wrap.appendChild(this.answerLine(`Before, answer ${k + 1}`, a.text, a.passed)))
-      item.answers.after.forEach((a, k) => wrap.appendChild(this.answerLine(`After, answer ${k + 1}`, a.text, a.passed)))
+      item.answers.before.forEach((a, k) => wrap.appendChild(this.answerLine(`Before, answer ${k + 1}`, a.text, a.passed, a)))
+      item.answers.after.forEach((a, k) => wrap.appendChild(this.answerLine(`After, answer ${k + 1}`, a.text, a.passed, a)))
       for (const t of item.turns) {
         if (t.kind === 'guide') {
           if (t.state === 'leaked') wrap.appendChild(this.answerLine('The teacher asked', 'The question was left out because it gave away a value the rules look for.', null))
@@ -359,6 +365,8 @@ export class LessonPanel {
   private draw(): void {
     this.body.replaceChildren()
     const l = this.lesson
+    const said = this.simulation || !l ? '' : stageLine(l)
+    if (this.status.textContent !== said) this.status.textContent = said
     if (this.simulation) {
       this.body.appendChild(el('p', undefined, `${NO_EXPERIMENT}. The chart stays blank: nothing on it is model work.`))
       return
@@ -390,9 +398,8 @@ export class LessonPanel {
     }
 
     // 2. flags
+    // The server's reasons are complete: the rubric_literal and shared_literals sentences are among them.
     const noticed: string[] = l.flags.reasons.map(sentence)
-    for (const name of l.flags.rubric_literal) noticed.push(`${name}: every rule checks a fixed phrase, so a gain may be the phrase.`)
-    for (const name of l.flags.shared_literals) noticed.push(`${name}: a rule value appears in a held back question.`)
     if (noticed.length) {
       const flag = el('div', 'lp-flag')
       flag.appendChild(el('b', undefined, 'The lab noticed'))
@@ -417,7 +424,7 @@ export class LessonPanel {
 
     // 4. how it was graded
     const graded = el('div')
-    graded.appendChild(el('p', undefined, `The lab asked every question ${l.questions.samples} times and graded each answer with rules a lab model wrote. An answer passes when it meets every rule. Pass bands come only from questions the teacher's calls never contained. ${TUTOR_MEASURE_NOTE}`))
+    graded.appendChild(el('p', undefined, `The lab asked every question ${l.questions.samples} times and graded each answer with rules a lab model wrote. An answer passes when it meets every rule. Pass bands come only from held back questions, whose text the teacher's calls never contained. ${TUTOR_MEASURE_NOTE}`))
     if (rec) {
       rec.rubrics.forEach((rules, i) => {
         if (!rules.length || !l.subskills[i]) return

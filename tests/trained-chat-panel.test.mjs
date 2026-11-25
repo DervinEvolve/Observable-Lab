@@ -717,8 +717,9 @@ const CONSENT = [
   'If you press Offer It, the lab stores this conversation: your messages, the model\'s replies, which model you talked to, and the day. It does not store your address or an account.',
   'The lab\'s AI models may choose to train a small model on it. Anything trained on it is labelled "written by visitors". A model trained on it can repeat parts of it.',
   'The text is not shown on this page or in the lab\'s public record. The record shows only how many conversations were offered. The lab\'s owner can read it. It may be sent to Tinker (Thinking Machines) and Modal to train a small model. Those are companies outside the lab.',
-  'The lab keeps it for 90 days, then deletes it. You can take it back with a code you get after offering. If a model has already trained on it, the stored text is still deleted, but that model cannot unlearn it, and copies in the training services may stay until they delete them.',
-  'The lab checks for email addresses, phone numbers, long numbers, links and user names, and refuses a conversation that has one. It cannot find names, street addresses or other private details, so do not write them.',
+  // the spec's words, with the review's two additions: the published hash of a training set, and that the checks can miss
+  'The lab keeps it for 90 days, then deletes it. You can take it back with a code you get after offering. If a model has already trained on it, the stored text is still deleted, but that model cannot unlearn it, and copies in the training services may stay until they delete them. A model trained on it is listed with a hash of its whole training set, a code that identifies the set and shows none of its text.',
+  'The lab checks automatically for email addresses, phone numbers, long numbers, links and user names, and refuses a conversation that has one. The checks can miss some. They cannot find names, street addresses or other private details, so do not write them.',
   'Offer only if you are 18 or older.',
   'Until you press Offer It, nothing you write here is kept.',
 ]
@@ -865,11 +866,13 @@ test('the offer button is there, disabled with its reason, until the panel holds
     assert.equal(button.textContent, 'Offer This Conversation to the Lab')
     assert.equal(button.disabled, true) // no reply yet
     assert.equal(note.hidden, false)
-    assert.equal(note.textContent, 'Only a conversation the lab can verify can be offered.')
+    // the note says why from what the panel holds: nothing sent yet
+    assert.equal(note.textContent, 'Send a message first. Then you can offer the conversation.')
     state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'No receipt.', turns_left: 7 }) // a reply the lab could not chain
     await say(root, settle, 'Hello')
     assert.equal(button.disabled, true)
     assert.equal(note.hidden, false)
+    assert.equal(note.textContent, 'Only a conversation the lab can verify can be offered.')
     state.post = () => ({ adapter: 'e41-0a1b2c3d', reply: 'Hi.', turns_left: 6, receipt: 'r2' })
     await say(root, settle, 'Hello again')
     assert.equal(button.disabled, false)
@@ -1273,6 +1276,14 @@ test('a skill map is read strictly: cells are whole counts with a band, rows are
   assert.deepEqual(sum, { more: true, verdict: 'More Answers Passed', text: 'from 11 of 30 to 18 of 30 answers passed' })
   assert.equal(panel.skillSummary({ ...a.skillMap, rows: [{ name: 'x', before: cell(4, 6, 3), after: cell(3, 6, 3) }] }).verdict, 'Not More Answers Passed')
   assert.equal(panel.skillSummary({ ...a.skillMap, rows: [{ name: 'x', before: cell(4, 6, 3), after: null }] }), null)
+  // the lab marked the change within noise: the counts are shown, with no verdict either way
+  assert.deepEqual(panel.skillSummary({ ...a.skillMap, withinNoise: true }), { more: false, verdict: 'Within Noise', text: 'from 11 of 30 to 18 of 30 answers passed' })
+  assert.equal(panel.readSkillMap({ ...tutor().skill_map, within_noise: true }).withinNoise, true)
+  // cut off answers are a flag on the card and in the details, next to the verdict
+  assert.deepEqual(panel.skillFlags({ ...a.skillMap, seenOnly: true, cutShort: true }), [
+    'Flag: better only on questions seen in teaching.', 'Flag: many answers were cut off by the token limit, so a gain may come from shorter answers.',
+  ])
+  assert.equal(panel.readSkillMap({ ...tutor().skill_map, cut_short: true }).cutShort, true)
   assert.equal(panel.bandText(a.skillMap.rows[0]), '1 to 4')
   assert.equal(panel.bandText(a.skillMap.rows[2]), '0 before')
   assert.equal(panel.skillSentence(a.skillMap.rows[0]), 'Counting rules. Before: 1 of 6 answers passed. Pass band 1 of 5. After: 5 of 6 answers passed. Pass band 4 of 5.')
@@ -1338,7 +1349,8 @@ test('an adapter trained on visitor conversations says so on its card details, a
   assert.equal(a.dataOrigin, 'written by visitors in chats with lab/e41-0a1b2c3d')
   const d = panel.describeAdapter(a)
   assert.ok(d.origin.includes('conversations written by visitors'))
-  assert.ok(d.origin.includes('Nobody at the lab has read them.'))
+  assert.ok(d.origin.includes('No model read them and nobody reviewed them. The lab\'s owner can read them, and each read is counted.'))
+  assert.equal(d.origin.includes('Nobody at the lab has read them'), false, 'not true after the owner reads one')
   assert.equal(d.label, 'Data origin: written by visitors in chats with lab/e41-0a1b2c3d.')
   assert.equal(view(sft({ origin: 'written by visitors' })).dataOrigin, 'written by visitors')
   assert.equal(view(sft({ origin: 'written by visitors in chats with lab/not-a-slug' })).dataOrigin, undefined)
@@ -1370,4 +1382,26 @@ test('the offer and lesson code keeps the page rules: text only, no storage, no 
   assert.match(css, /\.tc-offer \{ min-height: 44px;/)
   assert.match(css, /\.tc-offer-go \{ min-height: 44px;/)
   assert.match(css, /\.tc-code-input \{ min-height: 44px;[^}]*font-size: 16px;/)
+})
+
+test('the disabled offer button says why, from what the panel holds', () => {
+  const t = (role, content) => ({ role, content })
+  assert.equal(offer.offerDisabledNote({ turns: [], busy: false, halfPair: false }), 'Send a message first. Then you can offer the conversation.')
+  assert.equal(offer.offerDisabledNote({ turns: [t('user', 'Hi')], busy: true, halfPair: false }), 'Wait for the reply. Then you can offer the conversation.')
+  assert.equal(offer.offerDisabledNote({ turns: [t('user', 'Hi'), t('assistant', 'Hello')], busy: false, halfPair: true }), 'The trained model did not answer the last message, so this conversation cannot be offered.')
+  assert.equal(offer.offerDisabledNote({ turns: [t('user', 'Hi'), t('assistant', 'Hello')], busy: false, halfPair: false }), 'Only a conversation the lab can verify can be offered.')
+  for (const s of [offer.OFFER_NOTE_EMPTY, offer.OFFER_NOTE_WAITING, offer.OFFER_NOTE_HALF]) assert.doesNotMatch(s, /[–—]/)
+  // an offer answered after the visitor moved to another conversation marks nothing on the new one
+  const src = readFileSync(join(root, 'src/systems/TrainedChatPanel.ts'), 'utf8')
+  assert.match(src, /const conv = this\.convId[\s\S]{0,1200}if \(conv === this\.convId\) this\.offered = true/)
+})
+
+test('"talk to it" with the chat and the story both off does not open a hidden panel', async () => {
+  await withPage(async ({ body, settle }) => {
+    const p = new panel.TrainedChatPanel()
+    await settle()
+    p.openWith('e42-0a1b2c3d')
+    const panelEl = body.children.find(c => c.id === 'trained-chat-panel')
+    assert.doesNotMatch(panelEl.className, /\bopen\b/)
+  })
 })
