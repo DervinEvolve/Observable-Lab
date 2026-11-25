@@ -855,7 +855,7 @@ With both off nothing changes: the research epoch sends the same requests and st
 
 **Public state.** `GET /api/experiment?mode=research` carries `current_spec.meta.research.scoring`, the `research` field of `GET /api/experiment` carries `scoring` once there is one, and `GET /api/experiment/scoring` gives the margin with its floor, its ceiling and which of them it is now (`margin_basis`), the noise with its sample count, the last verdict and the newest twelve repeats. None of them has a dollar amount.
 
-**Vercel functions.** One new function, `api/experiment/scoring.ts` (the project now has 22; it needs no entry in `vercel.json`, because it only reads two tables and answers). It is public and read-only, like the other observer routes, and with both switches off it reads nothing.
+**Vercel functions.** One new function, `api/experiment/scoring.ts` (the project now has 26; it needs no entry in `vercel.json`, because it only reads two tables and answers). It is public and read-only, like the other observer routes, and with both switches off it reads nothing.
 
 **What I check after turning it on.**
 

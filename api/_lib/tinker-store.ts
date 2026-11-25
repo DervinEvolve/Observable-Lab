@@ -562,7 +562,7 @@ const UNIQUE_VIOLATION = '23505'
 
 /**
  * Gives a run's adapter its display name, if no other adapter has it. "Has
- * it" means a run that is still open, or an adapter that is still alive
+ * it" means a run that is still open (a Socratic lesson included), or an adapter that is still alive
  * (kept ones are alive for as long as they are kept): any other row that
  * holds the name gives it up first. Then the name is written, and the unique
  * index decides: two runs asking for one name at the same moment cannot both
@@ -578,6 +578,7 @@ export async function claimAdapterName(runId: string, name: string, now: Date = 
     WHERE name_key = ${key} AND id <> ${runId}
       AND status NOT IN ('reserved', 'running')
       AND NOT (status = 'ok' AND expires_at > ${now.toISOString()})
+      AND status <> 'lesson'
   `
   try {
     const r = await sql`UPDATE tinker_runs SET display_name = ${name}, name_key = ${key} WHERE id = ${runId} RETURNING id`
@@ -929,7 +930,7 @@ export function reachedRunner(row: Pick<TinkerRunRow, 'status' | 'result'> & { c
 
 /** One origin's runs in the public summary. */
 export interface OriginSummary {
-  origin: typeof ORIGIN_MODELS | typeof ORIGIN_DATASET
+  origin: typeof ORIGIN_MODELS | typeof ORIGIN_DATASET | typeof ORIGIN_VISITORS
   /** Every run that reached the runner, whatever became of it. */
   runs: number
   /** Runs that finished with both held-out losses measured by the lab. */
@@ -950,21 +951,21 @@ function median(values: number[]): number | null {
 
 /** Per origin: how many runs, and the median held-out loss before and after training. No I/O. */
 export function summarizeOrigins(rows: (Pick<TinkerRunRow, 'dataset_source' | 'status' | 'result'> & { call_id?: string | null; kind?: string | null })[]): OriginSummary[] {
-  const groups: Record<'models' | 'dataset', { runs: number; before: number[]; after: number[]; datasets: Map<string, number> }> = {
+  const groups: Record<'models' | 'dataset' | 'visitors', { runs: number; before: number[]; after: number[]; datasets: Map<string, number> }> = {
     models: { runs: 0, before: [], after: [], datasets: new Map() },
     dataset: { runs: 0, before: [], after: [], datasets: new Map() },
+    visitors: { runs: 0, before: [], after: [], datasets: new Map() },
   }
   for (const row of rows) {
     // A row that never reached the runner is not a training run of either origin.
     if (!reachedRunner(row)) continue
     // A Tinker RL run is scored with a rubric, not a loss: its scores are another unit and have their own record.
     if (row.kind === 'rl') continue
-    // A run on conversations visitors offered is neither origin. The public
-    // summary gets its own row for it when the wiring lands (spec 2.7).
-    if (fromVisitorOffers(row)) continue
-    const g = row.dataset_source ? groups.dataset : groups.models
+    // A run on conversations visitors offered is neither of the first two
+    // origins: it has a third row of its own (spec 2.7).
+    const g = fromVisitorOffers(row) ? groups.visitors : row.dataset_source ? groups.dataset : groups.models
     g.runs += 1
-    if (row.dataset_source) {
+    if (row.dataset_source && g === groups.dataset) {
       const from = dataFrom(row) ?? '(its stored source cannot be read)'
       g.datasets.set(from, (g.datasets.get(from) ?? 0) + 1)
     }
@@ -982,7 +983,12 @@ export function summarizeOrigins(rows: (Pick<TinkerRunRow, 'dataset_source' | 's
       ? { datasets: [...g.datasets.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0])).slice(0, 20).map(([data_from, runs]) => ({ data_from, runs })) }
       : {}),
   })
-  return [one(ORIGIN_MODELS, groups.models), one(ORIGIN_DATASET, groups.dataset)]
+  // The third row appears only once a run on visitor conversations has
+  // reached the runner, so a lab that never had one gets the two rows it always got.
+  return [
+    one(ORIGIN_MODELS, groups.models), one(ORIGIN_DATASET, groups.dataset),
+    ...(groups.visitors.runs ? [one(ORIGIN_VISITORS, groups.visitors)] : []),
+  ]
 }
 
 /** How many of the newest runs the origin summary is taken from. */

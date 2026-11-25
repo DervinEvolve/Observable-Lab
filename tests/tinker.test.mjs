@@ -45,7 +45,7 @@ function compile(directory) {
   }
 }
 compile('api')
-for (const path of ['src/systems/TrainedChatPanel.ts', 'src/systems/paperTheme.ts', 'src/systems/toolRuns.ts', 'src/shared/types.ts']) {
+for (const path of ['src/systems/TrainedChatPanel.ts', 'src/systems/chatOffer.ts', 'src/systems/paperTheme.ts', 'src/systems/toolRuns.ts', 'src/shared/types.ts']) {
   const output = ts.transpileModule(readFileSync(join(root, path), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
   }).outputText.replace(/from '([^']+)'/g, (whole, specifier) => specifier.startsWith('.') ? `from '${specifier}.js'` : whole)
@@ -1264,7 +1264,8 @@ test('with the tool on, the models are told what it does and where its limits ar
     LAB_ENABLE_SPRITE_SESSIONS: 'true', SPRITES_TOKEN,
   })
   assert.ok(prompts.toolLines().includes('the lab model endpoint also answers for it as the model "lab/<name>"'))
-  assert.deepEqual(toolsConfig.enabledTools(), ['sprite_session', 'tinker_train', 'live_model', 'live_trained'])
+  // The Socratic lesson is on by default and has what it needs here (the runner and the Tinker key).
+  assert.deepEqual(toolsConfig.enabledTools(), ['sprite_session', 'tinker_train', 'tinker_tutor', 'live_model', 'live_trained'])
   delete process.env.LAB_ENABLE_SPRITE_SESSIONS
   assert.equal(prompts.toolLines().includes('lab/<name>'), false)
   assert.equal(toolsConfig.liveTrainedToolStatus().enabled, false)
@@ -1427,7 +1428,10 @@ test('the chat lists kept adapters with the lab-measured scores, and answers a m
   globalThis.fetch = fakeTinker(sent, () => tinkerCompletion({ content: '  Marmalade is orange.  ' }))
   const res = await visit(say(slug))
   assert.equal(res.code, 200)
-  assert.deepEqual(res.body, { adapter: slug, reply: 'Marmalade is orange.', cut_short: false, turns_left: 7 })
+  // Visitor offers are on by default (and CRON_SECRET is set), so the reply also carries a receipt for it; nothing else changed.
+  const { receipt, ...body } = res.body
+  assert.match(receipt, /^\d{4}-\d{2}-\d{2}\.[A-Za-z0-9_-]{43}$/)
+  assert.deepEqual(body, { adapter: slug, reply: 'Marmalade is orange.', cut_short: false, turns_left: 7 })
   assert.equal(sent[0].headers.Authorization, `Bearer ${TINKER_KEY}`)
   assert.deepEqual(sent[0].body, { model: SAMPLER, messages: [{ role: 'user', content: VISITOR_TEXT }], max_completion_tokens: 200, temperature: 0.7, reasoning_effort: false })
 
@@ -1906,7 +1910,7 @@ test('the panel reads adapters strictly and says who measured the score', () => 
   assert.deepEqual(panel.parseLimits({ limits: { max_message_chars: 500, max_turns: 8 } }), { maxMessageChars: 500, maxTurns: 8 })
   assert.deepEqual(panel.parseLimits({ limits: { max_message_chars: -1, max_turns: 'many' } }), { maxMessageChars: 500, maxTurns: 8 })
   // Visitor-facing text carries no em dash, and model text is never written as markup.
-  for (const file of ['src/systems/TrainedChatPanel.ts', 'api/_lib/trained-chat.ts']) {
+  for (const file of ['src/systems/TrainedChatPanel.ts', 'src/systems/chatOffer.ts', 'api/_lib/trained-chat.ts']) {
     const source = readFileSync(join(root, file), 'utf8')
     assert.equal(/[\u2014\u2013]/.test(source), false, `${file} has a dash that visitors would see`)
   }
@@ -1962,8 +1966,12 @@ test('a run on conversations visitors offered asks the runner for no samples and
   assert.equal(target.adapter.from_visitors, true)
   assert.equal(target.adapter.origin, 'written by visitors in chats with lab/e40-0a1b2c3d')
   assert.equal(JSON.stringify(target).includes(OFFERED[0]), false)
-  // The origin summary does not count it as a model-written or a dataset run.
-  assert.deepEqual(store.summarizeOrigins([{ ...run, result: JSON.parse(run.result), dataset_source: JSON.parse(run.dataset_source) }]).map(o => o.runs), [0, 0])
+  // The origin summary does not count it as a model-written or a dataset run: it has a third row of its own.
+  const summary = store.summarizeOrigins([{ ...run, result: JSON.parse(run.result), dataset_source: JSON.parse(run.dataset_source) }])
+  assert.deepEqual(summary.map(o => [o.origin, o.runs]), [['written by the models', 0], ['public dataset', 0], ['written by visitors', 1]])
+  assert.equal(JSON.stringify(summary).includes(OFFERED[0]), false)
+  // A lab with no such run gets the two rows it always got.
+  assert.deepEqual(store.summarizeOrigins([]).map(o => o.origin), ['written by the models', 'public dataset'])
 })
 
 test('a run on a shelf dataset or written examples still asks for samples, and one source at a time is read', async () => {
@@ -2049,14 +2057,321 @@ test('a lesson adapter carries its skill map and the losses of its last training
   assert.deepEqual([plain.kind, plain.skill_map, plain.holdout_loss_after], [undefined, undefined, 1.1])
 })
 
-test('the Socratic lesson is a stub that is off, and its key is still an unknown tool', () => {
-  enableTinker()
-  const config = toolsConfig.toolConfig()
+// A small lesson that the lesson's reader accepts (tinker-tutor.ts): 4 subskills, 3 practice and 3 held back questions each.
+const LESSON_WORDS = ['amber', 'basil', 'cedar', 'delta', 'ember', 'fjord', 'grove', 'heron', 'iris', 'juniper', 'kelp', 'lumen', 'maple', 'nectar', 'onyx', 'pearl', 'quartz', 'raven', 'sage', 'tundra']
+const lessonQuestion = (s, held, j) => {
+  const n = s * 5 + (held ? 3 : 0) + j
+  return { prompt: `${held ? 'Recall' : 'Name'} the code for ${LESSON_WORDS[n % 20]} ${LESSON_WORDS[(n + 7) % 20]} ${s}${j}${held ? 'h' : 'p'}. Give it on the last line.`, expected: `${held ? 'h' : 'p'}${s}${j}code` }
+}
+const lessonAsk = (extra = {}) => ({
+  purpose: 'teach the code words', topic: 'Code words',
+  subskills: [0, 1, 2, 3].map(s => ({
+    name: `Codes ${s}`, rubric: { rules: [{ type: 'exact_match', weight: 1, from: 'expected', scope: 'last_line' }] },
+    practice: [0, 1, 2].map(j => lessonQuestion(s, false, j)), held_back: [0, 1, 2].map(j => lessonQuestion(s, true, j)),
+  })),
+  ...extra,
+})
+const ENCOURAGING = /\b(should|try|consider|recommend|great|best|improve)\b/i
+
+test('the Socratic lesson is on by default once the runner and the Tinker key are set, says once why it is off, and switched off it is an unknown tool the models hear nothing of', () => {
+  enableTinker({ TINKER_API_KEY: TINKER_KEY })
+  let config = toolsConfig.toolConfig()
   assert.ok(toolsConfig.TOOL_NAMES.includes('tinker_tutor'))
-  assert.deepEqual([config.tinker_tutor.enabled, config.tinker_tutor.off_reason], [false, 'not built yet'])
-  assert.equal(toolsConfig.enabledTools(config).includes('tinker_tutor'), false)
-  const plan = toolRequests.planTools({ tinker_tutor: { topic: 'x' } }, config)
-  assert.deepEqual(plan.ignored, [{ tool: 'tinker_tutor', reason: 'unknown tool' }])
-  assert.doesNotMatch(prompts.toolLines(config), /tutor|Socratic|lesson/i)
-  assert.doesNotMatch(prompts.executorToolsSection(config), /tinker_tutor|Socratic/)
+  assert.deepEqual([config.tinker_tutor.enabled, config.tinker_tutor.per_day], [true, 1])
+  assert.equal(toolsConfig.PER_EPOCH.tinker_tutor_lessons, 1)
+  assert.ok(toolsConfig.enabledTools(config).includes('tinker_tutor'))
+  // What the models are told: the ability and its limits, nothing about what to teach.
+  const line = prompts.toolLines(config).split('\n').find(l => l.startsWith('- Socratic lesson:'))
+  assert.ok(line, 'the tools list has no lesson line')
+  for (const fact of ['4 to 10 subskills', '3 to 8 practice questions', '3 to 6 held back questions', '120000 bytes', 'at most 24 practice questions', 'the Executor of the epoch', '$1.00 a lesson', 'at most 1 a day', 'an epoch has one Tinker run of any kind']) {
+    assert.ok(line.includes(fact), `the lesson line does not say: ${fact}`)
+  }
+  assert.doesNotMatch(line, ENCOURAGING)
+  const section = prompts.executorToolsSection(config)
+  assert.match(section, /"tinker_tutor": \{ "purpose": "one line \(optional\)", "topic": "a short name, 1 to 48 characters", "base_model": "Qwen\/Qwen3\.5-4B" \(optional\), "subskills": \[/)
+  assert.match(section, /"guiding_turns": 1 \| 2, "rounds": 1 \| 2 \} \(optional\)/)
+  const paragraph = section.split('\n').find(l => l.startsWith('A Socratic lesson takes exactly the fields shown'))
+  assert.ok(paragraph)
+  assert.match(paragraph, /exact_match \{ "value" or "from", "scope" \}/)
+  assert.doesNotMatch(paragraph, ENCOURAGING)
+  // A fixed teacher is named in the note.
+  process.env.LAB_TUTOR_TEACHER_MODEL = 'x-ai/grok-4.7'
+  assert.ok(prompts.toolLines(toolsConfig.toolConfig()).includes('a teacher model (Grok 4.7)'))
+  delete process.env.LAB_TUTOR_TEACHER_MODEL
+
+  // With a teacher cap of 0 it is off and the logs say why, once (a reason is said once per process).
+  process.env.LAB_TUTOR_TEACHER_USD = '0'
+  logs = []
+  config = toolsConfig.toolConfig()
+  toolsConfig.toolConfig()
+  assert.deepEqual([config.tinker_tutor.enabled, config.tinker_tutor.off_reason], [false, 'LAB_TUTOR_TEACHER_USD is 0'])
+  assert.deepEqual(logs.filter(l => l.includes('Socratic lesson')), ['[Tools] the Socratic lesson is on by default and is off here: LAB_TUTOR_TEACHER_USD is 0'])
+  delete process.env.LAB_TUTOR_TEACHER_USD
+  // Without the Tinker key it is off too.
+  delete process.env.TINKER_API_KEY
+  config = toolsConfig.toolConfig()
+  assert.deepEqual([config.tinker_tutor.enabled, config.tinker_tutor.off_reason], [false, 'TINKER_API_KEY is not set on this server'])
+
+  // Switched off: no log line, an unknown tool, and not a word in the prompts.
+  for (const value of [' False ', '0', 'OFF', 'no']) {
+    enableTinker({ TINKER_API_KEY: TINKER_KEY, LAB_ENABLE_TINKER_TUTOR: value })
+    logs = []
+    config = toolsConfig.toolConfig()
+    assert.equal(config.tinker_tutor.enabled, false, value)
+    assert.equal(logs.some(l => l.includes('Socratic lesson')), false)
+    assert.equal(toolsConfig.enabledTools(config).includes('tinker_tutor'), false)
+    const plan = toolRequests.planTools({ tinker_tutor: lessonAsk() }, config)
+    assert.deepEqual(plan.ignored, [{ tool: 'tinker_tutor', reason: 'unknown tool' }])
+    assert.equal(plan.tinker_tutor, undefined)
+    assert.doesNotMatch(prompts.toolLines(config), /tutor|Socratic|lesson/i)
+    assert.doesNotMatch(prompts.executorToolsSection(config), /tinker_tutor|Socratic/)
+  }
+  delete process.env.LAB_ENABLE_TINKER_TUTOR
+})
+
+test('a lesson is planned only alone: beside a training run or an RL run it is refused with the one run an epoch rule', () => {
+  enableTinker({ TINKER_API_KEY: TINKER_KEY, LAB_ENABLE_TINKER_RL: 'true' })
+  const config = toolsConfig.toolConfig()
+  assert.ok(config.tinker_tutor.enabled && config.tinker_rl.enabled && config.tinker_train.enabled)
+  let plan = toolRequests.planTools({ tinker_tutor: lessonAsk() }, config)
+  assert.deepEqual(plan.ignored, [])
+  assert.equal(plan.tinker_tutor.topic, 'Code words')
+  assert.equal(plan.tinker_tutor.subskills.length, 4)
+  plan = toolRequests.planTools({ tinker_tutor: lessonAsk(), tinker_train: ask() }, config)
+  assert.ok(plan.tinker_train)
+  assert.equal(plan.tinker_tutor, undefined)
+  assert.deepEqual(plan.ignored, [{ tool: 'tinker_tutor', reason: 'an epoch has one Tinker run and this answer also asks for tinker_train' }])
+  // A training request that is refused still holds the epoch's one run for itself.
+  plan = toolRequests.planTools({ tinker_tutor: lessonAsk(), tinker_train: { examples: [] } }, config)
+  assert.equal(plan.tinker_tutor, undefined)
+  assert.ok(plan.ignored.some(x => x.tool === 'tinker_tutor' && x.reason.endsWith('also asks for tinker_train')))
+  const rl = {
+    purpose: 'p', tasks: Array.from({ length: 8 }, (_, i) => ({ prompt: `Add ${i} and ${i}.`, expected: String(2 * i) })),
+    rubric: { rules: [{ type: 'exact_match', weight: 1, from: 'expected' }] },
+  }
+  plan = toolRequests.planTools({ tinker_tutor: lessonAsk(), tinker_rl: rl }, config)
+  assert.equal(plan.tinker_tutor, undefined)
+  assert.ok(plan.ignored.some(x => x.tool === 'tinker_tutor' && x.reason === 'an epoch has one Tinker run and this answer also asks for tinker_rl'))
+  // A malformed lesson is refused whole, with its reason, under its own name.
+  plan = toolRequests.planTools({ tinker_tutor: lessonAsk({ colour: 'red' }) }, config)
+  assert.deepEqual(plan.ignored, [{ tool: 'tinker_tutor', reason: 'unknown field: colour' }])
+  // With RL switched off an RL request does not hold the run: the lesson stands.
+  process.env.LAB_ENABLE_TINKER_RL = 'false'
+  plan = toolRequests.planTools({ tinker_tutor: lessonAsk(), tinker_rl: rl }, toolsConfig.toolConfig())
+  assert.ok(plan.tinker_tutor)
+  assert.deepEqual(plan.ignored, [{ tool: 'tinker_rl', reason: 'not enabled' }])
+})
+
+test('the Reviewer rules on a lesson by name, and anything but an explicit approve is a no', () => {
+  enableTinker({ TINKER_API_KEY: TINKER_KEY })
+  const plan = toolRequests.planTools({ tinker_tutor: lessonAsk() }, toolsConfig.toolConfig())
+  const tutorFacts = { line: 'a Socratic lesson for Qwen/Qwen3.5-4B on "Code words". The lab counts which answers pass.' }
+  const section = prompts.reviewerToolSection({ tinker_tutor: tutorFacts })
+  assert.match(section, /- A Socratic lesson: a Socratic lesson for Qwen\/Qwen3\.5-4B on "Code words"\. The lab counts which answers pass\.\n/)
+  assert.match(section, /\{ "tinker_tutor": "approve" \| "reject" \}\. Nothing is opened or started without "approve"\./)
+  assert.deepEqual(epochTools.readToolVerdicts({ tool_verdicts: { tinker_tutor: 'APPROVE', tinker_train: 'maybe' } }), { tinker_tutor: 'approve' })
+  assert.deepEqual(epochTools.readToolVerdicts({ tool_verdicts: { tinker_tutor: 'reject' } }), { tinker_tutor: 'reject' })
+  assert.deepEqual(epochTools.readToolVerdicts({ tool_verdicts: { tinker_tutor: true } }), {})
+  assert.ok(plan.tinker_tutor)
+})
+
+test('a lesson that has not been approved never starts, and its refusal is stored under its own name', async () => {
+  enableTinker({ TINKER_API_KEY: TINKER_KEY })
+  const sent = []
+  globalThis.fetch = async (url, init) => { sent.push(String(url)); throw new Error(`no request may leave: ${url}`) }
+  const plan = toolRequests.planTools({ tinker_tutor: lessonAsk() }, toolsConfig.toolConfig())
+  const out = await epochTools.runDeliverables({ ...CTX, reviewerModelId: 'x-ai/grok-4.7' }, plan, {}, new Set())
+  assert.equal(out.length, 1)
+  assert.deepEqual([out[0].tool, out[0].status], ['tinker_tutor', 'skipped'])
+  assert.match(out[0].summary, /the Reviewer did not approve it/)
+  assert.deepEqual(sent, [])
+  assert.equal(lab.tinkerRuns.length, 0)
+  assert.equal(lab.toolRuns.at(-1).tool, 'tinker_tutor')
+  assert.match(lab.toolRuns.at(-1).request_summary, /^Socratic lesson for Qwen\/Qwen3\.5-4B on "Code words": 4 subskills, 24 questions, taught by /)
+})
+
+test('an open lesson keeps its adapter name: a lesson row is never asked to give it up', async () => {
+  enableTinker({ LAB_ENABLE_TINKER_NAMES: 'true' })
+  lab.statements = []
+  await store.claimAdapterName('00000000-0000-4000-8000-000000000999', 'Finch').catch(() => false)
+  const release = lab.statements.find(x => x.text.startsWith('UPDATE tinker_runs SET name_key = NULL'))
+  assert.ok(release, 'no release statement was made')
+  assert.ok(release.text.includes("AND status NOT IN ('reserved', 'running')"))
+  assert.ok(release.text.includes("AND status <> 'lesson'"), 'a lesson that is still open would lose its name')
+})
+
+// ---------------------------------------------------------------------------
+// A training run on conversations visitors offered, through the epoch
+// (visitor-offers.ts, visitor-offers-store.ts, epoch-tools.ts). The offers
+// table is faked here beside the training run's tables.
+// ---------------------------------------------------------------------------
+class OffersTable {
+  constructor(rows) { this.rows = rows }
+  handle(text, v) {
+    if (/^(CREATE|ALTER)\b/.test(text) && text.includes('visitor_offers')) return { rows: [] }
+    if (text.startsWith('SELECT id, day FROM visitor_offers WHERE status = \'stored\' AND adapter_from_visitors = FALSE AND messages IS NOT NULL')) {
+      return { rows: this.rows.filter(r => r.status === 'stored' && !r.adapter_from_visitors && r.messages).map(r => ({ id: r.id, day: r.day })) }
+    }
+    if (text.startsWith('UPDATE visitor_offers SET used_in = used_in || to_jsonb(?::text)')) {
+      const [claim, ids] = v
+      const out = []
+      for (const r of this.rows) if (String(ids).split(',').includes(r.id) && r.status === 'stored' && r.messages) { r.used_in.push(claim); out.push({ id: r.id, day: r.day, messages: r.messages }) }
+      return { rows: out }
+    }
+    if (text.startsWith('UPDATE visitor_offers SET used_in = used_in - ?::text WHERE id::text = ANY')) {
+      const [claim, ids] = v
+      for (const r of this.rows) if (String(ids).split(',').includes(r.id)) r.used_in = r.used_in.filter(x => x !== claim)
+      return { rows: [] }
+    }
+    if (text.startsWith('UPDATE visitor_offers SET used_in = used_in - ?::text WHERE used_in ? ?::text')) {
+      for (const r of this.rows) r.used_in = r.used_in.filter(x => x !== v[0])
+      return { rows: [] }
+    }
+    if (text.startsWith('UPDATE visitor_offers SET used_in = (used_in - ?::text) || to_jsonb(?::text) WHERE used_in ? ?::text')) {
+      for (const r of this.rows) if (r.used_in.includes(v[0])) r.used_in = [...r.used_in.filter(x => x !== v[0]), v[1]]
+      return { rows: [] }
+    }
+    if (text.includes('visitor_offers')) throw new Error(`unexpected statement on visitor_offers: ${text}`)
+    return null
+  }
+}
+const SAID = i => [`Tell me about crumbly Lancashire number ${i} please`, `Crumbly Lancashire ${i} is a pale cheese from the north west.`]
+function offerRows(n = 24, days = 6) {
+  return Array.from({ length: n }, (_, i) => ({
+    id: `00000000-0000-4000-9000-${String(i + 1).padStart(12, '0')}`, day: `2026-11-${String(10 + (i % days)).padStart(2, '0')}`, status: 'stored',
+    adapter_from_visitors: false, used_in: [], messages: [{ role: 'user', content: SAID(i)[0] }, { role: 'assistant', content: SAID(i)[1] }],
+  }))
+}
+function withOffers(rows) {
+  const table = new OffersTable(rows)
+  db.handler = (text, values) => table.handle(text, values) ?? lab.handle(text, values)
+  return table
+}
+function enableOffers(extra = {}) {
+  enableTinker({ TINKER_API_KEY: TINKER_KEY, LAB_ENABLE_TRAINED_CHAT: 'true', CRON_SECRET: 'test-only-scheduler-secret-0000000000', ...extra })
+}
+const offersAsk = (extra = {}) => ({ purpose: 'what visitors asked about', visitor_offers: { limit: 20 }, ...extra })
+
+test('a training request may name visitor conversations only while offers are on, and never beside examples or a dataset', () => {
+  enableOffers()
+  const config = toolsConfig.toolConfig()
+  let plan = toolRequests.planTools({ tinker_train: offersAsk() }, config)
+  assert.deepEqual(plan.ignored, [])
+  assert.deepEqual(plan.tinker_train_offers.visitor_offers, { adapter: null, limit: 20 })
+  assert.equal(plan.tinker_train, undefined)
+  plan = toolRequests.planTools({ tinker_train: offersAsk({ examples: dataset() }) }, config)
+  assert.equal(plan.tinker_train_offers, undefined)
+  assert.equal(plan.tinker_train, undefined)
+  assert.deepEqual(plan.ignored, [{ tool: 'tinker_train', reason: 'give exactly one of "examples", "dataset" and "visitor_offers"' }])
+  // It holds the epoch's one run like any training request.
+  plan = toolRequests.planTools({ tinker_train: offersAsk(), tinker_tutor: lessonAsk() }, config)
+  assert.ok(plan.tinker_train_offers)
+  assert.ok(plan.ignored.some(x => x.tool === 'tinker_tutor' && x.reason.endsWith('also asks for tinker_train')))
+  // Offers off: the field is an unknown field of a training request, as it always was.
+  for (const off of [{ LAB_ENABLE_VISITOR_OFFERS: 'off' }, { LAB_ENABLE_TRAINED_CHAT: 'false' }, { CRON_SECRET: '' }]) {
+    enableOffers(off)
+    plan = toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig())
+    assert.equal(plan.tinker_train_offers, undefined, JSON.stringify(off))
+    assert.deepEqual(plan.ignored.map(x => x.tool), ['tinker_train'])
+    assert.match(plan.ignored[0].reason, /visitor_offers/)
+  }
+  // The note is in the tools list only with a count, which the epoch reads only while offers are on.
+  enableOffers()
+  const lines = prompts.toolLines(toolsConfig.toolConfig(), { visitorOffers: 37 })
+  const note = lines.split('\n').find(l => l.startsWith('- Visitor conversations:'))
+  assert.ok(note && note.includes('The lab holds 37 of them now.'))
+  assert.doesNotMatch(note, ENCOURAGING)
+  assert.equal(prompts.toolLines(toolsConfig.toolConfig()).includes('Visitor conversations:'), false)
+  assert.equal(prompts.getSharedContext(4, { capabilities: [], constraints: [], behaviors: [], conflicts: [], identity: {}, meta: { stability_score: 0.5 } }, [], undefined, { visitorOffers: 37 }).includes('The lab holds 37 of them now.'), true)
+})
+
+test('an approved run on visitor conversations claims them in one statement, sends no samples, marks them with its id, and stores none of their text', async () => {
+  enableOffers()
+  const table = withOffers(offerRows())
+  const sent = []
+  // The runner answers with samples anyway: they would be visitor text.
+  globalThis.fetch = fakeRunner(sent, [{ status: 'done', result: runnerOk({ samples: [{ prompt: SAID(3)[0], completion: SAID(3)[1] }] }) }])
+  const plan = toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig())
+  const out = await deliver(plan)
+  assert.equal(out.length, 1)
+  assert.equal(out[0].status, 'ok', out[0].summary)
+  assert.equal('sent' in out[0], false, 'the run id used for the claim is not part of what the epoch reports')
+  const start = sent.find(x => x.kind === 'start')
+  assert.equal(start.body.train.samples, 0)
+  const run = lab.tinkerRuns[0]
+  // Exactly the conversations the run used carry its id; every other claim was released.
+  const used = table.rows.filter(r => r.used_in.length)
+  assert.equal(used.length, 20)
+  assert.ok(used.every(r => r.used_in.length === 1 && r.used_in[0] === run.slug))
+  assert.equal(table.rows.some(r => r.used_in.some(x => x.startsWith('claim-'))), false)
+  // At most a quarter from any one day.
+  const perDay = new Map()
+  for (const r of used) perDay.set(r.day, (perDay.get(r.day) ?? 0) + 1)
+  assert.ok([...perDay.values()].every(n => n <= 5))
+  // The source went on the row before the start, and it holds counts only.
+  const texts = lab.statements.map(x => x.text)
+  assert.ok(texts.findIndex(t => t.startsWith('UPDATE tinker_runs SET dataset_source')) < texts.findIndex(t => t.startsWith('UPDATE tinker_runs SET status = ?, call_id = ?')))
+  const source = JSON.parse(run.dataset_source)
+  assert.deepEqual([source.kind, source.conversations_used, source.days], ['visitor_offers', 20, 6])
+  // No offered string anywhere the lab keeps or says something about the run:
+  // the run row (its result and source), the tool run rows that the public
+  // state and the activity record are read from, the adapter, and the outcome.
+  const target = await store.getAdapter(run.slug)
+  const kept = JSON.stringify({ run, toolRuns: lab.toolRuns, out, target, logs })
+  for (let i = 0; i < 24; i++) for (const said of SAID(i)) assert.equal(kept.includes(said), false, said)
+  assert.equal(kept.includes('Crumbly Lancashire'), false)
+  assert.deepEqual(JSON.parse(run.result).samples, [])
+  assert.match(lab.toolRuns.at(-1).output_tail, /examples: 20 conversations written by visitors, read by the lab; data origin: written by visitors$/)
+})
+
+test('a run on visitor conversations that is refused or never sent gives its claim back', async () => {
+  enableOffers()
+  // Not approved: nothing is read or claimed.
+  let table = withOffers(offerRows())
+  let out = await deliver(toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig()), { tinker_train: 'reject' })
+  assert.match(out[0].summary, /the Reviewer did not approve it/)
+  assert.equal(lab.statements.some(x => x.text.includes('visitor_offers')), false)
+
+  // The runner refuses the start: the run is closed at no cost and every claim is released.
+  table = withOffers(offerRows())
+  const sent = []
+  globalThis.fetch = fakeRunner(sent, undefined, new Response(JSON.stringify({ error: 'refused: bad request' }), { status: 400, headers: { 'content-type': 'application/json' } }))
+  out = await deliver(toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig()))
+  assert.equal(out[0].status, 'error', out[0].summary)
+  assert.ok(sent.some(x => x.kind === 'start'))
+  assert.ok(table.rows.every(r => r.used_in.length === 0), 'a refused start keeps no claim')
+
+  // Too few conversations (fewer than 10 after the quarter a day rule): no run, nothing claimed, the reason stored.
+  lab = new FakeDb()
+  table = withOffers(offerRows(12, 2))
+  globalThis.fetch = async url => { throw new Error(`Unexpected outbound request to ${url}`) }
+  out = await deliver(toolRequests.planTools({ tinker_train: offersAsk() }, toolsConfig.toolConfig()))
+  assert.equal(out[0].status, 'skipped')
+  assert.match(out[0].summary, /visitor conversations/)
+  assert.equal(lab.tinkerRuns.length, 0)
+  assert.ok(table.rows.every(r => r.used_in.length === 0))
+  assert.equal(lab.toolRuns.at(-1).status, 'skipped')
+})
+
+test('the measure note is one sentence list, the same on the chart, the lesson panel, the chat card, the tool run line and the review facts', async () => {
+  const { TUTOR_MEASURE_NOTE } = await load('api/_lib/tinker-tutor.js')
+  assert.match(TUTOR_MEASURE_NOTE, /^The lab counts which answers pass\. .*Nobody has checked that the rules measure the skill\.$/)
+  // The page cannot import the server's code, so each surface holds a copy; every copy is the server's text, word for word.
+  const declared = file => {
+    const m = readFileSync(join(root, file), 'utf8').match(/export const TUTOR_MEASURE_NOTE = '([^']+)'/)
+    return m ? m[1] : null
+  }
+  assert.equal(declared('src/systems/skillMap.ts'), TUTOR_MEASURE_NOTE, 'the skill map (chart and lesson panel)')
+  assert.equal(declared('src/systems/TrainedChatPanel.ts'), TUTOR_MEASURE_NOTE, 'the chat card')
+  assert.match(readFileSync(join(root, 'src/systems/LessonPanel.ts'), 'utf8'), /\$\{TUTOR_MEASURE_NOTE\}/)
+  assert.match(readFileSync(join(root, 'src/systems/TrainedChatPanel.ts'), 'utf8'), /\$\{TUTOR_BANDS_NOTE\} \$\{TUTOR_MEASURE_NOTE\}/)
+  // The chart's paper carries the short foot line; the chart module names the note it stands for.
+  assert.match(readFileSync(join(root, 'src/entities/SkillMapChart.ts'), 'utf8'), /skillMap/)
+  // The server's own surfaces: the tool run line and the review facts.
+  const run = readFileSync(join(root, 'api/_lib/tinker-tutor-run.ts'), 'utf8')
+  assert.match(run, /TUTOR_MEASURE_NOTE/)
+  const tutor = await load('api/_lib/tinker-tutor.js')
+  enableTinker({ TINKER_API_KEY: TINKER_KEY })
+  const facts = tutor.tinkerTutorReviewFacts(tutor.normalizeTinkerTutorRequest(lessonAsk()).request, 'x-ai/grok-4.7')
+  assert.ok(facts.line.endsWith(TUTOR_MEASURE_NOTE))
 })

@@ -12,11 +12,31 @@ import { getRecentToolRuns } from '../_lib/tool-runs-store.js'
 import { enabledTools } from '../_lib/tools-config.js'
 import { trainedChatStatus } from '../_lib/tinker.js'
 import { rlPractice } from '../_lib/tinker-rl-public.js'
+import { tutorLesson } from '../_lib/tinker-tutor-public.js'
+import { visitorOffersStatus } from '../_lib/visitor-offers.js'
+import { offersCounts, type VisitorOffersCounts } from '../_lib/visitor-offers-store.js'
 import { chatActivity } from '../_lib/trained-chat-activity.js'
 import { researchStoryStatus } from '../_lib/research-talk.js'
 import { exhibitsHandler } from '../_lib/exhibits-reader.js'
 import { researchAlongside } from '../_lib/experiment-modes.js'
 import { researchRunState, researchSummary } from '../_lib/research-alongside.js'
+
+/**
+ * The public counts of conversations visitors offered (spec 2.9): present
+ * while offers are on, or while any offer is on record. Counts only, never
+ * text. With offers off it only looks (the table is not created), and a
+ * failed read leaves the field out.
+ */
+async function visitorOffersPart(): Promise<VisitorOffersCounts | null> {
+  const enabled = visitorOffersStatus().enabled
+  try {
+    const counts = await offersCounts(new Date(), { createTables: enabled })
+    const any = counts.stored + counts.offered_today + counts.trained_on + counts.taken_back + counts.read_by_owner > 0
+    return enabled || any ? counts : null
+  } catch {
+    return null
+  }
+}
 
 // Viewers poll this endpoint; the budget is read at most once a minute per instance.
 let budgetCache: { at: number; status: BudgetStatus } | null = null
@@ -178,6 +198,10 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
     const practice = await rlPractice().catch(() => null)
     // When a visitor last got a reply from a trained model, for the room's speaking tube. Read from rows the chat already writes.
     const activity = trainedChatStatus().enabled ? await chatActivity().catch(() => null) : null
+    // The Socratic lesson, for the skill map: whether it is on and the newest lesson, from stored rows only.
+    const lesson = await tutorLesson().catch(() => null)
+    // Conversations visitors offered: counts only.
+    const offers = await visitorOffersPart()
 
     return res.status(200).json({
       ...response, growth_events: growthEvents, tool_runs: toolRuns, tools_enabled: enabledTools(),
@@ -192,6 +216,10 @@ async function handleGet(_req: VercelRequest, res: VercelResponse) {
       ...(research ? { research } : {}),
       // Present while Tinker RL is on or has ever run. The bench rests without it.
       ...(practice && (practice.enabled || practice.run) ? { rl_practice: practice } : {}),
+      // Present while the Socratic lesson is on or a lesson exists. The skill map rests without it.
+      ...(lesson ? { tutor_lesson: lesson } : {}),
+      // Present while visitor offers are on or any offer is on record.
+      ...(offers ? { visitor_offers: offers } : {}),
     })
   } catch (error) {
     console.error('[API] Error fetching experiment:', error)

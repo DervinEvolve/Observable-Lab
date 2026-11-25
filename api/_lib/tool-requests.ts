@@ -14,6 +14,8 @@ import { normalizeProposal, type ProposalRequest } from './lab-proposals.js'
 import { normalizeTinkerRequest, type TinkerRequest } from './tinker.js'
 import { normalizeTinkerRlRequest, type TinkerRlRequest } from './tinker-rl.js'
 import { KEEP_TOOL, TINKER_NAME_TOOL, normalizeKeepRequest, type KeepRequest } from './tinker-keep-request.js'
+import { TUTOR_TOOL, normalizeTinkerTutorRequest, type TinkerTutorRequest } from './tinker-tutor.js'
+import { namesVisitorOffers, normalizeOffersRequest, visitorOffersStatus, type TinkerOffersRequest } from './visitor-offers.js'
 import {
   DATASETS_TOOL, namesDataset, normalizeDatasetRef, normalizeDatasetRequest, normalizeTinkerDatasetRequest,
   type DatasetRef, type DatasetRequest, type TinkerDatasetRequest,
@@ -40,13 +42,28 @@ export interface ToolPlan {
    * together with tinker_train: it becomes one once the lab has read the rows.
    */
   tinker_train_dataset?: TinkerDatasetRequest
+  /**
+   * A Tinker training request that names conversations visitors offered
+   * instead of writing its examples (visitor-offers.ts). Only while offers
+   * are on for the models, and never together with tinker_train or
+   * tinker_train_dataset: it becomes one once the lab has read the offers.
+   */
+  tinker_train_offers?: TinkerOffersRequest
+  /** A Socratic lesson (tinker-tutor.ts). An epoch has one Tinker run, so it never stands beside tinker_train or tinker_rl. */
+  tinker_tutor?: TinkerTutorRequest
   keep_adapter?: KeepRequest
   ignored: Array<{ tool: string; reason: string }>
 }
 
 const text = (v: unknown, max: number) => (typeof v === 'string' ? v.replace(/\s+/g, ' ').trim().slice(0, max) : '')
 
-export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
+/**
+ * `opts.offers`: may a training request name conversations visitors offered?
+ * Read from visitor-offers.ts when left out: offers on, the visitor chat on,
+ * a receipt key and Tinker training on. While it is false a "visitor_offers"
+ * field on a training request is an unknown field, as it always was.
+ */
+export function planTools(raw: unknown, config: ToolConfig, opts: { offers?: boolean } = {}): ToolPlan {
   const plan: ToolPlan = { subagents: { ...DEFAULT_SUBAGENTS, chosen: false }, ignored: [] }
   if (raw === undefined || raw === null) return plan
   if (typeof raw !== 'object' || Array.isArray(raw)) {
@@ -141,7 +158,19 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
 
   // Asked once: a request for a tool that is off is recorded once.
   const tinkerOff = off('tinker_train')
-  if (!tinkerOff && datasetsOn && namesDataset(req.tinker_train)) {
+  const offersOn = !tinkerOff && (opts.offers ?? visitorOffersStatus({ models: true }).enabled)
+  if (offersOn && namesVisitorOffers(req.tinker_train)) {
+    // A training request that names conversations visitors offered. As
+    // strict as the other two forms; "examples" or "dataset" beside it refuses it.
+    const checked = normalizeOffersRequest(req.tinker_train)
+    if ('error' in checked) plan.ignored.push({ tool: 'tinker_train', reason: checked.error })
+    else {
+      plan.tinker_train_offers = checked.request
+      if (checked.request.name_refused) {
+        plan.ignored.push({ tool: TINKER_NAME_TOOL, reason: `name refused: ${checked.request.name_refused}; the run stands and the adapter gets no name` })
+      }
+    }
+  } else if (!tinkerOff && datasetsOn && namesDataset(req.tinker_train)) {
     // A training request that names a shelf dataset instead of writing its
     // examples. As strict as the inline form, and the same rule for a name.
     const checked = normalizeTinkerDatasetRequest(req.tinker_train)
@@ -172,7 +201,7 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
   // request is refused with that reason.
   const rlOff = off('tinker_rl')
   if (!rlOff) {
-    if (plan.tinker_train || plan.tinker_train_dataset || (req.tinker_train !== undefined && req.tinker_train !== null && req.tinker_train !== false && config.tinker_train.enabled && config.tinker_train.per_day > 0)) {
+    if (plan.tinker_train || plan.tinker_train_dataset || plan.tinker_train_offers || (req.tinker_train !== undefined && req.tinker_train !== null && req.tinker_train !== false && config.tinker_train.enabled && config.tinker_train.per_day > 0)) {
       plan.ignored.push({ tool: 'tinker_rl', reason: 'an epoch has one Tinker run and this answer also asks for tinker_train' })
     } else {
       const checked = normalizeTinkerRlRequest(req.tinker_rl)
@@ -181,6 +210,29 @@ export function planTools(raw: unknown, config: ToolConfig): ToolPlan {
         plan.tinker_rl = checked.request
         if (checked.request.name_refused) {
           plan.ignored.push({ tool: TINKER_NAME_TOOL, reason: `name refused: ${checked.request.name_refused}; the run stands and the adapter gets no name` })
+        }
+      }
+    }
+  }
+
+  // The Socratic lesson (tinker-tutor.ts), only while it is on. An epoch has
+  // one Tinker run of any kind: when the answer also asks for a training run
+  // or an RL run (and that tool is on), those keep their place and the lesson
+  // is refused with that reason.
+  const asked = (tool: 'tinker_train' | 'tinker_rl') =>
+    req[tool] !== undefined && req[tool] !== null && req[tool] !== false && config[tool].enabled && config[tool].per_day > 0
+  if (tutorOn && req[TUTOR_TOOL] !== undefined && req[TUTOR_TOOL] !== null && req[TUTOR_TOOL] !== false) {
+    if (plan.tinker_train || plan.tinker_train_dataset || plan.tinker_train_offers || asked('tinker_train')) {
+      plan.ignored.push({ tool: TUTOR_TOOL, reason: 'an epoch has one Tinker run and this answer also asks for tinker_train' })
+    } else if (plan.tinker_rl || asked('tinker_rl')) {
+      plan.ignored.push({ tool: TUTOR_TOOL, reason: 'an epoch has one Tinker run and this answer also asks for tinker_rl' })
+    } else {
+      const checked = normalizeTinkerTutorRequest(req[TUTOR_TOOL])
+      if ('error' in checked) plan.ignored.push({ tool: TUTOR_TOOL, reason: checked.error })
+      else {
+        plan.tinker_tutor = checked.request
+        if (checked.request.name_refused) {
+          plan.ignored.push({ tool: TINKER_NAME_TOOL, reason: `name refused: ${checked.request.name_refused}; the lesson stands and the adapter gets no name` })
         }
       }
     }

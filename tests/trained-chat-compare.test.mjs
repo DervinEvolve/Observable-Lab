@@ -48,8 +48,13 @@ beforeEach(() => {
   globalThis.fetch = async url => { throw new Error(`Unexpected outbound request to ${url}`) }
 })
 
+// Visitor offers (on by default) add a receipt to a reply; these tests pin
+// the comparison's shapes as they were, so offers are off here. Their own
+// tests are in visitor-offers.test.mjs.
 function enableChat(extra = {}) {
-  Object.assign(process.env, { LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY, CRON_SECRET: 'test-only-scheduler-secret-0000000000', ...extra })
+  Object.assign(process.env, {
+    LAB_ENABLE_TRAINED_CHAT: 'true', TINKER_API_KEY: TINKER_KEY, CRON_SECRET: 'test-only-scheduler-secret-0000000000', LAB_ENABLE_VISITOR_OFFERS: 'false', ...extra,
+  })
 }
 let ipCounter = 0
 const freshIp = () => `198.51.100.${(++ipCounter % 250) + 1}`

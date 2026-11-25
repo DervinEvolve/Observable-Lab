@@ -49,7 +49,11 @@ import {
   type DatasetFetchResult, type TinkerDatasetRecord, type TinkerDatasetRequest,
 } from './datasets.js'
 import { readDatasetRows, runDatasetFetch } from './datasets-client.js'
-import { tinkerWaitMs, type TinkerRequest } from './tinker.js'
+import { newSplitSalt, tinkerWaitMs, type TinkerRequest } from './tinker.js'
+import { TUTOR_TOOL, tutorSummary } from './tinker-tutor.js'
+import { runTinkerTutor, teacherModelFor, tinkerTutorWorstCaseUsd, tutorRunsToday } from './tinker-tutor-run.js'
+import { offersRequestSummary, offersRunCeiling } from './visitor-offers.js'
+import { markOffersUsed, readOffersForRun } from './visitor-offers-store.js'
 
 /** The reading of a shelf dataset's rows for a training run is stored under this, apart from the run itself. */
 export const DATASET_ROWS_TOOL = 'dataset_rows'
@@ -359,14 +363,14 @@ export async function runSideTools(ctx: EpochToolContext, plan: ToolPlan, ran: S
   return out
 }
 
-export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal' | 'tinker_train' | 'tinker_rl' | 'keep_adapter', 'approve' | 'reject'>>
+export type ToolVerdicts = Partial<Record<'exhibit' | 'lab_proposal' | 'tinker_train' | 'tinker_rl' | 'tinker_tutor' | 'keep_adapter', 'approve' | 'reject'>>
 
 /** The Reviewer's verdicts on tool deliverables; anything but an explicit "approve" is a no. */
 export function readToolVerdicts(reviewerOutput: unknown): ToolVerdicts {
   const raw = reviewerOutput && typeof reviewerOutput === 'object' ? (reviewerOutput as Record<string, unknown>).tool_verdicts : undefined
   const out: ToolVerdicts = {}
   if (!raw || typeof raw !== 'object') return out
-  for (const key of ['exhibit', 'lab_proposal', 'tinker_train', 'tinker_rl', 'keep_adapter'] as const) {
+  for (const key of ['exhibit', 'lab_proposal', 'tinker_train', 'tinker_rl', 'tinker_tutor', 'keep_adapter'] as const) {
     const v = String((raw as Record<string, unknown>)[key] ?? '').toLowerCase()
     if (v === 'approve' || v === 'reject') out[key] = v
   }
@@ -497,6 +501,68 @@ export async function runDeliverables(
       if (!ok.ok) return void out.push(await skip(ctx, TINKER_RL_TOOL, summary, ok.reason))
       const outcome = await runTinkerRl(ctx, request)
       if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_RL_TOOL, summary, outcome.summary))
+      out.push(outcome)
+    })())
+  }
+
+  // A Tinker training run on conversations visitors offered (visitor-offers.ts).
+  // The plan holds one only while offers are on for the models, and never
+  // beside another training request. The Reviewer must have approved it. Then
+  // the lab reads and claims the offers in one statement (a take back after
+  // that answers "trained on"), and from there it is the run above. The claim
+  // is a token until the run's start is known: it becomes the run's id when
+  // the job was sent, and it is released when nothing was sent.
+  if (plan.tinker_train_offers && !done(TINKER_TOOL)) {
+    const asked = plan.tinker_train_offers
+    const summary = offersRequestSummary(asked)
+    tasks.push((async () => {
+      if (verdicts.tinker_train !== 'approve') return void out.push(await skip(ctx, TINKER_TOOL, summary, 'the Reviewer did not approve it'))
+      // Before the read: the runs-per-day limit, and today's budget against the most the limits would let it cost.
+      const first = await allowed(TINKER_TOOL, config, offersRunCeiling(asked).max_cost_usd, () => tinkerRunsToday())
+      if (!first.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, first.reason))
+      const claim = `claim-${newSplitSalt()}`
+      let read: Awaited<ReturnType<typeof readOffersForRun>>
+      try {
+        read = await readOffersForRun(asked, newSplitSalt(), claim)
+      } catch (e) {
+        console.warn(`[Epoch ${ctx.epochNumber}] could not read the visitor conversations:`, e instanceof Error ? e.message : e)
+        await markOffersUsed(claim, null).catch(() => console.warn(`[Epoch ${ctx.epochNumber}] could not release a claim on visitor conversations`))
+        return void out.push(await skip(ctx, TINKER_TOOL, summary, 'the lab could not read the visitor conversations, so nothing was started'))
+      }
+      if (!read.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, read.error))
+      let sent: string | null = null
+      try {
+        const ok = await allowed(TINKER_TOOL, config, tinkerWorstCaseUsd(read.request), () => tinkerRunsToday())
+        if (!ok.ok) return void out.push(await skip(ctx, TINKER_TOOL, summary, ok.reason))
+        const outcome = await runTinkerTrain(ctx, read.request, { offers: read.record })
+        sent = outcome.sent ?? null
+        if (outcome.status === 'skipped') return void out.push(await skip(ctx, TINKER_TOOL, summary, outcome.summary))
+        out.push({ tool: outcome.tool, status: outcome.status, summary: outcome.summary })
+      } finally {
+        // The claim becomes the run's id once the job was sent (it may have
+        // trained on them), and is released when nothing was sent.
+        await markOffersUsed(claim, sent).catch(() =>
+          console.warn(`[Epoch ${ctx.epochNumber}] could not settle a claim on visitor conversations`))
+      }
+    })())
+  }
+
+  // A Socratic lesson (tinker-tutor-run.ts). The Reviewer must have approved
+  // it; then its own lessons-per-day count and the lab's budget are checked
+  // against the most its Tinker use and its teacher could cost, and the Tinker
+  // caps, the teacher's price and earlier lessons' questions in runTinkerTutor.
+  // The epoch's one row in tinker_runs stops a second run of any kind. A
+  // lesson still open when its first slice ends goes on in the lesson cron.
+  if (plan.tinker_tutor && !done(TUTOR_TOOL)) {
+    const request = plan.tinker_tutor
+    const teacher = teacherModelFor(ctx)
+    const summary = tutorSummary(request, teacher)
+    tasks.push((async () => {
+      if (verdicts.tinker_tutor !== 'approve') return void out.push(await skip(ctx, TUTOR_TOOL, summary, 'the Reviewer did not approve it'))
+      const ok = await allowed(TUTOR_TOOL, config, await tinkerTutorWorstCaseUsd(request, teacher), () => tutorRunsToday())
+      if (!ok.ok) return void out.push(await skip(ctx, TUTOR_TOOL, summary, ok.reason))
+      const outcome = await runTinkerTutor(ctx, request)
+      if (outcome.status === 'skipped') return void out.push(await skip(ctx, TUTOR_TOOL, summary, outcome.summary))
       out.push(outcome)
     })())
   }

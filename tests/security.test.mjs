@@ -84,6 +84,12 @@ const PUBLIC_ROUTES = {
   // dollar amounts. With both of its switches off (the default) it says so
   // and reads nothing; tests/research-confirm.test.mjs holds it to that.
   'experiment/scoring': ['GET'],
+  // The full record of one Socratic lesson (api/_lib/tinker-tutor-public.ts):
+  // read-only, built from stored rows, limited per address; tests/tinker-tutor.test.mjs holds it to that.
+  'experiment/lesson': ['GET'],
+  // A visitor offers a conversation, or takes one back (api/experiment/chat-offer.ts).
+  // Public by design; with offers off an offer is refused before the database; tests/visitor-offers.test.mjs holds it to that.
+  'experiment/chat-offer': ['POST'],
 }
 // Routes authorised by a scoped key the lab itself issues (the lab model
 // endpoint, api/_lib/live-model.ts). They are neither public nor operator
@@ -676,5 +682,44 @@ test('one disallowed generated path is dropped, and the allowed files are still 
   } finally {
     delete process.env.OPENROUTER_API_KEY
     delete process.env.LAB_ENABLE_CODE_WRITES
+  }
+})
+
+test('the lesson cron route takes only the scheduler secret, the offers operator route only the operator secret, and no new route answers with a secret', async () => {
+  let outbound = 0
+  globalThis.fetch = async () => { outbound++; throw new Error('Unexpected outbound request') }
+  const saved = { ...process.env }
+  // No runner and no Tinker key here: a lesson slice can call nothing.
+  for (const name of Object.keys(process.env)) if (/^(TINKER|POSTGRES)/.test(name)) delete process.env[name]
+  const bodies = []
+  const call = async (route, method, authorization, extra = {}) => {
+    const { default: handler } = await load(`api/${route}.js`)
+    const res = response()
+    await handler({ method, headers: { authorization, 'content-type': 'application/json', ...(extra.headers || {}) }, query: extra.query || {}, body: extra.body ?? {} }, res)
+    bodies.push(JSON.stringify(res.body ?? null))
+    return res
+  }
+  try {
+    // The lesson cron: the operator's secret is not the scheduler's.
+    for (const method of ['GET', 'POST']) assert.equal((await call('epoch/lesson', method, `Bearer ${operator}`)).code, 401)
+    assert.equal((await call('epoch/lesson', 'POST', `Bearer ${cron}`)).code, 405)
+    const slice = await call('epoch/lesson', 'GET', `Bearer ${cron}`)
+    assert.equal(slice.code, 200)
+    assert.deepEqual(slice.body, { lessons: [] })
+    assert.equal(slice.headers['Cache-Control'], 'no-store')
+    // The operator route that reads offered text: the scheduler's secret is not the operator's, and there is no GET.
+    for (const method of ['GET', 'POST']) assert.equal((await call('experiment/visitor-offers', method, `Bearer ${cron}`, { body: { action: 'read', limit: 1 } })).code, 401)
+    assert.equal((await call('experiment/visitor-offers', 'GET', `Bearer ${operator}`)).code, 405)
+    // The public lesson record refuses a bad slug before it reads anything.
+    assert.equal((await call('experiment/lesson', 'GET', undefined, { query: { slug: '../etc' } })).code, 400)
+    // With offers switched off an offer is refused before the database.
+    process.env.LAB_ENABLE_VISITOR_OFFERS = 'false'
+    const off = await call('experiment/chat-offer', 'POST', undefined, { body: { adapter: 'e41-0a1b2c3d', messages: [{ role: 'user', content: 'hello there friend' }, { role: 'assistant', content: 'hello' }], receipt: 'x' } })
+    assert.equal(off.code, 503)
+    assert.equal(off.body.error, 'off')
+    for (const body of bodies) for (const secret of [operator, cron]) assert.equal(body.includes(secret), false)
+    assert.equal(outbound, 0)
+  } finally {
+    process.env = saved
   }
 })

@@ -19,6 +19,7 @@ import { spritesConfigured } from './sprites.js'
 import { liveModelStatus, type LiveModelStatus } from './live-model.js'
 import { liveTrainedStatus, tinkerKeepStatus, tinkerStatus } from './tinker.js'
 import { tinkerRlPerDay, tinkerRlStatus } from './tinker-rl.js'
+import { tinkerTutorPerDay, tinkerTutorStatus } from './tinker-tutor.js'
 
 export const TOOL_NAMES = [
   'subagents', 'sprite_session', 'gpu_job', 'weights', 'exhibit', 'lab_proposal', 'tinker_train', 'tinker_rl', 'keep_adapter', 'datasets', 'tinker_tutor',
@@ -38,6 +39,7 @@ export const PER_EPOCH = {
   tinker_rl_runs: 1,      // reinforcement-learning runs on Tinker (an epoch has one run of either kind)
   adapter_keeps: 1,       // requests to keep a trained adapter
   datasets: 1,            // public datasets fetched onto the lab's shelf
+  tinker_tutor_lessons: 1, // Socratic lessons (an epoch has one Tinker run of any kind)
 } as const
 
 /** Sprite session limits. */
@@ -159,6 +161,15 @@ function warnAboutRl(status: { enabled: boolean; off_reason?: string }): void {
   console.warn(`[Tools] Tinker RL is on by default and is off here: ${status.off_reason}`)
 }
 
+// The Socratic lesson is on by default too, so the same applies: one line per
+// reason when it is on and off here, nothing when it was switched off on purpose.
+let tutorWarnedFor: string | null = null
+function warnAboutTutor(status: { enabled: boolean; off_reason?: string }): void {
+  if (status.enabled || !status.off_reason || status.off_reason.startsWith('LAB_ENABLE_TINKER_TUTOR') || tutorWarnedFor === status.off_reason) return
+  tutorWarnedFor = status.off_reason
+  console.warn(`[Tools] the Socratic lesson is on by default and is off here: ${status.off_reason}`)
+}
+
 export function modalGpuUsdPerSecond(): number {
   return rateEnv('LAB_MODAL_GPU_USD_PER_SECOND', DEFAULT_MODAL_GPU_USD_PER_SECOND)
 }
@@ -193,6 +204,8 @@ export function toolConfig(): ToolConfig {
   const tinker = tinkerStatus()
   const rl = tinkerRlStatus()
   warnAboutRl(rl)
+  const tutor = tinkerTutorStatus()
+  warnAboutTutor(tutor)
   const keep = tinkerKeepStatus()
   // Public datasets (datasets.ts). A dataset on the shelf is read by a GPU job
   // or by a Tinker training run, so with neither on there is nothing to use
@@ -249,15 +262,11 @@ export function toolConfig(): ToolConfig {
             : 'neither GPU jobs nor Tinker training is on, so nothing could read a dataset',
       intEnv('LAB_DATASETS_PER_DAY', 2, 0, 20),
     ),
-    // The Socratic lesson (tinker-tutor.ts). A stub until it is built: always
-    // off, so the models are never told of it and planTools treats the key
-    // as an unknown tool, as it always did.
-    tinker_tutor: status(false, TINKER_TUTOR_NOT_BUILT, intEnv('LAB_TINKER_TUTOR_PER_DAY', 1, 0, 5)),
+    // The Socratic lesson (tinker-tutor.ts): on by default, through the same
+    // runner and Tinker's sampling endpoint. Its count is its own.
+    tinker_tutor: status(tutor.enabled, tutor.off_reason ?? '', tinkerTutorPerDay()),
   }
 }
-
-/** Why the Socratic lesson is off while it is a stub. */
-export const TINKER_TUTOR_NOT_BUILT = 'not built yet'
 
 /**
  * The lab model endpoint (live-model.ts). It is not a tool the Executor asks

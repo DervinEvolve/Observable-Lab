@@ -52,6 +52,13 @@ export interface TinkerOutcome {
   tool: string
   status: ToolRunStatus | 'started'
   summary: string
+  /**
+   * Only for a run on conversations visitors offered: the run's id once its
+   * job was sent to the runner (started, finished, or sent without an answer
+   * that settles it), so the offers it read can be marked with it. Absent
+   * when nothing was sent.
+   */
+  sent?: string
 }
 
 const name = (id: string) => modelDisplayName(id) || id.split('/').pop() || id
@@ -299,6 +306,9 @@ export async function runTinkerTrain(
     const found = await findTinkerCall(row.slug)
     if (found) started = { ok: true, callId: found }
   }
+  // For a run on visitor conversations the caller marks them with the run's
+  // id once the job was sent (spec 2.7); nothing else gets the field.
+  const sent = opts.offers ? { sent: row.slug } : {}
   if (!started.ok && started.unconfirmed) {
     // The request left and nothing settles whether a run was started: it may
     // be training. Its row stays open with the money set aside. A later tick
@@ -307,6 +317,7 @@ export async function runTinkerTrain(
     return {
       tool: TINKER_TOOL, status: 'error',
       summary: `${name(ctx.executorModelId)}'s Tinker training: ${started.error}; the ${usdText(reservation.usd)} set aside stays counted until the lab closes the run`,
+      ...sent,
     }
   }
   if (!started.ok) {
@@ -327,11 +338,12 @@ export async function runTinkerTrain(
   const poll = await waitForTinkerJob(started.callId, waitMs, opts.pollMs)
   if (poll.state === 'done' || poll.state === 'failed') {
     const outcome = await completeRun({ ...row, call_id: started.callId }, poll)
-    if (outcome) return outcome
+    if (outcome) return { ...outcome, ...sent }
   }
   return {
     tool: TINKER_TOOL, status: 'started',
     summary: `${name(ctx.executorModelId)}'s Tinker training is running (at most ${usdText(reservation.usd)} set aside); the lab collects the result at a later hourly check`,
+    ...sent,
   }
 }
 

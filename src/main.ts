@@ -37,6 +37,9 @@ import { SpeakingTubeGlow } from './entities/SpeakingTubeGlow'
 import { parseChatActivity } from './systems/speakingTube'
 import { PracticeBenchPanel } from './systems/PracticeBenchPanel'
 import { benchCameraView, parsePractice } from './systems/practiceBench'
+import { SkillMapChart } from './entities/SkillMapChart'
+import { LessonPanel } from './systems/LessonPanel'
+import { parseTutorLesson } from './systems/skillMap'
 import { ResearchStoryBox } from './systems/ResearchStoryBox'
 import { JSpaceReadout } from './systems/JSpaceReadout'
 import { PatinaSystem } from './lib/patina'
@@ -72,6 +75,8 @@ class ObservableLab {
   private speakingTube: SpeakingTubeGlow | null = null
   private practiceBench: PracticeBench | null = null
   private practicePanel: PracticeBenchPanel | null = null
+  private skillMap: SkillMapChart | null = null
+  private lessonPanel: LessonPanel | null = null
   private growthSeen = false // a growth record (or the dev preview) has arrived
   private growthShattered = false // the record says the glass is broken
   private growthTarget = 0
@@ -295,6 +300,11 @@ class ObservableLab {
       }
     }
     this.scene.add(this.practiceBench.group)
+
+    // The skill map on the wall above the bench draws the newest Socratic lesson from the stored
+    // record only; a blank sheet with a dark lamp until a lesson is on record. Nothing on it moves.
+    this.skillMap = new SkillMapChart()
+    this.scene.add(this.skillMap.group)
 
     // The Commentator's speaking tube glows while a real trained-model reply is recent. One additive
     // sprite, outside the merged room groups; hidden (and free) when there is nothing real to show.
@@ -581,6 +591,10 @@ class ObservableLab {
       const slug = modelId.replace(/^lab\//, '')
       this.trainedChat?.openWith(slug)
     })
+    // The lesson panel opens from the skill map; "Talk to It" opens the chat on the lesson's adapter
+    this.lessonPanel = new LessonPanel(modelId => {
+      this.trainedChat?.openWith(modelId.replace(/^lab\//, ''))
+    })
     // The story box of the research loop's kept model lives in the same panel, with its own switch
     this.trainedChat.attachStory(onChange => new ResearchStoryBox(onChange))
     // A real reply to this visitor lights the tube at once; nothing else here does
@@ -636,6 +650,8 @@ class ObservableLab {
       trainingRig: this.trainingRig,
       practiceBench: this.practiceBench,
       practicePanel: () => this.practicePanel,
+      skillMap: this.skillMap,
+      lessonPanel: () => this.lessonPanel,
       speakingTube: this.speakingTube,
       jspace: this.jspaceLens,
       voices: this.latestVoice,
@@ -1227,6 +1243,12 @@ class ObservableLab {
       const practice = parsePractice((state as unknown as { rl_practice?: unknown }).rl_practice)
       this.practiceBench?.setPractice(practice, false)
       this.practicePanel?.setPractice(practice, false)
+    }
+    // The skill map and the lesson panel: only what the state stored about the newest Socratic lesson
+    {
+      const lesson = parseTutorLesson((state as unknown as { tutor_lesson?: unknown }).tutor_lesson)
+      this.skillMap?.setLesson(lesson, false)
+      this.lessonPanel?.setLesson(lesson, false)
     }
 
     if (extra.repos !== undefined) {
@@ -1946,6 +1968,11 @@ class ObservableLab {
         if (tag?.kind === 'practice') {
           this.uiOverlay.hideInspectorCard()
           this.practicePanel?.show()
+          return
+        }
+        if (tag?.kind === 'lesson') {
+          this.uiOverlay.hideInspectorCard()
+          this.lessonPanel?.show()
           return
         }
         if (tag) {
@@ -2881,6 +2908,7 @@ class ObservableLab {
     // Training rig (lamps, fan, data pulses, gauge)
     this.trainingRig?.update(deltaTime)
     this.practiceBench?.update(deltaTime)
+    this.skillMap?.update(deltaTime)
     this.speakingTube?.update(deltaTime)
 
     // J-space lens follows its scientist

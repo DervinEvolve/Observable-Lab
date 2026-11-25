@@ -40,3 +40,16 @@ test('the production build ships only the credited, passive provider logo assets
   }
   assert.ok(text.includes('provider-logo'), 'logo avatar style missing')
 })
+
+test('the production bundle has the skill map, the lesson panel and the offer flow, and calls no lesson or offers route that is not public', () => {
+  assert.ok(existsSync(dist), 'run `npm run build` first')
+  const js = readdirSync(dist).filter(name => name.endsWith('.js')).map(name => readFileSync(join(dist, name), 'utf8')).join('\n')
+  // Wired into the room (src/main.ts): the chart's blank sheet, the panel's route, the offer route and the consent sheet.
+  for (const wired of ['No lesson has been taught yet.', '/api/experiment/lesson', '/api/experiment/chat-offer', 'Offer This Conversation to the Lab', 'Take Back an Offer']) {
+    assert.ok(js.includes(wired), `production bundle is missing ${wired}`)
+  }
+  // The lesson cron and the owner's offers route are never called from the page.
+  for (const banned of ['/api/epoch/lesson', '/api/experiment/visitor-offers']) {
+    assert.equal(js.includes(banned), false, `production bundle contains ${banned}`)
+  }
+})

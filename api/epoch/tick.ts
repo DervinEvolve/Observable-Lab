@@ -13,6 +13,7 @@ import { ensureResearchExperiment, type ResearchActivation } from '../_lib/resea
 import { ResearchRunPendingError } from '../_lib/research.js'
 import { collectTinkerRuns } from '../_lib/tinker-run.js'
 import { collectTinkerKeeps } from '../_lib/tinker-keep.js'
+import { pruneOffers } from '../_lib/visitor-offers-store.js'
 
 type TickBody = Record<string, unknown>
 
@@ -48,6 +49,11 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   // query. It never throws.
   const kept = await collectTinkerKeeps()
   if (kept.length) console.log(`[CRON] Collected ${kept.length} adapter keep(s)`)
+  // Conversations visitors offered: past their kept days the text is deleted
+  // and the row stays as a count. This runs whether offers are on or off, so
+  // the promise of deletion holds after they are switched off. It never throws.
+  const expired = await pruneOffers()
+  if (expired) console.log(`[CRON] Deleted the text of ${expired} expired visitor offer(s)`)
 
   if (!researchAlongside()) {
     try {

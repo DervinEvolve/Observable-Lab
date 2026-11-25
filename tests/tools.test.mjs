@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
 import ts from 'typescript'
+import { execFileSync } from 'node:child_process'
 
 const root = resolve(import.meta.dirname, '..')
 const build = mkdtempSync(join(tmpdir(), 'observable-tools-test-'))
@@ -898,4 +899,112 @@ test('docs/EXHIBITS.md and docs/TOOLS.md state the same numbers as the code', ()
   }
   assert.match(tools, /0\.000306/)
   for (const doc of [ex, tools]) assert.doesNotMatch(doc, /—/)
+})
+
+// ---------------------------------------------------------------------------
+// The Socratic lesson and visitor offers switched off (TUTOR-SPEC section 4):
+// the prompts and the public state are exactly what they were before either
+// existed. "Before" is the server code of the commit that came before them,
+// read from git and run here beside the current code, on the same fakes.
+// ---------------------------------------------------------------------------
+const BEFORE = '24c797f7ac05f470164b2ee0e9bbcafcba1fc9ca'
+function compileBefore() {
+  let files
+  try {
+    files = execFileSync('git', ['-C', root, 'ls-tree', '-r', '--name-only', BEFORE, 'api'], { encoding: 'utf8' }).split('\n').filter(f => f.endsWith('.ts'))
+  } catch {
+    return null
+  }
+  const out = join(build, 'before')
+  for (const path of files) {
+    const source = execFileSync('git', ['-C', root, 'show', `${BEFORE}:${path}`], { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 })
+    const output = ts.transpileModule(source, { compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext } })
+      .outputText.replaceAll(`from '@vercel/postgres'`, `from '${fakePgUrl}'`)
+    const destination = join(out, path.replace(/\.ts$/, '.js'))
+    mkdirSync(dirname(destination), { recursive: true })
+    writeFileSync(destination, output)
+  }
+  return out
+}
+const beforeDir = compileBefore()
+
+test('with the lesson and visitor offers switched off, the prompts and the public state are exactly what they were before them', { skip: beforeDir ? false : 'git history is not available' }, async () => {
+  const old = {
+    prompts: await import(pathToFileURL(join(beforeDir, 'api/_lib/prompts.js')).href),
+    experiment: (await import(pathToFileURL(join(beforeDir, 'api/experiment/index.js')).href)).default,
+  }
+  const OFF = { LAB_ENABLE_TINKER_TUTOR: 'false', LAB_ENABLE_VISITOR_OFFERS: 'false' }
+  const TINKER = {
+    LAB_ENABLE_TINKER: 'true', TINKER_JOBS_START_URL: 'https://tinker.example/start', TINKER_JOBS_STATUS_URL: 'https://tinker.example/status',
+    TINKER_JOBS_TOKEN: JOBS_TOKEN, TINKER_API_KEY: 'test-only-tinker-key-00000000000000000', LAB_ENABLE_TRAINED_CHAT: 'true',
+    CRON_SECRET: 'test-only-cron-secret-0000000000000000000000', LAB_ENABLE_TINKER_NAMES: 'true',
+  }
+  const settings = [{ ...OFF }, { ...OFF, everything: true }, { ...OFF, everything: true, ...TINKER }]
+  const reviewerSection = p => p.reviewerToolSection({ tinker_train: { line: 'a run' }, tinker_rl: { line: 'an RL run' }, keep_adapter: { line: 'a keep' } })
+  globalThis.fetch = async url => { throw new Error(`Unexpected outbound request to ${url}`) }
+  for (const setting of settings) {
+    process.env = { ...BASE_ENV }
+    const { everything, ...env } = setting
+    if (everything) enableEverything()
+    Object.assign(process.env, env)
+    const said = p => ({
+      context: p.getSharedContext(4, spec(), []),
+      executor: p.ROLE_PROMPTS.executor({ direction: 'x' }),
+      reviewer: p.ROLE_PROMPTS.reviewer({ mutations: [] }, { challenges: [] }, undefined, reviewerSection(p)),
+      lines: p.toolLines(),
+      section: p.executorToolsSection(),
+    })
+    const now = said(prompts)
+    const then = said(old.prompts)
+    for (const key of Object.keys(then)) assert.equal(now[key], then[key], `${key} changed with ${JSON.stringify(setting)}`)
+    assert.ok(then.context.length > 1000)
+
+    // The public state, from the same stored rows.
+    lab = new FakeLab()
+    db.handler = (text, values) => lab.handle(text, values)
+    lab.addExperiment()
+    const a = response()
+    await experimentHandler({ method: 'GET', headers: {}, query: {} }, a)
+    const b = response()
+    await old.experiment({ method: 'GET', headers: {}, query: {} }, b)
+    assert.equal(a.code, 200)
+    assert.equal(JSON.stringify(a.body), JSON.stringify(b.body), `the public state changed with ${JSON.stringify(setting)}`)
+    assert.equal('tutor_lesson' in a.body || 'visitor_offers' in a.body, false)
+  }
+
+  // Switched on (the default), the same state gains the two parts and nothing else changes.
+  process.env = { ...BASE_ENV }
+  enableEverything()
+  Object.assign(process.env, TINKER)
+  lab = new FakeLab()
+  db.handler = (text, values) => lab.handle(text, values)
+  lab.addExperiment()
+  const on = response()
+  await experimentHandler({ method: 'GET', headers: {}, query: {} }, on)
+  const off = response()
+  await old.experiment({ method: 'GET', headers: {}, query: {} }, off)
+  const { tutor_lesson: lesson, visitor_offers: offers, tools_enabled: toolsNow, ...rest } = on.body
+  const { tools_enabled: toolsThen, ...restThen } = off.body
+  assert.deepEqual(lesson, { enabled: true, lesson: null })
+  assert.deepEqual(offers, { enabled: true, stored: 0, offered_today: 0, trained_on: 0, taken_back: 0, read_by_owner: 0 })
+  assert.deepEqual(toolsNow, [...toolsThen.filter(t => t !== 'live_model' && t !== 'live_trained'), 'tinker_tutor', ...toolsThen.filter(t => t === 'live_model' || t === 'live_trained')])
+  assert.equal(JSON.stringify(rest), JSON.stringify(restThen))
+})
+
+test('switched on, the models are told of the lesson and the Reviewer is asked to rule on it', () => {
+  enableEverything()
+  Object.assign(process.env, {
+    TINKER_JOBS_START_URL: 'https://tinker.example/start', TINKER_JOBS_STATUS_URL: 'https://tinker.example/status', TINKER_JOBS_TOKEN: JOBS_TOKEN,
+    TINKER_API_KEY: 'test-only-tinker-key-00000000000000000',
+  })
+  const ctx = prompts.getSharedContext(4, spec(), [])
+  const exec = prompts.ROLE_PROMPTS.executor({ direction: 'x' })
+  assert.match(ctx, /- Socratic lesson: as Executor you may ask for one lesson/)
+  assert.match(exec, /"tinker_tutor": \{ "purpose"/)
+  assert.match(exec, /A Socratic lesson takes exactly the fields shown/)
+  // No training tool is on here, so the note about visitor conversations is not there either.
+  assert.doesNotMatch(ctx, /Visitor conversations:/)
+  const section = prompts.reviewerToolSection({ tinker_tutor: { line: 'a lesson. The lab counts which answers pass.' } })
+  assert.match(section, /- A Socratic lesson: a lesson\. The lab counts which answers pass\.\n/)
+  assert.match(section, /Nothing is opened or started without "approve"\./)
 })

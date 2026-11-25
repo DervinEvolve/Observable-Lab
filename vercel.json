@@ -11,6 +11,9 @@
     "api/epoch/clear.ts": {
       "maxDuration": 60
     },
+    "api/epoch/lesson.ts": {
+      "maxDuration": 800
+    },
     "api/north/run.ts": {
       "maxDuration": 800
     },
@@ -40,6 +43,10 @@
     {
       "path": "/api/epoch/tick",
       "schedule": "0 * * * *"
+    },
+    {
+      "path": "/api/epoch/lesson",
+      "schedule": "*/10 * * * *"
     }
   ],
   "git": {

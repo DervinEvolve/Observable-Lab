@@ -50,7 +50,7 @@ function compile(directory) {
   }
 }
 compile('api')
-for (const path of ['src/systems/TrainedChatPanel.ts', 'src/systems/paperTheme.ts']) {
+for (const path of ['src/systems/TrainedChatPanel.ts', 'src/systems/chatOffer.ts', 'src/systems/paperTheme.ts']) {
   const output = ts.transpileModule(readFileSync(join(root, path), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
   }).outputText.replace(/from '([^']+)'/g, (whole, specifier) => specifier.startsWith('.') ? `from '${specifier}.js'` : whole)

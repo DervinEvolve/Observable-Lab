@@ -46,6 +46,11 @@ import { toolConfig } from './tools-config.js'
 import { planTools, type ToolPlan } from './tool-requests.js'
 import { prepareExhibit } from './exhibits.js'
 import { adaptersContext, keepReviewFacts } from './tinker-keep.js'
+import { tinkerTutorReviewFacts } from './tinker-tutor.js'
+import { teacherModelFor } from './tinker-tutor-run.js'
+import { visitorOffersReviewFacts, visitorOffersStatus, type TinkerOffersRequest } from './visitor-offers.js'
+import { usableOfferCount } from './visitor-offers-store.js'
+import { tinkerRunUsd } from './tinker.js'
 import {
   alreadyRan, recentToolContext, recordIgnored, runSideTools,
   type EpochToolContext, type ToolOutcome,
@@ -182,6 +187,17 @@ function applyMutations(
 // Finds the exact capabilities/behaviors item a given mutation+decision
 // touched, so a merged code contribution can tag that specific leaf/branch
 // (code_pr_url) rather than just existing somewhere in the abstract spec.
+
+/**
+ * What the Reviewer is told about a training request on conversations
+ * visitors offered: the count is read now, for the adapter asked for when
+ * one is named (0 when it cannot be read). The section adds its own full stop.
+ */
+async function offersReviewFacts(request: TinkerOffersRequest): Promise<{ line: string }> {
+  const stored = await usableOfferCount(request.visitor_offers.adapter).catch(() => 0)
+  return { line: visitorOffersReviewFacts(request, { stored, runCapUsd: tinkerRunUsd() }).line.replace(/\.$/, '') }
+}
+
 export function findMutatedSpecItem(
   newSpec: AgentSpecification,
   mutation: Mutation,
@@ -322,7 +338,13 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
   `
   const recentEpochs = recentResult.rows as Epoch[]
 
-  let sharedContext = getSharedContext(epochNumber, specBefore, recentEpochs)
+  // How many conversations visitors offered the lab holds, for the tools
+  // list, only while offers are on for the models and Tinker training is on.
+  // Read from the table, like the adapters below; if it cannot be read the
+  // note is left out.
+  const trainOn = (() => { const c = toolConfig().tinker_train; return c.enabled && c.per_day > 0 })()
+  const visitorOffers = trainOn && visitorOffersStatus({ models: true }).enabled ? await usableOfferCount().catch(() => null) : null
+  let sharedContext = getSharedContext(epochNumber, specBefore, recentEpochs, undefined, visitorOffers === null ? {} : { visitorOffers })
 
   // The lab notebook — durable memory across epochs and role rotations.
   const notebook = await getRecentNotebook(experimentId)
@@ -540,8 +562,11 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
           lab_proposal: toolPlan?.lab_proposal ? { title: toolPlan.lab_proposal.title, files: toolPlan.lab_proposal.files.map(f => f.path) } : undefined,
           // A training request names a shelf dataset only while public datasets are on (tool-requests.ts).
           tinker_train: toolPlan?.tinker_train ? tinkerReviewFacts(toolPlan.tinker_train)
-            : toolPlan?.tinker_train_dataset ? tinkerDatasetReviewFacts(toolPlan.tinker_train_dataset) : undefined,
+            : toolPlan?.tinker_train_dataset ? tinkerDatasetReviewFacts(toolPlan.tinker_train_dataset)
+              // Conversations visitors offered: the count is read now, for the adapter asked for when one is named.
+              : toolPlan?.tinker_train_offers ? await offersReviewFacts(toolPlan.tinker_train_offers) : undefined,
           tinker_rl: toolPlan?.tinker_rl ? tinkerRlReviewFacts(toolPlan.tinker_rl) : undefined,
+          tinker_tutor: toolPlan?.tinker_tutor ? tinkerTutorReviewFacts(toolPlan.tinker_tutor, teacherModelFor({ executorModelId: executorModel })) : undefined,
           keep_adapter: toolPlan?.keep_adapter ? await keepReviewFacts(toolPlan.keep_adapter, { modelId: executorModel }) : undefined,
         })),
         'Make final decisions on each proposed mutation.'
@@ -571,7 +596,8 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
     // so doing both in one request overran it. It is queued on the epoch row
     // and runs in its own request on the next tick (epoch-followup.ts).
     const candidate = pickContributionCandidate(mutations, decisions, challengerOutput.challenges)
-    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal || toolPlan.tinker_train || toolPlan.tinker_train_dataset || toolPlan.tinker_rl || toolPlan.keep_adapter))
+    const hasDeliverables = Boolean(toolPlan && (toolPlan.exhibit || toolPlan.lab_proposal || toolPlan.tinker_train || toolPlan.tinker_train_dataset
+      || toolPlan.tinker_train_offers || toolPlan.tinker_rl || toolPlan.tinker_tutor || toolPlan.keep_adapter))
     const followup: EpochFollowUp = {
       status: candidate || hasDeliverables ? 'pending' : 'none',
       contribution_mutation_index: candidate ? candidate.decision.mutation_index : null,
@@ -595,9 +621,11 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
     if (hasDeliverables) {
       toolOutcomes.push({
         tool: 'deliverables', status: 'queued',
-        summary: (toolPlan?.tinker_train || toolPlan?.tinker_train_dataset || toolPlan?.tinker_rl
-          ? `any exhibit or lab proposal the Reviewer approved is opened after this epoch, and an approved Tinker ${toolPlan?.tinker_rl ? "RL" : "training"} run is started then`
-          : 'any exhibit or lab proposal the Reviewer approved is opened after this epoch')
+        summary: (toolPlan?.tinker_tutor
+          ? 'any exhibit or lab proposal the Reviewer approved is opened after this epoch, and an approved Socratic lesson is started then'
+          : toolPlan?.tinker_train || toolPlan?.tinker_train_dataset || toolPlan?.tinker_train_offers || toolPlan?.tinker_rl
+            ? `any exhibit or lab proposal the Reviewer approved is opened after this epoch, and an approved Tinker ${toolPlan?.tinker_rl ? "RL" : "training"} run is started then`
+            : 'any exhibit or lab proposal the Reviewer approved is opened after this epoch')
           + (toolPlan?.keep_adapter ? '; an approved request to keep a trained adapter is carried out then too' : ''),
       })
     }

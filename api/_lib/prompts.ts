@@ -19,6 +19,11 @@ import { trainedChatStatus } from './tinker.js'
 import { KEEP_REASON_MAX, keepNote } from './tinker-keep-request.js'
 import { ADAPTER_NAME_MAX, ADAPTER_NAME_MIN } from './tinker-names.js'
 import { weightsLimits } from './weights.js'
+import {
+  TUTOR_ANSWER_TOKENS, TUTOR_GUIDING_TURNS, TUTOR_HELD_BACK, TUTOR_NAME_MAX, TUTOR_PRACTICE, TUTOR_ROUNDS, TUTOR_SUBSKILLS, TUTOR_TOPIC_MAX,
+  tinkerTutorNote, tutorTeacherModelSetting, tutorTeacherUsd,
+} from './tinker-tutor.js'
+import { visitorOffersNote } from './visitor-offers.js'
 import { DATASETS_DEFAULT_ROWS, DATASETS_MAX_SYSTEM_BYTES, datasetRunCeiling, datasetsNote, type TinkerDatasetRequest } from './datasets.js'
 import { MAX_PARTS, MAX_TRIANGLES, FIXED_TRIANGLES, TUBE_RADIAL_SEGMENTS, MATERIALS, PLACEMENTS, SHAPES } from './exhibits.js'
 
@@ -50,11 +55,19 @@ export function contributionLines(): string {
 }
 
 /**
+ * Counts the epoch runner reads from the database for the tools list.
+ * `visitorOffers` is how many conversations visitors offered the lab holds,
+ * given only while offers are on for the models (visitor-offers.ts); without
+ * it the visitor note is not added.
+ */
+export interface ToolLineExtras { visitorOffers?: number | null }
+
+/**
  * The tools the models really have this run, one line each, built from the
  * same config the runner uses (tools-config.ts). A tool that is off is not
  * mentioned at all.
  */
-export function toolLines(config: ToolConfig = toolConfig()): string {
+export function toolLines(config: ToolConfig = toolConfig(), extras: ToolLineExtras = {}): string {
   const on = (t: keyof ToolConfig) => config[t].enabled && config[t].per_day > 0
   const lines: string[] = []
   if (on('subagents')) {
@@ -89,10 +102,20 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
       perDay: config.tinker_train.per_day, liveTrained: liveTrainedToolStatus(config).enabled,
       ...(tinkerNamesFlag() ? { names: true } : {}), ...(on('keep_adapter') ? { keep: true } : {}),
     })}`)
+    // Conversations visitors offered, as a source of examples: only while
+    // offers are on for the models (the runner reads the count and passes it).
+    if (typeof extras.visitorOffers === 'number') lines.push(`- ${visitorOffersNote({ total: extras.visitorOffers })}`)
   }
   if (on('tinker_rl')) {
     // What it does and where its limits are, nothing about which tasks or what to reward.
     lines.push(`- ${tinkerRlNote({ perDay: config.tinker_rl.per_day, ...(tinkerNamesFlag() ? { names: true } : {}), ...(trainedChatStatus().enabled ? { chat: true } : {}) })}`)
+  }
+  if (on('tinker_tutor')) {
+    // What a lesson does and where its limits are, nothing about what to teach or whether to.
+    lines.push(`- ${tinkerTutorNote({
+      perDay: config.tinker_tutor.per_day, teacherUsd: tutorTeacherUsd(), teacherModel: tutorTeacherModelSetting(),
+      ...(tinkerNamesFlag() ? { names: true } : {}), ...(trainedChatStatus().enabled ? { chat: true } : {}),
+    })}`)
   }
   if (on('keep_adapter')) {
     // What keeping does and where its limits are, nothing about which adapter to keep.
@@ -106,6 +129,9 @@ export function toolLines(config: ToolConfig = toolConfig()): string {
   }
   return lines.join('\n')
 }
+
+/** The fields of each rubric rule, as the Tinker RL and Socratic lesson paragraphs give them. */
+const RULE_FIELDS = 'exact_match { "value" or "from", "scope" }; contains { "any" or "all" (lists of strings) or "value" or "from", "ignore_case" (default true), "scope" }; not_contains { "any" or "value" or "from", "ignore_case", "scope" }; number_close { "value" (a number) or "from", "tolerance" (default 0.000001), "relative" (true or false), "pick" ("first" or "last", default last), "scope" }; regex_match { "pattern", "ignore_case", "scope" }; json_valid { "schema": { "type", "required", "properties", "items" } (optional) }; length_between { "min", "max", "scope" }. "from" is "expected" or "data.<name>"; "scope" is "whole", "first_line" or "last_line"'
 
 /** The "tools" part of the Executor's answer, only for tools that are on. */
 export function executorToolsSection(config: ToolConfig = toolConfig()): string {
@@ -123,6 +149,10 @@ export function executorToolsSection(config: ToolConfig = toolConfig()): string 
   }
   if (on('tinker_rl')) {
     fields.push(`    "tinker_rl": { "purpose": "one line", "task_set": "a short name for the task set (optional)", "base_model": "${tinkerBaseModels().models.join('" | "')}" (optional), "tasks": [ { "prompt": "text", "expected": "text (optional)", "data": { "name": whole number or short text } (optional) }, ... ${RL_MIN_TASKS} to ${RL_MAX_TASKS} of them ], "rubric": { "rules": [ { "type": ${RUBRIC_TYPES.map(t => `"${t}"`).join(' | ')}, "weight": above 0 and at most 1, ...the fields of that rule (see below) } ] }, "settings": { "rank": ${TINKER_RANKS.join(' | ')}, "learning_rate": ${RL_LEARNING_RATE.min} to ${RL_LEARNING_RATE.max}, "group_size": ${RL_GROUP_SIZE.min} to ${RL_GROUP_SIZE.max}, "steps": ${RL_STEPS.min} to ${RL_STEPS.max}, "tasks_per_step": ${RL_TASKS_PER_STEP.min} to ${RL_TASKS_PER_STEP.max}, "max_completion_tokens": ${RL_COMPLETION_TOKENS.min} to ${RL_COMPLETION_TOKENS.max}, "loss": ${RL_LOSSES.map(l => `"${l}"`).join(' | ')} } (optional)${tinkerNamesFlag() ? `, "name": "a display name, ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters (optional)"` : ''} }`)
+  }
+  if (on('tinker_tutor')) {
+    const question = '{ "prompt": "text", "expected": "text (optional)", "data": { "name": whole number or short text } (optional) }'
+    fields.push(`    "tinker_tutor": { "purpose": "one line (optional)", "topic": "a short name, 1 to ${TUTOR_TOPIC_MAX} characters", "base_model": "${tinkerBaseModels().models.join('" | "')}" (optional), "subskills": [ { "name": "a short name, 1 to ${TUTOR_NAME_MAX} characters", "rubric": { "rules": [ { "type": ${RUBRIC_TYPES.map(t => `"${t}"`).join(' | ')}, "weight": above 0 and at most 1, ...the fields of that rule (see below) } ] }, "practice": [ ${question}, ... ${TUTOR_PRACTICE.min} to ${TUTOR_PRACTICE.max} of them ], "held_back": [ ${question}, ... ${TUTOR_HELD_BACK.min} to ${TUTOR_HELD_BACK.max} of them ] }, ... ${TUTOR_SUBSKILLS.min} to ${TUTOR_SUBSKILLS.max} of them ], "settings": { "rank": ${TINKER_RANKS.join(' | ')}, "learning_rate": ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, "epochs": ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, "batch_size": ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}, "max_answer_tokens": ${TUTOR_ANSWER_TOKENS.min} to ${TUTOR_ANSWER_TOKENS.max}, "guiding_turns": ${TUTOR_GUIDING_TURNS.min} | ${TUTOR_GUIDING_TURNS.max}, "rounds": ${TUTOR_ROUNDS.min} | ${TUTOR_ROUNDS.max} } (optional)${tinkerNamesFlag() ? `, "name": "a display name, ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters (optional)"` : ''} }`)
   }
   if (on('keep_adapter')) fields.push(`    "keep_adapter": { "adapter": "the lab id of a trained adapter that is alive, like lab/e41-0a1b2c3d", "reason": "one line, at most ${KEEP_REASON_MAX} characters" }`)
   if (!fields.length) return ''
@@ -172,7 +202,10 @@ At most ${MAX_TRIANGLES} triangles in all, counted per copy as: ${tri}, tube ${T
     text += `\nIn place of "examples", a Tinker training request may name a dataset that is already on the lab's shelf: "dataset": { "repo": "org/name" or "org/name@<commit>", "file": "the path of one data file (needed when the dataset holds more than one file with rows)", "user_column": "the column for the user turn", "assistant_column": "the column for the assistant turn", "system": "text of yours put before every row as a system message, at most ${DATASETS_MAX_SYSTEM_BYTES} bytes (optional)", "limit": ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} rows (optional, ${DATASETS_DEFAULT_ROWS} when left out) }. Give "examples" or "dataset", never both; the other fields are the same. The dataset must have been fetched in an earlier epoch or asked for in this same answer; one that is not on the shelf refuses the run, with the reason stored. The files, rows and column names of a fetched dataset are in the stored record of its fetch.`
   }
   if (on('tinker_rl')) {
-    text += `\nA Tinker RL request takes exactly the fields shown: any other field, a value out of range, a malformed task or rule, or a rule that reads "expected" or "data.<name>" from a task that has none refuses the whole request. Rule fields: exact_match { "value" or "from", "scope" }; contains { "any" or "all" (lists of strings) or "value" or "from", "ignore_case" (default true), "scope" }; not_contains { "any" or "value" or "from", "ignore_case", "scope" }; number_close { "value" (a number) or "from", "tolerance" (default 0.000001), "relative" (true or false), "pick" ("first" or "last", default last), "scope" }; regex_match { "pattern", "ignore_case", "scope" }; json_valid { "schema": { "type", "required", "properties", "items" } (optional) }; length_between { "min", "max", "scope" }. "from" is "expected" or "data.<name>"; "scope" is "whole", "first_line" or "last_line". A task's prompt is shown to the model as one user message. Settings left out get rank 16, learning_rate ${RL_LEARNING_RATE.fallback}, group_size ${RL_GROUP_SIZE.fallback}, steps ${RL_STEPS.fallback}, tasks_per_step ${RL_TASKS_PER_STEP.fallback}, max_completion_tokens ${RL_COMPLETION_TOKENS.fallback} and loss ${RL_LOSSES[0]}. An epoch has one Tinker run, so this and tinker_train cannot both be asked for. Nothing runs without the Reviewer's approval.`
+    text += `\nA Tinker RL request takes exactly the fields shown: any other field, a value out of range, a malformed task or rule, or a rule that reads "expected" or "data.<name>" from a task that has none refuses the whole request. Rule fields: ${RULE_FIELDS}. A task's prompt is shown to the model as one user message. Settings left out get rank 16, learning_rate ${RL_LEARNING_RATE.fallback}, group_size ${RL_GROUP_SIZE.fallback}, steps ${RL_STEPS.fallback}, tasks_per_step ${RL_TASKS_PER_STEP.fallback}, max_completion_tokens ${RL_COMPLETION_TOKENS.fallback} and loss ${RL_LOSSES[0]}. An epoch has one Tinker run, so this and tinker_train cannot both be asked for. Nothing runs without the Reviewer's approval.`
+  }
+  if (on('tinker_tutor')) {
+    text += `\nA Socratic lesson takes exactly the fields shown: any other field, a value out of range, a malformed question or rule, or a rule that reads "expected" or "data.<name>" from a question that has none refuses the whole request. Rule fields: ${RULE_FIELDS}. A question's prompt is shown to the model as one user message. Settings left out get rank 16, learning_rate ${TINKER_LEARNING_RATE.fallback}, epochs ${TINKER_EPOCHS.fallback}, batch_size ${TINKER_BATCH_SIZE.fallback}, max_answer_tokens ${TUTOR_ANSWER_TOKENS.fallback}, guiding_turns ${TUTOR_GUIDING_TURNS.fallback} and rounds ${TUTOR_ROUNDS.fallback}. An epoch has one Tinker run, so a lesson cannot be asked for beside tinker_train or tinker_rl. Nothing runs without the Reviewer's approval.`
   }
   if (on('keep_adapter')) {
     text += `\nA request to keep an adapter takes exactly "adapter" and "reason". Nothing is kept without the Reviewer's approval.`
@@ -219,6 +252,7 @@ export function reviewerToolSection(requests: {
   lab_proposal?: { title: string; files: string[] }
   tinker_train?: { line: string }
   tinker_rl?: { line: string }
+  tinker_tutor?: { line: string }
   keep_adapter?: { line: string }
 }): string {
   const parts: string[] = []
@@ -226,6 +260,7 @@ export function reviewerToolSection(requests: {
   if (requests.lab_proposal) parts.push(`- A proposal to the lab's own repository: "${requests.lab_proposal.title}" changing ${requests.lab_proposal.files.join(', ')}. The owner reviews it before anything merges.`)
   if (requests.tinker_train) parts.push(`- A Tinker training run: ${requests.tinker_train.line}.`)
   if (requests.tinker_rl) parts.push(`- A Tinker RL run: ${requests.tinker_rl.line}.`)
+  if (requests.tinker_tutor) parts.push(`- A Socratic lesson: ${requests.tinker_tutor.line}`)
   if (requests.keep_adapter) parts.push(`- Keeping a trained adapter: ${requests.keep_adapter.line}.`)
   if (!parts.length) return ''
   const keys = [
@@ -233,13 +268,14 @@ export function reviewerToolSection(requests: {
     requests.lab_proposal ? '"lab_proposal": "approve" | "reject"' : '',
     requests.tinker_train ? '"tinker_train": "approve" | "reject"' : '',
     requests.tinker_rl ? '"tinker_rl": "approve" | "reject"' : '',
+    requests.tinker_tutor ? '"tinker_tutor": "approve" | "reject"' : '',
     requests.keep_adapter ? '"keep_adapter": "approve" | "reject"' : '',
   ].filter(Boolean).join(', ')
   return `
 
 THE EXECUTOR ALSO ASKED FOR:
 ${parts.join('\n')}
-Rule on each with a "tool_verdicts" object in your JSON: { ${keys} }. Nothing is opened${requests.tinker_train || requests.tinker_rl ? ' or started' : ''}${requests.keep_adapter ? ' or kept' : ''} without "approve".`
+Rule on each with a "tool_verdicts" object in your JSON: { ${keys} }. Nothing is opened${requests.tinker_train || requests.tinker_rl || requests.tinker_tutor ? ' or started' : ''}${requests.keep_adapter ? ' or kept' : ''} without "approve".`
 }
 
 // Create a compressed version of the spec for context (removes pruned items, summarizes older content)
@@ -291,7 +327,8 @@ export function getSharedContext(
   epochNumber: number,
   currentSpec: AgentSpecification,
   recentHistory: Epoch[],
-  selfName?: string
+  selfName?: string,
+  extras: ToolLineExtras = {},
 ): string {
   const unresolvedConflicts = currentSpec.conflicts.filter(c => !c.resolved)
   const summarized = summarizeSpec(currentSpec, epochNumber)
@@ -305,7 +342,7 @@ THE MISSION:
 Build a genuinely state-of-the-art AI agent — as capable, general, reliable, and useful as this team can make it. Not a demo, not a toy, not a narrow single-purpose tool. You are designing the specification${(process.env.LAB_ENABLE_CODE_WRITES || '').trim().toLowerCase() === 'true' ? ' AND writing the real, tested code' : ''} for an agent that should push the frontier: the kind that plans, uses tools, reasons over long tasks, remembers, retrieves knowledge, writes and runs code, catches its own mistakes, and improves. Every epoch should move the agent measurably closer to the state of the art. Judge every proposal against that bar: "does a truly capable agent need this, and are we building it for real?"
 
 THE LAB IS REAL, AND SO ARE YOUR TOOLS — this is not a thought experiment:
-${contributionLines()}${toolLines() ? `\n${toolLines()}` : ''}
+${contributionLines()}${toolLines(toolConfig(), extras) ? `\n${toolLines(toolConfig(), extras)}` : ''}
 - Real web search for the Planner and the Executor — look things up and ground your work in current reality (details below).
 - A shared lab notebook — durable memory your colleagues read in future epochs (details below).
 - The lab's knowledge graph — the memory of who did what to which part of the spec, built from the stored record (LAB MEMORY below; ask it with "recall").
