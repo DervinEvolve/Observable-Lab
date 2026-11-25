@@ -554,6 +554,8 @@ The chat on kept adapters and the "compare with untrained" call ask Tinker's Ope
 uv run --no-project --python 3.12 --with-requirements requirements-runner.txt modal deploy modal/tinker_jobs.py
 ```
 
+Because this deploy also moves the runner to `tinker-cookbook==0.7.1`, I run the two Qwen smokes from Tinker training and Tinker RL again right after it (`python modal/tinker_smoke.py` and `python modal/tinker_smoke.py rl`, no `--model`), before any model asks for a run. They are the check that the Qwen path still works on the new release.
+
 2. Check the chat format first. No Tinker call, no key, no cost. It renders one made-up conversation the way the runner trains and samples it and prints the prompt it built and eight checks. Six test that sampling and training render the same way (the effort really goes into the prompt; the sampling prompt is the start of the training example token for token; training weighs nothing the prompt already holds, and nothing but the answer, with at most a short end marker after it). Two test the family: the cookbook recommends `tml_v0` for the model, and the tokenizer the renderer wraps is the h200k one that Inkling 2 uses. If this cookbook version does not expose the tokenizer class, that line says `not checked` and passes; only the paid step 3 then shows that the tokens are right:
 
 ```
