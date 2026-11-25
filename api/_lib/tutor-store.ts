@@ -23,6 +23,7 @@
  * at its worst case cost.
  */
 import { sql } from '@vercel/postgres'
+import { ensureSpendTable } from './spend.js'
 import { ensureTinkerExtras, ensureTinkerTables, utcDay } from './tinker-store.js'
 import type { TinkerTutorRequest } from './tinker-tutor.js'
 
@@ -57,7 +58,12 @@ export function ensureTutorTables(): Promise<void> {
           stop_reason TEXT
         )
       `
+      // How a lesson is to close, stored before it moves to 'closing', so a slice that dies there closes it the same way.
+      await sql`ALTER TABLE tutor_lessons ADD COLUMN IF NOT EXISTS close_status TEXT`
+      await sql`ALTER TABLE tutor_lessons ADD COLUMN IF NOT EXISTS close_reason TEXT`
       await sql`CREATE INDEX IF NOT EXISTS idx_tutor_lessons_open ON tutor_lessons(stage, created_at)`
+      // The lessons-per-day limit, held by one conditional statement (two experiments' epochs can run at the same time).
+      await sql`CREATE TABLE IF NOT EXISTS tutor_day_slots (day TEXT PRIMARY KEY, n INTEGER NOT NULL DEFAULT 0)`
       await sql`
         CREATE TABLE IF NOT EXISTS tutor_answers (
           run_id UUID NOT NULL,
@@ -177,6 +183,9 @@ export interface LessonRow {
   progress: LessonProgress | null
   lease_until: string | null
   stop_reason: string | null
+  /** Set when the lesson moved to 'closing' for a stated reason; null when closing is to decide from the record. */
+  close_status: 'ok' | 'ended' | 'failed' | 'error' | null
+  close_reason: string | null
 }
 
 export function lessonRow(r: Record<string, unknown>): LessonRow {
@@ -202,6 +211,8 @@ export function lessonRow(r: Record<string, unknown>): LessonRow {
     progress: json<LessonProgress | null>(r.progress, null),
     lease_until: iso(r.lease_until),
     stop_reason: r.stop_reason ? String(r.stop_reason) : null,
+    close_status: r.close_status === 'ok' || r.close_status === 'ended' || r.close_status === 'failed' || r.close_status === 'error' ? r.close_status : null,
+    close_reason: r.close_reason ? String(r.close_reason) : null,
   }
 }
 
@@ -217,6 +228,8 @@ export interface AnswerRow {
   score: number | null
   passed: boolean
   cut_short: boolean | null
+  /** The answer came back with no text (read from the row: the public reads do not carry every answer's text). */
+  empty?: boolean
   too_long: boolean
   prompt_tokens: number | null
   completion_tokens: number | null
@@ -236,6 +249,7 @@ export function answerRow(r: Record<string, unknown>): AnswerRow {
     score: r.score === null || r.score === undefined ? null : num(r.score),
     passed: r.passed === true,
     cut_short: r.cut_short === null || r.cut_short === undefined ? null : r.cut_short === true,
+    ...(r.empty === true ? { empty: true } : {}),
     too_long: r.too_long === true,
     prompt_tokens: r.prompt_tokens === null || r.prompt_tokens === undefined ? null : Number(r.prompt_tokens),
     completion_tokens: r.completion_tokens === null || r.completion_tokens === undefined ? null : Number(r.completion_tokens),
@@ -496,6 +510,11 @@ export async function setStage(runId: string, stage: LessonStage, round: number)
 }
 
 /** Teaching stopped for this lesson: the first reason is kept. */
+/** Moves a lesson to 'closing' with the status and reason it is to close with, in one statement. */
+export async function setClosing(runId: string, status: 'ok' | 'ended' | 'failed' | 'error', reason: string | null): Promise<void> {
+  await sql`UPDATE tutor_lessons SET stage = 'closing', close_status = ${status}, close_reason = ${reason ? reason.slice(0, 500) : null} WHERE run_id = ${runId}`
+}
+
 export async function setStopReason(runId: string, reason: string): Promise<void> {
   await sql`UPDATE tutor_lessons SET stop_reason = ${reason.slice(0, 500)} WHERE run_id = ${runId} AND stop_reason IS NULL`
 }
@@ -530,7 +549,11 @@ export async function closeLessonRun(params: {
   spendDay: string
   reservedUsd: number
   now: Date
+  /** The lesson's line on the lab's spend ledger (tool/tinker_tutor), written in the same statement as the close when it cost anything. */
+  ledger: { experimentId: string; epoch: number; assigned: string | null; budgetScope: 'classic' | 'research' }
 }): Promise<Record<string, unknown> | null> {
+  await ensureSpendTable()
+  const cost = usd(params.costUsd)
   const r = await sql`
     WITH closed AS (
       UPDATE tinker_runs
@@ -545,6 +568,12 @@ export async function closeLessonRun(params: {
       SET reserved_usd = GREATEST(0, reserved_usd - ${usd(params.reservedUsd)}), spent_usd = spent_usd + ${usd(params.costUsd)}
       WHERE day = ${params.spendDay} AND scope = 'all' AND EXISTS (SELECT 1 FROM closed)
       RETURNING day
+    ),
+    ledger AS (
+      INSERT INTO model_calls (experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens, reasoning_tokens, budget_scope)
+      SELECT ${params.ledger.experimentId}::uuid, ${params.ledger.epoch}::integer, 'tinker_tutor', 'tool/tinker_tutor', ${params.ledger.assigned}::text, ${cost}::numeric, 'estimate', 0, 0, 0, ${params.ledger.budgetScope === 'research' ? 'research' : null}::text
+      FROM closed WHERE ${cost}::numeric > 0
+      RETURNING id
     )
     SELECT * FROM closed
   `
@@ -557,19 +586,32 @@ export async function closeLessonRun(params: {
  * its Tinker reservation (settled to what its calls were measured at, under
  * the day it was reserved), and its lesson row. Returns the slugs closed.
  */
-export async function closeAbandonedLessons(cutoff: Date, reason: string, now: Date): Promise<string[]> {
+export async function closeAbandonedLessons(cutoff: Date, reason: string, now: Date): Promise<Array<{ slug: string; experiment_id: string; epoch: number; model: string; spent: number }>> {
+  await ensureSpendTable()
+  // A training job is counted as the worker counts it (tinker-tutor-run.ts tinkerSpentUsd): at its measured cost, or at its whole
+  // budget while it may still be training (running, or starting with a start that was not confirmed).
   const r = await sql`
     WITH old AS (
-      SELECT l.run_id, l.slug, l.spend_day, l.reserved_usd,
+      SELECT l.run_id, l.slug, l.spend_day, l.reserved_usd, l.experiment_id, l.epoch, l.budget_scope,
         COALESCE((SELECT SUM(a.cost_usd) FROM tutor_answers a WHERE a.run_id = l.run_id), 0)
-          + COALESCE((SELECT SUM(t.cost_usd) FROM tutor_turns t WHERE t.run_id = l.run_id), 0) + l.train_usd AS spent
+          + COALESCE((SELECT SUM(t.cost_usd) FROM tutor_turns t WHERE t.run_id = l.run_id), 0)
+          + COALESCE((SELECT SUM(CASE
+              WHEN leg->>'cost_usd' IS NOT NULL THEN (leg->>'cost_usd')::numeric
+              WHEN leg->>'state' = 'running' OR (leg->>'state' = 'starting' AND leg->>'started_at' IS NOT NULL) THEN COALESCE((leg->>'budget_usd')::numeric, 0)
+              ELSE 0 END) FROM jsonb_array_elements(l.train) AS leg), 0) AS spent
       FROM tutor_lessons l
       WHERE l.stage <> 'done' AND l.created_at < ${cutoff.toISOString()}
     ),
     closed AS (
       UPDATE tinker_runs r SET status = 'failed', reason = ${reason}, cost_usd = old.spent, finished_at = ${now.toISOString()}
       FROM old WHERE r.id = old.run_id AND r.status = 'lesson'
-      RETURNING r.id, old.slug, old.spend_day, old.reserved_usd, old.spent
+      RETURNING r.id, r.model, r.assigned_model, old.slug, old.spend_day, old.reserved_usd, old.spent, old.experiment_id, old.epoch, old.budget_scope
+    ),
+    ledger AS (
+      INSERT INTO model_calls (experiment_id, epoch_number, purpose, model_id, assigned_model_id, cost_usd, cost_source, prompt_tokens, completion_tokens, reasoning_tokens, budget_scope)
+      SELECT experiment_id, epoch, 'tinker_tutor', 'tool/tinker_tutor', COALESCE(assigned_model, model), spent, 'estimate', 0, 0, 0, CASE WHEN budget_scope = 'research' THEN 'research' ELSE NULL END
+      FROM closed WHERE spent > 0
+      RETURNING id
     ),
     settled AS (
       UPDATE tinker_spend_days d
@@ -583,14 +625,35 @@ export async function closeAbandonedLessons(cutoff: Date, reason: string, now: D
       WHERE run_id IN (SELECT run_id FROM old)
       RETURNING run_id
     )
-    SELECT slug FROM closed
+    SELECT slug, experiment_id, epoch, model, spent FROM closed
   `
-  return r.rows.map(row => String(row.slug))
+  return r.rows.map(row => ({ slug: String(row.slug), experiment_id: String(row.experiment_id), epoch: Number(row.epoch) || 0, model: String(row.model ?? ''), spent: num(row.spent) }))
 }
 
 // ---------------------------------------------------------------------------
 // Counts and the public record's reads
 // ---------------------------------------------------------------------------
+
+/**
+ * Takes one of today's lesson places (LAB_TINKER_TUTOR_PER_DAY) in one
+ * statement, so two epochs that run at the same time cannot both take the
+ * last one. False when the day is full.
+ */
+export async function takeTutorDaySlot(now: Date, perDay: number): Promise<boolean> {
+  if (!(perDay >= 1)) return false
+  await ensureTutorTables()
+  const r = await sql`
+    INSERT INTO tutor_day_slots (day, n) VALUES (${utcDay(now)}, 1)
+    ON CONFLICT (day) DO UPDATE SET n = tutor_day_slots.n + 1 WHERE tutor_day_slots.n < ${perDay}
+    RETURNING n
+  `
+  return r.rows.length > 0
+}
+
+/** Gives a place back: the lesson was refused before any call was sent. */
+export async function releaseTutorDaySlot(now: Date): Promise<void> {
+  await sql`UPDATE tutor_day_slots SET n = GREATEST(0, n - 1) WHERE day = ${utcDay(now)}`.catch(() => {})
+}
 
 /**
  * Lessons that count toward today's limit (LAB_TINKER_TUTOR_PER_DAY): every
@@ -644,6 +707,7 @@ export async function subskillAnswers(runId: string, subskill: number): Promise<
 export async function answerMarks(runId: string): Promise<AnswerRow[]> {
   const r = await sql`
     SELECT phase, subskill, held_back, question, sample, status, attempts, passed, cut_short, too_long, cost_usd,
+      (status = 'ok' AND (answer IS NULL OR btrim(answer) = '')) AS empty,
       CASE WHEN passed = FALSE AND held_back = FALSE THEN answer ELSE NULL END AS answer
     FROM tutor_answers WHERE run_id = ${runId}
   `

@@ -167,7 +167,7 @@ class FakeDb {
     if (this.writes >= this.killAfterWrites) { this.dead = true; throw new Error('killed') }
     this.statements.push({ text, values: v })
     const out = this.answer(text, v)
-    if (/^(INSERT INTO tutor_answers|UPDATE tutor_turns SET state|WITH t AS|UPDATE tutor_lessons SET train|INSERT INTO tutor_turns|WITH closed AS)/.test(text)) this.writes++
+    if (/^(INSERT INTO tutor_answers|UPDATE tutor_turns SET state|WITH t AS|UPDATE tutor_lessons SET train|INSERT INTO tutor_turns|WITH closed AS|UPDATE tutor_lessons SET stage = 'closing')/.test(text)) this.writes++
     return out
   }
 
@@ -238,12 +238,15 @@ class FakeDb {
     if (text.startsWith('WITH closed AS ( UPDATE tinker_runs SET status = ?')) {
       assert.ok(text.includes("WHERE id = ? AND status = 'lesson' RETURNING *"), 'a lesson is closed only once')
       assert.ok(text.includes('UPDATE tinker_spend_days') && text.includes('EXISTS (SELECT 1 FROM closed)'), 'closing settles in the same statement')
-      const [status, reason, cost_usd, result, sampler_path, expires_at, dataset_examples, finished_at, id, reserved, cost, day] = v
+      assert.ok(text.includes('ledger AS ( INSERT INTO model_calls') && text.includes('FROM closed WHERE'), 'the ledger row is written in the closing statement')
+      const [status, reason, cost_usd, result, sampler_path, expires_at, dataset_examples, finished_at, id, reserved, cost, day, experiment_id, epoch_number, assigned, ledgerCost, budget_scope] = v
+      if (this.failClose) { this.failClose--; throw new Error('the closing statement failed') }
       const row = this.tinkerRuns.find(r => r.id === id && r.status === 'lesson')
       if (!row) return { rows: [] }
       Object.assign(row, { status, reason, cost_usd, result: JSON.parse(result), sampler_path, expires_at, dataset_examples, finished_at })
       const d = this.spendDays.get(`${day}|all`)
       if (d) { d.reserved_usd = Math.max(0, d.reserved_usd - reserved); d.spent_usd += cost }
+      if (ledgerCost > 0) this.modelCalls.push({ experiment_id, epoch_number, purpose: 'tinker_tutor', model_id: 'tool/tinker_tutor', assigned_model_id: assigned, cost_usd: ledgerCost, cost_source: 'estimate', budget_scope, created_at: new Date() })
       this.closes = (this.closes ?? 0) + 1
       return { rows: [{ ...row }] }
     }
@@ -254,6 +257,20 @@ class FakeDb {
         return ['lesson', 'ok'].includes(r.status) || num(r.cost_usd) > 0 || num(l?.teacher_calls) > 0 || charged
       })
       return { rows: [{ n: counted.length }] }
+    }
+    // ---- the lessons-per-day places ----
+    if (text.startsWith('INSERT INTO tutor_day_slots (day, n) VALUES (?, 1) ON CONFLICT (day) DO UPDATE SET n = tutor_day_slots.n + 1 WHERE tutor_day_slots.n < ? RETURNING n')) {
+      this.slots ??= new Map()
+      const n = this.slots.get(v[0])
+      if (n === undefined) { this.slots.set(v[0], 1); return { rows: [{ n: 1 }] } }
+      if (!(n < v[1])) return { rows: [] }
+      this.slots.set(v[0], n + 1)
+      return { rows: [{ n: n + 1 }] }
+    }
+    if (text.startsWith('UPDATE tutor_day_slots SET n = GREATEST(0, n - 1) WHERE day = ?')) {
+      this.slots ??= new Map()
+      if (this.slots.has(v[0])) this.slots.set(v[0], Math.max(0, this.slots.get(v[0]) - 1))
+      return { rows: [] }
     }
     // ---- held back hashes ----
     if (text.startsWith('SELECT h.hash, h.held_back, h.lesson_slug, r.status, r.finished_at FROM tutor_held_hashes h')) {
@@ -272,6 +289,7 @@ class FakeDb {
       const row = {
         run_id, slug, created_at, stage, round, request: JSON.parse(request), teacher_model, teacher_cap_usd, teacher_usd: 0, teacher_reserved_usd: 0, teacher_calls: 0,
         budget_scope, experiment_id, epoch, spend_day, reserved_usd, train: [], train_usd: 0, progress: null, lease_until: null, stop_reason: null,
+        close_status: null, close_reason: null,
       }
       this.lessons.push(row)
       return { rows: [{ ...row }] }
@@ -307,6 +325,7 @@ class FakeDb {
       return { rows: [{ total: this.lessons.filter(l => l.stage !== 'done').reduce((a, l) => a + num(l.teacher_reserved_usd), 0) }] }
     }
     if (text.startsWith('UPDATE tutor_lessons SET stage = ?, round = ? WHERE run_id = ?')) { const l = this.lesson(v[2]); if (l) Object.assign(l, { stage: v[0], round: v[1] }); return { rows: [] } }
+    if (text.startsWith("UPDATE tutor_lessons SET stage = 'closing', close_status = ?, close_reason = ? WHERE run_id = ?")) { const l = this.lesson(v[2]); if (l) Object.assign(l, { stage: 'closing', close_status: v[0], close_reason: v[1] }); return { rows: [] } }
     if (text.startsWith('UPDATE tutor_lessons SET stop_reason = ? WHERE run_id = ? AND stop_reason IS NULL')) { const l = this.lesson(v[1]); if (l && l.stop_reason === null) l.stop_reason = v[0]; return { rows: [] } }
     if (text.startsWith('UPDATE tutor_lessons SET progress = ? WHERE run_id = ?')) { const l = this.lesson(v[1]); if (l) l.progress = JSON.parse(v[0]); return { rows: [] } }
     if (text.startsWith('UPDATE tutor_lessons SET train = ?, train_usd = ? WHERE run_id = ?')) { const l = this.lesson(v[2]); if (l) Object.assign(l, { train: JSON.parse(v[0]), train_usd: v[1] }); return { rows: [] } }
@@ -315,18 +334,22 @@ class FakeDb {
       const old = this.lessons.filter(l => l.stage !== 'done' && Date.parse(l.created_at) < Date.parse(cutoff))
       const slugs = []
       for (const l of old) {
+        assert.ok(text.includes("jsonb_array_elements(l.train)") && text.includes("leg->>'state' = 'running'"), 'a training job that may be running is counted at its budget')
+        assert.ok(text.includes('ledger AS ( INSERT INTO model_calls'), 'the sweep writes the ledger row')
+        const legs = (l.train ?? []).reduce((a, leg) => a + (leg.cost_usd !== null && leg.cost_usd !== undefined ? leg.cost_usd : leg.state === 'running' || (leg.state === 'starting' && leg.started_at) ? leg.budget_usd : 0), 0)
         const spent = [...this.answers.values()].filter(a => a.run_id === l.run_id).reduce((a, x) => a + x.cost_usd, 0)
-          + [...this.turns.values()].filter(t => t.run_id === l.run_id).reduce((a, x) => a + x.cost_usd, 0) + num(l.train_usd)
+          + [...this.turns.values()].filter(t => t.run_id === l.run_id).reduce((a, x) => a + x.cost_usd, 0) + legs
         const r = this.run(l.run_id)
         if (r && r.status === 'lesson') {
           Object.assign(r, { status: 'failed', reason, cost_usd: spent, finished_at: now })
           const d = this.spendDays.get(`${l.spend_day}|all`)
           if (d) { d.reserved_usd = Math.max(0, d.reserved_usd - num(l.reserved_usd)); d.spent_usd += spent }
-          slugs.push(l.slug)
+          if (spent > 0) this.modelCalls.push({ experiment_id: l.experiment_id, epoch_number: l.epoch, purpose: 'tinker_tutor', model_id: 'tool/tinker_tutor', assigned_model_id: r.assigned_model ?? r.model, cost_usd: spent, cost_source: 'estimate', created_at: new Date() })
+          slugs.push({ slug: l.slug, experiment_id: l.experiment_id, epoch: l.epoch, model: r.model, spent })
         }
         Object.assign(l, { stage: 'done', teacher_reserved_usd: 0, lease_until: null, stop_reason: l.stop_reason ?? reason2 })
       }
-      return { rows: slugs.map(slug => ({ slug })) }
+      return { rows: slugs }
     }
     // ---- answers ----
     if (text.startsWith('INSERT INTO tutor_answers')) {
@@ -340,7 +363,8 @@ class FakeDb {
     if (text.startsWith('SELECT * FROM tutor_answers WHERE run_id = ? AND subskill = ?')) return { rows: [...this.answers.values()].filter(a => a.run_id === v[0] && a.subskill === v[1]).map(a => ({ ...a })) }
     if (text.startsWith('SELECT * FROM tutor_answers WHERE run_id = ?')) return { rows: [...this.answers.values()].filter(a => a.run_id === v[0]).map(a => ({ ...a })) }
     if (text.startsWith('SELECT phase, subskill, held_back, question, sample, status')) {
-      return { rows: [...this.answers.values()].filter(a => a.run_id === v[0]).map(a => ({ ...a, answer: !a.passed && !a.held_back ? a.answer : null })) }
+      assert.ok(text.includes("(status = 'ok' AND (answer IS NULL OR btrim(answer) = '')) AS empty"), 'the public read says which answers came back empty')
+      return { rows: [...this.answers.values()].filter(a => a.run_id === v[0]).map(a => ({ ...a, empty: a.status === 'ok' && !(a.answer ?? '').trim(), answer: !a.passed && !a.held_back ? a.answer : null })) }
     }
     // ---- turns ----
     if (text.startsWith('SELECT * FROM tutor_turns WHERE run_id = ?')) return { rows: [...this.turns.values()].filter(t => t.run_id === v[0]).map(t => ({ ...t })) }
@@ -1004,11 +1028,14 @@ test('a held back question of an earlier lesson cannot be asked again, and the r
   const swap = lessonRaw()
   for (const s of swap.subskills) for (const t of s.held_back) t.prompt = `${t.prompt} New`
   swap.subskills[2].practice[1] = { prompt: prompt(0, true, 1), expected: 'other1' }
+  // (its own held back copy, now a near copy of that practice question, would be refused by check 6 first)
+  swap.subskills[0].held_back[1] = { prompt: 'Which xylophone maker sold the quiet brass mallets first?', expected: 'quietmallets' }
   assert.match((await tutorRun.runTinkerTutor({ ...CTX, epochNumber: 43 }, read(swap), { deadlineAt: far(), pollMs: 1 })).summary, /subskills\[2\]\.practice\[1\] was a held back question of the lesson at lab\//)
   // a held back question that was a practice question of a lesson that closed ok recently is refused
   const reuse = lessonRaw()
   for (const s of reuse.subskills) { for (const t of [...s.held_back, ...s.practice]) t.prompt = `${t.prompt} Again` }
   reuse.subskills[3].held_back[0] = { prompt: prompt(1, false, 2), expected: 'other2' }
+  reuse.subskills[1].practice[2] = { prompt: 'Which lighthouse keeper logged the longest calm night?', expected: 'calmnight' }
   assert.match((await tutorRun.runTinkerTutor({ ...CTX, epochNumber: 44 }, read(reuse), { deadlineAt: far(), pollMs: 1 })).summary, /subskills\[3\]\.held_back\[0\] was a practice question of the lesson at lab\//)
   assert.equal(lab.tinkerRuns.length, 1)
   assert.equal(lab.spend('all').reserved_usd, 0)
@@ -1146,11 +1173,20 @@ test('an old open lesson with the switch off and no runner is closed by one stat
   // younger than 6 hours: left alone
   assert.deepEqual(await tutorRun.advanceTutorLessons({ deadlineAt: far() }), [])
   assert.equal(theRun().status, 'lesson')
+  // a training job that may still be running when the lesson is swept counts at its whole budget, as the worker counts it
+  l.train = [{ round: 1, run_id: l.slug, call_id: 'fc-x', started_at: new Date().toISOString(), split_salt: 's', examples: 12, counts: {}, sha256: 'x', budget_usd: 0.05, state: 'running', result: null, cost_usd: null, usage_known: false }]
+  l.train_usd = 0
   const before = lab.statements.length
   const moved = await tutorRun.advanceTutorLessonsDetailed({ deadlineAt: far(), now: new Date(Date.now() + 7 * 3600_000) })
   assert.deepEqual(moved.map(m => [m.slug, m.status]), [[l.slug, 'failed']])
-  assert.equal(lab.statements.length - before, 1, 'one statement')
+  const writes = lab.statements.slice(before).filter(s => !/^(CREATE|ALTER)\b/.test(s.text))
+  assert.equal(writes.filter(s => /^(WITH|UPDATE (tinker|tutor)|INSERT INTO (tinker|tutor))/.test(s.text)).length, 1, 'one statement closes the run, settles the money and writes the ledger row')
   assert.equal(sent, 0, 'no model or runner call')
+  assert.ok(Math.abs(num(theRun().cost_usd) - 0.05) < 1e-9, `a running job counts at its budget, not $0 (${theRun().cost_usd})`)
+  const ledger = lab.modelCalls.filter(c => c.model_id === 'tool/tinker_tutor')
+  assert.equal(ledger.length, 1, 'the sweep writes the lesson\'s ledger row')
+  assert.ok(Math.abs(num(ledger[0].cost_usd) - 0.05) < 1e-9)
+  assert.equal(lab.toolRuns.filter(r => r.tool === 'tinker_tutor' && r.status === 'failed').length, 1, 'and a tool run row')
   assert.equal(theRun().status, 'failed')
   assert.equal(theRun().reason, 'the lesson was left open and the tool is off')
   assert.equal(l.stage, 'done')
@@ -1527,4 +1563,255 @@ test('no file of the lesson reads the Tinker key, and no request to the runner o
   const { net } = await runLesson()
   const sent = JSON.stringify([net.teacher, net.starts])
   for (const secret of [TINKER_KEY, JOBS_TOKEN, BASE_ENV.OPENROUTER_API_KEY]) assert.equal(sent.includes(secret), false)
+})
+
+// ===========================================================================
+// Money and liveness on a service that fails (review findings)
+// ===========================================================================
+const byteRunnerTokens = start => {
+  const sizes = start.train.examples.map(e => 12 + e.messages.reduce((a, m) => a + Buffer.byteLength(m.content) + 8, 0)).sort((a, b) => b - a)
+  const hold = tinker.holdoutCount(sizes.length)
+  return { train: sizes.reduce((a, b) => a + b, 0) * start.train.settings.epochs, eval: 2 * sizes.slice(0, hold).reduce((a, b) => a + b, 0), sample_prompt: 3 * sizes[0], sample_completion: 3 * 120 }
+}
+/** Each distinct student request first answers HTTP 200 with no choices (so it may have been served, and is charged its worst case) `times` times. */
+function flaky(net, times) {
+  const seen = new Map()
+  const inner = net.fetch
+  return async (url, options = {}) => {
+    if (String(url) === tinkerChat.TINKER_CHAT_URL) {
+      const body = JSON.parse(options.body)
+      const key = body.model + JSON.stringify(body.messages)
+      const n = (seen.get(key) ?? 0) + 1
+      seen.set(key, n)
+      if (n <= times) { net.student.push(body); return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } }) }
+    }
+    return inner(url, options)
+  }
+}
+async function untilDone(limit = 400) {
+  let t = 0
+  while (theLesson().stage !== 'done' && t < limit) { t++; await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + t * 10_000), pollMs: 1 }) }
+  return t
+}
+
+test('the measured Tinker cost never passes the money set aside, even when every student call fails twice and is charged its worst case', async () => {
+  for (const settings of [{}, { rounds: 2 }, { max_answer_tokens: 256, guiding_turns: 1 }]) {
+    for (const times of [2, 4]) {
+      lab = new FakeDb(); db.handler = (text, values) => lab.handle(text, values); openrouter.resetModelCatalog(); process.env = { ...BASE_ENV }
+      configure()
+      const knowsAdapter = (q, path) => (path === SAMPLER ? (q.held ? q.j <= 1 : q.j !== 2) : true)
+      const net = makeNet({ byteTokens: true, runnerTokens: byteRunnerTokens, knowsAdapter })
+      globalThis.fetch = flaky(net, times)
+      await tutorRun.runTinkerTutor(CTX, read(lessonRaw({ settings })), { deadlineAt: far(), pollMs: 1 })
+      await untilDone()
+      const run = theRun()
+      const label = `${JSON.stringify(settings)} failing ${times} times`
+      assert.equal(theLesson().stage, 'done', label)
+      assert.ok(num(run.cost_usd) <= num(run.reserved_usd) + 1e-9, `${label}: measured ${run.cost_usd}, set aside ${run.reserved_usd}`)
+      assert.ok(lab.spend('all').spent_usd <= num(run.reserved_usd) + 1e-9, `${label}: settled ${lab.spend('all').spent_usd}`)
+      assert.equal(lab.spend('all').reserved_usd, 0, label)
+    }
+  }
+})
+
+test('a failed student call in teaching defers that miss only: the rest of teaching goes on in the same slice', async () => {
+  configure()
+  const net = makeNet()
+  // every distinct teaching call (reply or retry, more than one message) fails once
+  const seen = new Set()
+  const inner = net.fetch
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === tinkerChat.TINKER_CHAT_URL) {
+      const body = JSON.parse(options.body)
+      const key = body.model + JSON.stringify(body.messages)
+      if (body.messages.length > 1 && !seen.has(key)) { seen.add(key); net.student.push(body); return new Response(JSON.stringify({ error: { message: 'busy' } }), { status: 503 }) }
+    }
+    return inner(url, options)
+  }
+  await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+  const slices = await untilDone(40)
+  assert.equal(theLesson().stage, 'done')
+  assert.equal(theRun().status, 'ok', theRun().reason)
+  // each call fails once: one pass of teaching meets every first failure, so a few slices finish it (one a failure each would need dozens)
+  assert.ok(slices <= 6, `teaching needed ${slices} slices`)
+})
+
+test('a slice that dies after the move to closing closes the lesson with the status and reason it chose, and one ledger row', async () => {
+  lab.failClose = 1
+  const { out } = await runLesson({ knowsBase: () => true })
+  assert.equal(theLesson().stage, 'closing')
+  assert.equal(theLesson().close_status, 'ended')
+  assert.notEqual(out.status, 'ended')
+  await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + 15 * 60_000), pollMs: 1 })
+  assert.equal(theRun().status, 'ended')
+  assert.equal(theRun().reason, 'the untrained model passed every practice question, so there was nothing to teach')
+  assert.equal(theLesson().stage, 'done')
+  const ledger = lab.modelCalls.filter(c => c.model_id === 'tool/tinker_tutor')
+  assert.equal(ledger.length, 1, 'the ledger row is written by the closing statement, once')
+  assert.ok(Math.abs(num(ledger[0].cost_usd) - num(theRun().cost_usd)) < 1e-9)
+  assert.equal(lab.spend('all').reserved_usd, 0)
+})
+
+test('the lesson\'s ledger row is written in the statement that closes it, so a slice that dies right after the close loses nothing', async () => {
+  let afterClose = false
+  const orig = lab.handle.bind(lab)
+  lab.handle = (text, v) => {
+    if (afterClose) { afterClose = false; throw new Error('killed') }
+    const out = orig(text, v)
+    if (text.startsWith('WITH closed AS') && out.rows?.length) afterClose = true
+    return out
+  }
+  await runLesson().catch(() => null)
+  await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + 15 * 60_000), pollMs: 1 })
+  assert.equal(theRun().status, 'ok')
+  const ledger = lab.modelCalls.filter(c => c.model_id === 'tool/tinker_tutor')
+  assert.equal(ledger.length, 1)
+  assert.ok(num(ledger[0].cost_usd) > 0)
+  assert.equal(lab.closes, 1)
+})
+
+test('a large lesson whose every student request first comes back with no answer still costs no more than was set aside', async () => {
+  // The review's case: 10 subskills, 8 practice and 4 held back questions of 950 bytes, answers up to 256 tokens.
+  const settings = { max_answer_tokens: 256, epochs: 1, guiding_turns: 1 }
+  const raw = lessonRaw({ settings })
+  raw.subskills = Array.from({ length: 10 }, (_, s) => ({
+    name: `S${s}`, rubric: structuredClone(RUBRIC),
+    practice: Array.from({ length: 8 }, (_, j) => ({ prompt: `p ${s} ${j} ${'w' + s + 'x' + j} `.padEnd(950, String.fromCharCode(97 + ((s * 7 + j) % 26))), expected: `p${s}${j}code` })),
+    held_back: Array.from({ length: 4 }, (_, j) => ({ prompt: `h ${s} ${j} ${'v' + s + 'y' + j} `.padEnd(950, String.fromCharCode(65 + ((s * 5 + j) % 26))), expected: `h${s}${j}code` })),
+  }))
+  const byPrompt = new Map()
+  for (const sub of raw.subskills) {
+    sub.practice.forEach((t, j) => byPrompt.set(t.prompt, { held: false, j, expected: t.expected }))
+    sub.held_back.forEach((t, j) => byPrompt.set(t.prompt, { held: true, j, expected: t.expected }))
+  }
+  configure()
+  const net = makeNet({ runnerTokens: byteRunnerTokens })
+  const seen = new Map()
+  const json = (body, status = 200) => new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } })
+  globalThis.fetch = async (url, options = {}) => {
+    const u = String(url)
+    if (u === tinkerChat.TINKER_CHAT_URL) {
+      const body = JSON.parse(options.body)
+      const key = body.model + JSON.stringify(body.messages)
+      const n = (seen.get(key) ?? 0) + 1
+      seen.set(key, n)
+      if (n <= 4) return json({})
+      const msgs = body.messages
+      const q = byPrompt.get(msgs[0].content)
+      const adapter = String(body.model).startsWith('tinker://')
+      const content = msgs.length === 1 ? (adapter || q.held || q.j > 0 ? q.expected : 'no idea') : msgs[msgs.length - 1].content === tutor.TUTOR_RETRY_LINE ? q.expected : 'Let me think.'
+      const usage = { prompt_tokens: 64 + msgs.reduce((a, m) => a + Buffer.byteLength(m.content) + 8, 0), completion_tokens: body.max_completion_tokens }
+      return json({ choices: [{ message: { content }, finish_reason: 'stop' }], usage })
+    }
+    if (u === OR_CHAT) return json({ model: TEACHER, choices: [{ message: { content: JSON.stringify({ question: 'Which step of your answer went wrong here?' }) }, finish_reason: 'stop' }], usage: { cost: 0.0002, prompt_tokens: 500, completion_tokens: 60 } })
+    return net.fetch(url, options)
+  }
+  await tutorRun.runTinkerTutor(CTX, read(raw), { deadlineAt: far(), pollMs: 1 })
+  await untilDone()
+  const run = theRun()
+  assert.equal(theLesson().stage, 'done')
+  assert.ok(num(run.cost_usd) <= num(run.reserved_usd) + 1e-9, `measured ${run.cost_usd}, set aside ${run.reserved_usd} (${run.status}: ${run.reason})`)
+  assert.ok(lab.spend('all').spent_usd <= num(run.reserved_usd) + 1e-9)
+})
+
+test('a teacher whose catalog entry lists no output limit cannot teach: the worst case of its calls would not bound them', () => {
+  assert.equal(tutorRun.teacherTakesLimit({ supported_parameters: ['max_tokens', 'reasoning'] }), true)
+  assert.equal(tutorRun.teacherTakesLimit({ supported_parameters: ['max_completion_tokens'] }), true)
+  assert.equal(tutorRun.teacherTakesLimit({ supported_parameters: ['temperature', 'response_format'] }), false)
+  assert.equal(tutorRun.teacherTakesLimit(null), true, 'with no catalog the request body sends max_tokens (buildRequestBody)')
+  const src = readFileSync(join(root, 'api/_lib/tinker-tutor-run.ts'), 'utf8')
+  assert.match(src, /if \(!teacherTakesLimit\(caps\)\) return skipped\(/)
+  assert.match(src, /if \(!teacherTakesLimit\(this\.caps\)\) return this\.stop\(/)
+})
+
+test('two lessons asked at the same moment cannot both take the last place of the day', async () => {
+  configure({ LAB_TINKER_TUTOR_PER_DAY: '1' })
+  globalThis.fetch = makeNet().fetch
+  const other = { ...CTX, experimentId: '22222222-2222-4222-8222-222222222222' }
+  const outs = await Promise.all([CTX, other].map(ctx => tutorRun.runTinkerTutor(ctx, read(lessonRaw()), { deadlineAt: Date.now() })))
+  assert.deepEqual(outs.map(o => o.status).sort(), ['skipped', 'started'])
+  assert.match(outs.find(o => o.status === 'skipped').summary, /today's 1 lesson place/)
+  assert.equal(lab.tinkerRuns.length, 1)
+  // a lesson refused before any call gives its place back
+  lab = new FakeDb(); db.handler = (text, values) => lab.handle(text, values)
+  await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: Date.now() })
+  const again = await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: Date.now() })
+  assert.equal(again.status, 'skipped')
+  assert.equal(lab.slots.get(store.utcDay()), 1, 'this epoch already has a run: the second place was given back')
+})
+
+test('a held back question cannot reach the teacher through another subskill: checks 6 and 7 look at every subskill', () => {
+  const q = (prompt, expected) => ({ prompt, expected })
+  const rub = { rules: [{ type: 'exact_match', from: 'expected', weight: 1, scope: 'last_line' }] }
+  const mk = (name, practice, held) => ({ name, rubric: rub, practice, held_back: held })
+  const subs = () => [
+    mk('Alpha', [q('Compute 11 plus 12. Reply with the number only.', '23'), q('Compute 31 plus 14. Reply with the number only.', '45'), q('Compute 51 plus 16. Reply with the number only.', '67')],
+      [q('What is 17 times 23? Give only the number.', '391'), q('What is 19 times 21? Give only the number.', '399'), q('What is 13 times 29? Give only the number.', '377')]),
+    mk('Beta', [q('Please multiply seventeen by twenty-three and state the product as digits.', '391'), q('Please multiply nineteen by twenty-one and state the product as digits.', '399'), q('Please multiply thirteen by twenty-nine and state the product as digits.', '377')],
+      [q('Compute 101 minus 7. Reply with the number only.', '94'), q('Compute 202 minus 9. Reply with the number only.', '193'), q('Compute 303 minus 8. Reply with the number only.', '295')]),
+    mk('Gamma', [q('Name the capital of France in one word.', 'Paris'), q('Name the capital of Italy in one word.', 'Rome'), q('Name the capital of Spain in one word.', 'Madrid')],
+      [q('Which city is the capital of Germany? One word.', 'Berlin'), q('Which city is the capital of Austria? One word.', 'Vienna'), q('Which city is the capital of Portugal? One word.', 'Lisbon')]),
+    mk('Delta', [q('Spell cat backwards.', 'tac'), q('Spell dog backwards.', 'god'), q('Spell rat backwards.', 'tar')],
+      [q('Reverse the letters of pin.', 'nip'), q('Reverse the letters of top.', 'pot'), q('Reverse the letters of bat.', 'tab')]),
+  ]
+  // check 7 across subskills: Alpha's held back question expects 391, which Beta's practice question shows the teacher
+  assert.equal(refused({ topic: 'Arithmetic', subskills: subs() }), 'subskills[0].held_back[0] expects a value the teacher is shown for subskills[1]')
+  // check 6 across subskills: a held back question that nearly repeats another subskill's practice question
+  const copy = subs()
+  copy[1].practice = [q('Compute 101 minus 70. Reply with the number only.', '31'), q('Please multiply nineteen by twenty-one and state the product as digits.', '1399'), q('Please multiply thirteen by twenty-nine and state the product as digits.', '1377')]
+  copy[0].held_back = [q('Compute 11 plus 13. Reply with the number only.', '24'), ...copy[0].held_back.slice(1).map((h, i) => q(h.prompt, `${500 + i}`))]
+  assert.equal(refused({ topic: 'Arithmetic', subskills: copy }), 'subskills[0].held_back[0] is nearly the same as practice[0]')
+  const across = subs()
+  across[0].held_back = [q('Name the capital of France in one word please.', 'Lyon'), ...across[0].held_back.slice(1)]
+  across[1].practice = across[1].practice.map((p, i) => q(p.prompt, `${700 + i}`))
+  assert.equal(refused({ topic: 'Arithmetic', subskills: across }), 'subskills[0].held_back[0] is nearly the same as subskills[2].practice[0]')
+})
+
+test('an answer the token limit cut off, or that came back empty, is counted in every test, shown as such, and flagged when there were fewer after training', async () => {
+  // The untrained model writes its thinking first, so under the answer limit it is cut off before any answer (an Inkling-like base);
+  // the adapter answers directly.
+  configure()
+  const net = makeNet()
+  const inner = net.fetch
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url) === tinkerChat.TINKER_CHAT_URL) {
+      const body = JSON.parse(options.body)
+      if (body.messages.length === 1 && !String(body.model).startsWith('tinker://')) {
+        const q = QUESTIONS.get(body.messages[0].content)
+        net.student.push(body)
+        const content = q.s === 0 ? '' : 'Let me think about the words one at a time'
+        return new Response(JSON.stringify({ choices: [{ message: { content }, finish_reason: q.s === 0 ? 'stop' : 'length' }], usage: { prompt_tokens: 40, completion_tokens: body.max_completion_tokens } }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+    }
+    return inner(url, options)
+  }
+  const out = await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+  assert.equal(out.status, 'ok', out.summary)
+  const flags = theRun().result.flags
+  assert.deepEqual(flags.cut_off.before, { cut: 36, empty: 12, graded: 48 })
+  assert.equal(flags.cut_off.after.cut + flags.cut_off.after.empty, 0)
+  assert.equal(flags.cut_short_before, true)
+  assert.ok(flags.reasons.some(r => /cut off by the token limit or came back empty \(48 of 48\)/.test(r)), flags.reasons.join(' | '))
+  // the public record carries the counts, and each answer says how it ended
+  const value = await tutorPublic.tutorLesson()
+  assert.deepEqual(value.lesson.flags.cut_off.before, { cut: 36, empty: 12, graded: 48 })
+  const qs = await tutorPublic.lessonQuestionsBySlug(theRun().slug, 1)
+  const before = qs.questions[0].answers.before
+  assert.ok(before.length > 0 && before.every(a => a.cut_short === true && a.passed === false), JSON.stringify(before))
+  const empties = (await tutorPublic.lessonQuestionsBySlug(theRun().slug, 0)).questions[0].answers.before
+  assert.ok(empties.every(a => a.empty === true && a.cut_short === false), JSON.stringify(empties))
+  // the tool run line names it
+  assert.match(lab.toolRuns.find(r => r.tool === 'tinker_tutor').output_tail, /cut off by the token limit or came back empty/)
+})
+
+test('a fall in cut off answers short of the share flag is flagged on its own', () => {
+  const request = read(lessonRaw())
+  const mark = (phase, i, cut) => ({ phase, subskill: i % 4, held_back: i % 2 === 0, question: i % 3, sample: i % 2, status: 'ok', passed: false, cut_short: cut })
+  const marks = [...Array.from({ length: 48 }, (_, i) => mark('before', i, i < 5)), ...Array.from({ length: 48 }, (_, i) => mark('after1', i, false))]
+  const before = tutor.phaseMap(request, marks, 'before')
+  const after = tutor.phaseMap(request, marks, 'after1')
+  const flags = tutor.tutorFlags({ request, before, after, marks, teacherFailed: 0, afterPhase: 'after1' })
+  assert.equal(flags.cut_short_before, false)
+  assert.equal(flags.cut_off_fell, true)
+  assert.ok(flags.reasons.some(r => r.startsWith('fewer answers were cut off by the token limit or came back empty after training (5 of 48 before, 0 of 48 after)')), flags.reasons.join(' | '))
 })

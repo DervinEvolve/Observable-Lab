@@ -26,11 +26,11 @@
 import { budgetScopeFor } from './experiment-modes.js'
 import type { Rubric, RubricTask } from './rubric.js'
 import { buildRequestBody, callModelOnce, getModelCapabilities, type ModelCapabilities } from './openrouter.js'
-import { dailyBudgetUsd, recordModelCall, refreshEpochCost, researchDailyBudgetUsd, spentTodayUsd, withSpendContext } from './spend.js'
+import { dailyBudgetUsd, refreshEpochCost, researchDailyBudgetUsd, spentTodayUsd, withSpendContext } from './spend.js'
 import { recordToolRun, type ToolRunStatus } from './tool-runs-store.js'
 import { TINKER_NAME_TOOL } from './tinker-keep-request.js'
 import {
-  TINKER_MAX_DATASET_BYTES, TINKER_MAX_EXAMPLE_BYTES, TINKER_PRICE_TABLE_DATE, estimateTinkerRun, isExternalPath, isSamplerPath, newAdapterSlug, newSplitSalt,
+  TINKER_ESTIMATE_MARGIN, TINKER_MAX_DATASET_BYTES, TINKER_MAX_EXAMPLE_BYTES, TINKER_PRICE_TABLE_DATE, estimateTinkerRun, isExternalPath, isSamplerPath, newAdapterSlug, newSplitSalt,
   normalizeTinkerRequest, normalizeTinkerResult, tinkerChatCostUsd, tinkerChatWorstCaseUsd, tinkerCostUsd, tinkerDailyUsd, tinkerJobsConfigured,
   tinkerKeepFlag, tinkerNamesFlag, tinkerRunUsd, tinkerSamplingConfigured, tinkerTtlDays, tinkerWaitMs, usdText,
   type TinkerRequest,
@@ -46,12 +46,12 @@ import {
   TUTOR_TEACH_UNTIL_MS, TUTOR_TEMPERATURE, TUTOR_TEXT_BYTES, TUTOR_TOOL, TUTOR_TRUNCATED_STOP, TUTOR_UNANSWERED_MAX,
   allQuestions, buildExamples, bytesOf, cleanText, cutBytes, estimateTutor, lessonHashes, lessonRecordOf, leakTargets, maxTeacherCalls, missesToTeach,
   modelName, passes, phaseMap, publicCut, readExplanation, readGuide, roundTwoNeedUsd, teacherCeilingUsd, teacherEffort, teacherUserPrompt, teacherWorstUsd,
-  testCeilingUsd, tutorFlags, tutorSummary, tutorTeacherModelSetting, tutorTeacherUsd, tinkerTutorStatus,
+  testCeilingUsd, tutorFlags, tutorSummary, tutorTeacherModelSetting, tutorTeacherUsd, tinkerTutorPerDay, tinkerTutorStatus,
   type AnswerMark, type Cell, type ExampleCounts, type Miss, type PhaseMap, type TaughtExchange, type TeacherTurnText, type TinkerTutorRequest,
 } from './tinker-tutor.js'
 import {
   closeAbandonedLessons, closeLessonRun, createLesson, heldHashMatches, loadAnswers, loadTurns, markTeacherCalling, openLessonRows, openTeacherReservedUsd,
-  releaseLease, reserveTeacher, saveAnswer, saveTurnStudent, setProgress, setStage, setStopReason, setTrain, settleLostTeacherCall, settleTeacher, takeLease,
+  releaseLease, releaseTutorDaySlot, reserveTeacher, saveAnswer, saveTurnStudent, setClosing, takeTutorDaySlot, setProgress, setStage, setStopReason, setTrain, settleLostTeacherCall, settleTeacher, takeLease,
   unreserveTeacher,
   type AnswerRow, type LessonRow, type LessonStage, type TrainLeg, type TurnRow,
 } from './tutor-store.js'
@@ -61,6 +61,17 @@ export { tutorRunsToday } from './tutor-store.js'
 // ---------------------------------------------------------------------------
 // Before a lesson opens
 // ---------------------------------------------------------------------------
+
+/**
+ * Can a teacher call be held to an exact output limit? Only when the model's
+ * catalog entry lists max_tokens or max_completion_tokens: otherwise no limit
+ * is sent (openrouter.ts buildRequestBody), and the worst case of a call,
+ * which assumes TUTOR_TEACHER_MAX_TOKENS of output, would not bound it.
+ */
+export function teacherTakesLimit(caps: Pick<ModelCapabilities, 'supported_parameters'> | null): boolean {
+  const supported = caps?.supported_parameters ?? ['max_tokens']
+  return supported.includes('max_tokens') || supported.includes('max_completion_tokens')
+}
 
 /** Who teaches: LAB_TUTOR_TEACHER_MODEL when set, else the model that really answered as Executor. */
 export function teacherModelFor(ctx: Pick<TinkerRunContext, 'executorModelId'>): string {
@@ -108,6 +119,7 @@ export async function runTinkerTutor(ctx: TinkerRunContext, request: TinkerTutor
   const teacher = teacherModelFor(ctx)
   const caps = await getModelCapabilities(teacher).catch(() => null)
   if (!caps?.pricing) return skipped(`the teacher, ${modelName(teacher)}, has no known price, so it cannot teach`)
+  if (!teacherTakesLimit(caps)) return skipped(`the teacher, ${modelName(teacher)}, takes no output limit, so the most a call could cost is not known and it cannot teach`)
   const estimate = estimateTutor(request)
   const runCap = tinkerRunUsd()
   if (estimate.max_cost_usd > runCap) {
@@ -122,14 +134,26 @@ export async function runTinkerTutor(ctx: TinkerRunContext, request: TinkerTutor
   }
   if (reuse) return skipped(reuse)
 
+  // One of today's places, taken in one statement; it is given back on every refusal below, before any call is sent.
+  try {
+    if (!(await takeTutorDaySlot(now, tinkerTutorPerDay()))) return skipped(`the lab already gave today's ${tinkerTutorPerDay()} lesson place${tinkerTutorPerDay() === 1 ? '' : 's'} (UTC day)`)
+  } catch (e) {
+    console.warn('[tinker-tutor] could not count today\'s lessons:', e instanceof Error ? e.message : e)
+    return skipped('the lab could not count today\'s lessons, so nothing was started')
+  }
+  const refusedEarly = async (reason: string): Promise<TinkerOutcome> => {
+    await releaseTutorDaySlot(now)
+    return skipped(reason)
+  }
+
   let reservation: Awaited<ReturnType<typeof reserveTinkerSpend>>
   try {
     reservation = await reserveTinkerSpend('all', estimate.max_cost_usd, tinkerDailyUsd(), now)
   } catch (e) {
     console.warn('[tinker-tutor] could not set the estimate aside:', e instanceof Error ? e.message : e)
-    return skipped('the lab could not check today\'s Tinker spend, so nothing was started')
+    return refusedEarly('the lab could not check today\'s Tinker spend, so nothing was started')
   }
-  if (!reservation.ok) return skipped(`its estimated Tinker cost of ${usdText(estimate.max_cost_usd)} was not set aside: ${reservation.reason}`)
+  if (!reservation.ok) return refusedEarly(`its estimated Tinker cost of ${usdText(estimate.max_cost_usd)} was not set aside: ${reservation.reason}`)
 
   const teacherCap = tutorTeacherUsd()
   let row: TinkerRunRow | null
@@ -142,11 +166,11 @@ export async function runTinkerTutor(ctx: TinkerRunContext, request: TinkerTutor
   } catch (e) {
     await settleTinkerSpend(reservation, 0)
     console.warn('[tinker-tutor] could not open a run:', e instanceof Error ? e.message : e)
-    return skipped('the lab could not store the lesson, so nothing was started')
+    return refusedEarly('the lab could not store the lesson, so nothing was started')
   }
   if (!row) {
     await settleTinkerSpend(reservation, 0)
-    return skipped('this epoch already has a Tinker run')
+    return refusedEarly('this epoch already has a Tinker run')
   }
 
   const budgetScope = await budgetScopeFor(ctx.experimentId).catch(() => 'classic' as const)
@@ -163,8 +187,9 @@ export async function runTinkerTutor(ctx: TinkerRunContext, request: TinkerTutor
     await closeLessonRun({
       runId: row.id, status: 'failed', reason, costUsd: 0, result: { kind: 'tutor', topic: request.topic }, samplerPath: null, expiresAt: null,
       examples: 0, spendDay: reservation.day, reservedUsd: reservation.usd, now,
+      ledger: { experimentId: ctx.experimentId, epoch: ctx.epochNumber, assigned: ctx.assignedExecutorId ?? ctx.executorModelId, budgetScope },
     }).catch(() => null)
-    return skipped(reason)
+    return refusedEarly(reason)
   }
 
   // The display name, while names are on: it never decides the lesson.
@@ -219,8 +244,17 @@ export async function advanceTutorLessonsDetailed(opts: { deadlineAt: number; no
   const runnable = tinkerTutorStatus().enabled || (tinkerJobsConfigured() && tinkerSamplingConfigured())
   if (!runnable) {
     try {
-      const closed = await closeAbandonedLessons(new Date(now.getTime() - TUTOR_MAX_AGE_MS), 'the lesson was left open and the tool is off', now)
-      return closed.map(slug => ({ slug, stage: 'done' as const, status: 'failed' }))
+      const reason = 'the lesson was left open and the tool is off'
+      const closed = await closeAbandonedLessons(new Date(now.getTime() - TUTOR_MAX_AGE_MS), reason, now)
+      for (const c of closed) {
+        await refreshEpochCost(c.experiment_id, c.epoch)
+        await recordToolRun({
+          experimentId: c.experiment_id, epoch: c.epoch, model: c.model, tool: TUTOR_TOOL, requestSummary: `Socratic lesson lab/${c.slug}`,
+          status: 'failed', costUsd: c.spent,
+          outputTail: `failed: ${reason}; estimated Tinker cost $${c.spent.toFixed(4)} (token counts at Tinker's published prices of ${TINKER_PRICE_TABLE_DATE}, or a training job's whole budget where its result is unknown; not a billed amount); ${TUTOR_MEASURE_NOTE}`,
+        })
+      }
+      return closed.map(c => ({ slug: c.slug, stage: 'done' as const, status: 'failed' }))
     } catch {
       return [] // no lesson table: nothing was ever opened
     }
@@ -259,6 +293,9 @@ const turnKey = (round: number, s: number, q: number, turn: number) => `${round}
 
 type Step = 'next' | 'paused' | 'closed'
 
+const NO_MONEY_TEST = 'the Tinker money set aside for the lesson does not cover the rest of a test, so it stopped there'
+const NO_MONEY_TEACH = 'the Tinker money set aside does not cover another call to the small model and what training and the retest need, so teaching stopped'
+
 class Stopped extends Error {}
 
 /** One slice of one lesson, under its lease. */
@@ -287,7 +324,9 @@ class LessonSlice {
     for (const t of await loadTurns(this.lesson.run_id)) this.turns.set(turnKey(t.round, t.subskill, t.question, t.turn), t)
     this.runRow = await getRun(this.lesson.slug)
     if (!this.runRow || this.runRow.status !== 'lesson') {
-      // Closed already (by another request, or by the sweep): nothing is left to do.
+      // Closed already (by another request, or by the sweep). The close wrote the run row, the money and the ledger in one
+      // statement; the epoch's cost is refreshed again in case the request that closed it stopped right after.
+      if (this.runRow) await refreshEpochCost(this.lesson.experiment_id, this.lesson.epoch)
       await setStage(this.lesson.run_id, 'done', this.lesson.round)
       this.stage = 'done'
       return { status: this.runRow?.status ?? 'failed' }
@@ -350,14 +389,33 @@ class LessonSlice {
 
   // ---- student calls -----------------------------------------------------------
 
-  private async student(messages: TinkerChatMessage[], maxTokens: number, samplerPath: string | null):
-    Promise<{ ok: true; text: string; cutShort: boolean; cost: number; promptTokens: number; completionTokens: number } | { ok: false; cost: number }> {
+  /** The most the student calls now in flight could cost: counted against the money set aside until they answer. */
+  private inFlightUsd = 0
+
+  /**
+   * One call to the small model, only when the money set aside still covers
+   * it: what was measured so far, the calls in flight, this call's worst case
+   * (a call that may have been served without usage is charged that much) and
+   * `keepUsd` for the stages after this one must all fit `reserved_usd`, which
+   * is the most the lesson's Tinker use may cost (spec 1.7(a)). Without that,
+   * retries charged at their worst case could pass it.
+   */
+  private async student(messages: TinkerChatMessage[], maxTokens: number, samplerPath: string | null, keepUsd = 0):
+    Promise<{ ok: true; text: string; cutShort: boolean; cost: number; promptTokens: number; completionTokens: number } | { ok: false; cost: number; noMoney?: true }> {
     const base = this.request.base_model
-    const answer = await callTinkerChat({
-      ...(samplerPath ? { samplerPath, adapterBase: base } : { baseModel: base }),
-      messages, maxTokens, temperature: TUTOR_TEMPERATURE, timeoutMs: TUTOR_STUDENT_TIMEOUT_MS,
-    })
     const worst = tinkerChatWorstCaseUsd(base, messages, maxTokens)
+    const held = Math.ceil(worst * 1e6) / 1e6
+    if (this.tinkerSpentUsd() + this.inFlightUsd + held + keepUsd > this.lesson.reserved_usd + 1e-9) return { ok: false, cost: 0, noMoney: true }
+    this.inFlightUsd += held
+    let answer: Awaited<ReturnType<typeof callTinkerChat>>
+    try {
+      answer = await callTinkerChat({
+        ...(samplerPath ? { samplerPath, adapterBase: base } : { baseModel: base }),
+        messages, maxTokens, temperature: TUTOR_TEMPERATURE, timeoutMs: TUTOR_STUDENT_TIMEOUT_MS,
+      })
+    } finally {
+      this.inFlightUsd -= held
+    }
     const charge = tinkerChatCharge(answer, (p, c) => tinkerChatCostUsd(base, p, c), worst)
     // Rounded as the row stores it, so the lesson's sum is the sum of its rows.
     const cost = Math.ceil(charge.usd * 1e6) / 1e6
@@ -365,8 +423,15 @@ class LessonSlice {
     return { ok: true, text: cleanText(answer.content), cutShort: answer.finishReason === 'length', cost, promptTokens: answer.promptTokens, completionTokens: answer.completionTokens }
   }
 
+  /** What teaching leaves for the stages after it: this round's training job and one retest, margin included. */
+  private keepAfterTeaching(): number {
+    const est = estimateTutor(this.request)
+    const training = est.parts.training_usd[this.lesson.round - 1] ?? 0
+    return Math.ceil(TINKER_ESTIMATE_MARGIN * training * 1e6) / 1e6 + testCeilingUsd(est, this.request.settings.rounds)
+  }
+
   /** Every question asked TUTOR_SAMPLES times, what is missing only. 'next' when the whole test is graded. */
-  private async test(phase: string, samplerPath: string | null): Promise<'next' | 'paused'> {
+  private async test(phase: string, samplerPath: string | null): Promise<'next' | 'paused' | 'no_money'> {
     const todo: Array<{ s: number; held: boolean; q: number; sample: number; prompt: string; rubric: Rubric; task: RubricTask }> = []
     for (const ref of allQuestions(this.request)) {
       for (let sample = 0; sample < TUTOR_SAMPLES; sample++) {
@@ -379,13 +444,15 @@ class LessonSlice {
     }
     const A = this.request.settings.max_answer_tokens ?? TUTOR_ANSWER_TOKENS.fallback
     let i = 0
+    let noMoney = false
     const worker = async () => {
-      while (i < todo.length && this.timeFor(TUTOR_STUDENT_TIMEOUT_MS)) {
+      while (i < todo.length && !noMoney && this.timeFor(TUTOR_STUDENT_TIMEOUT_MS)) {
         const item = todo[i++]
         const key = keyOf(phase, item.s, item.held, item.q, item.sample)
         const before = this.answers.get(key)
         const attempts = (before?.attempts ?? 0) + 1
         const got = await this.student([{ role: 'user', content: item.prompt }], A, samplerPath)
+        if (!got.ok && got.noMoney) { noMoney = true; break }
         let row: AnswerRow
         if (got.ok) {
           const graded = passes(item.rubric, item.task, got.text)
@@ -409,7 +476,8 @@ class LessonSlice {
       }
     }
     await Promise.all(Array.from({ length: Math.min(TUTOR_STUDENT_CONCURRENCY, todo.length) }, worker))
-    return this.phaseDone(phase) ? 'next' : 'paused'
+    if (this.phaseDone(phase)) return 'next'
+    return noMoney ? 'no_money' : 'paused'
   }
 
   private unansweredShare(phase: string): number {
@@ -420,7 +488,9 @@ class LessonSlice {
   // ---- stages ------------------------------------------------------------------
 
   private async diagnostic(): Promise<Step> {
-    if ((await this.test('before', null)) === 'paused') return 'paused'
+    const tested = await this.test('before', null)
+    if (tested === 'no_money') return this.finish('failed', NO_MONEY_TEST)
+    if (tested === 'paused') return 'paused'
     if (this.unansweredShare('before') > TUTOR_UNANSWERED_MAX) {
       return this.finish('failed', 'more than a tenth of the untrained model\'s answers never came from the training service')
     }
@@ -456,6 +526,7 @@ class LessonSlice {
   private async teaching(): Promise<Step> {
     const round = this.lesson.round
     const taught = this.taughtList(round)
+    let deferred = false
     for (const miss of taught) {
       if (this.missDone(round, miss)) continue
       if (this.lesson.stop_reason) break
@@ -466,12 +537,15 @@ class LessonSlice {
       try {
         const r = await this.teachMiss(round, miss)
         if (r === 'paused') return 'paused'
+        if (r === 'deferred') deferred = true
       } catch (e) {
         if (!(e instanceof Stopped)) throw e
         break
       }
       await this.writeProgress()
     }
+    // A miss whose call failed in this slice is tried again by the next one; training waits for it.
+    if (deferred && !this.lesson.stop_reason && this.age <= TUTOR_TEACH_UNTIL_MS) return 'paused'
     await this.moveTo('training', round)
     return 'next'
   }
@@ -497,7 +571,12 @@ class LessonSlice {
       .map(t => ({ guide: t.teacher_text, reply: t.student_reply, answer: t.student_answer }))
   }
 
-  private async teachMiss(round: number, miss: Miss): Promise<'done' | 'paused'> {
+  /**
+   * Teaches one miss as far as it can go now. 'paused' when the slice is out of
+   * time; 'deferred' when a call to the small model failed and is tried again
+   * by a later slice, so the other misses go on meanwhile.
+   */
+  private async teachMiss(round: number, miss: Miss): Promise<'done' | 'paused' | 'deferred'> {
     const T = this.request.settings.guiding_turns
     const A = this.request.settings.max_answer_tokens
     const sub = this.request.subskills[miss.subskill]
@@ -514,9 +593,10 @@ class LessonSlice {
       if (row.state === 'asked') {
         if (!this.timeFor(TUTOR_STUDENT_TIMEOUT_MS)) return 'paused'
         const key = `reply|${turnKey(round, miss.subskill, miss.question, turn)}`
-        if (this.failedThisSlice.has(key)) return 'paused'
+        if (this.failedThisSlice.has(key)) return 'deferred'
         const messages = [...this.dialogue(round, miss, turn), { role: 'user' as const, content: row.teacher_text as string }]
-        const got = await this.student(messages, TUTOR_REPLY_TOKENS, path)
+        const got = await this.student(messages, TUTOR_REPLY_TOKENS, path, this.keepAfterTeaching())
+        if (!got.ok && got.noMoney) return this.stop(NO_MONEY_TEACH)
         const next: TurnRow = { ...row, attempts: row.attempts + 1 }
         if (got.ok) {
           next.state = 'replied'
@@ -530,17 +610,18 @@ class LessonSlice {
         next.cost_usd = row.cost_usd + got.cost
         this.turns.set(turnKey(round, miss.subskill, miss.question, turn), next)
         row = next
-        if (row.state === 'asked') return 'paused'
+        if (row.state === 'asked') return 'deferred'
       }
       if (row.state === 'replied') {
         if (!this.timeFor(TUTOR_STUDENT_TIMEOUT_MS)) return 'paused'
         const key = `retry|${turnKey(round, miss.subskill, miss.question, turn)}`
-        if (this.failedThisSlice.has(key)) return 'paused'
+        if (this.failedThisSlice.has(key)) return 'deferred'
         const messages: TinkerChatMessage[] = [
           ...this.dialogue(round, miss, turn), { role: 'user', content: row.teacher_text as string },
           { role: 'assistant', content: row.student_reply || ' ' }, { role: 'user', content: TUTOR_RETRY_LINE },
         ]
-        const got = await this.student(messages, A, path)
+        const got = await this.student(messages, A, path, this.keepAfterTeaching())
+        if (!got.ok && got.noMoney) return this.stop(NO_MONEY_TEACH)
         const next: TurnRow = { ...row, attempts: row.attempts + 1 }
         if (got.ok) {
           const graded = passes(sub.rubric, miss.task, got.text)
@@ -555,7 +636,7 @@ class LessonSlice {
         next.cost_usd = row.cost_usd + got.cost
         this.turns.set(turnKey(round, miss.subskill, miss.question, turn), next)
         row = next
-        if (row.state === 'replied') return 'paused'
+        if (row.state === 'replied') return 'deferred'
       }
       if (row.state === 'graded' && row.passed) return 'done'
     }
@@ -590,6 +671,7 @@ class LessonSlice {
     this.caps ??= await getModelCapabilities(model).catch(() => null)
     const pricing = this.caps?.pricing
     if (!pricing) return this.stop(`the teacher, ${modelName(model)}, has no known price`)
+    if (!teacherTakesLimit(this.caps)) return this.stop(`the teacher, ${modelName(model)}, takes no output limit`)
     if (this.lesson.teacher_calls >= maxTeacherCalls(this.request.settings)) return this.stop('the teacher was called as many times as a lesson allows')
     const sub = this.request.subskills[miss.subskill]
     const system = kind === 'guide' ? TUTOR_GUIDE_SYSTEM : TUTOR_EXPLAIN_SYSTEM
@@ -813,7 +895,9 @@ class LessonSlice {
     const path = leg?.result?.sampler_path
     if (!isSamplerPath(path)) return this.roundFailed(round, 'the trained adapter has no saved path')
     const phase = `after${round}`
-    if ((await this.test(phase, path)) === 'paused') return 'paused'
+    const tested = await this.test(phase, path)
+    if (tested === 'no_money') return this.roundFailed(round, NO_MONEY_TEST)
+    if (tested === 'paused') return 'paused'
     if (this.unansweredShare(phase) > TUTOR_UNANSWERED_MAX) return this.roundFailed(round, 'more than a tenth of the trained model\'s answers never came from the training service')
     if (round === 1 && this.request.settings.rounds === 2) {
       const reason = await this.roundTwoBlocked()
@@ -856,6 +940,8 @@ class LessonSlice {
   }
 
   private async closeNormally(): Promise<Step> {
+    // A lesson that moved here for a stated reason (and whose slice died before the close) closes with that reason.
+    if (this.lesson.close_status) return this.finish(this.lesson.close_status, this.lesson.close_reason)
     const final = this.finalRound()
     if (final === null) return this.finish('failed', 'no test of a trained adapter finished')
     const reason = final < this.request.settings.rounds ? this.roundTwoNote ?? this.lesson.stop_reason ?? 'round 2 did not finish' : this.lesson.stop_reason
@@ -896,16 +982,19 @@ class LessonSlice {
     const cost = Math.round(this.tinkerSpentUsd() * 1e6) / 1e6
     const result = this.record(final)
     const examples = leg?.examples ?? 0
-    await this.moveTo('closing')
+    // The status and reason are stored with the move to 'closing', so a slice that dies before the close below closes the lesson the same way.
+    await setClosing(this.lesson.run_id, status, reason)
+    this.stage = 'closing'
+    this.lesson.stage = 'closing'
+    this.lesson.close_status = status
+    this.lesson.close_reason = reason
+    // One statement: the run row is closed once, the reservation settled and the ledger row written (only by the request that closed it).
     const closed = await closeLessonRun({
       runId: this.lesson.run_id, status, reason, costUsd: cost, result, samplerPath: path, expiresAt, examples,
       spendDay: this.lesson.spend_day, reservedUsd: this.lesson.reserved_usd, now: this.now,
+      ledger: { experimentId: this.lesson.experiment_id, epoch: this.lesson.epoch, assigned: run.assigned_model ?? run.model, budgetScope: this.lesson.budget_scope },
     })
     if (closed) {
-      if (cost > 0) {
-        await withSpendContext({ experimentId: this.lesson.experiment_id, epochNumber: this.lesson.epoch, purpose: TUTOR_TOOL, budgetScope: this.lesson.budget_scope }, () =>
-          recordModelCall({ model: `tool/${TUTOR_TOOL}`, assigned: run.assigned_model ?? run.model, cost_usd: cost, cost_source: 'estimate', prompt_tokens: 0, completion_tokens: 0, reasoning_tokens: 0 }))
-      }
       await refreshEpochCost(this.lesson.experiment_id, this.lesson.epoch)
       const toolStatus: ToolRunStatus = status === 'ok' ? 'ok' : status === 'error' ? 'error' : 'failed'
       const name = shownName(run)
@@ -984,7 +1073,7 @@ export function summarizeLesson(request: TinkerTutorRequest, answers: AnswerRow[
   }
   const after = round ? phaseMap(request, marks, `after${round}`) : null
   const teacherFailed = turns.filter(t => t.kind === 'explain' && t.state === 'explain_failed' && t.teacher_answer !== null).length
-  const flags = tutorFlags({ request, before, after, marks, teacherFailed })
+  const flags = tutorFlags({ request, before, after, marks, teacherFailed, afterPhase: round ? `after${round}` : null })
   let missed = 0, taught = 0, solved = 0, explained = 0, leaked = 0
   for (const r of [1, 2]) {
     const phase = r === 1 ? 'before' : 'after1'

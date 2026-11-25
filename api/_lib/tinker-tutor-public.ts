@@ -13,7 +13,7 @@ import { TINKER_PRICE_TABLE_DATE, isAdapterSlug, trainedChatStatus } from './tin
 import { ORIGIN_MODELS, getRun, shownName, type TinkerRunRow } from './tinker-store.js'
 import {
   TUTOR_EXPLAIN_SHOWN_BYTES, TUTOR_LIVE_MS, TUTOR_MEASURED_BY, TUTOR_SAMPLES, TUTOR_SUBSKILLS, allQuestions, missesToTeach, modelName, publicCut, tinkerTutorStatus,
-  type Cell, type TinkerTutorRequest,
+  type Cell, type CutOff, type TinkerTutorRequest,
 } from './tinker-tutor.js'
 import { summarizeLesson } from './tinker-tutor-run.js'
 import { answerMarks, getLessonRow, latestLessonSlug, loadTurns, subskillAnswers, type AnswerRow, type LessonRow, type TurnRow } from './tutor-store.js'
@@ -47,7 +47,10 @@ export interface PublicLesson {
   teaching: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number; leaked: number; not_taught: number; teacher_calls: number } | null
   examples: { kept: number; guided: number; answer: number; explained: number; left_out: number; total: number } | null
   training: { steps_done: number | null; steps_planned: number | null; holdout_loss_before: number | null; holdout_loss_after: number | null } | null
-  flags: { seen_only: boolean; too_easy: boolean; unanswered: number; cut_short_before: boolean; rubric_literal: string[]; shared_literals: string[]; within_noise: boolean; reasons: string[] }
+  flags: {
+    seen_only: boolean; too_easy: boolean; unanswered: number; cut_short_before: boolean; rubric_literal: string[]; shared_literals: string[]; within_noise: boolean; reasons: string[]
+    cut_off_fell: boolean; cut_off: { before: CutOff | null; after: CutOff | null }
+  }
   exchanges: Array<{ subskill: string; question: string; wrong: string; guide: string; reply: string; answer: string; passed: boolean }>
   cost: { tinker_estimated_usd: number | null; tinker_max_usd: number; teacher_usd: number; teacher_max_usd: number; basis: string }
   measured_by: typeof TUTOR_MEASURED_BY
@@ -66,7 +69,8 @@ export interface LessonQuestions {
   questions: Array<{
     held_back: boolean
     prompt: string
-    answers: { before: Array<{ text: string; passed: boolean }>; after: Array<{ text: string; passed: boolean }> }
+    /** cut_short: the token limit cut the answer off; empty: it came back with no text. Both are graded as they stand. */
+    answers: { before: Array<{ text: string; passed: boolean; cut_short: boolean; empty: boolean }>; after: Array<{ text: string; passed: boolean; cut_short: boolean; empty: boolean }> }
     turns: Array<{ kind: 'guide' | 'explain'; state: string; teacher: string; reply: string; answer: string; passed: boolean }>
   }>
 }
@@ -123,6 +127,7 @@ export function publicLesson(run: TinkerRunRow, lesson: LessonRow | null, answer
       seen_only: summary.flags.seen_only, too_easy: summary.flags.too_easy, unanswered: summary.flags.unanswered, cut_short_before: summary.flags.cut_short_before,
       rubric_literal: summary.flags.rubric_literal.map(n => publicCut(n, 40)), shared_literals: summary.flags.shared_literals.map(n => publicCut(n, 40)),
       within_noise: summary.flags.within_noise, reasons: summary.flags.reasons.slice(0, 20).map(r => publicCut(r, 300)),
+      cut_off_fell: summary.flags.cut_off_fell, cut_off: summary.flags.cut_off,
     },
     exchanges: exchangesOf(request, answers, turns),
     cost: {
@@ -226,7 +231,11 @@ export async function lessonQuestionsBySlug(slug: string, subskill: number): Pro
   const answersOf = (held: boolean, q: number, phase: string) => answers
     .filter(a => a.phase === phase && a.held_back === held && a.question === q && (a.status === 'ok' || a.status === 'no_answer'))
     .sort((a, b) => a.sample - b.sample)
-    .map(a => ({ text: publicCut(a.answer ?? '', 300), passed: a.passed }))
+    .map(a => ({
+      text: publicCut(a.answer ?? '', 300), passed: a.passed,
+      // how the answer ended, as the lab stored it: cut off by the token limit, or no text at all
+      cut_short: a.cut_short === true, empty: a.status === 'ok' && a.cut_short !== true && !(a.answer ?? '').trim(),
+    }))
   const list: LessonQuestions['questions'] = []
   for (const [held, tasks] of [[false, s.practice], [true, s.held_back]] as const) {
     for (const [q, task] of tasks.entries()) {
