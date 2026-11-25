@@ -121,6 +121,9 @@ RENDERERS = {
     "thinkingmachines/Inkling-2-Mini": "tml_v0",
 }
 
+# The tokenizer class each effort-taking renderer must wrap (tinker-cookbook 0.7.x, tml-renderers). Inkling 2 uses h200k.
+TOKENIZER_CLASS = {"tml_v0": "H200kBaseChatTokenizer"}
+
 # Renderers that take a thinking effort, and the one the runner uses for both
 # training and sampling. 0.0 is the "none" level of Tinker's thinking-effort
 # page: the model is conditioned toward no reasoning (it is not a hard
@@ -1878,14 +1881,35 @@ def judge_render(prompt, other_prompt, example, weights, decode) -> list:
     weighted = [i for i, w in enumerate(weights) if w > 0]
     first = weighted[0] if weighted else -1
     trained_text = decode([example[i] for i in weighted]) if weighted else ""
+    # Judged on text, not on a token count compared with a character count: the answer, then at most a short end marker.
+    at = trained_text.rfind(RENDER_CHECK_ANSWER)
+    tail_ok = at >= 0 and len(trained_text) - at - len(RENDER_CHECK_ANSWER) <= 16 and len(trained_text[:at]) <= 16
     return [
         {"what": "the generation prompt is not empty", "ok": len(prompt) > 0},
         {"what": "a different effort gives a different prompt, so the effort is really sent", "ok": list(prompt) != list(other_prompt)},
         {"what": "the generation prompt is the start of the training example, token for token", "ok": len(prompt) > 0 and list(example[:len(prompt)]) == list(prompt)},
         {"what": "training weighs nothing the sampling prompt already holds", "ok": first >= len(prompt) > 0},
         {"what": "the weighted tokens are the answer", "ok": RENDER_CHECK_ANSWER in trained_text},
-        {"what": "the weights cover the answer and no more than a little format after it", "ok": 0 < len(weighted) <= len(RENDER_CHECK_ANSWER) + 16},
+        {"what": "the weights cover the answer and no more than a little format after it", "ok": tail_ok},
     ]
+
+
+def judge_family(base_model: str, recommended, tokenizer_class) -> list:
+    """Checks that the renderer and tokenizer are the ones made for this model, not only that they agree with each other.
+
+    `recommended`: the cookbook's recommended renderer name for the model (None if it could not be read).
+    `tokenizer_class`: the class name of the tokenizer the renderer wraps (None if this cookbook version hides it).
+    A value that could not be read is reported as not checked, never as a pass.
+    """
+    want = RENDERERS[base_model]
+    checks = [{"what": "the cookbook recommends this renderer for the model", "ok": recommended == want}]
+    wanted_tokenizer = TOKENIZER_CLASS.get(want)
+    if wanted_tokenizer:
+        if tokenizer_class is None:
+            checks.append({"what": "the tokenizer is the model's own family (not checked: this cookbook version does not expose it)", "ok": True, "checked": False})
+        else:
+            checks.append({"what": "the tokenizer is the model's own family", "ok": tokenizer_class == wanted_tokenizer})
+    return checks
 
 
 # ---------------------------------------------------------------------------
@@ -1941,6 +1965,13 @@ class TinkerDeps:
             question + [{"role": "assistant", "content": RENDER_CHECK_ANSWER}], train_on_what=TrainOnWhat.LAST_ASSISTANT_MESSAGE)
         decode = renderer.tokenizer.decode
         checks = judge_render(prompt.to_ints(), other.to_ints(), example.to_ints(), [float(w) for w in weights.tolist()], decode)
+        try:
+            from tinker_cookbook.model_info import get_recommended_renderer_name
+            recommended = get_recommended_renderer_name(base_model)
+        except Exception:
+            recommended = None
+        inner = getattr(getattr(renderer, "_renderer", None), "_tml_tokenizer", None)
+        checks += judge_family(base_model, recommended, type(inner).__name__ if inner is not None else None)
         return {
             "status": "ok" if all(c["ok"] for c in checks) else "failed", "renderer": name, "effort": renderer.effort,
             "prompt_tokens": int(prompt.length), "prompt_text": decode(prompt.to_ints()), "checks": checks,

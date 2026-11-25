@@ -324,6 +324,25 @@ class RenderCheckTests(unittest.TestCase):
         self.assertIn("the weighted tokens are the answer", failed)
         self.assertIn("the weights cover the answer and no more than a little format after it", failed)
 
+    def test_thirty_extra_trained_format_tokens_fail(self):
+        prompt, other, example, weights = self.good()
+        example = example + [ord("x")] * 30
+        weights = weights + [0.1] * 30
+        self.assertIn("the weights cover the answer and no more than a little format after it", self.failed(prompt, other, example, weights))
+
+    def test_the_wrong_renderer_or_tokenizer_family_fails(self):
+        ok = M.judge_family("thinkingmachines/Inkling-2-Mini", "tml_v0", "H200kBaseChatTokenizer")
+        self.assertTrue(all(c["ok"] for c in ok))
+        wrong_tok = M.judge_family("thinkingmachines/Inkling-2-Mini", "tml_v0", "O200kBaseChatTokenizer")
+        self.assertEqual([c["ok"] for c in wrong_tok], [True, False])
+        wrong_name = M.judge_family("thinkingmachines/Inkling-2-Mini", "qwen3_5", "H200kBaseChatTokenizer")
+        self.assertFalse(wrong_name[0]["ok"])
+        self.assertFalse(M.judge_family("thinkingmachines/Inkling-2-Mini", None, None)[0]["ok"])
+
+    def test_a_tokenizer_the_cookbook_hides_is_reported_as_not_checked(self):
+        hidden = M.judge_family("thinkingmachines/Inkling-2-Mini", "tml_v0", None)
+        self.assertEqual(hidden[1].get("checked"), False)
+
     def test_an_example_with_no_weight_at_all_fails(self):
         prompt, other, example, weights = self.good()
         self.assertTrue(self.failed(prompt, other, example, [0.0] * len(example)))

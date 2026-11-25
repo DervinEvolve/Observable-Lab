@@ -24,10 +24,11 @@
 #   uv run ... python modal/tinker_smoke.py render --model thinkingmachines/Inkling-2-Mini
 # It calls the deployed `render_check`, which renders one made-up conversation
 # the way the runner trains and samples it, with no Tinker call, no key and no
-# cost, and prints the prompt it built and six checks: the effort really goes
+# cost, and prints the prompt it built and its checks: the effort really goes
 # in, the sampling prompt is the start of the training example token for token,
-# and training weighs only the answer. A renderer or tokenizer that is wrong
-# for the model fails it. The training check below (and `keep`) runs it first
+# training weighs only the answer, the renderer name is the cookbook's for the
+# model and the tokenizer is the right family. Only the paid training check
+# below proves the tokens themselves. The training check below (and `keep`) runs it first
 # for such a model and stops when it fails.
 #
 # A second check, of the two HTTP endpoints the lab server uses (it starts one
