@@ -27,7 +27,7 @@ import { budgetScopeFor } from './experiment-modes.js'
 import type { Rubric, RubricTask } from './rubric.js'
 import { buildRequestBody, callModelOnce, getModelCapabilities, type ModelCapabilities } from './openrouter.js'
 import { dailyBudgetUsd, refreshEpochCost, researchDailyBudgetUsd, spentTodayUsd, withSpendContext } from './spend.js'
-import { recordToolRun, toolsRunInEpoch, type ToolRunInput, type ToolRunStatus } from './tool-runs-store.js'
+import { TOOL_OUTPUT_TAIL_BYTES, recordToolRun, toolsRunInEpoch, type ToolRunInput, type ToolRunStatus } from './tool-runs-store.js'
 import { TINKER_NAME_TOOL } from './tinker-keep-request.js'
 import {
   TINKER_ESTIMATE_MARGIN, TINKER_MAX_DATASET_BYTES, TINKER_MAX_EXAMPLE_BYTES, TINKER_PRICE_TABLE_DATE, estimateTinkerRun, isExternalPath, isSamplerPath, newAdapterSlug, newSplitSalt,
@@ -262,7 +262,16 @@ export async function advanceTutorLessonsDetailed(opts: { deadlineAt: number; no
   if (!opts.only) {
     // What a request that died while opening a lesson left behind: a place of the day, or a run row with no lesson.
     try {
-      await repairLessonOpenings(now, new Date(now.getTime() - TUTOR_LEASE_MS), NEVER_OPENED)
+      const repaired = await repairLessonOpenings(now, new Date(now.getTime() - TUTOR_LEASE_MS), NEVER_OPENED)
+      // A run row closed here gets its tool run row, as every other way a lesson's run row is closed does, unless the epoch already has one.
+      for (const c of repaired.runs) {
+        const have = await toolsRunInEpoch(c.experiment_id, c.epoch)
+        if (have.has(TUTOR_TOOL) || have.has('*')) continue
+        await recordToolRun({
+          experimentId: c.experiment_id, epoch: c.epoch, model: c.model, tool: TUTOR_TOOL, requestSummary: `Socratic lesson lab/${c.slug}`,
+          status: 'failed', costUsd: 0, outputTail: `failed: ${NEVER_OPENED}; no Tinker use and no teacher call, so no cost`,
+        })
+      }
     } catch {
       // no lesson tables yet, or the database is away: nothing to repair now
     }
@@ -404,8 +413,9 @@ class LessonSlice {
       taught: this.stage === 'diagnostic' ? 0 : done, to_teach: this.stage === 'diagnostic' ? 0 : taught.length,
       seq: (this.lesson.progress?.seq ?? 0) + 1, updated_at: new Date().toISOString(),
     }
-    await setProgress(this.lesson.run_id, progress)
+    // Kept before the write is sent: the four calls in flight each write a record, and each takes its own number.
     this.lesson.progress = progress
+    await setProgress(this.lesson.run_id, progress)
   }
 
   // ---- student calls -----------------------------------------------------------
@@ -1186,22 +1196,50 @@ export function summarizeLesson(request: TinkerTutorRequest, answers: AnswerRow[
   }
 }
 
-/** The one line of the tool run (spec 1.9). Says what was counted, by whom, and that the Tinker cost is an estimate. */
+/**
+ * The flags of a tool run line, within `room` bytes: every reason when they
+ * fit, or else as many as fit from the front (tutorFlags puts the shared
+ * answers reasons last) with the number left to the lesson's record. The
+ * store keeps the end of a line that is too long, so without this a lesson
+ * with many flags lost the start of its line, where the pass counts are.
+ */
+function flagsWithin(reasons: string[], room: number): string {
+  if (!reasons.length) return ''
+  for (let n = reasons.length; n > 0; n--) {
+    const left = reasons.length - n
+    const text = `; FLAG: ${reasons.slice(0, n).join('; ')}${left ? `; and ${left} more on the lesson's record` : ''}`
+    if (Buffer.byteLength(text, 'utf8') <= room) return text
+  }
+  return `; FLAG: ${reasons.length} on the lesson's record`
+}
+
+/** Room kept below the stored length of a tool run line (TOOL_OUTPUT_TAIL_BYTES), for what cleaning the line may add. */
+const LINE_MARGIN_BYTES = 96
+
+/**
+ * The one line of the tool run (spec 1.9). Says what was counted, by whom, and
+ * that the Tinker cost is an estimate. The number of flags stands beside the
+ * pass counts: the next epoch's models are given the first 300 characters of
+ * this line (recentToolContext), which end before the reasons.
+ */
 export function describeLesson(input: {
   status: string; reason: string | null; result: Record<string, unknown>; slug: string; base: string; expiresAt: string | null
   tinkerUsd: number; teacherUsd: number; name: string | null
 }): string {
   const r = input.result as { overall?: { before: Cell | null; after: Cell | null }; skill_map?: LessonSummary['skill_map']; teaching?: LessonSummary['teaching']; flags?: { reasons?: string[] } }
   const costs = `estimated Tinker cost $${input.tinkerUsd.toFixed(4)} (token counts at Tinker's published prices of ${TINKER_PRICE_TABLE_DATE}, not a billed amount); teacher cost $${input.teacherUsd.toFixed(4)} (OpenRouter's reported cost)`
-  const flags = r.flags?.reasons?.length ? `; FLAG: ${r.flags.reasons.join('; ')}` : ''
-  if (input.status !== 'ok') return `${input.status}: ${input.reason ?? 'unknown'}${flags}; ${costs}; ${TUTOR_MEASURE_NOTE}`
+  const reasons = Array.isArray(r.flags?.reasons) ? r.flags.reasons.filter(x => typeof x === 'string') : []
+  const tail = `; ${costs}; ${TUTOR_MEASURE_NOTE}`
+  const line = (head: string) => `${head}${flagsWithin(reasons, TOOL_OUTPUT_TAIL_BYTES - LINE_MARGIN_BYTES - Buffer.byteLength(head + tail, 'utf8'))}${tail}`
+  if (input.status !== 'ok') return line(`${input.status}: ${input.reason ?? 'unknown'}`)
   const b = r.overall?.before, a = r.overall?.after
   const n = b?.total ?? a?.total ?? 0
   const bands = (r.skill_map ?? []).map(s => `${s.name} ${s.before ? s.before.band : '?'} to ${s.after ? s.after.band : '?'}`).join(', ')
   const t = r.teaching
   const adapter = `adapter lab/${input.slug}${input.name ? ` named "${input.name}"` : ''} on ${input.base}${input.expiresAt ? `, kept until ${input.expiresAt.slice(0, 10)}` : ''}`
   const cut = t?.cut_off ? ` (in ${t.cut_off} turn${t.cut_off === 1 ? '' : 's'} of teaching the token limit cut off the small model's reply or answer)` : ''
-  return `COUNTED BY THE LAB, with rules a model wrote: held back answers passed: ${b?.passed ?? '?'} of ${n} before, ${a?.passed ?? '?'} of ${n} after; pass bands by subskill ${bands}; ${t?.solved ?? 0} of ${t?.missed ?? 0} missed practice questions solved by guiding questions, ${t?.explained ?? 0} explained${cut}; ${adapter}${input.reason ? `; ${input.reason}` : ''}${flags}; ${costs}; ${TUTOR_MEASURE_NOTE}`
+  const flagged = reasons.length ? `, with ${reasons.length} flag${reasons.length === 1 ? '' : 's'} on the lesson's record` : ''
+  return line(`COUNTED BY THE LAB, with rules a model wrote: held back answers passed: ${b?.passed ?? '?'} of ${n} before, ${a?.passed ?? '?'} of ${n} after${flagged}; pass bands by subskill ${bands}; ${t?.solved ?? 0} of ${t?.missed ?? 0} missed practice questions solved by guiding questions, ${t?.explained ?? 0} explained${cut}; ${adapter}${input.reason ? `; ${input.reason}` : ''}`)
 }
 
 /** For the public record: the explanation's shown copy. */

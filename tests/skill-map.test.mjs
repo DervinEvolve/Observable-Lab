@@ -913,3 +913,28 @@ test('held back questions that share an answer with practice are carried on the 
     p.close()
   }, { record: { ...flagged(), rubrics: [[], [], [], []] } })
 })
+
+test('the page reads as many reasons as the server can give one lesson, and the panel prints every one', async () => {
+  // six reasons said once and four said once a subskill: the page's limit is the server's, read from its source
+  assert.equal(logic.MAX_REASONS, 6 + 4 * logic.MAX_SUBSKILLS)
+  assert.equal(logic.MAX_REASONS, 46)
+  assert.ok(read('api/_lib/tinker-tutor.ts').includes('export const TUTOR_MAX_REASONS = 6 + 4 * TUTOR_SUBSKILLS.max\n'))
+  assert.ok(read('api/_lib/tinker-tutor.ts').includes('export const TUTOR_SUBSKILLS = { min: 4, max: 10 } as const'))
+  assert.ok(read('api/_lib/tinker-tutor-public.ts').includes('reasons: summary.flags.reasons.slice(0, TUTOR_MAX_REASONS)'))
+  const reasons = n => Array.from({ length: n }, (_, i) => `Subskill ${i}: reason number ${i} of the lesson`)
+  const withReasons = n => finished({ flags: { ...finished().flags, reasons: reasons(n) } })
+  // a ten subskill yes or no lesson whose scores all fell has 21: more than the 20 the page read before
+  for (const n of [21, 46]) assert.deepEqual(state(withReasons(n)).lesson.flags.reasons, reasons(n), `${n} reasons`)
+  assert.equal(state(withReasons(47)).lesson, null, 'more than the server can send is not a record the page reads')
+  // the other lists of names keep their own limit
+  assert.equal(state(finished({ flags: { ...finished().flags, rubric_literal: Array.from({ length: 21 }, (_, i) => `Name ${i}`) } })).lesson, null)
+  await withPage(async ({ body, fetchStub, settle }) => {
+    const p = new LessonPanel(() => {}, { fetch: fetchStub })
+    p.setLesson(state(withReasons(46)), false)
+    p.show()
+    await settle()
+    const all = box(body).children.find(c => c.id === 'lesson-panel').textContent
+    for (const r of reasons(46)) assert.equal(all.split(`${r}.`).length - 1, 1, r)
+    p.close()
+  }, { record: { ...withReasons(46), rubrics: [[], [], [], []] } })
+})

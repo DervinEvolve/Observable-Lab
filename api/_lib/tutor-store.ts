@@ -332,7 +332,13 @@ export async function heldHashMatches(hashes: string[]): Promise<Array<{ hash: s
   }))
 }
 
-/** Writes the lesson row and its question hashes. Throws when it could not. */
+/**
+ * Writes the lesson row and its question hashes in one statement, so a
+ * request that dies here leaves both or neither: a lesson row with no hashes
+ * would be run to its end by later slices while the check against earlier
+ * lessons (lessonReuseReason) knew nothing of its questions. Throws when it
+ * could not.
+ */
 export async function createLesson(params: {
   runId: string
   slug: string
@@ -349,20 +355,23 @@ export async function createLesson(params: {
 }): Promise<LessonRow | null> {
   await ensureTutorTables()
   const r = await sql`
-    INSERT INTO tutor_lessons (
-      run_id, slug, created_at, stage, round, request, teacher_model, teacher_cap_usd, budget_scope, experiment_id, epoch, spend_day, reserved_usd
-    ) VALUES (
-      ${params.runId}, ${params.slug}, ${params.now.toISOString()}, ${'diagnostic'}, ${1}, ${JSON.stringify(params.request)}, ${params.teacherModel},
-      ${usd(params.teacherCapUsd)}, ${params.budgetScope}, ${params.experimentId}, ${params.epoch}, ${params.spendDay}, ${usd(params.reservedUsd)}
+    WITH lesson AS (
+      INSERT INTO tutor_lessons (
+        run_id, slug, created_at, stage, round, request, teacher_model, teacher_cap_usd, budget_scope, experiment_id, epoch, spend_day, reserved_usd
+      ) VALUES (
+        ${params.runId}, ${params.slug}, ${params.now.toISOString()}, ${'diagnostic'}, ${1}, ${JSON.stringify(params.request)}, ${params.teacherModel},
+        ${usd(params.teacherCapUsd)}, ${params.budgetScope}, ${params.experimentId}, ${params.epoch}, ${params.spendDay}, ${usd(params.reservedUsd)}
+      )
+      ON CONFLICT (run_id) DO NOTHING
+      RETURNING *
+    ),
+    hashes AS (
+      INSERT INTO tutor_held_hashes (hash, held_back, topic, lesson_slug)
+      SELECT x.hash, x.held_back, ${params.request.topic}::text, ${params.slug}::text
+      FROM jsonb_to_recordset(${JSON.stringify(params.hashes)}::jsonb) AS x(hash TEXT, held_back BOOLEAN)
+      ON CONFLICT DO NOTHING
     )
-    ON CONFLICT (run_id) DO NOTHING
-    RETURNING *
-  `
-  await sql`
-    INSERT INTO tutor_held_hashes (hash, held_back, topic, lesson_slug)
-    SELECT x.hash, x.held_back, ${params.request.topic}::text, ${params.slug}::text
-    FROM jsonb_to_recordset(${JSON.stringify(params.hashes)}::jsonb) AS x(hash TEXT, held_back BOOLEAN)
-    ON CONFLICT DO NOTHING
+    SELECT * FROM lesson
   `
   return r.rows[0] ? lessonRow(r.rows[0] as Record<string, unknown>) : null
 }
@@ -545,8 +554,16 @@ export async function setStopReason(runId: string, reason: string): Promise<void
   await sql`UPDATE tutor_lessons SET stop_reason = ${reason.slice(0, 500)} WHERE run_id = ${runId} AND stop_reason IS NULL`
 }
 
+/**
+ * Stores a progress record. Never backwards (as setRlProgress): the four
+ * calls in flight each write one, and a record that lands after a newer one
+ * does not replace it.
+ */
 export async function setProgress(runId: string, progress: LessonProgress): Promise<void> {
-  await sql`UPDATE tutor_lessons SET progress = ${JSON.stringify(progress)} WHERE run_id = ${runId}`
+  await sql`
+    UPDATE tutor_lessons SET progress = ${JSON.stringify(progress)}
+    WHERE run_id = ${runId} AND (progress IS NULL OR (progress->>'seq') IS NULL OR (progress->>'seq')::int < ${progress.seq}::int)
+  `
 }
 
 export async function setTrain(runId: string, train: TrainLeg[]): Promise<void> {
@@ -690,15 +707,17 @@ export async function takeTutorDaySlot(now: Date, perDay: number): Promise<boole
  *   tutor_lessons for that day) gives the difference back.
  *
  * Never creates a table: with none, the caller treats the error as nothing
- * to repair. Returns how many run rows and places were repaired.
+ * to repair. Returns the run rows it closed (the caller writes a tool run for
+ * each, as for every other way a lesson's run row is closed) and how many
+ * places were given back.
  */
-export async function repairLessonOpenings(now: Date, cutoff: Date, reason: string): Promise<{ runs: number; places: number }> {
+export async function repairLessonOpenings(now: Date, cutoff: Date, reason: string): Promise<{ runs: Array<{ experiment_id: string; epoch: number; model: string; slug: string }>; places: number }> {
   const orphans = await sql`
     WITH orphan AS (
       UPDATE tinker_runs r SET status = 'failed', reason = ${reason}, cost_usd = 0, finished_at = ${now.toISOString()}
       WHERE r.kind = 'tutor' AND r.status = 'lesson' AND r.created_at < ${cutoff.toISOString()}
         AND NOT EXISTS (SELECT 1 FROM tutor_lessons l WHERE l.run_id = r.id)
-      RETURNING r.spend_day, r.reserved_usd
+      RETURNING r.spend_day, r.reserved_usd, r.experiment_id, r.epoch, r.model, r.slug
     ),
     settled AS (
       UPDATE tinker_spend_days d SET reserved_usd = GREATEST(0, d.reserved_usd - s.reserved)
@@ -706,7 +725,7 @@ export async function repairLessonOpenings(now: Date, cutoff: Date, reason: stri
       WHERE d.day = s.spend_day AND d.scope = 'all'
       RETURNING d.day
     )
-    SELECT COUNT(*) AS n FROM orphan
+    SELECT experiment_id, epoch, model, slug FROM orphan
   `
   const places = await sql`
     UPDATE tutor_day_slots s SET n = c.n
@@ -715,7 +734,10 @@ export async function repairLessonOpenings(now: Date, cutoff: Date, reason: stri
       AND (s.taken_at IS NULL OR s.taken_at < ${cutoff.toISOString()})
     RETURNING s.day
   `
-  return { runs: Number(orphans.rows[0]?.n) || 0, places: places.rows.length }
+  return {
+    runs: orphans.rows.map(r => ({ experiment_id: String(r.experiment_id), epoch: Number(r.epoch) || 0, model: String(r.model), slug: String(r.slug) })),
+    places: places.rows.length,
+  }
 }
 
 /** Gives a place back: the lesson was refused before any call was sent. */

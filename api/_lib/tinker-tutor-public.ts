@@ -12,7 +12,7 @@ import { describeRubric } from './rubric.js'
 import { TINKER_PRICE_TABLE_DATE, isAdapterSlug, trainedChatStatus } from './tinker.js'
 import { ORIGIN_MODELS, getRun, shownName, type TinkerRunRow } from './tinker-store.js'
 import {
-  TUTOR_EXPLAIN_SHOWN_BYTES, TUTOR_LIVE_MS, TUTOR_MEASURED_BY, TUTOR_SAMPLES, TUTOR_SUBSKILLS, allQuestions, missesToTeach, modelName, publicCut, tinkerTutorStatus,
+  TUTOR_EXPLAIN_SHOWN_BYTES, TUTOR_LIVE_MS, TUTOR_MAX_REASONS, TUTOR_MEASURED_BY, TUTOR_SAMPLES, TUTOR_SUBSKILLS, allQuestions, missesToTeach, modelName, publicCut, tinkerTutorStatus,
   type Cell, type CutOff, type TinkerTutorRequest,
 } from './tinker-tutor.js'
 import { summarizeLesson } from './tinker-tutor-run.js'
@@ -144,7 +144,7 @@ export function publicLesson(run: TinkerRunRow, lesson: LessonRow | null, answer
       seen_only: summary.flags.seen_only, too_easy: summary.flags.too_easy, unanswered: summary.flags.unanswered, cut_short_before: summary.flags.cut_short_before,
       rubric_literal: summary.flags.rubric_literal.map(n => publicCut(n, 40)), shared_literals: summary.flags.shared_literals.map(n => publicCut(n, 40)),
       shared_answers: summary.flags.shared_answers.slice(0, TUTOR_SUBSKILLS.max).map(e => ({ name: publicCut(e.name, 40), shared: e.shared, of: e.of })),
-      within_noise: summary.flags.within_noise, reasons: summary.flags.reasons.slice(0, 20).map(r => publicCut(r, 300)),
+      within_noise: summary.flags.within_noise, reasons: summary.flags.reasons.slice(0, TUTOR_MAX_REASONS).map(r => publicCut(r, 300)),
       cut_off_fell: summary.flags.cut_off_fell, cut_off: summary.flags.cut_off,
     },
     exchanges: exchangesOf(request, answers, turns),

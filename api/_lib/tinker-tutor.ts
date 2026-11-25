@@ -21,7 +21,7 @@
  */
 import { createHash } from 'node:crypto'
 import {
-  RUBRIC_MAX_RULES, describeRubric, normaliseText, normalizeRubric, normalizeTask, rubricFitsTasks, rubricMax, scoreCompletion,
+  RUBRIC_MAX_RULES, describeRubric, normaliseText, normalizeRubric, normalizeTask, numbersIn, rubricFitsTasks, rubricMax, scoreCompletion,
   type Rubric, type RubricRule, type RubricTask,
 } from './rubric.js'
 import {
@@ -381,13 +381,33 @@ export function leaks(text: string, targets: string[]): boolean {
 /**
  * The forms a value is compared in: its text after normaliseText and, when it
  * is a plain number, the number itself, so "579.0" and "579" are the same
- * value. There is no length floor: "no" is compared as "yes" is.
+ * value. There is no length floor: "no" is compared as "yes" is. A value that
+ * normaliseText leaves nothing of (only quotes or ending punctuation, such as
+ * "?") is compared as written. For a value a number_close rule reads, the
+ * number the grader takes from it (the first number in its text, numbersIn)
+ * is a form too, so "1,234", "12 km" and "$15.00" are the numbers 1234, 12
+ * and 15 there.
  */
-function valueForms(v: string): string[] {
-  const n = normaliseText(v)
+function valueForms(v: string, numberClose = false): string[] {
+  const n = normaliseText(v) || v.normalize('NFKC').replace(/\s+/gu, ' ').trim()
   if (!n) return []
+  const out = [n]
   const plain = /^[+-]?(\d+(\.\d*)?|\.\d+)$/.test(n) ? Number(n) : NaN
-  return Number.isFinite(plain) ? [n, `number:${plain}`] : [n]
+  if (Number.isFinite(plain)) out.push(`number:${plain}`)
+  const read = numberClose ? numbersIn(v)[0] : undefined
+  if (read !== undefined && Number.isFinite(read) && !out.includes(`number:${read}`)) out.push(`number:${read}`)
+  return out
+}
+
+/** The values a subskill's rules read from a question through "from" (targetsRead), in the forms they are compared in. */
+function expectedForms(rubric: Rubric, task: RubricTask): string[] {
+  const out: string[] = []
+  for (const rule of rubric.rules) {
+    if (!rule.from) continue
+    const v = rule.from === 'expected' ? task.expected : task.data?.[rule.from.slice(5)]
+    if (v !== undefined) out.push(...valueForms(String(v), rule.type === 'number_close'))
+  }
+  return out
 }
 
 /**
@@ -402,15 +422,14 @@ function valueForms(v: string): string[] {
  * is stored as a flag. Subskills with no such question are left out.
  */
 export function sharedAnswers(subskills: ReadonlyArray<Pick<TutorSubskill, 'name' | 'rubric' | 'practice' | 'held_back'>>): SharedAnswers[] {
-  const expects = (rubric: Rubric, task: RubricTask) => targetsRead(rubric, task).flatMap(valueForms)
   const taught = new Set<string>()
   for (const s of subskills) {
-    for (const v of rubricLiterals(s.rubric)) for (const f of valueForms(v)) taught.add(f)
-    for (const p of s.practice) for (const f of expects(s.rubric, p)) taught.add(f)
+    for (const rule of s.rubric.rules) for (const v of ruleLiterals(rule)) for (const f of valueForms(v, rule.type === 'number_close')) taught.add(f)
+    for (const p of s.practice) for (const f of expectedForms(s.rubric, p)) taught.add(f)
   }
   const out: SharedAnswers[] = []
   for (const s of subskills) {
-    const shared = s.held_back.filter(h => expects(s.rubric, h).some(f => taught.has(f))).length
+    const shared = s.held_back.filter(h => expectedForms(s.rubric, h).some(f => taught.has(f))).length
     if (shared > 0) out.push({ name: s.name, shared, of: s.held_back.length })
   }
   return out
@@ -752,6 +771,16 @@ export function seenOnly(seenBefore: Count | null, seenAfter: Count | null, held
   return gs >= TUTOR_SEEN_GAIN_FLOOR - 1e-12 && gh < TUTOR_SEEN_GAP_SHARE * gs
 }
 
+/**
+ * The most reasons tutorFlags can give one lesson: six that are said once
+ * (seen only, too easy, unanswered, cut off before or fewer cut off after,
+ * within noise, the teacher's own answers) and four that are said once a
+ * subskill (fixed phrase, a rule value in a held back question, a held back
+ * score that fell, shared answers). The public record carries this many, so
+ * the lesson panel prints every reason.
+ */
+export const TUTOR_MAX_REASONS = 6 + 4 * TUTOR_SUBSKILLS.max
+
 /** The flags of 1.6. They are stored and shown; they block nothing. */
 export function tutorFlags(input: {
   request: Pick<TinkerTutorRequest, 'subskills' | 'flags'>
@@ -783,7 +812,6 @@ export function tutorFlags(input: {
   for (const name of request.flags.rubric_literal) reasons.push(`${name}: every rule checks a fixed phrase, so a gain may be the phrase`)
   for (const name of request.flags.shared_literals) reasons.push(`${name}: a rule value appears in a held back question`)
   const sharedAnswerCounts = sharedAnswersOf(request.flags)
-  for (const e of sharedAnswerCounts) reasons.push(sharedAnswersReason(e))
   const noise = withinNoise(before.overall, after?.overall ?? null)
   if (noise) reasons.push('the change from before to after is smaller than one pass band, so it is within noise')
   if (input.teacherFailed) reasons.push(`${input.teacherFailed} of the teacher's own answers did not pass the rules`)
@@ -795,6 +823,8 @@ export function tutorFlags(input: {
       reasons.push(`${s.name}: a held back score fell from ${f2(b.passed / b.total)} to ${f2(a.passed / a.total)}`)
     }
   }
+  // Last, as the chart's note ranks them: where a list of reasons is cut to fit, these go first and the other flags stay.
+  for (const e of sharedAnswerCounts) reasons.push(sharedAnswersReason(e))
   return {
     seen_only: overallSeen || seenOnlyBy.some(Boolean), too_easy: easy, unanswered, cut_short_before: cut, cut_off_fell: fell,
     cut_off: { before: cutBefore, after: cutAfter },
@@ -1265,7 +1295,7 @@ export function tinkerTutorNote(opts: { perDay: number; teacherUsd: number; teac
     ? ` You may give the adapter a display name with "name": ${ADAPTER_NAME_MIN} to ${ADAPTER_NAME_MAX} characters, only letters, digits, spaces, hyphens, apostrophes and dots; a name that is refused is left off with the reason stored and the lesson goes on.`
     : ''
   const chat = opts.chat ? ' While the adapter is alive it can be talked to in the room\'s trained chat.' : ''
-  return `Socratic lesson: as Executor you may ask for one lesson for an open-weight model on Tinker, a training service. LoRA only. The base model is one of: ${models}. You write the lesson into your answer as data, and no code: a topic, and ${TUTOR_SUBSKILLS.min} to ${TUTOR_SUBSKILLS.max} subskills. Each subskill has a name, a rubric, ${TUTOR_PRACTICE.min} to ${TUTOR_PRACTICE.max} practice questions and ${TUTOR_HELD_BACK.min} to ${TUTOR_HELD_BACK.max} held back questions, each { "prompt" (text, at most 1500 bytes), optionally "expected" and "data" }, at most ${TUTOR_MAX_BYTES} bytes of text in all, no two questions alike. A rubric is 1 to ${RUBRIC_MAX_RULES} rules, ${RUBRIC_MENU}. An answer passes when it satisfies every rule; a rubric that an empty answer passes is refused. The lab's own code then does all of this: it asks the untrained model every question ${TUTOR_SAMPLES} times and grades each answer; for at most ${TUTOR_MAX_TAUGHT} practice questions it got wrong, a teacher model (${teacher}) is asked for one guiding question at a time, the small model replies and answers again, and the lab grades it, for at most ${TUTOR_GUIDING_TURNS.max} guiding questions a question ("guiding_turns"), after which the teacher is asked for a short explanation and an answer that must itself pass the rubric; one adapter is trained on those exchanges; then every question is asked again. The teacher's calls never contain the text of a held back question and carry no context of yours; a held back question is refused when its words are nearly the same as those of a practice question of any subskill; a reworded question is not caught. A held back question that expects a value a practice question of any subskill also expects (a value the rules read from "expected" or "data", the same text after normalising or the same number, of any length), or a value a rubric gives as a fixed value, is accepted and flagged on the record with the count for its subskill, because the adapter may pass it by recalling a taught answer; that is a limit of the measure. A value that is only part of another value, or that only appears inside a practice prompt, is not counted. A pass band 0 to 5 for each subskill is computed by the lab from the share of held back answers that passed, before and after; the lab counts the passes, you and the teacher do not report them. A gain on practice questions with little gain on held back ones is flagged, and so are rubrics whose every rule is a fixed phrase (a value of its own, or a pattern that is a fixed text). Settings are bounded: rank ${TINKER_RANKS.join(', ')}, learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}, as for Tinker training; max_answer_tokens ${TUTOR_ANSWER_TOKENS.min} to ${TUTOR_ANSWER_TOKENS.max} (the limit counts every token the small model writes, which for a base model that thinks before it answers may include that thinking; an answer the limit cut off is graded as it stands, and the record counts the answers the service reports as cut off or that used the whole limit, in every test and in teaching; a reply to a guiding question may be at most ${TUTOR_REPLY_TOKENS} tokens); guiding_turns ${TUTOR_GUIDING_TURNS.min} or ${TUTOR_GUIDING_TURNS.max}; rounds ${TUTOR_ROUNDS.min} or ${TUTOR_ROUNDS.max} (a second round teaches what the first adapter still misses and trains again from the base model). A request that breaks any of this is refused whole, with the reason stored. The lesson needs the Reviewer's approval and runs after the epoch, over up to a few hours. The lab estimates the most its Tinker use could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC); the teacher's calls may cost at most $${opts.teacherUsd.toFixed(2)} a lesson; at most ${opts.perDay} a day; an epoch has one Tinker run of any kind; all inside the lab's daily spending cap. The lesson, every graded answer, the teacher's questions, both skill maps, the flags and the costs are public, as is the record the lab's models read as memory; a held back question with the same text (after normalising) as a held back question of an earlier lesson is refused. The adapter is kept for ${tinkerTtlDays()} days and then expires.${chat}${named}`
+  return `Socratic lesson: as Executor you may ask for one lesson for an open-weight model on Tinker, a training service. LoRA only. The base model is one of: ${models}. You write the lesson into your answer as data, and no code: a topic, and ${TUTOR_SUBSKILLS.min} to ${TUTOR_SUBSKILLS.max} subskills. Each subskill has a name, a rubric, ${TUTOR_PRACTICE.min} to ${TUTOR_PRACTICE.max} practice questions and ${TUTOR_HELD_BACK.min} to ${TUTOR_HELD_BACK.max} held back questions, each { "prompt" (text, at most 1500 bytes), optionally "expected" and "data" }, at most ${TUTOR_MAX_BYTES} bytes of text in all, no two questions alike. A rubric is 1 to ${RUBRIC_MAX_RULES} rules, ${RUBRIC_MENU}. An answer passes when it satisfies every rule; a rubric that an empty answer passes is refused. The lab's own code then does all of this: it asks the untrained model every question ${TUTOR_SAMPLES} times and grades each answer; for at most ${TUTOR_MAX_TAUGHT} practice questions it got wrong, a teacher model (${teacher}) is asked for one guiding question at a time, the small model replies and answers again, and the lab grades it, for at most ${TUTOR_GUIDING_TURNS.max} guiding questions a question ("guiding_turns"), after which the teacher is asked for a short explanation and an answer that must itself pass the rubric; one adapter is trained on those exchanges; then every question is asked again. The teacher's calls never contain the text of a held back question and carry no context of yours; a held back question is refused when its words are nearly the same as those of a practice question of any subskill; a reworded question is not caught. A held back question that expects a value a practice question of any subskill also expects (a value the rules read from "expected" or "data"; the same text after normalising, or as written when normalising leaves nothing of it, or the same number: a value written as a plain number, or, for a value a number_close rule reads, the first number in it; of any length), or a value a rubric gives as a fixed value, is accepted and flagged on the record with the count for its subskill, because the adapter may pass it by recalling a taught answer; that is a limit of the measure. A value that is only part of another value, or that only appears inside a practice prompt, is not counted. A pass band 0 to 5 for each subskill is computed by the lab from the share of held back answers that passed, before and after; the lab counts the passes, you and the teacher do not report them. A gain on practice questions with little gain on held back ones is flagged, and so are rubrics whose every rule is a fixed phrase (a value of its own, or a pattern that is a fixed text). Settings are bounded: rank ${TINKER_RANKS.join(', ')}, learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}, epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}, batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}, as for Tinker training; max_answer_tokens ${TUTOR_ANSWER_TOKENS.min} to ${TUTOR_ANSWER_TOKENS.max} (the limit counts every token the small model writes, which for a base model that thinks before it answers may include that thinking; an answer the limit cut off is graded as it stands, and the record counts the answers the service reports as cut off or that used the whole limit, in every test and in teaching; a reply to a guiding question may be at most ${TUTOR_REPLY_TOKENS} tokens); guiding_turns ${TUTOR_GUIDING_TURNS.min} or ${TUTOR_GUIDING_TURNS.max}; rounds ${TUTOR_ROUNDS.min} or ${TUTOR_ROUNDS.max} (a second round teaches what the first adapter still misses and trains again from the base model). A request that breaks any of this is refused whole, with the reason stored. The lesson needs the Reviewer's approval and runs after the epoch, over up to a few hours. The lab estimates the most its Tinker use could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC); the teacher's calls may cost at most $${opts.teacherUsd.toFixed(2)} a lesson; at most ${opts.perDay} a day; an epoch has one Tinker run of any kind; all inside the lab's daily spending cap. The lesson, every graded answer, the teacher's questions, both skill maps, the flags and the costs are public, as is the record the lab's models read as memory; a held back question with the same text (after normalising) as a held back question of an earlier lesson is refused. The adapter is kept for ${tinkerTtlDays()} days and then expires.${chat}${named}`
 }
 
 /** What the Reviewer is told about a lesson: its size, its rubrics in words, its settings, the teacher, and the most it could cost. */

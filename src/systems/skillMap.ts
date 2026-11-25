@@ -23,6 +23,8 @@ export const ORIGIN_MODELS = 'written by the models'
 
 export const MAX_SUBSKILLS = 10
 export const MAX_EXCHANGES = 3
+/** The most reasons the lab's server can give one lesson (TUTOR_MAX_REASONS in api/_lib/tinker-tutor.ts: six said once, four said once a subskill). */
+export const MAX_REASONS = 6 + 4 * MAX_SUBSKILLS
 
 const SLUG = /^e[0-9]{1,6}-[0-9a-f]{8}$/
 const STATUSES = ['running', 'ok', 'ended', 'failed', 'error'] as const
@@ -134,7 +136,7 @@ function readLessonStrict(rawIn: unknown): PublicLesson {
     training = { steps_done: steps(t.steps_done), steps_planned: steps(t.steps_planned), holdout_loss_before: loss(t.holdout_loss_before), holdout_loss_after: loss(t.holdout_loss_after) }
   }
   const f = obj(r.flags)
-  const names = (v: unknown, n: number): string[] => (Array.isArray(v) && v.length <= 20 ? v.map(x => text(x, n)) : bad())
+  const names = (v: unknown, n: number, most = 20): string[] => (Array.isArray(v) && v.length <= most ? v.map(x => text(x, n)) : bad())
   const c = obj(r.cost)
   const money = (v: unknown): number | null => (v === null || v === undefined ? null : (finite(v) !== null && (v as number) >= 0 ? (v as number) : bad()))
   const exchanges = Array.isArray(r.exchanges) && r.exchanges.length <= MAX_EXCHANGES ? r.exchanges.map(readExchange) : bad()
@@ -172,7 +174,7 @@ function readLessonStrict(rawIn: unknown): PublicLesson {
       shared_literals: names(f.shared_literals, 40),
       shared_answers: readSharedAnswers(f.shared_answers),
       within_noise: flag(f.within_noise),
-      reasons: names(f.reasons, 300),
+      reasons: names(f.reasons, 300, MAX_REASONS),
       cut_off_fell: f.cut_off_fell === true,
       cut_off: readCutOff(f.cut_off),
     },

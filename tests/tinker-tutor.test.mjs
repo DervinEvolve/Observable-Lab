@@ -170,6 +170,10 @@ class FakeDb {
     if (this.answerDelayMs && text.startsWith('INSERT INTO tutor_answers')) {
       return new Promise(r => setTimeout(r, this.answerDelayMs())).then(() => { const out = this.answer(text, v); this.writes++; return out })
     }
+    // And the write of a progress record, so that records in flight land in another order than they were sent.
+    if (this.progressDelayMs && text.startsWith('UPDATE tutor_lessons SET progress')) {
+      return new Promise(r => setTimeout(r, this.progressDelayMs())).then(() => this.answer(text, v))
+    }
     const out = this.answer(text, v)
     if (/^(INSERT INTO tutor_answers|UPDATE tutor_turns SET state|WITH t AS|UPDATE tutor_lessons SET train|INSERT INTO tutor_turns|WITH closed AS|UPDATE tutor_lessons SET stage = 'closing')/.test(text)) this.writes++
     return out
@@ -280,16 +284,17 @@ class FakeDb {
     if (text.startsWith("WITH orphan AS ( UPDATE tinker_runs r SET status = 'failed', reason = ?, cost_usd = 0, finished_at = ?")) {
       assert.ok(text.includes("WHERE r.kind = 'tutor' AND r.status = 'lesson' AND r.created_at < ?") && text.includes('NOT EXISTS (SELECT 1 FROM tutor_lessons l WHERE l.run_id = r.id)'), 'only a lesson run with no lesson row, old enough, is closed')
       assert.ok(text.includes('UPDATE tinker_spend_days d SET reserved_usd = GREATEST(0, d.reserved_usd - s.reserved)'), 'its money set aside is given back in the same statement')
+      assert.ok(text.endsWith('SELECT experiment_id, epoch, model, slug FROM orphan'), 'the rows it closed are returned, for their tool run rows')
       const [reason, now, cutoff] = v
-      let n = 0
+      const rows = []
       for (const r of this.tinkerRuns) {
         if (r.kind !== 'tutor' || r.status !== 'lesson' || !(Date.parse(r.created_at) < Date.parse(cutoff)) || this.lesson(r.id)) continue
         Object.assign(r, { status: 'failed', reason, cost_usd: 0, finished_at: now })
         const d = this.spendDays.get(`${r.spend_day}|all`)
         if (d) d.reserved_usd = Math.max(0, d.reserved_usd - num(r.reserved_usd))
-        n++
+        rows.push({ experiment_id: r.experiment_id, epoch: r.epoch, model: r.model, slug: r.slug })
       }
-      return { rows: [{ n }] }
+      return { rows }
     }
     if (text.startsWith('UPDATE tutor_day_slots s SET n = c.n FROM (SELECT d.day, (SELECT COUNT(*) FROM tutor_lessons l WHERE l.spend_day = d.day) AS n FROM tutor_day_slots d) c')) {
       assert.ok(text.includes('WHERE s.day = c.day AND s.n > c.n AND s.day >= ? AND (s.taken_at IS NULL OR s.taken_at < ?)'), 'a place is given back only when it is old enough')
@@ -312,14 +317,11 @@ class FakeDb {
       const wanted = new Set(JSON.parse(v[0]))
       return { rows: this.hashes.filter(h => wanted.has(h.hash)).map(h => { const r = this.tinkerRuns.find(x => x.slug === h.lesson_slug); return { ...h, status: r?.status ?? null, finished_at: r?.finished_at ?? null } }) }
     }
-    if (text.startsWith('INSERT INTO tutor_held_hashes')) {
-      const [topic, slug, list] = v
-      for (const h of JSON.parse(list)) if (!this.hashes.some(x => x.hash === h.hash && x.lesson_slug === slug)) this.hashes.push({ hash: h.hash, held_back: h.held_back, topic, lesson_slug: slug })
-      return { rows: [] }
-    }
-    // ---- lessons ----
-    if (text.startsWith('INSERT INTO tutor_lessons')) {
-      const [run_id, slug, created_at, stage, round, request, teacher_model, teacher_cap_usd, budget_scope, experiment_id, epoch, spend_day, reserved_usd] = v
+    // ---- lessons: the lesson row and its question hashes are one statement, so both are written or neither ----
+    if (text.startsWith('WITH lesson AS ( INSERT INTO tutor_lessons')) {
+      assert.ok(text.includes('hashes AS ( INSERT INTO tutor_held_hashes (hash, held_back, topic, lesson_slug)') && text.endsWith('SELECT * FROM lesson'), 'the hashes are written by the statement that writes the lesson row')
+      const [run_id, slug, created_at, stage, round, request, teacher_model, teacher_cap_usd, budget_scope, experiment_id, epoch, spend_day, reserved_usd, topic, hashSlug, list] = v
+      for (const h of JSON.parse(list)) if (!this.hashes.some(x => x.hash === h.hash && x.lesson_slug === hashSlug)) this.hashes.push({ hash: h.hash, held_back: h.held_back, topic, lesson_slug: hashSlug })
       if (this.lesson(run_id)) return { rows: [] }
       const row = {
         run_id, slug, created_at, stage, round, request: JSON.parse(request), teacher_model, teacher_cap_usd, teacher_usd: 0, teacher_reserved_usd: 0, teacher_calls: 0,
@@ -362,7 +364,13 @@ class FakeDb {
     if (text.startsWith('UPDATE tutor_lessons SET stage = ?, round = ? WHERE run_id = ?')) { const l = this.lesson(v[2]); if (l) Object.assign(l, { stage: v[0], round: v[1] }); return { rows: [] } }
     if (text.startsWith("UPDATE tutor_lessons SET stage = 'closing', close_status = ?, close_reason = ? WHERE run_id = ?")) { const l = this.lesson(v[2]); if (l) Object.assign(l, { stage: 'closing', close_status: v[0], close_reason: v[1] }); return { rows: [] } }
     if (text.startsWith('UPDATE tutor_lessons SET stop_reason = ? WHERE run_id = ? AND stop_reason IS NULL')) { const l = this.lesson(v[1]); if (l && l.stop_reason === null) l.stop_reason = v[0]; return { rows: [] } }
-    if (text.startsWith('UPDATE tutor_lessons SET progress = ? WHERE run_id = ?')) { const l = this.lesson(v[1]); if (l) l.progress = JSON.parse(v[0]); return { rows: [] } }
+    if (text.startsWith("UPDATE tutor_lessons SET progress = ? WHERE run_id = ? AND (progress IS NULL OR (progress->>'seq') IS NULL OR (progress->>'seq')::int < ?::int)")) {
+      // never backwards: a record that lands after a newer one does not replace it
+      const l = this.lesson(v[1])
+      const stored = l?.progress?.seq
+      if (l && (stored === undefined || stored === null || stored < v[2])) l.progress = JSON.parse(v[0])
+      return { rows: [] }
+    }
     if (text.startsWith('UPDATE tutor_lessons SET train = ?, train_usd = ? WHERE run_id = ?')) { const l = this.lesson(v[2]); if (l) Object.assign(l, { train: JSON.parse(v[0]), train_usd: v[1] }); return { rows: [] } }
     if (text.startsWith('WITH old AS (')) {
       const [cutoff, reason, now, reason2] = v
@@ -994,7 +1002,9 @@ test('a whole lesson: the before map, the taught set and its order, every kind o
   const evidence = lab.toolRuns.filter(r => r.tool === 'tinker_tutor')
   assert.equal(evidence.length, 1)
   assert.match(evidence[0].request_summary, /^Socratic lesson for Qwen\/Qwen3\.5-4B on "Code words": 4 subskills, 24 questions, taught by DeepSeek V4 Pro$/)
-  assert.match(evidence[0].output_tail, /^COUNTED BY THE LAB, with rules a model wrote: held back answers passed: 8 of 24 before, 16 of 24 after; pass bands by subskill Codes 0 2 to 3, /)
+  // the number of flags stands beside the pass counts (this lesson has one: an answer of the teacher's did not pass), and the reason follows after FLAG
+  assert.match(evidence[0].output_tail, /^COUNTED BY THE LAB, with rules a model wrote: held back answers passed: 8 of 24 before, 16 of 24 after, with 1 flag on the lesson's record; pass bands by subskill Codes 0 2 to 3, /)
+  assert.ok(evidence[0].output_tail.includes('; FLAG: 1 of the teacher\'s own answers did not pass the rules; estimated Tinker cost'))
   assert.match(evidence[0].output_tail, /5 of 8 missed practice questions solved by guiding questions, 2 explained/)
   assert.match(evidence[0].output_tail, /estimated Tinker cost \$\d\.\d{4} \(token counts at Tinker's published prices of 2026-11-25, not a billed amount\); teacher cost \$\d\.\d{4} \(OpenRouter's reported cost\)/)
   assert.ok(evidence[0].output_tail.includes(tutor.TUTOR_MEASURE_NOTE), 'the tool run line carries the note')
@@ -2044,6 +2054,17 @@ test('what a request that dies while opening a lesson leaves behind is repaired 
       assert.equal(theRun().cost_usd, 0)
       assert.equal(lab.spend('all').reserved_usd, 0, 'the Tinker money it set aside was given back')
       assert.equal(await tutorRun.tutorRunsToday(), 0)
+      // the run row closed by the repair has its tool run row, as every other way a lesson's run row is closed has: failed, at no cost
+      const rows = lab.toolRuns.filter(r => r.tool === 'tinker_tutor')
+      assert.equal(rows.length, 1, 'one tool run row for the run row the repair closed')
+      assert.deepEqual([rows[0].experiment_id, rows[0].epoch, rows[0].model, rows[0].status, rows[0].cost_usd], [CTX.experimentId, CTX.epochNumber, TEACHER, 'failed', 0])
+      assert.equal(rows[0].request_summary, `Socratic lesson lab/${theRun().slug}`)
+      assert.equal(rows[0].output_tail, 'failed: the lesson was never opened: the request that asked for it stopped first, so nothing was sent; no Tinker use and no teacher call, so no cost')
+      // a later slice finds nothing left to repair and writes no second row
+      await tutorRun.advanceTutorLessons({ deadlineAt: far(), now: new Date(Date.now() + tutor.TUTOR_LEASE_MS + 120_000), pollMs: 1 })
+      assert.equal(lab.toolRuns.filter(r => r.tool === 'tinker_tutor').length, 1)
+    } else {
+      assert.equal(lab.toolRuns.filter(r => r.tool === 'tinker_tutor').length, 0, 'a place alone has no run row and so no tool run row')
     }
     // another experiment's epoch gets a lesson the same day
     const other = { ...CTX, experimentId: '22222222-2222-4222-8222-222222222222' }
@@ -2081,6 +2102,77 @@ test('a slice that dies in any of the three statements after the close still lea
     assert.equal(rows[0].detail.adapter, `lab/${theRun().slug}`)
     assert.equal(lab.modelCalls.filter(c => c.model_id === 'tool/tinker_tutor').length, 1)
     assert.equal(lab.closes, 1)
+  }
+})
+
+test('the lesson row and its question hashes are one statement: a request that dies there leaves both, and the same held back questions are refused later', async () => {
+  // the statement is committed and its answer never arrives ('lost'), or it answers and the request dies at its next statement ('next')
+  for (const mode of ['lost', 'next']) {
+    freshLab()
+    configure({ LAB_TINKER_TUTOR_PER_DAY: '3' })
+    const net = makeNet()
+    globalThis.fetch = net.fetch
+    let dead = false
+    const base = lab.handle.bind(lab)
+    lab.handle = (text, v) => {
+      if (dead) throw new Error('killed')
+      const r = base(text, v)
+      if (text.startsWith('WITH lesson AS ( INSERT INTO tutor_lessons')) { dead = true; if (mode === 'lost') throw new Error('killed') }
+      return r
+    }
+    const first = await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 }).catch(e => ({ status: 'threw', summary: e.message }))
+    dead = false
+    assert.equal(lab.statements.filter(s => /INSERT INTO tutor_held_hashes/.test(s.text)).length, 1, `${mode}: one statement names the hashes`)
+    assert.equal(lab.statements.filter(s => /INSERT INTO tutor_lessons/.test(s.text)).length, 1)
+    assert.equal(lab.lessons.length, 1, `${mode}: the lesson row was written (the request answered ${first.status})`)
+    assert.equal(lab.hashes.length, 24, `${mode}: and so were its 24 question hashes`)
+    assert.equal(lab.hashes.filter(h => h.held_back).length, 12)
+    // later slices run the lesson to its end
+    await untilDone(60)
+    assert.equal(theLesson().stage, 'done', mode)
+    assert.equal(theRun().status, 'ok', mode)
+    // the same lesson asked in the next epoch: its held back questions are known, so it is refused and nothing is opened
+    const again = await tutorRun.runTinkerTutor({ ...CTX, epochNumber: 42 }, read(lessonRaw()), { deadlineAt: Date.now() })
+    assert.equal(again.status, 'skipped', mode)
+    assert.equal(again.summary, `subskills[0].held_back[0] was a held back question of the lesson at lab/${theRun().slug}`)
+    assert.equal(lab.tinkerRuns.length, 1)
+  }
+  // and the source: the store has no second statement for the hashes
+  const source = readFileSync(join(root, 'api/_lib/tutor-store.ts'), 'utf8')
+  assert.equal(source.split('INSERT INTO tutor_held_hashes').length - 1, 1)
+  assert.match(source, /WITH lesson AS \(\s+INSERT INTO tutor_lessons[\s\S]+?hashes AS \(\s+INSERT INTO tutor_held_hashes[\s\S]+?ON CONFLICT DO NOTHING\s+\)\s+SELECT \* FROM lesson/)
+})
+
+test('every progress record of a lesson has a number of its own, and a record that lands late never replaces a newer one', async () => {
+  // Four calls are in flight in a test and each writes a progress record. The writes take 0 to 7 ms here, so they overlap
+  // and land in another order than they were sent, as with a database that takes time to answer.
+  for (let seed = 1; seed <= 5; seed++) {
+    freshLab()
+    configure()
+    let s = seed
+    const rnd = () => (s = (s * 1103515245 + 12345) % 2147483648) / 2147483648
+    lab.progressDelayMs = () => Math.floor(rnd() * 8)
+    lab.answerDelayMs = () => Math.floor(rnd() * 3)
+    globalThis.fetch = makeNet().fetch
+    let below = 0, top = 0
+    const base = lab.answer.bind(lab)
+    lab.answer = (text, v) => {
+      const out = base(text, v)
+      if (text.startsWith('UPDATE tutor_lessons SET progress')) {
+        top = Math.max(top, v[2])
+        if (theLesson().progress.seq < top) below++
+      }
+      return out
+    }
+    await tutorRun.runTinkerTutor(CTX, read(lessonRaw()), { deadlineAt: far(), pollMs: 1 })
+    await untilDone(60)
+    assert.equal(theLesson().stage, 'done', `seed ${seed}`)
+    const sent = lab.statements.filter(x => x.text.startsWith('UPDATE tutor_lessons SET progress')).map(x => ({ ...JSON.parse(x.values[0]), bound: x.values[2] }))
+    assert.ok(sent.length >= 30, `seed ${seed}: ${sent.length} progress records`)
+    assert.ok(sent.every(p => p.bound === p.seq), 'the statement compares the stored number with the record\'s own')
+    assert.equal(new Set(sent.map(p => p.seq)).size, sent.length, `seed ${seed}: two progress records were sent with the same number`)
+    assert.equal(below, 0, `seed ${seed}: after a write the stored record was older than one already stored`)
+    assert.equal(theLesson().progress.seq, Math.max(...sent.map(p => p.seq)), `seed ${seed}: the stored record is the newest one sent`)
   }
 })
 
@@ -2137,7 +2229,7 @@ test('the held back checks see through a comma, an invisible character and a num
   assert.deepEqual(read(numbers('0500')).flags.shared_answers, [{ name: 'Sums 0', shared: 1, of: 3 }])
   // what the note tells the models about these checks is what they do
   const note = tutor.tinkerTutorNote({ perDay: 1, teacherUsd: 1 })
-  assert.ok(note.includes('a held back question is refused when its words are nearly the same as those of a practice question of any subskill; a reworded question is not caught. A held back question that expects a value a practice question of any subskill also expects (a value the rules read from "expected" or "data", the same text after normalising or the same number, of any length), or a value a rubric gives as a fixed value, is accepted and flagged on the record with the count for its subskill, because the adapter may pass it by recalling a taught answer; that is a limit of the measure. A value that is only part of another value, or that only appears inside a practice prompt, is not counted.'))
+  assert.ok(note.includes('a held back question is refused when its words are nearly the same as those of a practice question of any subskill; a reworded question is not caught. A held back question that expects a value a practice question of any subskill also expects (a value the rules read from "expected" or "data"; the same text after normalising, or as written when normalising leaves nothing of it, or the same number: a value written as a plain number, or, for a value a number_close rule reads, the first number in it; of any length), or a value a rubric gives as a fixed value, is accepted and flagged on the record with the count for its subskill, because the adapter may pass it by recalling a taught answer; that is a limit of the measure. A value that is only part of another value, or that only appears inside a practice prompt, is not counted.'))
   assert.doesNotMatch(note, /expects a value the teacher is shown/)
   assert.doesNotMatch(note, /3 characters or more/)
   assert.doesNotMatch(note, /shorter value/)
@@ -2347,6 +2439,108 @@ test('shared answers reach the flags, the tool run line and the public record on
   assert.equal(lesson.flags.reasons.some(r => /recall of a taught answer/.test(r)), false)
   assert.deepEqual(lesson.overall, theRun().result.overall)
   assert.ok(tutor.tinkerTutorReviewFacts(theLesson().request, TEACHER).line.includes('The lab counted no such held back question in this lesson.'))
+})
+
+test('a value a number rule reads is compared as the number the grader takes from it, and a value that is only punctuation is compared as written', () => {
+  const answers = (rubrics, practice, held) => {
+    const raw = lessonRaw()
+    raw.subskills.forEach((s, i) => {
+      if (rubrics[i]) s.rubric = structuredClone(rubrics[i])
+      if (practice[i]) s.practice.forEach((t, j) => { t.expected = practice[i][j] })
+      if (held[i]) s.held_back.forEach((t, j) => { t.expected = held[i][j] })
+    })
+    return raw
+  }
+  // number_close reads the first number in the target text: "1,234" is 1234, "12 km" is 12, "$15.00" is 15, "70%" is 70
+  const NUM = { rules: [{ type: 'number_close', weight: 1, from: 'expected' }] }
+  const numbers = read(answers([NUM, NUM, NUM], [['1234', '12', '15'], ['21', '22', '23'], ['70', '32', '33']], [['1,234', '12 km', '$15.00'], ['24', '70%', '26'], ['34', '35', '36'], ['1,234', 'h31codey', '12 km']]))
+  assert.deepEqual(numbers.flags.shared_answers, [{ name: 'Codes 0', shared: 3, of: 3 }, { name: 'Codes 1', shared: 1, of: 3 }])
+  // the lab's own grader agrees: the practice answer passes the held back question
+  for (const j of [0, 1, 2]) assert.equal(rubric.scoreCompletion(numbers.subskills[0].rubric, numbers.subskills[0].held_back[j], numbers.subskills[0].practice[j].expected), 1, `question ${j}`)
+  assert.equal(rubric.scoreCompletion(numbers.subskills[1].rubric, numbers.subskills[1].held_back[1], numbers.subskills[2].practice[0].expected), 1)
+  // under an exact rule the same texts are other answers (Codes 3 above): "1234" does not pass a question that expects "1,234"
+  assert.equal(rubric.scoreCompletion(numbers.subskills[3].rubric, numbers.subskills[3].held_back[0], '1234'), 0)
+  // a fixed number of another subskill's rule is a taught value too
+  const fixed = answers([{ rules: [{ type: 'number_close', weight: 1, value: 40 }] }, NUM], [], [null, ['40 km', '24', '25']])
+  assert.deepEqual(read(fixed).flags.shared_answers, [{ name: 'Codes 1', shared: 1, of: 3 }])
+  // values that are nothing but ending punctuation or a quote normalise to nothing: they are compared as written
+  const MARK = { rules: [{ type: 'contains', weight: 1, from: 'expected' }] }
+  const marks = read(answers([MARK, MARK], [['?', '!', '.'], [';', ':', ',']], [['?', '!', '.'], ['?', ';', '"']]))
+  assert.deepEqual(marks.flags.shared_answers, [{ name: 'Codes 0', shared: 3, of: 3 }, { name: 'Codes 1', shared: 2, of: 3 }])
+  assert.equal(rubric.scoreCompletion(marks.subskills[1].rubric, marks.subskills[1].held_back[0], marks.subskills[0].practice[0].expected), 1)
+  // and the note the models read says both
+  const note = tutor.tinkerTutorNote({ perDay: 1, teacherUsd: 1 })
+  assert.ok(note.includes('the same text after normalising, or as written when normalising leaves nothing of it, or the same number: a value written as a plain number, or, for a value a number_close rule reads, the first number in it'))
+})
+
+test('a lesson with as many flags as it can have keeps the start of its tool run line, says how many flags it has beside the pass counts, and every reason reaches the public record', async () => {
+  assert.equal(tutor.TUTOR_MAX_REASONS, 6 + 4 * tutor.TUTOR_SUBSKILLS.max)
+  // Ten subskills with names of 40 characters, every answer yes or no, and every held back score falls.
+  const names = Array.from({ length: 10 }, (_, s) => `Deduction of kind ${s} with a longer name xx`.slice(0, 40))
+  const questionsBefore = new Map(QUESTIONS)
+  const make = (s, held, list) => list.map((expected, j) => { const p = prompt(s, held, j); QUESTIONS.set(p, { s, held, j, expected }); return { prompt: p, expected } })
+  const raw = { topic: 'Yes or no', subskills: names.map((name, s) => ({ name, rubric: structuredClone(RUBRIC), practice: make(s, false, ['yes', 'no', 'yes']), held_back: make(s, true, ['no', 'yes', 'no']) })) }
+  try {
+    const { out, request } = await runLesson({ plan: {}, knowsBase: q => (q.held ? q.j <= 1 : q.j === 0), knowsAdapter: q => (q.held ? q.j === 0 : true) }, raw)
+    assert.equal(out.status, 'ok', out.summary)
+    assert.equal(request.flags.shared_answers.length, 10)
+    const stored = theRun().result.flags.reasons
+    const shared = request.flags.shared_answers.map(tutor.sharedAnswersReason)
+    const fell = names.map(n => `${n}: a held back score fell from 0.67 to 0.33`)
+    assert.equal(stored.length, 21)
+    // the shared answers reasons come last, after every other flag
+    assert.deepEqual(stored.slice(1, 11), fell)
+    assert.deepEqual(stored.slice(11), shared)
+
+    // the public record carries every reason, so the lesson panel prints every one
+    tutorPublic.resetTutorLessonCache()
+    const lesson = (await tutorPublic.tutorLesson()).lesson
+    assert.deepEqual(lesson.flags.reasons, stored)
+
+    // the tool run line: within what the store keeps, so its start is not cut away
+    const row = lab.toolRuns.find(r => r.tool === 'tinker_tutor')
+    const line = row.output_tail
+    const { TOOL_OUTPUT_TAIL_BYTES } = await load('api/_lib/tool-runs-store.js')
+    assert.ok(Buffer.byteLength(line) <= TOOL_OUTPUT_TAIL_BYTES, `${Buffer.byteLength(line)} bytes`)
+    assert.ok(line.startsWith('COUNTED BY THE LAB, with rules a model wrote: held back answers passed: 40 of 60 before, 20 of 60 after, with 21 flags on the lesson\'s record; pass bands by subskill Deduction of kind 0 with a longer name x 3 to 2, '))
+    assert.ok(line.endsWith(tutor.TUTOR_MEASURE_NOTE), 'the costs and the measure note are still at its end')
+    assert.match(line, /; estimated Tinker cost \$\d\.\d{4} /)
+    // every other flag is in it; of the shared answers reasons as many as fit, in order, and the rest are counted
+    for (const s of [stored[0], ...fell]) assert.equal(line.split(s).length - 1, 1, s)
+    const more = Number(/; and (\d+) more on the lesson's record; estimated Tinker cost/.exec(line)?.[1])
+    assert.ok(more >= 1 && more <= 10, `the line says how many reasons it left to the record: ${more}`)
+    shared.forEach((s, i) => assert.equal(line.includes(s), i < 10 - more, `shared answers reason ${i}`))
+    // with all of them the line would not have fitted
+    assert.ok(Buffer.byteLength(line) + more * (Buffer.byteLength(shared[0]) + 2) > TOOL_OUTPUT_TAIL_BYTES)
+
+    // what the next epoch's models are given of that line: its first 300 characters, with the number of flags in them
+    const tools = await load('api/_lib/epoch-tools.js')
+    const saved = db.handler
+    db.handler = async (text, values) => (/FROM tool_runs/.test(text) && /ORDER BY created_at DESC/.test(text)
+      ? { rows: lab.toolRuns.map((r, i) => ({ ...r, id: i + 1, detail: r.detail, created_at: new Date().toISOString() })) }
+      : saved(text, values))
+    let context
+    try { context = await tools.recentToolContext(CTX.experimentId) } finally { db.handler = saved }
+    assert.ok(context.includes(`tinker_tutor (ok): ${row.request_summary} -> ${line.slice(0, 300)}`))
+    assert.ok(context.includes('held back answers passed: 40 of 60 before, 20 of 60 after, with 21 flags on the lesson\'s record;'))
+    assert.equal(context.includes('FLAG:'), false, 'the reasons themselves are past the 300 characters')
+  } finally {
+    QUESTIONS.clear()
+    for (const [p, q] of questionsBefore) QUESTIONS.set(p, q)
+  }
+
+  // a lesson that failed keeps its status and reason at the start, and its flags fit the same way
+  const many = Array.from({ length: 46 }, (_, i) => `Subskill ${i}: ${'a reason of some length '.repeat(6)}`)
+  const failed = tutorRun.describeLesson({ status: 'failed', reason: 'the retest could not finish', result: { flags: { reasons: many } }, slug: 'e41-0a1b2c3d', base: BASE, expiresAt: null, tinkerUsd: 0.01, teacherUsd: 0, name: null })
+  const { TOOL_OUTPUT_TAIL_BYTES } = await load('api/_lib/tool-runs-store.js')
+  assert.ok(Buffer.byteLength(failed) <= TOOL_OUTPUT_TAIL_BYTES)
+  assert.ok(failed.startsWith(`failed: the retest could not finish; FLAG: ${many[0]}; `))
+  assert.match(failed, /; and \d+ more on the lesson's record; estimated Tinker cost \$0\.0100 /)
+  assert.ok(failed.endsWith(tutor.TUTOR_MEASURE_NOTE))
+  // and a lesson with no flag says nothing about flags
+  const none = tutorRun.describeLesson({ status: 'ok', reason: null, result: { overall: { before: { passed: 1, total: 2, band: 3 }, after: { passed: 2, total: 2, band: 5 } }, flags: { reasons: [] } }, slug: 'e41-0a1b2c3d', base: BASE, expiresAt: null, tinkerUsd: 0, teacherUsd: 0, name: null })
+  assert.ok(none.startsWith('COUNTED BY THE LAB, with rules a model wrote: held back answers passed: 1 of 2 before, 2 of 2 after; pass bands by subskill '))
+  assert.equal(/flag/i.test(none), false)
 })
 
 // ===========================================================================
