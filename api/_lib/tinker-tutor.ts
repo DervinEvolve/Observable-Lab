@@ -847,6 +847,7 @@ export function missesToTeach(request: Pick<TinkerTutorRequest, 'subskills'>, an
 /** What buildRequestBody (openrouter.ts) appends to a JSON-only system prompt. Kept here to size the prompt; the cost is measured on the real body. */
 export const JSON_ONLY_SUFFIX = '\n\nReturn valid JSON only. Do not include markdown or commentary.'
 
+// adapted from Jane Street's socratic-tutor skill (MIT), see THIRD_PARTY_NOTICES.md
 export const TUTOR_GUIDE_SYSTEM = [
   'You are tutoring a small language model. It answered one question wrong. Write ONE guiding question that helps it find its own mistake.',
   'Rules:',
@@ -857,6 +858,7 @@ export const TUTOR_GUIDE_SYSTEM = [
   'Return JSON only: {"question": "..."}',
 ].join('\n')
 
+// adapted from Jane Street's socratic-tutor skill (MIT), see THIRD_PARTY_NOTICES.md
 export const TUTOR_EXPLAIN_SYSTEM = [
   'You are tutoring a small language model. It did not reach the answer after your guiding questions. Now explain directly.',
   '- "explanation": at most 600 characters, what it got wrong and why.',

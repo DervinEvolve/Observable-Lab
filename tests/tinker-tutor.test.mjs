@@ -2348,3 +2348,36 @@ test('shared answers reach the flags, the tool run line and the public record on
   assert.deepEqual(lesson.overall, theRun().result.overall)
   assert.ok(tutor.tinkerTutorReviewFacts(theLesson().request, TEACHER).line.includes('The lab counted no such held back question in this lesson.'))
 })
+
+// ===========================================================================
+// The credit to the method's source
+// ===========================================================================
+test('the teacher\'s instructions are credited as adapted from the source skill, in the code, both notices and the license file', () => {
+  const file = name => readFileSync(join(root, name), 'utf8')
+  // the license text ships with the repository, with its copyright line
+  const license = file('docs/licenses/JaneStreet-agent-skills-MIT.txt')
+  assert.match(license, /^The MIT License/)
+  assert.ok(license.includes('Copyright (c) 2026 Jane Street Group, LLC <opensource-contacts@janestreet.com>'))
+  assert.ok(license.includes('Permission is hereby granted, free of charge'))
+  // the place of use carries the comment, directly above each of the teacher's two instruction texts
+  const code = file('api/_lib/tinker-tutor.ts')
+  const comment = '// adapted from Jane Street\'s socratic-tutor skill (MIT), see THIRD_PARTY_NOTICES.md\n'
+  assert.ok(code.includes(`${comment}export const TUTOR_GUIDE_SYSTEM = [`))
+  assert.ok(code.includes(`${comment}export const TUTOR_EXPLAIN_SYSTEM = [`))
+  // both notices: adapted from, MIT licensed, the source link, the license file
+  const SOURCE = 'https://github.com/janestreet/agent_skills'
+  const notices = file('THIRD_PARTY_NOTICES.md')
+  assert.ok(notices.includes(`The teacher's instructions of the Socratic lesson (\`api/_lib/tinker-tutor.ts\`, described in docs/TOOLS.md) are adapted from the socratic-tutor skill in Jane Street's [agent skills collection](${SOURCE}), copyright (c) 2026 Jane Street Group, LLC, MIT licensed.`))
+  assert.ok(notices.includes('docs/licenses/JaneStreet-agent-skills-MIT.txt'))
+  const tools = file('docs/TOOLS.md')
+  assert.ok(tools.includes(`The teacher's instructions are adapted from the socratic-tutor skill in Jane Street's [agent skills collection](${SOURCE}), which is MIT licensed`))
+  assert.ok(tools.includes('[docs/licenses/JaneStreet-agent-skills-MIT.txt](licenses/JaneStreet-agent-skills-MIT.txt)'))
+  // neither says that no text is used, and the steps of the method are not listed in the source's own words
+  for (const text of [notices, tools, file('README.md')]) {
+    assert.doesNotMatch(text, /none of its text is used|No text of the skill is used/)
+    assert.doesNotMatch(text, /a diagnostic, a skill map with levels/)
+  }
+  const credit = tools.slice(tools.indexOf('The teacher\'s instructions are adapted from'), tools.indexOf('has the notice.'))
+  for (const run of ['one question at a time', 'a final assessment', 'a skill map with levels']) assert.equal(credit.includes(run), false, run)
+  assert.equal(/[–—]/.test(credit), false)
+})
