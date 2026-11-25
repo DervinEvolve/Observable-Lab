@@ -14,10 +14,10 @@ const root = resolve(import.meta.dirname, '..')
 const build = mkdtempSync(join(tmpdir(), 'observable-chat-panel-test-'))
 symlinkSync(join(root, 'node_modules'), join(build, 'node_modules'))
 writeFileSync(join(build, 'package.json'), '{"type":"module"}')
-for (const path of ['src/systems/TrainedChatPanel.ts', 'src/systems/ResearchStoryBox.ts']) {
+for (const path of ['src/systems/TrainedChatPanel.ts', 'src/systems/ResearchStoryBox.ts', 'src/systems/paperTheme.ts']) {
   const output = ts.transpileModule(readFileSync(join(root, path), 'utf8'), {
     compilerOptions: { target: ts.ScriptTarget.ES2022, module: ts.ModuleKind.ESNext },
-  }).outputText
+  }).outputText.replace(/from '([^']+)'/g, (whole, specifier) => specifier.startsWith('.') ? `from '${specifier}.js'` : whole)
   mkdirSync(dirname(join(build, path)), { recursive: true })
   writeFileSync(join(build, path.replace(/\.ts$/, '.js')), output)
 }
@@ -25,6 +25,7 @@ after(() => rmSync(build, { recursive: true, force: true }))
 const load = path => import(pathToFileURL(join(build, path)).href)
 const panel = await load('src/systems/TrainedChatPanel.js')
 const storyBox = await load('src/systems/ResearchStoryBox.js')
+const theme = await load('src/systems/paperTheme.js')
 const source = readFileSync(join(root, 'src/systems/TrainedChatPanel.ts'), 'utf8')
 
 const BASE = 'Qwen/Qwen3.5-4B'
@@ -67,7 +68,8 @@ test('the maker mark follows the name: five providers, fallback models by their 
   assert.equal(panel.accentFor('GPT-6 Astra'), '#412991')
   assert.equal(panel.accentFor('Grok 4.7'), '#1DA1F2')
   for (const other of ['North', 'GLM 5.3', 'a lab model', '', null, undefined]) assert.equal(panel.accentFor(other), panel.ACCENT_NEUTRAL, String(other))
-  assert.match(panel.PANEL_CSS, new RegExp(`--tc-wood-edge: ${panel.ACCENT_NEUTRAL};`))
+  assert.equal(theme.PAPER_TOKENS['--paper-line'], panel.ACCENT_NEUTRAL)
+  assert.match(theme.paperRootCss(), new RegExp(`--paper-line: ${panel.ACCENT_NEUTRAL};`))
 })
 
 test('card tags, counters and the shelf signature', () => {
@@ -139,7 +141,8 @@ const lum = hex => {
 }
 const ratio = (a, b) => { const [x, y] = [lum(a), lum(b)].sort((m, n) => n - m); return (x + 0.05) / (y + 0.05) }
 const token = name => {
-  const m = new RegExp(`--tc-${name}: (#[0-9A-Fa-f]{6});`).exec(panel.PANEL_CSS)
+  const role = { ink2: 'ink-2', 'wood-edge': 'line', model: 'white' }[name] ?? name
+  const m = new RegExp(`--paper-${role}: (#[0-9A-Fa-f]{6});`).exec(theme.paperRootCss())
   assert.ok(m, `token ${name}`)
   return m[1]
 }
@@ -164,7 +167,10 @@ test('every text pair is at least 4.5 to 1 and every control edge at least 3 to 
   assert.ok(Math.abs(ratio(t['brass-edge'], t.surface) - 3.83) < 0.1)
   // brass is never text: a rule that colours text with the brass fill would fail the paper
   assert.ok(ratio(t.brass, t.surface) < 3)
-  assert.equal(/[^-]color: var\(--tc-brass\)/.test(panel.PANEL_CSS), false)
+  assert.equal(/[^-]color: var\(--paper-brass\)/.test(panel.PANEL_CSS), false)
+  // the panel takes every colour from the shared theme: no hex or rgba literal of its own
+  assert.equal(/#[0-9A-Fa-f]{3,8}\b|rgba?\(/.test(panel.PANEL_CSS), false, 'a colour literal in the panel css')
+  assert.equal(/--tc-/.test(panel.PANEL_CSS), false)
 })
 
 // ---------------------------------------------------------------------------
@@ -473,7 +479,7 @@ test('the source keeps its pinned rules, its dash rule, and its safety rules', (
   assert.equal([...source.matchAll(/innerHTML\s*=/g)].length, 1) // only the button's static icon
   assert.equal(/localStorage|sessionStorage/.test(source), false)
   assert.equal((source.match(/setInterval\(/g) ?? []).length, 1)
-  assert.equal(/^import /m.test(source), false) // compiled alone by five tests
+  assert.deepEqual(source.match(/^import [^]*? from '[^']+'/gm).map(m => m.slice(m.lastIndexOf("'", m.length - 2) + 1, -1)), ['./paperTheme']) // the shared theme is the only import; the tests that compile this file also compile it
   for (const needle of ['role", \'dialog\'', 'aria-modal', 'role', 'aria-live', 'z-index: 1080', 'env(safe-area-inset-bottom)', 'prefers-reduced-motion', 'visualViewport', '(pointer: coarse)', 'inert']) {
     assert.ok(source.includes(needle.replace('role", ', '')), needle)
   }
