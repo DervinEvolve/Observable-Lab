@@ -181,7 +181,7 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
     ...(a.name ? { id: a.modelId } : {}),
     ...(a.kept ? { mark: 'kept' } : {}),
     origin: a.kind === 'rl'
-      ? `Epoch ${a.epoch}. Reinforcement learning on ${a.examples} tasks and a rubric written by ${a.authorName}. Base model ${a.baseModel}.`
+      ? `Epoch ${a.epoch}. Practice by Reward (reinforcement learning) on ${a.examples} tasks and a rubric written by ${a.authorName}. Base model ${a.baseModel}.`
       : a.dataFrom
       ? `Epoch ${a.epoch}. Trained on ${a.examples} rows of the public dataset ${a.dataFrom}, chosen by ${a.authorName}. Nobody at the lab has read those rows. Base model ${a.baseModel}.`
       : `Epoch ${a.epoch}. Data written by ${a.authorName} (${a.examples} examples). Base model ${a.baseModel}.`,
@@ -189,8 +189,17 @@ export function describeAdapter(a: TrainedAdapterView): { title: string; id?: st
     score,
     kept: a.kept
       ? `Marked to keep${a.keptBy ? ` by ${a.keptBy}` : ''}.${until ? ` Stays until ${until}.` : ''}`
-      : until ? `Kept until ${until}.` : '',
+      : until ? `Removed after ${formatDay(until)} unless it is marked to keep.` : '',
   }
+}
+
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+/** "2026-12-01" as "1 Dec 2026". Anything else is returned as it came. */
+export function formatDay(iso: string): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso)
+  if (!m) return iso
+  const month = MONTHS[Number(m[2]) - 1]
+  return month ? `${Number(m[3])} ${month} ${m[1]}` : iso
 }
 
 // ---------------------------------------------------------------------------
@@ -242,10 +251,24 @@ export interface GaugeView {
   kind: 'sft' | 'rl' | 'none'
   heading: string
   caption: string
+  /** One plain sentence on what the number is. */
+  explain: string
+  /** "Better", "Worse" or "Little change", from the two stored numbers only. Empty for kind 'none'. */
+  verdict: string
   rows: Array<{ label: 'Before' | 'After'; value: number; text: string; pct: number }>
   aria: string
   /** Only for kind 'none'. */
   none: string
+}
+
+/** A change smaller than this share of the larger number is called "Little change". */
+export const LITTLE_CHANGE = 0.05
+
+/** Better, Worse or Little change, from the two stored numbers and which way is better. */
+export function verdictOf(before: number, after: number, higherIsBetter: boolean): string {
+  const top = Math.max(Math.abs(before), Math.abs(after))
+  if (top === 0 || Math.abs(after - before) / top < LITTLE_CHANGE) return 'Little change'
+  return (after > before) === higherIsBetter ? 'Better' : 'Worse'
 }
 
 /**
@@ -255,7 +278,7 @@ export interface GaugeView {
  * scale.
  */
 export function gaugeView(a: TrainedAdapterView): GaugeView {
-  const none: GaugeView = { kind: 'none', heading: '', caption: '', rows: [], aria: '', none: 'No held-out score recorded.' }
+  const none: GaugeView = { kind: 'none', heading: '', caption: '', explain: '', verdict: '', rows: [], aria: '', none: 'No held-out score recorded.' }
   const rl = a.kind === 'rl'
   const before = rl ? a.scoreBefore ?? null : a.lossBefore
   const after = rl ? a.scoreAfter ?? null : a.lossAfter
@@ -264,6 +287,8 @@ export function gaugeView(a: TrainedAdapterView): GaugeView {
   if (rl) {
     return {
       kind: 'rl', heading: 'Held-Out Score', caption: 'Higher Is Better', none: '',
+      explain: 'Score from a rubric written by a lab model, on tasks held out of training. Measured by the lab.',
+      verdict: verdictOf(before, after, true),
       rows: [
         { label: 'Before', value: before, text: before.toFixed(2), pct: clamp(before * 100) },
         { label: 'After', value: after, text: after.toFixed(2), pct: clamp(after * 100) },
@@ -275,6 +300,8 @@ export function gaugeView(a: TrainedAdapterView): GaugeView {
   const pct = (v: number) => (top > 0 ? clamp((v / top) * 100) : 0)
   return {
     kind: 'sft', heading: 'Held-Out Loss', caption: 'Lower Is Better', none: '',
+    explain: 'Loss is how wrong the model was on examples it never trained on. Measured by the lab.',
+    verdict: verdictOf(before, after, false),
     rows: [
       { label: 'Before', value: before, text: before.toFixed(2), pct: pct(before) },
       { label: 'After', value: after, text: after.toFixed(2), pct: pct(after) },
@@ -288,9 +315,9 @@ export function shelfSignature(parts: { adapters: TrainedAdapterView[]; story: b
   return JSON.stringify(parts)
 }
 
-/** "Turn 3 of 8" is the turn the next message will be; once all are used it says so. */
+/** "Question 3 of 8" is the question the next message will be; once all are used it says so. */
 export function turnCounterText(used: number, max: number): string {
-  return used >= max ? `${max} of ${max} used` : `Turn ${used + 1} of ${max}`
+  return used >= max ? `${max} of ${max} used` : `Question ${used + 1} of ${max}`
 }
 
 /** The character counter shows from 80 percent of the limit. */
@@ -299,9 +326,10 @@ export function counterVisible(length: number, limit: number): boolean {
 }
 
 /** What the visitor's box holds in compare mode: the untrained side's earlier answers. Null means a normal chat. */
-export function buildChatBody(adapter: string, history: Turn[], baseReplies: string[] | null): Record<string, unknown> {
+export function buildChatBody(adapter: string, history: Turn[], baseReplies: string[] | null, only?: 'trained' | 'untrained' | null): Record<string, unknown> {
   const messages = history.map(t => ({ role: t.role, content: t.content }))
-  return baseReplies === null ? { adapter, messages } : { adapter, messages, compare: true, base_replies: [...baseReplies] }
+  if (baseReplies === null) return { adapter, messages }
+  return { adapter, messages, compare: true, base_replies: [...baseReplies], ...(only ? { only } : {}) }
 }
 
 export type ReplySide = { ok: true; reply: string; cutShort: boolean } | { ok: false; message: string | null }
@@ -357,8 +385,11 @@ interface Turn { role: 'user' | 'assistant'; content: string }
 const SERVER_WAIT_SECONDS = 45
 const STORY = 'story'
 const WIDE = '(max-width: 760px)'
-const TUBE_LINE = 'When someone gets a reply here, the Commentator\'s speaking tube in the room glows for two minutes.'
-const EMPTY_AFTER = 'None has been saved yet, so there is no one to talk to.'
+const TUBE_LINE = 'The speaking tube in the room glows for up to two minutes after a trained model answers anyone.'
+const OWN_TUBE_LINE = 'Your reply lit the speaking tube in the room.'
+const CLOSED_LINE = 'This model is no longer on the shelf. Your conversation stays here. Start a new one to talk to another model.'
+const HALF_NOTE = 'Only one answer came back. Ask Again asks only the model that did not answer, and uses one more message.'
+const COMPARE_DROPPED = 'Comparing with the untrained model was switched off. Your next question goes to one model.'
 
 export const PANEL_CSS = `
       #trained-chat-container { position: fixed; bottom: 188px; right: 20px; z-index: 150; font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
@@ -383,24 +414,28 @@ export const PANEL_CSS = `
       #trained-chat-panel .tc-shelf-count { font-size: 13px; color: var(--tc-ink2); }
       #trained-chat-panel .tc-cards { display: flex; flex-direction: column; gap: 8px; }
       #trained-chat-panel .tc-card { display: flex; flex-direction: column; gap: 5px; width: 100%; min-height: 76px; padding: 10px 12px 10px 14px; text-align: left; background: var(--tc-raised); border: 1px solid var(--tc-wood-edge); border-radius: 10px; cursor: pointer; font-size: 13px; line-height: 1.35; position: relative; transition: background 0.12s ease; }
-      #trained-chat-panel .tc-card:hover { background: var(--tc-surface); }
+      #trained-chat-panel .tc-card:hover { background: var(--tc-surface); border-color: var(--tc-ink); }
       #trained-chat-panel .tc-card[aria-pressed="true"] { border: 2px solid var(--tc-brass-edge); padding: 9px 11px 9px 13px; }
       #trained-chat-panel .tc-card[aria-pressed="true"]::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 4px; background: var(--tc-brass); border-radius: 8px 0 0 8px; }
       #trained-chat-panel .tc-card-top { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
       #trained-chat-panel .tc-card-title { font-family: var(--tc-serif); font-size: 15px; font-weight: 700; overflow-wrap: anywhere; }
       #trained-chat-panel .tc-card-title.tc-mono { font: 600 13px/1.3 ui-monospace, Menlo, monospace; }
-      #trained-chat-panel .tc-kept { flex: none; padding: 0 7px; border-radius: 9px; border: 1px solid var(--tc-brass-edge); background: var(--tc-brass); color: var(--tc-ink); font: 600 12px/18px 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
+      #trained-chat-panel .tc-kept { flex: none; padding: 0 7px; border-radius: 9px; border: 1px solid var(--tc-brass-edge); background: var(--tc-brass); color: var(--tc-ink); font: 600 13px/18px 'Inter', -apple-system, BlinkMacSystemFont, sans-serif; }
       #trained-chat-panel .tc-maker { display: flex; align-items: center; gap: 7px; color: var(--tc-ink2); }
       #trained-chat-panel .tc-swatch { flex: none; width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--tc-ink); }
-      #trained-chat-panel .tc-tag { align-self: flex-start; padding: 0 8px; border-radius: 10px; border: 1px solid var(--tc-brass-edge); font-size: 12px; font-variant: small-caps; letter-spacing: 0.4px; font-weight: 600; line-height: 18px; color: var(--tc-ink); }
-      #trained-chat-panel .tc-gauge { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; font-size: 12px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-tag { align-self: flex-start; padding: 0 8px; border-radius: 10px; border: 1px solid var(--tc-brass-edge); font-size: 13px; letter-spacing: 0.2px; font-weight: 600; line-height: 18px; color: var(--tc-ink); }
+      #trained-chat-panel .tc-gauge { display: flex; flex-direction: column; gap: 3px; margin-top: 2px; font-size: 13px; color: var(--tc-ink2); }
       #trained-chat-panel .tc-gauge-head { display: flex; justify-content: space-between; gap: 6px; }
-      #trained-chat-panel .tc-gauge-row { display: grid; grid-template-columns: 44px 1fr 34px; align-items: center; gap: 6px; }
-      #trained-chat-panel .tc-track { height: 8px; background: var(--tc-sunk); border: 1px solid var(--tc-wood-edge); border-radius: 4px; overflow: hidden; }
+      #trained-chat-panel .tc-gauge-row { display: grid; grid-template-columns: 48px 1fr 40px; align-items: center; gap: 6px; }
+      #trained-chat-panel .tc-track { position: relative; height: 8px; background: var(--tc-sunk); border: 1px solid var(--tc-wood-edge); border-radius: 4px; overflow: hidden; }
       #trained-chat-panel .tc-bar { height: 100%; background: #8B7B66; }
-      #trained-chat-panel .tc-bar.tc-after { background: var(--tc-brass); border-right: 1px solid var(--tc-brass-edge); }
+      #trained-chat-panel .tc-bar.tc-after { background: var(--tc-brass-edge); }
+      #trained-chat-panel .tc-tick { position: absolute; top: -1px; bottom: -1px; width: 2px; margin-left: -1px; background: var(--tc-ink); }
+      #trained-chat-panel .tc-verdict { display: flex; flex-wrap: wrap; gap: 0 6px; margin-top: 2px; color: var(--tc-ink); }
+      #trained-chat-panel .tc-verdict-word { font-weight: 700; }
+      #trained-chat-panel .tc-explain { margin: 2px 0 0; color: var(--tc-ink2); }
       #trained-chat-panel .tc-gauge-num { text-align: right; font-variant-numeric: tabular-nums; color: var(--tc-ink); }
-      #trained-chat-panel .tc-shelf-foot { margin-top: auto; padding-top: 6px; border-top: 1px solid var(--tc-hair); font-size: 12px; color: var(--tc-ink2); display: flex; flex-direction: column; gap: 6px; }
+      #trained-chat-panel .tc-shelf-foot { margin-top: auto; padding-top: 6px; border-top: 1px solid var(--tc-hair); font-size: 13px; color: var(--tc-ink2); display: flex; flex-direction: column; gap: 6px; }
       #trained-chat-panel .tc-shelf-foot p, #trained-chat-panel .tc-sheet p { margin: 0; }
       #trained-chat-panel .tc-sheet { display: flex; flex-direction: column; gap: 10px; align-items: flex-start; padding: 28px 24px; max-width: 520px; }
       #trained-chat-panel .tc-sheet h2 { margin: 0; font-family: var(--tc-serif); font-size: 18px; font-weight: 700; }
@@ -409,7 +444,8 @@ export const PANEL_CSS = `
       #trained-chat-panel.tc-full-sheet .tc-body { grid-template-columns: minmax(0, 1fr); }
       #trained-chat-panel.tc-full-sheet .tc-shelf { background: var(--tc-surface); border-right: 0; }
       #trained-chat-panel.tc-full-sheet .tc-conv, #trained-chat-panel.tc-full-sheet .tc-shelf-head, #trained-chat-panel.tc-full-sheet .tc-cards { display: none; }
-      #trained-chat-panel.tc-full-sheet .tc-sheet-host { margin: auto 0; display: flex; justify-content: center; }
+      #trained-chat-panel.tc-full-sheet .tc-sheet-host { margin: 20px 0 0; display: flex; flex-direction: column; align-items: center; gap: 16px; }
+      #trained-chat-panel .tc-slot { display: flex; align-items: center; justify-content: center; width: 100%; max-width: 300px; min-height: 76px; border: 1px dashed var(--tc-wood-edge); border-radius: 10px; color: var(--tc-ink2); font-size: 13px; }
       #trained-chat-panel.tc-full-sheet .tc-shelf .tc-sheet { padding: 28px 24px; max-width: 480px; align-items: center; text-align: center; font-size: 15px; }
       #trained-chat-panel.tc-full-sheet .tc-shelf .tc-sheet h2 { font-size: 20px; }
       #trained-chat-panel.tc-full-sheet .tc-shelf-foot { margin-top: 0; }
@@ -417,25 +453,29 @@ export const PANEL_CSS = `
       #trained-chat-panel .tc-conv-head { flex: none; display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; min-height: 56px; padding: 8px 14px; background: var(--tc-raised); border-bottom: 1px solid var(--tc-hair); }
       #trained-chat-panel .tc-who { flex: 1 1 220px; min-width: 0; }
       #trained-chat-panel .tc-who-title { display: flex; align-items: center; gap: 7px; font-family: var(--tc-serif); font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }
-      #trained-chat-panel .tc-who-sub { font-size: 12.5px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-who-sub { font-size: 13px; color: var(--tc-ink2); }
       #trained-chat-panel .tc-controls { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
       #trained-chat-panel .tc-btn, #trained-chat-panel .tc-back { min-height: 44px; padding: 0 12px; background: var(--tc-raised); border: 1px solid var(--tc-wood-edge); border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; color: var(--tc-ink); }
-      #trained-chat-panel .tc-btn:hover, #trained-chat-panel .tc-back:hover { background: var(--tc-sunk); }
+      #trained-chat-panel .tc-btn:hover, #trained-chat-panel .tc-back:hover { background: var(--tc-sunk); border-color: var(--tc-ink); }
+      #trained-chat-panel .tc-btn.tc-link { background: none; border-color: transparent; color: var(--tc-brass-ink); text-decoration: underline; text-underline-offset: 3px; }
+      #trained-chat-panel .tc-btn.tc-link:hover { background: var(--tc-sunk); }
       #trained-chat-panel .tc-back { display: none; }
       #trained-chat-panel .tc-switch { display: inline-flex; align-items: center; gap: 8px; min-height: 44px; padding: 0 10px; background: var(--tc-raised); border: 1px solid var(--tc-wood-edge); border-radius: 10px; font-size: 14px; font-weight: 600; cursor: pointer; }
-      #trained-chat-panel .tc-switch[aria-disabled="true"] { cursor: default; opacity: 0.75; }
+      #trained-chat-panel .tc-switch[aria-disabled="true"] { cursor: default; background: var(--tc-sunk); }
+      #trained-chat-panel .tc-switch-state { font-size: 13px; font-weight: 600; color: var(--tc-ink2); }
       #trained-chat-panel .tc-switch-knob { position: relative; flex: none; width: 34px; height: 18px; border-radius: 9px; border: 1.5px solid var(--tc-wood-edge); background: var(--tc-sunk); }
       #trained-chat-panel .tc-switch-knob::after { content: ''; position: absolute; top: 1px; left: 1px; width: 12px; height: 12px; border-radius: 50%; background: var(--tc-wood-edge); }
       #trained-chat-panel .tc-switch[aria-checked="true"] .tc-switch-knob { background: var(--tc-brass); border-color: var(--tc-brass-edge); }
       #trained-chat-panel .tc-switch[aria-checked="true"] .tc-switch-knob::after { left: 17px; background: var(--tc-ink); }
-      #trained-chat-panel .tc-switch-note { flex: none; margin: 0; padding: 6px 14px; font-size: 12.5px; color: var(--tc-ink2); border-bottom: 1px solid var(--tc-hair); background: var(--tc-surface); }
+      #trained-chat-panel .tc-switch-note { flex: none; margin: 0; padding: 6px 14px; font-size: 13px; color: var(--tc-ink2); border-bottom: 1px solid var(--tc-hair); background: var(--tc-surface); }
       #trained-chat-panel .tc-details { flex: none; max-height: 34%; overflow-y: auto; padding: 8px 14px; background: var(--tc-raised); border-bottom: 1px solid var(--tc-hair); }
       #trained-chat-panel [hidden] { display: none !important; }
+      #trained-chat-panel .tc-det-maker { display: none; }
       #trained-chat-panel .tc-details p { margin: 0 0 6px; font-size: 13px; color: var(--tc-ink); }
       #trained-chat-panel .tc-log { flex: 1 1 auto; min-height: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; padding: 16px 16px 12px; }
       #trained-chat-panel .tc-log-empty { margin: auto; max-width: 360px; text-align: center; color: var(--tc-ink2); font-size: 14px; }
       #trained-chat-panel .tc-ex { display: flex; flex-direction: column; gap: 8px; }
-      #trained-chat-panel .tc-who-label { font-size: 12px; font-variant: small-caps; letter-spacing: 0.5px; font-weight: 600; color: var(--tc-ink2); margin-bottom: 2px; }
+      #trained-chat-panel .tc-who-label { font-size: 13px; letter-spacing: 0.2px; font-weight: 700; color: var(--tc-ink2); margin-bottom: 2px; }
       #trained-chat-panel .tc-slip { align-self: flex-end; max-width: 85%; }
       #trained-chat-panel .tc-slip .tc-who-label { text-align: right; }
       #trained-chat-panel .tc-msg { padding: 9px 12px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 15px; line-height: 1.5; }
@@ -448,23 +488,25 @@ export const PANEL_CSS = `
       #trained-chat-panel .tc-pair .tc-sheet-wrap { max-width: none; width: 100%; }
       #trained-chat-panel .tc-pair.tc-two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       #trained-chat-panel .tc-sheet-wrap.tc-untrained .tc-msg.assistant { background: var(--tc-sunk); border: 1px dashed var(--tc-wood-edge); border-left: 3px solid var(--tc-wood-edge); }
-      #trained-chat-panel .tc-fine { font-size: 12px; color: var(--tc-ink2); margin-top: 3px; }
+      #trained-chat-panel .tc-fine { font-size: 13px; color: var(--tc-ink2); margin-top: 3px; }
       #trained-chat-panel .tc-story-slot { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
       #trained-chat-panel:not(.tc-story-chosen) .tc-story-slot, #trained-chat-panel.tc-story-chosen .tc-chatonly { display: none; }
       #trained-chat-panel.tc-chat-off .tc-shelf { display: none; }
       #trained-chat-panel.tc-chat-off .tc-body { grid-template-columns: minmax(0, 1fr); }
       #trained-chat-panel.tc-chat-off .tc-back { display: none; }
       #trained-chat-panel .tc-foot { flex: none; padding: 8px 14px 10px; background: var(--tc-raised); border-top: 1px solid var(--tc-wood-edge); }
+      #trained-chat-panel .tc-info { margin: 0 0 8px; }
+      #trained-chat-panel .tc-tube-own { margin: 6px 0 0; font-size: 13px; color: var(--tc-brass-ink); }
       #trained-chat-panel .tc-banner { margin: 0 0 8px; padding: 8px 10px; border: 1px solid var(--tc-danger); border-radius: 8px; background: var(--tc-danger-bg); color: var(--tc-danger); font-size: 14px; }
       #trained-chat-panel .tc-form { display: flex; flex-direction: column; gap: 6px; }
       #trained-chat-panel .tc-input-row { display: flex; gap: 8px; align-items: flex-end; }
       #trained-chat-panel textarea { flex: 1; min-height: 44px; max-height: 130px; resize: none; border-radius: 10px; border: 1px solid var(--tc-wood-edge); background: var(--tc-model); color: var(--tc-ink); padding: 10px; font-family: inherit; font-size: 16px; line-height: 1.3; }
-      #trained-chat-panel .tc-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 12px; color: var(--tc-ink2); }
+      #trained-chat-panel .tc-meta { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; color: var(--tc-ink2); }
       #trained-chat-panel .tc-count.tc-over { color: var(--tc-danger); font-weight: 600; }
       #trained-chat-panel .tc-limit { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; font-size: 14px; }
       #trained-chat-panel .tc-limit p { margin: 0; flex: 1 1 200px; }
-      #trained-chat-panel .tc-note { margin: 6px 0 0; font-size: 12px; color: var(--tc-ink2); }
-      .tc-send, #trained-chat-panel .tc-new { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--tc-brass-edge); background: var(--tc-brass); color: var(--tc-ink); cursor: pointer; font-family: inherit; font-size: 12px; font-weight: 600; }
+      #trained-chat-panel .tc-note { margin: 6px 0 0; font-size: 13px; color: var(--tc-ink2); }
+      .tc-send, #trained-chat-panel .tc-new { min-width: 44px; min-height: 44px; padding: 0 14px; border-radius: 10px; border: 1px solid var(--tc-brass-edge); background: var(--tc-brass); color: var(--tc-ink); cursor: pointer; font-family: inherit; font-size: 13px; font-weight: 600; }
       #trained-chat-panel .tc-send, #trained-chat-panel .tc-new, #trained-chat-panel .tc-again { font-size: 15px; color: var(--tc-ink); }
       #trained-chat-panel .tc-new { background: var(--tc-raised); border-color: var(--tc-wood-edge); font-size: 14px; font-weight: 600; }
       #trained-chat-panel .tc-again { min-height: 44px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--tc-wood-edge); background: var(--tc-raised); font-weight: 600; cursor: pointer; }
@@ -492,10 +534,16 @@ export const PANEL_CSS = `
         #trained-chat-panel .tc-controls { display: contents; }
         #trained-chat-panel .tc-back { order: 1; }
         #trained-chat-panel .tc-controls .tc-new { order: 2; margin-left: auto; }
-        #trained-chat-panel .tc-who { order: 3; flex-basis: 100%; }
-        #trained-chat-panel .tc-controls .tc-btn, #trained-chat-panel .tc-controls .tc-switch { order: 4; }
+        #trained-chat-panel .tc-who { order: 3; flex: 1 1 140px; min-width: 140px; }
+        #trained-chat-panel .tc-det-maker { display: block; }
+        #trained-chat-panel .tc-who-sub { display: none; }
+        #trained-chat-panel .tc-controls .tc-btn { order: 3; }
+        #trained-chat-panel .tc-controls .tc-switch { order: 4; flex-basis: 100%; justify-content: space-between; }
+        #trained-chat-panel .tc-switch-note { padding: 4px 12px; }
         #trained-chat-panel .tc-sheet { padding: 24px 18px; }
       }
+      #trained-chat-panel.tc-short .tc-back, #trained-chat-panel.tc-short .tc-controls .tc-new, #trained-chat-panel.tc-short .tc-controls .tc-btn, #trained-chat-panel.tc-short .tc-who-sub, #trained-chat-panel.tc-short .tc-switch-note, #trained-chat-panel.tc-short .tc-details, #trained-chat-panel.tc-short .tc-note, #trained-chat-panel.tc-short .tc-tube-own, #trained-chat-panel.tc-short .tc-log-empty { display: none; }
+      #trained-chat-panel.tc-short .tc-conv-head { min-height: 0; padding-top: 4px; padding-bottom: 4px; }
       @media (max-height: 560px) {
         #trained-chat-panel .tc-switch-note, #trained-chat-panel .tc-who-sub, #trained-chat-panel .tc-note, #trained-chat-panel .tc-log-empty { display: none; }
         #trained-chat-panel .tc-head { min-height: 44px; }
@@ -545,6 +593,9 @@ export class TrainedChatPanel {
   private inputRow: HTMLDivElement
   private meta: HTMLDivElement
   private statusLine: HTMLDivElement
+  private infoLine: HTMLParagraphElement
+  private tubeOwn: HTMLParagraphElement
+  private switchState: HTMLSpanElement
 
   private adapters: TrainedAdapterView[] = []
   private limits: ChatLimits = { maxMessageChars: 500, maxTurns: 8 }
@@ -562,6 +613,19 @@ export class TrainedChatPanel {
   /** Elements of the exchange that is not yet part of the conversation (waiting, or half answered). */
   private openBlock: HTMLElement | null = null
   private halfPair = false
+  /** The answers of a half pair that did come back, so a retry asks only the side that failed. */
+  private held: { message: string; trained: ReplySide | null; untrained: ReplySide | null } | null = null
+  /** Counts conversations: a reply that comes back to an older one is not drawn into the current one. */
+  private convId = 0
+  /** The adapter of a conversation that was under way when it left the shelf. */
+  private retired: TrainedAdapterView | null = null
+  /** A slug the practice bench asked for before the list was read. */
+  private pendingSlug: string | null = null
+  private returnFocus: HTMLElement | null = null
+  /** The visitor chose a card themselves. Until then, the first model on the shelf is chosen for them. */
+  private picked = false
+  /** Set when a refresh switched comparing off under a conversation that had it on. */
+  private compareDropped = false
   private busy = false
   private isOpen = false
   /** What the room's state last said about the chat being switched on. */
@@ -652,7 +716,7 @@ export class TrainedChatPanel {
     who.append(this.whoTitle, this.whoSub)
     convHead.appendChild(who)
     const controls = el('div', 'tc-controls tc-chatonly')
-    this.detailsButton = el('button', 'tc-btn', 'Details')
+    this.detailsButton = el('button', 'tc-btn tc-link', 'Details')
     this.detailsButton.type = 'button'
     this.detailsButton.setAttribute('aria-expanded', 'false')
     this.detailsButton.setAttribute('aria-controls', 'trained-chat-details')
@@ -666,17 +730,15 @@ export class TrainedChatPanel {
     this.switchButton.setAttribute('role', 'switch')
     this.switchButton.setAttribute('aria-checked', 'false')
     this.switchButton.appendChild(el('span', 'tc-switch-label', 'Compare With Untrained'))
+    this.switchState = el('span', 'tc-switch-state')
+    this.switchButton.appendChild(this.switchState)
     this.switchButton.appendChild(el('span', 'tc-switch-knob'))
     this.switchButton.addEventListener('click', () => this.flipCompare())
     this.switchButton.hidden = true
     this.newButton = el('button', 'tc-new', 'New Conversation')
     this.newButton.type = 'button'
     this.newButton.hidden = true
-    this.newButton.addEventListener('click', () => {
-      this.reset()
-      this.renderConversation()
-      if (!this.coarse()) this.input.focus?.()
-    })
+    this.newButton.addEventListener('click', () => this.newConversation())
     controls.append(this.detailsButton, this.switchButton, this.newButton)
     convHead.appendChild(controls)
     this.switchNote = el('p', 'tc-switch-note tc-chatonly')
@@ -718,14 +780,14 @@ export class TrainedChatPanel {
     this.limitRow.appendChild(el('p', undefined, 'This conversation has used all its turns. Start a new one to keep going.'))
     const again = el('button', 'tc-new', 'New Conversation')
     again.type = 'button'
-    again.addEventListener('click', () => {
-      this.reset()
-      this.renderConversation()
-      if (!this.coarse()) this.input.focus?.()
-    })
+    again.addEventListener('click', () => this.newConversation())
     this.limitRow.appendChild(again)
     const standing = el('p', 'tc-note', 'Replies are not reviewed. They come from small models and can be wrong.')
-    foot.append(this.banner, this.form, this.limitRow, standing)
+    this.infoLine = el('p', 'tc-notice tc-info')
+    this.infoLine.hidden = true
+    this.tubeOwn = el('p', 'tc-tube-own')
+    this.tubeOwn.hidden = true
+    foot.append(this.banner, this.infoLine, this.form, this.limitRow, standing, this.tubeOwn)
     this.statusLine = el('div', 'tc-sr')
     this.statusLine.setAttribute('role', 'status')
 
@@ -765,8 +827,18 @@ export class TrainedChatPanel {
     } else {
       this.stopRefresh()
       this.chatShown = false
+      this.dropChat()
       this.sync()
     }
+  }
+
+  /** The chat went off: forget the adapters, the conversation and the choice, so nothing dead stays on screen. */
+  private dropChat(): void {
+    this.adapters = []
+    this.compareEnabled = false
+    this.pendingSlug = null
+    if (this.chosen !== STORY) this.chosen = null
+    this.reset()
   }
 
   /**
@@ -810,16 +882,34 @@ export class TrainedChatPanel {
     this.refreshTimer = null
   }
 
-  /** Opens the panel with one adapter chosen, as the practice bench's "talk to it" does. */
+  /**
+   * Opens the panel with one adapter chosen, as the practice bench's "talk to
+   * it" does. A slug that is not on the shelf is ignored and the shelf shows.
+   * Before the list is read, the slug is kept and checked when it arrives.
+   */
   openWith(slug: string): void {
-    if (SLUG.test(slug) && this.chosen !== slug) {
+    if (!this.isOpen) this.returnFocus = (document.activeElement as HTMLElement | null) ?? null
+    const loaded = this.chatShown && this.loadState === 'ok'
+    if (!SLUG.test(slug) || (loaded && !this.adapters.some(a => a.slug === slug))) {
+      this.open()
+      return
+    }
+    if (!loaded) this.pendingSlug = slug
+    else this.pick(slug)
+    this.open()
+    if (this.isOpen && loaded && !this.coarse()) this.input.focus?.()
+  }
+
+  /** Chooses an adapter that is on the shelf and shows its conversation. */
+  private pick(slug: string): void {
+    this.picked = true
+    if (this.chosen !== slug) {
       this.chosen = slug
       this.reset()
-      this.renderAll(true)
     }
+    this.renderAll(true)
     this.panel.classList.remove('tc-view-shelf')
     this.panel.classList.add('tc-view-chat')
-    this.open()
   }
 
   private coarse(): boolean {
@@ -848,7 +938,13 @@ export class TrainedChatPanel {
     this.panel.classList.remove('open')
     this.toggle.setAttribute('aria-expanded', 'false')
     this.trapOff()
-    if (wasOpen) this.toggle.focus?.()
+    if (wasOpen) {
+      const back = this.returnFocus
+      this.returnFocus = null
+      // Back to what opened the panel, when it is still on the page; else the panel's button.
+      if (back && back !== document.body && document.body?.contains?.(back) !== false) back.focus?.()
+      else this.toggle.focus?.()
+    }
   }
 
   /** While open: everything else on the page is inert, Tab stays inside, Escape closes, a phone keyboard shrinks the sheet. */
@@ -889,8 +985,14 @@ export class TrainedChatPanel {
       this.viewportHandler = () => {
         if (window.matchMedia?.(WIDE)?.matches) {
           this.panel.style.height = `${vv.height}px`
+          // With the soft keyboard up there is little room: the conversation keeps the space.
+          if (vv.height < 480) this.panel.classList.add('tc-short')
+          else this.panel.classList.remove('tc-short')
           this.log.scrollTop = this.log.scrollHeight
-        } else this.panel.style.height = ''
+        } else {
+          this.panel.style.height = ''
+          this.panel.classList.remove('tc-short')
+        }
       }
       vv.addEventListener('resize', this.viewportHandler)
       this.viewportHandler()
@@ -905,6 +1007,7 @@ export class TrainedChatPanel {
     if (this.viewportHandler) {
       window.visualViewport?.removeEventListener('resize', this.viewportHandler)
       this.panel.style.height = ''
+      this.panel.classList.remove('tc-short')
     }
     this.viewportHandler = null
   }
@@ -915,6 +1018,12 @@ export class TrainedChatPanel {
   }
 
   private reset(): void {
+    this.convId++
+    this.busy = false
+    this.retired = null
+    this.held = null
+    this.compareDropped = false
+    this.tubeOwn.hidden = true
     this.turns = []
     this.baseReplies = []
     this.serverTurnsLeft = null
@@ -925,6 +1034,17 @@ export class TrainedChatPanel {
     this.statusLine.textContent = ''
     this.clearBanner()
     this.input.value = ''
+    this.input.style.height = ''
+  }
+
+  /** Starts a fresh conversation. One that was with a model no longer on the shelf moves on to the first card. */
+  private newConversation(): void {
+    const gone = this.retired !== null
+    this.reset()
+    if (gone) this.chosen = null
+    this.signature = ''
+    this.renderAll(true)
+    if (!this.coarse()) this.input.focus?.()
   }
 
   private clearBanner(): void {
@@ -932,8 +1052,14 @@ export class TrainedChatPanel {
     this.banner.textContent = ''
   }
 
-  private showBanner(message: string | null): void {
-    this.banner.textContent = `Your message was not sent. ${message ?? 'The lab could not be reached. Check your connection and try again.'}`
+  /**
+   * `sent` is true when the message did reach the model (a busy answer): then
+   * the banner does not say it was not sent. A refusal or a lost connection
+   * did not send it.
+   */
+  private showBanner(message: string | null, sent = false): void {
+    if (sent) this.banner.textContent = `${message ?? 'No reply came back.'} Your text is still in the box.`
+    else this.banner.textContent = `Your message was not sent. ${message ?? 'The lab could not be reached. Check your connection and try again.'}`
     this.banner.hidden = false
   }
 
@@ -944,26 +1070,54 @@ export class TrainedChatPanel {
       const res = await fetch(API, { headers: { Accept: 'application/json' } })
       if (!res.ok) throw new Error(String(res.status))
       const list = parseListResponse(await res.json())
+      // The room may have said "off" while the request was out.
+      if (!this.available) return
       if (!list.enabled) {
         // The route itself says the chat is off: stop asking. It is asked
         // again only after the room's state has said off and then on again.
         this.stopRefresh()
         this.chatShown = false
+        this.dropChat()
         this.sync()
         return
       }
+      const before = this.current()
+      // The story box was chosen only because nothing else was there yet: a model on the shelf comes first.
+      if (this.chosen === STORY && !this.picked && list.adapters.length > 0) this.chosen = null
       this.chatShown = true
       this.loadState = list.unavailable ? 'unavailable' : 'ok'
       this.adapters = list.adapters
       this.limits = list.limits
       this.notice = list.notice
       this.compareEnabled = list.compareEnabled
+      if (!list.compareEnabled && this.compareOn) {
+        this.compareOn = false
+        this.compareDropped = this.committedTurns() > 0 || this.halfPair
+        this.held = null
+      }
       if (this.chosen && this.chosen !== STORY && !this.adapters.some(a => a.slug === this.chosen)) {
-        this.chosen = null
-        this.reset()
+        if ((this.committedTurns() > 0 || this.busy || this.halfPair) && before) {
+          // A conversation is under way: it stays on screen, closed, and the visitor decides what is next.
+          this.retired = before
+        } else {
+          this.chosen = null
+          this.reset()
+        }
+      }
+      if (this.pendingSlug) {
+        const want = this.pendingSlug
+        this.pendingSlug = null
+        if (this.adapters.some(a => a.slug === want)) {
+          this.sync()
+          this.pick(want)
+          if (this.isOpen && !this.coarse()) this.input.focus?.()
+          return
+        }
       }
       this.sync()
     } catch {
+      // One failed refresh must not take away a conversation that is on screen.
+      if (this.chatShown && this.loadState === 'ok') return
       if (!this.isOpen) {
         this.chatShown = false
         this.sync()
@@ -979,23 +1133,27 @@ export class TrainedChatPanel {
   }
 
   private current(): TrainedAdapterView | null {
-    return this.chosen && this.chosen !== STORY ? this.adapters.find(a => a.slug === this.chosen) ?? null : null
+    if (!this.chosen || this.chosen === STORY) return null
+    return this.adapters.find(a => a.slug === this.chosen) ?? (this.retired?.slug === this.chosen ? this.retired : null)
   }
 
   /** The conversation is with an adapter that is on the shelf now. */
   private canChat(): boolean {
-    return this.chatShown && this.loadState === 'ok' && this.current() !== null
+    return this.chatShown && this.loadState === 'ok' && this.retired === null && this.current() !== null
   }
 
   private renderAll(force = false): void {
     // The first chosen card: kept first, then newest, as the server lists them.
-    if (!this.chosen || (this.chosen === STORY && !this.storyShown())) {
+    if (!this.chatShown) {
+      // With the chat off, only the story box can be on screen.
+      this.chosen = this.storyShown() ? STORY : null
+    } else if (!this.chosen || (this.chosen === STORY && !this.storyShown())) {
       this.chosen = this.adapters[0]?.slug ?? (this.storyShown() ? STORY : null)
     }
     const signature = shelfSignature({
       adapters: this.adapters, story: this.storyShown(), chat: this.chatShown, state: this.loadState,
       compare: this.compareEnabled, limits: this.limits, notice: this.notice,
-    }) + `|${this.chosen}`
+    }) + `|${this.chosen}|${this.retired?.slug ?? ''}`
     if (!force && signature === this.signature) return
     this.signature = signature
     this.renderShelf()
@@ -1004,6 +1162,7 @@ export class TrainedChatPanel {
 
   private renderShelf(): void {
     const activeSlug = (document.activeElement as HTMLElement | null)?.getAttribute?.('data-slug') ?? null
+    const sheetFocus = this.shelfSheet.contains?.(document.activeElement) === true
     this.cards.replaceChildren()
     this.shelfSheet.replaceChildren()
     this.shelfFoot.replaceChildren()
@@ -1028,11 +1187,15 @@ export class TrainedChatPanel {
       sheet('The Shelf Could Not Be Read', ['Please try again in a moment.'], true)
       if (!story) this.panel.classList.add('tc-full-sheet')
     } else if (empty) {
-      sheet('Nothing Is on the Shelf Yet', [
-        'The lab\'s models can fine-tune small models. Each one that is saved appears here, and you can talk to it.',
-        EMPTY_AFTER,
+      sheet(story ? 'No Fine-Tuned Models Right Now' : 'Nothing Is on the Shelf Right Now', [
+        'No trained model is on the shelf. The lab\'s models can train small models. When the lab saves one, it appears here.',
       ], false)
-      if (!story) this.panel.classList.add('tc-full-sheet')
+      if (!story) {
+        const slot = el('div', 'tc-slot', 'Empty Slot')
+        slot.setAttribute('aria-hidden', 'true')
+        this.shelfSheet.appendChild(slot)
+        this.panel.classList.add('tc-full-sheet')
+      }
     }
     const list = chat && !failed ? this.adapters : []
     this.shelfHead.style.display = chat && !failed && !empty ? '' : 'none'
@@ -1043,6 +1206,8 @@ export class TrainedChatPanel {
       if (this.notice) this.shelfFoot.appendChild(el('p', undefined, this.notice))
       this.shelfFoot.appendChild(el('p', undefined, TUBE_LINE))
     }
+    // A redrawn "Try Again" must not drop focus on the page body.
+    if (sheetFocus) (this.shelfSheet.querySelector?.('button') as HTMLElement | null)?.focus?.()
     if (activeSlug) {
       const again = Array.from(this.cards.querySelectorAll?.('button') ?? []).find(b => (b as HTMLElement).getAttribute('data-slug') === activeSlug) as HTMLElement | undefined
       again?.focus?.()
@@ -1084,6 +1249,7 @@ export class TrainedChatPanel {
     top.appendChild(el('span', 'tc-card-title', 'The Research Loop\'s Story Model'))
     card.appendChild(top)
     card.appendChild(el('div', 'tc-maker', 'Continues a line you write.'))
+    card.appendChild(el('div', 'tc-explain', 'A tiny model the research loop trained from scratch. Its score is self-reported.'))
     card.appendChild(el('span', 'tc-tag', kindLabel('story')))
     card.addEventListener('click', () => this.choose(STORY))
     return card
@@ -1094,19 +1260,29 @@ export class TrainedChatPanel {
     if (g.kind === 'none') return el('div', 'tc-gauge', g.none)
     const box = el('div', 'tc-gauge')
     box.setAttribute('role', 'img')
-    box.setAttribute('aria-label', g.aria)
+    box.setAttribute('aria-label', `${g.aria} ${g.verdict}.`)
     const head = el('div', 'tc-gauge-head')
-    head.append(el('span', undefined, g.heading), el('span', undefined, g.caption))
+    head.append(el('span', undefined, g.heading), el('span', undefined, `${g.caption} ${g.kind === 'rl' ? '\u2191' : '\u2193'}`))
     box.appendChild(head)
+    const beforePct = g.rows[0]?.pct ?? 0
     for (const row of g.rows) {
       const line = el('div', 'tc-gauge-row')
       const track = el('div', 'tc-track')
       const bar = el('div', row.label === 'After' ? 'tc-bar tc-after' : 'tc-bar')
       bar.style.width = `${row.pct.toFixed(1)}%`
       track.appendChild(bar)
+      // On the After track, a tick marks where Before was, so the gap is what you see.
+      if (row.label === 'After') {
+        const tick = el('div', 'tc-tick')
+        tick.style.left = `${beforePct.toFixed(1)}%`
+        track.appendChild(tick)
+      }
       line.append(el('span', undefined, row.label), track, el('span', 'tc-gauge-num', row.text))
       box.appendChild(line)
     }
+    const verdict = el('div', 'tc-verdict')
+    verdict.append(el('span', 'tc-verdict-word', g.verdict), el('span', undefined, `from ${g.rows[0].text} to ${g.rows[1].text}`))
+    box.append(verdict, el('p', 'tc-explain', g.explain))
     return box
   }
 
@@ -1115,6 +1291,8 @@ export class TrainedChatPanel {
       this.chosen = slug
       this.reset()
     }
+    this.pendingSlug = null
+    this.picked = true
     this.signature = ''
     this.renderAll(true)
     this.panel.classList.remove('tc-view-shelf')
@@ -1136,10 +1314,11 @@ export class TrainedChatPanel {
       this.whoTitle.textContent = 'Story Model'
       return
     }
-    if (!a || !this.canChat()) {
+    if (!a || !(this.canChat() || this.retired !== null)) {
       this.whoTitle.textContent = ''
       this.switchNote.hidden = true
       this.switchButton.hidden = true
+      this.infoLine.hidden = true
       return
     }
     const d = describeAdapter(a)
@@ -1148,6 +1327,8 @@ export class TrainedChatPanel {
     swatch.setAttribute('aria-hidden', 'true')
     this.whoTitle.append(swatch, el('span', undefined, d.title))
     this.whoSub.textContent = `Trained by ${a.authorName}. Base model ${a.baseModel}.`
+    // On a phone the line under the name is hidden, so the details carry it.
+    this.details.appendChild(el('p', 'tc-det-maker', `Trained by ${a.authorName}. Base model ${a.baseModel}.`))
     for (const line of [a.purpose, d.origin, d.label, d.score, d.kept]) {
       if (!line) continue
       this.details.appendChild(el('p', undefined, line))
@@ -1176,21 +1357,32 @@ export class TrainedChatPanel {
 
   private refreshCompare(): void {
     const a = this.current()
-    const show = this.compareEnabled && a !== null
+    const show = this.compareEnabled && a !== null && this.retired === null
     this.switchButton.hidden = !show
     this.switchNote.hidden = !show
+    this.refreshInfo()
     if (!show || !a) return
     const locked = this.committedTurns() > 0
     this.switchButton.setAttribute('aria-checked', String(this.compareOn))
     this.switchButton.setAttribute('aria-disabled', String(locked))
+    this.switchState.textContent = locked ? `${this.compareOn ? 'On' : 'Off'}, locked` : this.compareOn ? 'On' : 'Off'
     this.switchNote.textContent = locked
-      ? 'Start a new conversation to change this.'
-      : `Asks the untrained ${a.baseModel} the same question, so you can see what training changed. Each question uses two of your messages.`
+      ? 'Locked for this conversation. Start a new one to change it.'
+      : 'Also asks the untrained model. Uses 2 messages.'
+  }
+
+  /** The one line above the box that explains why the conversation has changed under the visitor. */
+  private refreshInfo(): void {
+    const text = this.retired !== null ? CLOSED_LINE : this.compareDropped ? COMPARE_DROPPED : ''
+    this.infoLine.textContent = text
+    this.infoLine.hidden = text === ''
   }
 
   private flipCompare(): void {
     if (this.busy || this.committedTurns() > 0) return
     this.compareOn = !this.compareOn
+    this.compareDropped = false
+    this.held = null
     if (this.halfPair) this.discardOpenBlock()
     this.refreshCompare()
     this.refreshForm()
@@ -1200,6 +1392,14 @@ export class TrainedChatPanel {
     this.openBlock?.remove()
     this.openBlock = null
     this.halfPair = false
+  }
+
+  /** One side of a pair, as a sheet of paper. */
+  private sideSheet(a: TrainedAdapterView, title: string, trained: boolean, r: ReplySide, base: string): HTMLElement {
+    const label = trained ? `Trained: ${title}` : `Untrained: ${base}`
+    return r.ok
+      ? this.sheetFor(label, r.reply, { accent: trained ? accentFor(a.authorName) : undefined, untrained: !trained, cut: r.cutShort })
+      : this.sheetFor(label, r.message ?? (trained ? 'The trained model did not answer.' : 'The untrained model did not answer. It may not be available.'), { failed: true, untrained: !trained })
   }
 
   private refreshMeta(): void {
@@ -1218,7 +1418,7 @@ export class TrainedChatPanel {
     this.input.maxLength = this.limits.maxMessageChars
     this.input.disabled = this.busy || !ok
     this.send.disabled = this.busy || !ok
-    this.send.textContent = this.busy ? 'Sending' : this.compareOn ? 'Ask Both' : 'Send'
+    this.send.textContent = this.busy ? 'Sending' : this.compareOn && this.compareEnabled ? 'Ask Both' : 'Send'
     this.newButton.hidden = this.committedTurns() === 0 && !this.halfPair
     this.again.hidden = !this.halfPair
     this.again.disabled = this.busy
@@ -1251,88 +1451,135 @@ export class TrainedChatPanel {
   private async submit(): Promise<void> {
     const message = this.input.value.trim()
     const a = this.current()
+    if (message && !this.busy && !this.canChat()) {
+      // The shelf could not be read, or this model has left it: say so, never fail in silence.
+      this.showBanner('The chat is not available right now. Try again in a moment.')
+      return
+    }
     if (!message || this.busy || !a || !this.canChat() || this.committedTurns() >= this.limits.maxTurns) return
+    // Asking again after a half pair asks only the side that failed, when the question is unchanged.
+    const text1 = message.slice(0, this.limits.maxMessageChars)
+    const held = this.halfPair && this.held && this.held.message === text1 ? this.held : null
     if (this.halfPair) this.discardOpenBlock()
+    if (!held) this.held = null
     this.clearBanner()
     this.log.querySelector?.('.tc-log-empty')?.remove()
     const compare = this.compareOn && this.compareEnabled
-    const text1 = message.slice(0, this.limits.maxMessageChars)
+    const only: 'trained' | 'untrained' | null = compare && held ? (held.trained ? 'untrained' : 'trained') : null
     const history: Turn[] = [...this.turns, { role: 'user', content: text1 }]
     const title = describeAdapter(a).title
+    const conv = this.convId
     this.busy = true
     const block = el('div', 'tc-ex')
     block.appendChild(this.slip(text1))
+    const waitingFor = only === 'untrained' ? `the untrained ${a.baseModel}` : only === 'trained' ? title : compare ? `${title} and the untrained ${a.baseModel}` : title
     block.appendChild(this.sheetFor(
       title,
-      compare
-        ? `Waiting for ${title} and the untrained ${a.baseModel}. The server stops waiting after ${SERVER_WAIT_SECONDS} seconds.`
-        : `Waiting for ${title}. The server stops waiting after ${SERVER_WAIT_SECONDS} seconds.`,
+      `Waiting for ${waitingFor}. The server stops waiting after ${SERVER_WAIT_SECONDS} seconds.`,
       { wait: true },
     ))
     this.log.appendChild(block)
     this.openBlock = block
     this.scrollEnd()
-    this.statusLine.textContent = compare ? `Waiting for ${title} and the untrained model` : `Waiting for ${title}`
+    this.statusLine.textContent = `Waiting for ${waitingFor}`
     this.input.value = ''
     this.input.style.height = ''
     this.refreshForm()
-    const fail = (why: string | null) => {
+    // Is this still the conversation the question was asked in?
+    const current = () => conv === this.convId
+    const fail = (why: string | null, sent: boolean) => {
+      if (!current()) return
       this.discardOpenBlock()
       this.input.value = message
       this.statusLine.textContent = ''
-      this.showBanner(why)
-      this.showHint()
+      this.showBanner(why, sent)
+      if (held) {
+        // The side that answered stays on screen beside the failure.
+        const pair = el('div', 'tc-pair tc-two')
+        const failed: ReplySide = { ok: false, message: why }
+        pair.append(
+          this.sideSheet(a, title, true, only === 'untrained' ? held.trained ?? failed : failed, a.baseModel),
+          this.sideSheet(a, title, false, only === 'trained' ? held.untrained ?? failed : failed, a.baseModel),
+        )
+        const redo = el('div', 'tc-ex')
+        redo.append(this.slip(text1), pair, el('div', 'tc-fine', HALF_NOTE))
+        this.log.appendChild(redo)
+        this.openBlock = redo
+        this.halfPair = true
+        this.scrollEnd()
+      } else this.showHint()
     }
     try {
       const res = await fetch(API, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-        body: JSON.stringify(buildChatBody(a.slug, history, compare ? this.baseReplies : null)),
+        body: JSON.stringify(buildChatBody(a.slug, history, compare ? this.baseReplies : null, only)),
       })
       const json = await res.json().catch(() => ({}))
       const read = readReply(res.ok, json, compare)
+      if (!current()) {
+        // The visitor moved on while this was out. The reply is real, so the room still hears it, but it is not drawn here.
+        if ((read.kind === 'single') || (read.kind === 'pair' && read.trained.ok && only !== 'untrained')) this.onReply?.(Date.now())
+        return
+      }
       if (read.kind === 'error') {
-        fail(read.message)
+        const busy = !res.ok && (json as { error?: unknown } | null)?.error === 'busy'
+        fail(read.message, busy)
       } else if (read.kind === 'single') {
         this.turns = [...history, { role: 'assistant', content: read.reply }]
         this.serverTurnsLeft = read.turnsLeft
         block.replaceChildren(this.slip(text1), this.sheetFor(title, read.reply, { accent: accentFor(a.authorName), cut: read.cutShort }))
         this.openBlock = null
         this.statusLine.textContent = 'Reply received'
+        this.noteTube()
         this.onReply?.(Date.now())
       } else {
-        const side = (r: ReplySide, label: string, who: string, untrained: boolean): HTMLElement => r.ok
-          ? this.sheetFor(label, r.reply, { accent: untrained ? undefined : accentFor(a.authorName), untrained, cut: r.cutShort })
-          : this.sheetFor(label, r.message ?? `The ${who} model did not answer.`, { failed: true, untrained })
+        // A retry of one side: the other side is the answer held from the first try.
+        const trainedSide: ReplySide = only === 'untrained' && held?.trained ? held.trained : read.trained
+        const untrainedSide: ReplySide = only === 'trained' && held?.untrained ? held.untrained : read.untrained
         const pair = el('div', 'tc-pair tc-two')
         pair.append(
-          side(read.trained, `Trained: ${title}`, 'trained', false),
-          side(read.untrained, `Untrained: ${read.baseModel ?? a.baseModel}`, 'untrained', true),
+          this.sideSheet(a, title, true, trainedSide, a.baseModel),
+          this.sideSheet(a, title, false, untrainedSide, read.baseModel ?? a.baseModel),
         )
         block.replaceChildren(this.slip(text1), pair)
-        if (read.commit && read.trained.ok && read.untrained.ok) {
-          this.turns = [...history, { role: 'assistant', content: read.trained.reply }]
-          this.baseReplies = [...this.baseReplies, read.untrained.reply]
+        if (trainedSide.ok && untrainedSide.ok) {
+          this.turns = [...history, { role: 'assistant', content: trainedSide.reply }]
+          this.baseReplies = [...this.baseReplies, untrainedSide.reply]
           this.serverTurnsLeft = read.turnsLeft
           this.openBlock = null
+          this.halfPair = false
+          this.held = null
           this.statusLine.textContent = 'Both replies received'
         } else {
-          // Only one side answered: the good answer stays, nothing is kept in the conversation, and the text can be asked again.
+          // Only one side answered: its answer stays, nothing is kept in the conversation, and the question can be asked again.
           this.halfPair = true
+          this.held = { message: text1, trained: trainedSide.ok ? trainedSide : null, untrained: untrainedSide.ok ? untrainedSide : null }
           this.input.value = message
-          block.appendChild(el('div', 'tc-fine', 'Only one answer came back. Ask again to get both.'))
+          block.appendChild(el('div', 'tc-fine', HALF_NOTE))
           this.statusLine.textContent = 'Only one answer came back'
         }
-        if (read.trained.ok) this.onReply?.(Date.now())
+        if (only !== 'untrained' && read.trained.ok) {
+          this.noteTube()
+          this.onReply?.(Date.now())
+        }
       }
     } catch {
-      fail(null)
+      fail(null, false)
     } finally {
-      this.busy = false
-      this.refreshCompare()
-      this.refreshForm()
-      this.scrollEnd()
-      if (this.isOpen && !this.input.disabled && !this.coarse()) this.input.focus?.()
+      if (current()) {
+        this.busy = false
+        this.refreshCompare()
+        this.refreshForm()
+        this.scrollEnd()
+        if (this.isOpen && !this.input.disabled && !this.coarse()) this.input.focus?.()
+      }
     }
+  }
+
+  /** The visitor's own reply really arrived, so the room's tube was told: say so, once, in the conversation's foot. */
+  private noteTube(): void {
+    this.tubeOwn.textContent = OWN_TUBE_LINE
+    this.tubeOwn.hidden = false
   }
 }

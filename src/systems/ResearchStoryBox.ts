@@ -216,6 +216,8 @@ export class ResearchStoryBox {
       const res = await fetch(API, { headers: { Accept: 'application/json' } })
       if (!res.ok) throw new Error(String(res.status))
       const data = await res.json() as { enabled?: unknown }
+      // The room may have said "off" while the request was out: do not show the box again.
+      if (!this.available) return
       if (data.enabled !== true) {
         // The route itself says stories are off: stop asking. It is asked
         // again only after the room's state has said off and then on again.

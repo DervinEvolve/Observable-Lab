@@ -118,6 +118,9 @@ export function ensureTinkerTables(): Promise<void> {
           duration_ms INTEGER
         )
       `
+      // The room signal reads the newest answered call and counts today's on
+      // every state poll, so those two reads use this index, not a table scan.
+      await sql`CREATE INDEX IF NOT EXISTS idx_trained_chat_calls_ok ON trained_chat_calls(created_at DESC) WHERE status = 'ok'`
     })().catch(e => {
       tablesReady = null
       throw e
@@ -1180,10 +1183,11 @@ export async function countVisitorMessage(visitor: string, bucket: string, limit
   return Boolean(r.rows[0])
 }
 
-/** Removes rate rows older than two days. Never throws. */
+/** Removes rate rows older than two days and chat call rows older than thirty days. Never throws. */
 export async function pruneVisitorCounts(now: Date = new Date()): Promise<void> {
   try {
     await sql`DELETE FROM trained_chat_rate WHERE created_at < ${new Date(now.getTime() - 48 * 60 * 60 * 1000).toISOString()}`
+    await sql`DELETE FROM trained_chat_calls WHERE created_at < ${new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString()}`
   } catch {
     // housekeeping only
   }

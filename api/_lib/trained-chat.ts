@@ -83,7 +83,7 @@ export const TRAINED_CHAT_COMPARE_MAX_BODY_BYTES = 28 * 1024
 export const TRAINED_CHAT_TIMEOUT_MS = 45_000
 
 /** Shown beside the chat. Plain, and no dashes. */
-export const TRAINED_CHAT_NOTICE = 'A small model fine-tuned by the lab\'s AI models on data they wrote. Replies are not reviewed.'
+export const TRAINED_CHAT_NOTICE = 'Small models trained by the lab\'s AI models. Replies are not reviewed.'
 /** Shown instead while the list holds an adapter trained on a public dataset (only with LAB_TRAINED_CHAT_DATASET_ADAPTERS on). */
 export const TRAINED_CHAT_NOTICE_DATASETS = 'Small models fine-tuned by the lab\'s AI models. Some were trained on data the models wrote, and some on rows of a public dataset that nobody at the lab has read. Replies are not reviewed.'
 
@@ -107,6 +107,7 @@ const MESSAGES = {
   gone: 'That model is no longer kept. Trained models expire after a while.',
   notOffered: 'That model is not offered in this chat.',
   busy: 'The model did not answer this time. Please try again in a moment.',
+  baseBusy: 'The untrained model did not answer. It may not be available.',
   unavailable: 'The chat is not available just now. Please try again later.',
 }
 
@@ -127,6 +128,12 @@ export interface ChatRequest {
   baseMessages: TinkerChatMessage[]
   /** Characters of baseMessages. 0 unless compare. */
   baseChars: number
+  /**
+   * A retry of one side of a comparison that came back with only one answer:
+   * only that side is asked, so the side that already answered is not asked
+   * (or paid for) again, and the retry counts as one message. Null otherwise.
+   */
+  only: 'trained' | 'untrained' | null
 }
 
 // eslint-disable-next-line no-control-regex
@@ -142,8 +149,8 @@ export function readChatRequest(raw: unknown): ChatRequest | ChatRefusal {
   const bad = (message: string, error = 'invalid_request'): ChatRefusal => ({ ok: false, status: 400, error, message })
   if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return bad('Send a JSON object with "adapter" and "messages".')
   const req = raw as Record<string, unknown>
-  if (Object.keys(req).some(k => k !== 'adapter' && k !== 'messages' && k !== 'compare' && k !== 'base_replies')) {
-    return bad('Only "adapter", "messages", "compare" and "base_replies" are accepted.')
+  if (Object.keys(req).some(k => k !== 'adapter' && k !== 'messages' && k !== 'compare' && k !== 'base_replies' && k !== 'only')) {
+    return bad('Only "adapter", "messages", "compare", "base_replies" and "only" are accepted.')
   }
   if (!isAdapterSlug(req.adapter)) return bad('"adapter" must be the name of a trained model from the list.')
   const list = req.messages
@@ -172,8 +179,11 @@ export function readChatRequest(raw: unknown): ChatRequest | ChatRefusal {
   if ('compare' in req && typeof req.compare !== 'boolean') return bad('compare must be true or false.')
   if (req.compare !== true) {
     if ('base_replies' in req) return bad('base_replies is only accepted with compare.')
-    return { ok: true, adapter: req.adapter, messages, turns, chars, compare: false, baseMessages: [], baseChars: 0 }
+    if ('only' in req) return bad('only is accepted with compare.')
+    return { ok: true, adapter: req.adapter, messages, turns, chars, compare: false, baseMessages: [], baseChars: 0, only: null }
   }
+  if ('only' in req && req.only !== 'trained' && req.only !== 'untrained') return bad('only must be "trained" or "untrained".')
+  const only = req.only === 'trained' || req.only === 'untrained' ? req.only : null
   const replies = req.base_replies
   if (!Array.isArray(replies) || replies.length !== turns - 1 || replies.some(r => typeof r !== 'string' || !r.trim())) {
     return bad('base_replies must hold one reply for each earlier reply.')
@@ -193,7 +203,7 @@ export function readChatRequest(raw: unknown): ChatRequest | ChatRefusal {
     baseMessages.push({ role: 'assistant', content })
     baseChars += content.length
   }
-  return { ok: true, adapter: req.adapter, messages, turns, chars, compare: true, baseMessages, baseChars }
+  return { ok: true, adapter: req.adapter, messages, turns, chars, compare: true, baseMessages, baseChars, only }
 }
 
 function header(req: VercelRequest, name: string): string {
@@ -278,7 +288,8 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
     // A comparison asks two models, so it counts as two messages: the limits
     // fill twice as fast and the address limits do not loosen. A pass that is
     // refused does not undo the one before it, as a refused call never has.
-    for (let pass = 0; pass < (chat.compare ? 2 : 1); pass++) {
+    // A retry of one side asks one model, so it counts as one.
+    for (let pass = 0; pass < (chat.compare && !chat.only ? 2 : 1); pass++) {
       for (const [who, perWindow] of [[address, TRAINED_CHAT_ADDRESS_PER_WINDOW], [visitor, TRAINED_CHAT_PER_WINDOW]] as const) {
         if (!(await countVisitorMessage(who, windowBucket, perWindow))) {
           res.setHeader('Retry-After', String(TRAINED_CHAT_WINDOW_S))
@@ -310,13 +321,17 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
   const base = target.adapter.base_model
 
   // ---- today's money: the lab's budget, then the chat's cap, then all of Tinker's ----
+  // Each call's own worst case. A comparison sets aside both, once, under
+  // each scope, before either call is sent. A retry of one side sets aside
+  // only that side.
+  const worstTrained = chat.only === 'untrained' ? 0 : tinkerChatWorstCaseUsd(base, chat.messages, TRAINED_CHAT_MAX_TOKENS)
+  const worstBase = chat.compare && chat.only !== 'trained' ? tinkerChatWorstCaseUsd(base, chat.baseMessages, TRAINED_CHAT_MAX_TOKENS) : 0
+  const worst = chat.compare ? Math.ceil((worstTrained + worstBase) * 1e6) / 1e6 : worstTrained
   const budget = await checkDailyBudget(now)
   if (!budget.allowed) return say(res, budget.spent_usd === null ? 503 : 429, budget.spent_usd === null ? 'unavailable' : 'budget', budget.spent_usd === null ? MESSAGES.unavailable : MESSAGES.budget)
-  // Each call's own worst case. A comparison sets aside both, once, under
-  // each scope, before either call is sent.
-  const worstTrained = tinkerChatWorstCaseUsd(base, chat.messages, TRAINED_CHAT_MAX_TOKENS)
-  const worstBase = chat.compare ? tinkerChatWorstCaseUsd(base, chat.baseMessages, TRAINED_CHAT_MAX_TOKENS) : 0
-  const worst = chat.compare ? Math.ceil((worstTrained + worstBase) * 1e6) / 1e6 : worstTrained
+  // The lab's budget is checked against what is recorded, not what is held, so
+  // the check also asks that this call's worst case still fits.
+  if (budget.spent_usd !== null && budget.spent_usd + worst > budget.budget_usd + 1e-9) return say(res, 429, 'budget', chat.compare ? MESSAGES.budgetCompare : MESSAGES.budget)
   const budgetMessage = chat.compare ? MESSAGES.budgetCompare : MESSAGES.budget
   let chatHold: Reservation | null = null
   let allHold: Reservation
@@ -347,8 +362,8 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
   // callTinkerChat never throws, so one side failing cannot lose the other's answer.
   // The base model is always the adapter's own record, never anything the visitor sent.
   const [trained, untrained] = await Promise.all([
-    timed(trainedInput),
-    chat.compare
+    chat.only === 'untrained' ? Promise.resolve(null) : timed(trainedInput),
+    chat.compare && chat.only !== 'trained'
       ? timed({ baseModel: base, messages: chat.baseMessages, maxTokens: TRAINED_CHAT_MAX_TOKENS, temperature: TRAINED_CHAT_TEMPERATURE, timeoutMs: TRAINED_CHAT_TIMEOUT_MS })
       : Promise.resolve(null),
   ])
@@ -359,7 +374,7 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
   // comparison charges each call by its own worst case, then settles both
   // holds once with the sum.
   const measured = (p: number, c: number) => tinkerChatCostUsd(base, p, c)
-  const trainedCost = tinkerChatCharge(trained.answer, measured, worstTrained).usd
+  const trainedCost = trained ? tinkerChatCharge(trained.answer, measured, worstTrained).usd : 0
   const untrainedCost = untrained ? tinkerChatCharge(untrained.answer, measured, worstBase).usd : 0
   const costUsd = trainedCost + untrainedCost
   await settleTinkerSpend(chatHold, costUsd)
@@ -382,7 +397,7 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
       console.warn(`[trained-chat] no ${opts.model === target.adapter.model_id ? '' : 'untrained '}reply (${a.kind}${a.httpStatus ? `, ${a.httpStatus}` : ''})`)
     }
   }
-  await record(trained, trainedCost, { model: target.adapter.model_id, status: k => k, chars: chat.chars })
+  if (trained) await record(trained, trainedCost, { model: target.adapter.model_id, status: k => k, chars: chat.chars })
   if (untrained) await record(untrained, untrainedCost, { model: base, status: k => `base_${k}`, chars: chat.baseChars })
 
   const cleaned = (answer: Extract<TinkerChatResult, { ok: true }>) => ({
@@ -391,18 +406,21 @@ export async function handleTrainedChat(req: VercelRequest, res: VercelResponse)
   })
   const turnsLeft = Math.max(0, TRAINED_CHAT_MAX_TURNS - chat.turns)
 
-  if (!untrained) {
-    if (!trained.answer.ok) return say(res, trained.answer.kind === 'timeout' ? 504 : 502, 'busy', MESSAGES.busy)
+  if (!chat.compare) {
+    if (!trained || !trained.answer.ok) return say(res, trained && !trained.answer.ok && trained.answer.kind === 'timeout' ? 504 : 502, 'busy', MESSAGES.busy)
     return res.status(200).json({ adapter: target.adapter.slug, ...cleaned(trained.answer), turns_left: turnsLeft })
   }
-  if (!trained.answer.ok && !untrained.answer.ok) {
-    return say(res, trained.answer.kind === 'timeout' && untrained.answer.kind === 'timeout' ? 504 : 502, 'busy', MESSAGES.busy)
+  const answers = [trained?.answer, untrained?.answer].filter((a): a is TinkerChatResult => a !== undefined)
+  if (answers.every(a => !a.ok)) {
+    return say(res, answers.every(a => !a.ok && (a as { kind?: string }).kind === 'timeout') ? 504 : 502, 'busy', untrained && !trained ? MESSAGES.baseBusy : MESSAGES.busy)
   }
-  const side = (answer: TinkerChatResult) => answer.ok
+  const side = (answer: TinkerChatResult | undefined, message: string) => !answer
+    ? { ok: false as const, error: 'skipped', message: 'This side was not asked again.' }
+    : answer.ok
     ? { ok: true as const, ...cleaned(answer) }
-    : { ok: false as const, error: 'busy', message: MESSAGES.busy }
+    : { ok: false as const, error: 'busy', message }
   return res.status(200).json({
     adapter: target.adapter.slug, compare: true, base_model: base,
-    trained: side(trained.answer), untrained: side(untrained.answer), turns_left: turnsLeft,
+    trained: side(trained?.answer, MESSAGES.busy), untrained: side(untrained?.answer, MESSAGES.baseBusy), turns_left: turnsLeft,
   })
 }

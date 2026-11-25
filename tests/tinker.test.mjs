@@ -1292,7 +1292,7 @@ test('the chat lists kept adapters with the lab-measured scores, and answers a m
   assert.equal(list.code, 200)
   assert.equal(list.headers['Cache-Control'], 'no-store')
   assert.equal(list.body.enabled, true)
-  assert.equal(list.body.notice, "A small model fine-tuned by the lab's AI models on data they wrote. Replies are not reviewed.")
+  assert.equal(list.body.notice, "Small models trained by the lab's AI models. Replies are not reviewed.")
   assert.deepEqual(list.body.limits, { max_message_chars: 500, max_turns: 8, max_reply_tokens: 200 })
   assert.equal(list.body.compare_enabled, true)
   assert.equal(list.body.adapters.length, 1)
@@ -1761,7 +1761,7 @@ test('the panel asks for nothing until the room says the chat is on, and stops a
   assert.ok(shorthands.length >= 2)
   assert.deepEqual(shorthands.filter(v => /\binherit\b/.test(v) && v !== 'inherit'), [], 'a font shorthand mixes inherit with other values, which is invalid CSS')
   assert.match(source, /#trained-chat-panel textarea \{[^}]*font-family: inherit; font-size: 16px; line-height: 1\.3;/)
-  assert.match(source, /\.tc-send, #trained-chat-panel \.tc-new \{[^}]*font-family: inherit; font-size: 12px; font-weight: 600;/)
+  assert.match(source, /\.tc-send, #trained-chat-panel \.tc-new \{[^}]*font-family: inherit; font-size: 13px; font-weight: 600;/)
 })
 
 test('the panel reads adapters strictly and says who measured the score', () => {
@@ -1778,7 +1778,7 @@ test('the panel reads adapters strictly and says who measured the score', () => 
     title: 'lab/e41-0a1b2c3d',
     origin: 'Epoch 41. Data written by Claude Fable 5.2 (20 examples). Base model Qwen/Qwen3.5-4B.',
     score: 'Held-out loss 2.95 before training, 1.10 after, on 2 examples the lab held out. Measured by the lab. Lower is better.',
-    kept: 'Kept until 2026-12-02.',
+    kept: 'Removed after 2 Dec 2026 unless it is marked to keep.',
   })
   assert.deepEqual(panel.parseAdapters(null), [])
   assert.deepEqual(panel.parseLimits({ limits: { max_message_chars: 500, max_turns: 8 } }), { maxMessageChars: 500, maxTurns: 8 })

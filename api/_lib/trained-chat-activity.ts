@@ -7,12 +7,15 @@
  * were today (UTC). There is no new table, column or write. No message text,
  * no visitor hash, no turn count and no cost is in it, and an error, a refusal
  * or an untrained comparison row never counts. It is absent unless the chat is
- * on and an answer was given in the last 24 hours.
+ * on and an answer was given in the last 24 hours, and the adapter that
+ * answered is still offered by the chat. Times are rounded down to 30 seconds,
+ * so the field never gives the exact moment a chat finished.
  *
  * Read at most every few seconds per server instance, and it never throws.
  */
 import { isAdapterSlug, trainedChatStatus } from './tinker.js'
-import { chatCallsToday, latestChatCall } from './tinker-store.js'
+import { chatCallsToday, getAdapter, latestChatCall } from './tinker-store.js'
+import { chatOffers } from './trained-chat.js'
 
 export interface ChatActivity {
   /** The server's clock when this was built, so the page can measure age without trusting its own. */
@@ -23,6 +26,8 @@ export interface ChatActivity {
 
 const CACHE_MS = 4000
 const WINDOW_MS = 24 * 60 * 60 * 1000
+const ROUND_MS = 30_000
+const floorTime = (d: Date) => new Date(Math.floor(d.getTime() / ROUND_MS) * ROUND_MS)
 
 /** Pure: the field as visitors may see it, or null. */
 export function publicChatActivity(last: { slug: string; at: Date } | null, today: number, now: Date): ChatActivity | null {
@@ -30,9 +35,9 @@ export function publicChatActivity(last: { slug: string; at: Date } | null, toda
   const age = now.getTime() - last.at.getTime()
   if (!Number.isFinite(age) || age > WINDOW_MS) return null
   return {
-    now: now.toISOString(),
+    now: floorTime(now).toISOString(),
     today: Number.isInteger(today) && today >= 0 ? today : 0,
-    last: { adapter: last.slug, at: last.at.toISOString() },
+    last: { adapter: last.slug, at: floorTime(last.at).toISOString() },
   }
 }
 
@@ -45,7 +50,10 @@ export async function chatActivity(now: Date = new Date()): Promise<ChatActivity
   let value: ChatActivity | null = null
   try {
     const last = await latestChatCall()
-    value = last ? publicChatActivity(last, await chatCallsToday(now), now) : null
+    // The adapter must still be on the shelf: one that expired, or a dataset
+    // adapter whose switch was turned off, is not named.
+    const offered = last ? await getAdapter(last.slug, now) : null
+    value = last && offered && chatOffers(offered) ? publicChatActivity(last, await chatCallsToday(now), now) : null
   } catch {
     value = null
   }
