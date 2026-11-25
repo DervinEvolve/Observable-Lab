@@ -206,7 +206,7 @@ test('the chart has a words and a lamp for every state, and the lamp is lit only
   const d = view(lesson())
   assert.deepEqual([d.mode, d.stageLine, d.lamp], ['diagnostic', 'Testing the untrained model. 24 of 48 answers graded.', true])
   assert.deepEqual(d.rows.map(r => [r.name, r.bands]), [['Carrying digits', '2'], ['Reading the question', '3'], ['Units', null], ['Checking', null]])
-  assert.equal(d.byline, 'Taught by Grok 4.7. Epoch 41.')
+  assert.equal(d.byline, 'Topic and row names by Grok 4.7, who also taught. Epoch 41.')
   assert.equal(d.title, 'Arithmetic habits')
   assert.equal(view(lesson({ live: false })).lamp, false) // open but between slices: the last stage line, a dark lamp
   assert.equal(view(lesson({ live: false })).stageLine, d.stageLine)
@@ -300,7 +300,7 @@ test('the paper says what the record says and the lamp follows the record only',
   chart.setLesson(state(lesson()), false)
   chart.update(0)
   assert.ok(written.includes('Arithmetic habits'))
-  assert.ok(written.includes('Taught by Grok 4.7. Epoch 41.'))
+  assert.ok(written.includes('Topic and row names by Grok 4.7, who also taught. Epoch 41.'))
   assert.ok(written.includes('Testing the untrained model. 24 of 48 answers graded.'))
   assert.ok(written.includes(logic.CHART_FOOT))
   assert.ok(written.includes('2') && written.includes('3'))
@@ -715,4 +715,170 @@ test('the lesson can be opened from the page, not only by aiming at the chart: a
   assert.match(ui, /querySelector\('#info-lesson-button'\)\?\.addEventListener\('click', \(\) => this\.onOpenLesson\?\.\(\)\)/)
   assert.match(ui, /The framed sheet on the wall above the bench is the skill map of the newest Socratic lesson/)
   assert.match(read('src/main.ts'), /this\.uiOverlay\.onOpenLesson = \(\) => this\.lessonPanel\?\.show\(\)/)
+})
+
+// ---------------------------------------------------------------------------
+// The second review: a reader keeps their place, and model text is labelled
+// ---------------------------------------------------------------------------
+const turnQuestions = { questions: [
+  { held_back: false, prompt: 'What is 3 minus 8?', answers: { before: [{ text: '5', passed: false }], after: [{ text: 'minus 5', passed: true }] }, turns: [
+    { kind: 'guide', state: 'graded', teacher: 'Which number is larger?', reply: 'Let me think about the', answer: 'It is 5 because', passed: false, reply_cut_short: true, answer_cut_short: true },
+    { kind: 'guide', state: 'graded', teacher: 'What is below zero?', reply: 'A negative number.', answer: 'minus 5', passed: true },
+  ] },
+] }
+
+test('a change in the lesson while a row is open never empties the row or moves the reader: the answers stay until the new ones arrive, and focus comes back without scrolling', async () => {
+  const focusCalls = []
+  const realFocus = El.prototype.focus
+  El.prototype.focus = function (options) { focusCalls.push({ cls: this.className, options }); realFocus.call(this) }
+  try {
+    await withPage(async ({ body, asked, fetchStub, settle }) => {
+      // the fetches of the test are held back until released, so the page can be read while they are on their way
+      let release = () => {}
+      let hold = false
+      const slow = async url => { if (hold) await new Promise(r => { release = r }); return fetchStub(url) }
+      const p = new LessonPanel(() => {}, { fetch: slow })
+      const open = lesson({ stage: 'teaching', teaching: { missed: 2, taught: 1, solved: 0, explained: 0, teacher_failed: 0, leaked: 0, not_taught: 0, teacher_calls: 2 } })
+      p.setLesson(state(open), false)
+      p.show()
+      await settle()
+      body.all('.lp-row')[0].fire('click')
+      await settle()
+      assert.ok(body.all('.lp-detail')[0].textContent.includes('Which number is larger?'))
+      // the reader's focus is on the open row, and they have scrolled down to its answers
+      body.all('.lp-row')[0].focus()
+      const scroller = body.all('.lp-body')[0]
+      scroller.scrollTop = 861
+      const before = asked.length
+      focusCalls.length = 0
+      hold = true
+      // the next poll: the lesson moved on (a new progress record)
+      p.setLesson(state(lesson({ ...open, progress: { ...open.progress, seq: 4, taught: 1, to_teach: 2 } })), false)
+      // while the new record is on its way the open row still shows its answers
+      assert.equal(body.all('.lp-detail')[0].textContent.includes('Loading the questions.'), false, 'the open row was emptied')
+      assert.ok(body.all('.lp-detail')[0].textContent.includes('Which number is larger?'))
+      assert.equal(scroller.scrollTop, 861)
+      assert.equal(document.activeElement, body.all('.lp-row')[0], 'focus is on the same row')
+      assert.ok(focusCalls.length > 0 && focusCalls.every(c => c.options?.preventScroll === true), `focus was put back with scrolling: ${JSON.stringify(focusCalls)}`)
+      hold = false
+      release()
+      await settle()
+      release()
+      await settle()
+      assert.deepEqual(asked.slice(before), [`/api/experiment/lesson?slug=${SLUG}`, `/api/experiment/lesson?slug=${SLUG}&subskill=0`], 'the record and the open row are read once each')
+      assert.ok(body.all('.lp-detail')[0].textContent.includes('Which number is larger?'))
+      assert.equal(scroller.scrollTop, 861)
+      p.close()
+    }, { questions: turnQuestions, record: { ...lesson({ stage: 'teaching' }), rubrics: [[], [], [], []] } })
+  } finally {
+    El.prototype.focus = realFocus
+  }
+})
+
+test('the same record again redraws nothing, in the lesson panel and in the practice bench panel, so focus inside either is kept', async () => {
+  await withPage(async ({ body, asked, fetchStub, settle }) => {
+    const p = new LessonPanel(() => {}, { fetch: fetchStub })
+    p.setLesson(state(finished()), false)
+    p.show()
+    await settle()
+    const talk = body.all('.lp-talk')[0]
+    talk.focus()
+    const nodes = [...body.all('.lp-body')[0].children]
+    // only the practice record changed: the room hands the lesson panel the same lesson again
+    p.setLesson(state(finished()), false)
+    p.setLesson(state(finished()), false)
+    await settle()
+    assert.deepEqual(body.all('.lp-body')[0].children, nodes, 'the body was rebuilt')
+    assert.equal(document.activeElement, talk)
+    assert.equal(asked.length, 1)
+    // a real change redraws, and focus goes back to the same control, not to the page
+    p.setLesson(state(finished({ reason: 'round 2 did not run: the trained model passed every practice question' })), false)
+    await settle()
+    assert.notEqual(body.all('.lp-talk')[0], talk)
+    assert.equal(document.activeElement, body.all('.lp-talk')[0], 'focus is on Talk to It again')
+    p.close()
+  })
+  const { PracticeBenchPanel } = await load('src/systems/PracticeBenchPanel.js')
+  await withPage(async ({ body }) => {
+    const panel = new PracticeBenchPanel(() => {})
+    panel.setPractice(null, false)
+    panel.show()
+    const shown = [...body.all('.pb-body')[0].children]
+    panel.setPractice(null, false)
+    assert.deepEqual(body.all('.pb-body')[0].children, shown, 'the same record again must not rebuild the body')
+    panel.setPractice({ enabled: false, offReason: 'off here', run: null }, false)
+    assert.notDeepEqual(body.all('.pb-body')[0].children, shown)
+    panel.close()
+  })
+  // the helper both panels use puts focus back on the same control without scrolling
+  const src = read('src/systems/paperTheme.ts')
+  assert.match(src, /again\?\.focus\?\.\(\{ preventScroll: true \}\)/)
+  for (const file of ['src/systems/LessonPanel.ts', 'src/systems/PracticeBenchPanel.ts']) assert.match(read(file), /redrawInPlace\(this\.body, \(\) => this\.draw\(\)\)/)
+})
+
+test('the About card opens from the keyboard, and while it is collapsed nothing inside it can take focus', () => {
+  const ui = read('src/systems/UIOverlay.ts')
+  assert.match(ui, /<button type="button" class="info-toggle \$\{toggleClass\}" id="info-about-toggle" aria-expanded="\$\{this\.isInfoExpanded \? 'true' : 'false'\}" aria-controls="info-about-content">/)
+  assert.doesNotMatch(ui, /<div class="info-toggle/)
+  assert.match(ui, /toggle\.setAttribute\('aria-expanded', this\.isInfoExpanded \? 'true' : 'false'\)/)
+  const collapsed = ui.slice(ui.indexOf('.info-content {'), ui.indexOf('.info-content.expanded {'))
+  assert.match(collapsed, /visibility: hidden;/)
+  const expanded = ui.slice(ui.indexOf('.info-content.expanded {'), ui.indexOf('.info-divider {'))
+  assert.match(expanded, /visibility: visible;/)
+  assert.match(ui, /\.info-toggle:focus-visible \{\s*outline: 2px solid var\(--paper-ink\);/)
+})
+
+test('"many" is said only when the lab flagged many cut off answers, and fewer after training never replaces the within noise note', () => {
+  const f = over => finished({ flags: { ...finished().flags, seen_only: false, ...over } })
+  assert.equal(view(f({ cut_off_fell: true })).flagNote, 'Flag: fewer answers were cut off after training.')
+  assert.equal(view(f({ cut_off_fell: true, within_noise: true })).flagNote, 'Within noise: the change is smaller than one pass band.')
+  assert.equal(view(f({ cut_short_before: true, cut_off_fell: true, within_noise: true })).flagNote, 'Flag: many answers were cut off by the token limit.')
+})
+
+test('text a model wrote is labelled as the author\'s where it stands beside the lab\'s counts, and the panel says until when the model is kept', async () => {
+  assert.equal(logic.chartByline({ author_name: 'Gemini 4', teacher_name: 'DeepSeek V4 Pro', epoch: 7 }), 'Topic and row names by Gemini 4. Taught by DeepSeek V4 Pro. Epoch 7.')
+  assert.equal(logic.chartByline({ author_name: 'Grok 4.7', teacher_name: 'Grok 4.7', epoch: 41 }), 'Topic and row names by Grok 4.7, who also taught. Epoch 41.')
+  await withPage(async ({ body, fetchStub, settle }) => {
+    const p = new LessonPanel(() => {}, { fetch: fetchStub })
+    p.setLesson(state(finished({ purpose: 'Checked by the lab: every held back answer passed', kept_until: '2026-12-09T10:00:00.000Z' })), false)
+    p.show()
+    await settle()
+    const all = box(body).textContent
+    assert.ok(all.includes('Purpose, in the author\'s words: Checked by the lab: every held back answer passed'))
+    assert.ok(all.includes('The topic above and the subskill names below are the author\'s words.'))
+    assert.ok(all.includes('Kept until 2026-12-09.'))
+    assert.equal(all.includes('Finished 2026-11-25.'), false)
+    p.setLesson(state(finished({ name: 'Rootkeeper' })), false)
+    await settle()
+    const named = box(body).textContent
+    assert.ok(named.includes('Topic, as the author named it: Arithmetic habits.'))
+    assert.ok(named.includes('Finished 2026-11-25.'), 'a record with no kept until date says when the lesson finished')
+    p.close()
+  })
+  // a date that is not one is left out
+  assert.equal(state(finished({ kept_until: 'soon' })).lesson.kept_until, undefined)
+})
+
+test('a reply or an answer the token limit cut off in teaching is marked in the open row and counted in the teaching line', async () => {
+  const read2 = logic.readLessonQuestions(turnQuestions)
+  assert.deepEqual(read2.questions[0].turns.map(t => [t.reply_cut_short, t.answer_cut_short]), [[true, true], [false, false]])
+  assert.equal(teachingText({ missed: 2, taught: 2, solved: 1, explained: 1, teacher_failed: 0, cut_off: 3 }).endsWith('In 3 turns of teaching the token limit cut off the small model\'s reply or answer.'), true)
+  assert.equal(teachingText({ missed: 2, taught: 2, solved: 1, explained: 1, teacher_failed: 0, cut_off: 1 }).endsWith('In 1 turn of teaching the token limit cut off the small model\'s reply or answer.'), true)
+  assert.doesNotMatch(teachingText({ missed: 2, taught: 2, solved: 1, explained: 1, teacher_failed: 0 }), /cut off/)
+  assert.equal(state(finished({ teaching: { ...finished().teaching, cut_off: 4 } })).lesson.teaching.cut_off, 4)
+  assert.equal(state(finished()).lesson.teaching.cut_off, 0, 'an older record has no count')
+  await withPage(async ({ body, fetchStub, settle }) => {
+    const p = new LessonPanel(() => {}, { fetch: fetchStub })
+    p.setLesson(state(finished()), false)
+    p.show()
+    await settle()
+    body.all('.lp-row')[0].fire('click')
+    await settle()
+    const lines = body.all('.lp-detail')[0].all('.lp-line').map(l => l.textContent)
+    assert.ok(lines.includes('It replied: Let me think about the Cut off by the token limit'), lines.join(' | '))
+    assert.ok(lines.includes('It answered again: It is 5 because Did not pass. Cut off by the token limit'), lines.join(' | '))
+    assert.ok(lines.includes('It replied: A negative number.'))
+    assert.ok(lines.includes('It answered again: minus 5 Passed'))
+    p.close()
+  }, { questions: turnQuestions })
 })

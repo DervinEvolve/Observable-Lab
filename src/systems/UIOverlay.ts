@@ -703,11 +703,22 @@ export class UIOverlay {
           align-items: center;
           gap: 6px;
           cursor: pointer;
+          font: inherit;
           font-size: 13px;
           color: var(--paper-ink-2);
           padding: 4px 0;
           transition: color 0.15s ease;
           user-select: none;
+          /* a real button, so the keyboard can open the card: no button chrome */
+          background: none;
+          border: 0;
+          width: 100%;
+          text-align: left;
+        }
+
+        .info-toggle:focus-visible {
+          outline: 2px solid var(--paper-ink);
+          outline-offset: 2px;
         }
 
         .info-toggle:hover {
@@ -723,18 +734,21 @@ export class UIOverlay {
           transform: rotate(180deg);
         }
 
+        /* While collapsed the content is hidden for real (after its closing transition), so its buttons are not in the Tab order. */
         .info-content {
           max-height: 0;
           overflow: hidden;
-          transition: max-height 0.2s ease-out, opacity 0.15s ease;
+          transition: max-height 0.2s ease-out, opacity 0.15s ease, visibility 0s linear 0.2s;
           opacity: 0;
+          visibility: hidden;
         }
 
         .info-content.expanded {
           max-height: 70vh;
           overflow-y: auto;
           opacity: 1;
-          transition: max-height 0.2s ease-in, opacity 0.2s ease 0.05s;
+          visibility: visible;
+          transition: max-height 0.2s ease-in, opacity 0.2s ease 0.05s, visibility 0s;
         }
 
         .info-divider {
@@ -1665,10 +1679,10 @@ export class UIOverlay {
           <div class="health-dots">${healthDots}</div>
         </div>
       </div>
-      <div class="info-toggle ${toggleClass}" id="info-about-toggle">
-        <span class="info-toggle-arrow">▼</span>
+      <button type="button" class="info-toggle ${toggleClass}" id="info-about-toggle" aria-expanded="${this.isInfoExpanded ? 'true' : 'false'}" aria-controls="info-about-content">
+        <span class="info-toggle-arrow" aria-hidden="true">▼</span>
         <span>About</span>
-      </div>
+      </button>
       <div class="info-content ${toggleClass}" id="info-about-content">
         <div class="info-divider"></div>
         <p class="info-description">
@@ -1795,6 +1809,7 @@ export class UIOverlay {
     const content = this.infoPanelElement?.querySelector('#info-about-content')
 
     if (toggle && content) {
+      toggle.setAttribute('aria-expanded', this.isInfoExpanded ? 'true' : 'false')
       if (this.isInfoExpanded) {
         toggle.classList.add('expanded')
         content.classList.add('expanded')

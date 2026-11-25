@@ -1405,3 +1405,24 @@ test('"talk to it" with the chat and the story both off does not open a hidden p
     assert.doesNotMatch(panelEl.className, /\bopen\b/)
   })
 })
+
+// ---------------------------------------------------------------------------
+// The second review
+// ---------------------------------------------------------------------------
+test('on the first exchange a half pair says the trained model did not answer, not "send a message first"', () => {
+  // A half pair commits no turn, so the list is still empty while one answer is on screen.
+  assert.equal(offer.offerDisabledNote({ turns: [], busy: false, halfPair: true }), 'The trained model did not answer the last message, so this conversation cannot be offered.')
+  assert.equal(offer.offerDisabledNote({ turns: [], busy: true, halfPair: true }), 'Wait for the reply. Then you can offer the conversation.')
+  assert.equal(offer.offerDisabledNote({ turns: [], busy: false, halfPair: false }), 'Send a message first. Then you can offer the conversation.')
+})
+
+test('the lesson card says "many" cut off answers only when the lab flagged many: fewer after training has its own sentence', () => {
+  const map = { topic: 'Sums', teacherName: 'Grok 4.7', rows: [], seenOnly: false }
+  assert.deepEqual(panel.skillFlags({ ...map, cutShort: true, cutOffFell: true }), ['Flag: many answers were cut off by the token limit, so a gain may come from shorter answers.'])
+  assert.deepEqual(panel.skillFlags({ ...map, cutShort: false, cutOffFell: true }), ['Flag: fewer answers were cut off by the token limit after training, so part of a gain may come from shorter answers.'])
+  assert.deepEqual(panel.skillFlags({ ...map }), [])
+  const raw = { topic: 'Sums', teacher_name: 'Grok 4.7', rows: [{ name: 'Carrying', before: { passed: 2, total: 6, band: 2 }, after: { passed: 3, total: 6, band: 3 } }], seen_only: false }
+  assert.equal(panel.readSkillMap({ ...raw, cut_off_fell: true }).cutOffFell, true)
+  assert.equal(panel.readSkillMap({ ...raw, cut_off_fell: true }).cutShort, false)
+  assert.equal(panel.readSkillMap(raw).cutOffFell, false)
+})

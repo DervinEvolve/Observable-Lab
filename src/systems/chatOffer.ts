@@ -77,8 +77,9 @@ export const OFFER_NOTE_HALF = 'The trained model did not answer the last messag
 /** Why the offer button is disabled, from what the panel holds: the first reason that applies. */
 export function offerDisabledNote(state: { turns: readonly OfferTurn[]; busy: boolean; halfPair: boolean }): string {
   if (state.busy) return OFFER_NOTE_WAITING
-  if (!state.turns.length) return OFFER_NOTE_EMPTY
+  // A half pair commits no turn, so on the first exchange the list is still empty: this is asked before "send a message first".
   if (state.halfPair) return OFFER_NOTE_HALF
+  if (!state.turns.length) return OFFER_NOTE_EMPTY
   return OFFER_DISABLED_NOTE
 }
 export const OFFER_HEADING = 'Offer This Conversation'

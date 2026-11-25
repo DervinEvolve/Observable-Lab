@@ -112,7 +112,7 @@ export interface TrainedAdapterView {
 /** One cell of a skill map: answers that passed of answers asked, and the pass band from 0 to 5. All counted by the lab. */
 export interface SkillCell { passed: number; total: number; band: number }
 export interface SkillRowView { name: string; before: SkillCell | null; after: SkillCell | null }
-export interface SkillMapView { topic: string; teacherName: string; rows: SkillRowView[]; seenOnly: boolean; withinNoise?: boolean; cutShort?: boolean }
+export interface SkillMapView { topic: string; teacherName: string; rows: SkillRowView[]; seenOnly: boolean; withinNoise?: boolean; cutShort?: boolean; cutOffFell?: boolean }
 
 /** One sentence list, the same on every surface that shows a lesson (api/_lib/tinker-tutor.ts holds the same words; a test compares them). */
 export const TUTOR_MEASURE_NOTE = 'The lab counts which answers pass. The rules, the questions and the teaching text were written by models, and a model approved the rules. Nobody has checked that the rules measure the skill.'
@@ -177,7 +177,7 @@ export function readSkillMap(raw: unknown): SkillMapView | null {
     rows.push({ name, before: readSkillCell(r.before), after: readSkillCell(r.after) })
   }
   if (rows.length === 0) return null
-  return { topic, teacherName, rows, seenOnly: o.seen_only === true, withinNoise: o.within_noise === true, cutShort: o.cut_short === true }
+  return { topic, teacherName, rows, seenOnly: o.seen_only === true, withinNoise: o.within_noise === true, cutShort: o.cut_short === true, cutOffFell: o.cut_off_fell === true }
 }
 
 /** The adapters in a GET answer, strictly read: anything that is not a well formed adapter is left out. */
@@ -314,7 +314,9 @@ export function skillSummary(map: SkillMapView | undefined): { more: boolean; ve
 export function skillFlags(map: SkillMapView): string[] {
   const out: string[] = []
   if (map.seenOnly) out.push('Flag: better only on questions seen in teaching.')
+  // "Many" only when the lab flagged many; fewer after training can be a single answer and has its own sentence.
   if (map.cutShort) out.push('Flag: many answers were cut off by the token limit, so a gain may come from shorter answers.')
+  else if (map.cutOffFell) out.push('Flag: fewer answers were cut off by the token limit after training, so part of a gain may come from shorter answers.')
   return out
 }
 

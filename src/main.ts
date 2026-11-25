@@ -1170,6 +1170,9 @@ class ObservableLab {
    * RL run) and the skill map and lesson panel (the newest Socratic lesson).
    * Called on every state change, and by the state manager whenever only these
    * records changed. Only what the state stored is shown (no record: dark and still).
+   * Each view is handed its record every time and does nothing when it is the
+   * one it already shows, so a change in one record never redraws the other's
+   * open panel (PracticeBenchPanel.setPractice, LessonPanel.setLesson).
    */
   private applySideRecords(state: ExperimentState): void {
     const practice = parsePractice((state as unknown as { rl_practice?: unknown }).rl_practice)

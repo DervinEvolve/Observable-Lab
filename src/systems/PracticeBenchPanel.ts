@@ -1,4 +1,4 @@
-import { installPaperTheme, paperFocusRing, paperHeader, paperHeading, paperPrimaryButton, paperShell } from './paperTheme'
+import { installPaperTheme, paperFocusRing, paperHeader, paperHeading, paperPrimaryButton, paperShell, redrawInPlace } from './paperTheme'
 import { NOTHING_PRACTISED, NO_EXPERIMENT, benchView, curvePoints, plain, rewardColor, scoreText, type Practice, type PracticeRun } from './practiceBench'
 
 // The practice bench's record, opened by clicking or tapping the bench in the
@@ -97,6 +97,8 @@ export class PracticeBenchPanel {
   private isOpen = false
   private practice: Practice | null = null
   private simulation = true
+  /** What was last given to setPractice, as text: the same record again changes nothing on the page. */
+  private given = JSON.stringify([null, true])
   private lastFocus: HTMLElement | null = null
 
   /** `onTalk` is called with the adapter's lab id when the visitor chooses to talk to it. */
@@ -161,6 +163,11 @@ export class PracticeBenchPanel {
 
   /** What the room's state says about Tinker RL, and whether no experiment is connected. */
   public setPractice(practice: Practice | null, simulation: boolean): void {
+    // The same record again (another record of the room changed, or nothing did): nothing is redrawn, so a reader keeps
+    // their place and their keyboard focus.
+    const given = JSON.stringify([practice, simulation])
+    if (given === this.given) return
+    this.given = given
     this.practice = practice
     this.simulation = simulation
     if (this.isOpen) this.render()
@@ -197,7 +204,12 @@ export class PracticeBenchPanel {
     return r
   }
 
+  /** Redraws the body. The scroll position and the focused control stay where they were. */
   private render(): void {
+    redrawInPlace(this.body, () => this.draw())
+  }
+
+  private draw(): void {
     this.body.replaceChildren()
     const practice = this.practice
     if (this.simulation) {

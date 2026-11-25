@@ -595,7 +595,8 @@ export interface PublicLesson {
   subskills: PublicLessonSubskill[]
   overall: { before: Cell | null; after: Cell | null }
   progress: { graded: number; to_grade: number; taught: number; to_teach: number; seq: number; updated_at: string } | null
-  teaching: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number; leaked: number; not_taught: number; teacher_calls: number } | null
+  /** cut_off: turns of teaching in which the token limit cut off the small model's reply or its answer again (absent in older records: 0). */
+  teaching: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number; leaked: number; not_taught: number; teacher_calls: number; cut_off: number } | null
   examples: { kept: number; guided: number; answer: number; explained: number; left_out: number; total: number } | null
   training: { steps_done: number | null; steps_planned: number | null; holdout_loss_before: number | null; holdout_loss_after: number | null } | null
   flags: {
@@ -617,6 +618,7 @@ export interface PublicLesson {
   measured_by: 'counted by the lab, with rules a model wrote, on questions held back from teaching'
   origin: 'written by the models'
   talk?: string // 'lab/<slug>' while the adapter is alive and the chat is on
+  kept_until?: string // until when the trained adapter is kept, for a lesson that closed ok with one
   created_at: string
   finished_at: string | null
   reason: string | null
@@ -642,7 +644,8 @@ export interface LessonQuestions {
       before: LessonAnswer[] // text cut to 300
       after: LessonAnswer[]
     }
-    turns: Array<{ kind: 'guide' | 'explain'; state: string; teacher: string; reply: string; answer: string; passed: boolean }>
+    /** reply_cut_short and answer_cut_short: the token limit cut off the small model's reply to the guiding question, or its answer again. */
+    turns: Array<{ kind: 'guide' | 'explain'; state: string; teacher: string; reply: string; answer: string; passed: boolean; reply_cut_short: boolean; answer_cut_short: boolean }>
   }>
 }
 
@@ -652,6 +655,11 @@ export interface TutorSkillMap {
   teacher_name: string
   rows: Array<{ name: string; before: Cell | null; after: Cell | null }>
   seen_only: boolean
+  within_noise?: boolean
+  /** Many untrained answers were cut off by the token limit or came back empty. */
+  cut_short?: boolean
+  /** Fewer answers were cut off or empty after training than before (whether or not there were many). */
+  cut_off_fell?: boolean
 }
 
 // GET /api/experiment/trained-chat, field `offers`: present only while visitor offers are on.

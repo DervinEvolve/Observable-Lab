@@ -161,3 +161,25 @@ export const PAPER_NODE_MARKS: Readonly<Record<string, string>> = Object.freeze(
 export const PAPER_PROVIDER_MARKS: Readonly<Record<string, string>> = Object.freeze({
   google: '#4285F4', deepseek: '#10A37F', anthropic: '#D97706', openai: '#9C8CF0', 'x-ai': '#1DA1F2', 'z-ai': '#B0BEC5', cohere: '#E91E63',
 })
+
+/**
+ * Redraws a panel's body and leaves the reader where they were: the scroll
+ * position is kept, and keyboard focus goes back to the same control (the
+ * same tag and class, at the same place among its like) without scrolling
+ * the panel to it. A plain replace of the body would drop focus to the page
+ * and, when focus is put back the usual way, scroll the reader away from
+ * what they were reading.
+ */
+export function redrawInPlace(body: HTMLElement, draw: () => void): void {
+  const keep = body.scrollTop
+  const active = document.activeElement as HTMLElement | null
+  const like = (n: Element) => active !== null && n.tagName === active.tagName && n.className === active.className
+  const place = active && active !== body && body.contains?.(active) === true
+    ? (Array.from(body.querySelectorAll('button')) as Element[]).filter(like).indexOf(active)
+    : -1
+  draw()
+  body.scrollTop = keep
+  if (place < 0) return
+  const again = (Array.from(body.querySelectorAll('button')) as HTMLElement[]).filter(like)[place]
+  again?.focus?.({ preventScroll: true })
+}

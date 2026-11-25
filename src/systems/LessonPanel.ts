@@ -1,5 +1,5 @@
 import type { LessonQuestions, LessonRecord, PublicLesson } from '../shared/types'
-import { installPaperTheme, paperFocusRing, paperHeader, paperHeading, paperPrimaryButton, paperQuietButton, paperShell } from './paperTheme'
+import { installPaperTheme, paperFocusRing, paperHeader, paperHeading, paperPrimaryButton, paperQuietButton, paperShell, redrawInPlace } from './paperTheme'
 import { dollars } from './PracticeBenchPanel'
 import { NO_EXPERIMENT } from './practiceBench'
 import {
@@ -29,6 +29,8 @@ function el<K extends keyof HTMLElementTagNameMap>(tag: K, className?: string, t
 }
 
 const FOCUSABLE = 'button:not([disabled]), [href], [tabindex]:not([tabindex="-1"])'
+/** Beside a reply the token limit cut off (an answer's mark says it in its own words, answerMark). */
+const CUT_OFF_MARK = 'Cut off by the token limit'
 const LESSON_API = '/api/experiment/lesson'
 
 /** A reason as a sentence: a capital letter first and a full stop last. */
@@ -40,9 +42,9 @@ function sentence(t: string): string {
 }
 
 /** The teaching counts in words, with the right singular and plural. */
-export function teachingText(t: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number }): string {
+export function teachingText(t: { missed: number; taught: number; solved: number; explained: number; teacher_failed: number; cut_off?: number }): string {
   const q = (n: number, one: string, many: string): string => `${n} ${n === 1 ? one : many}`
-  return `${q(t.missed, 'practice question was', 'practice questions were')} missed. ${t.taught} ${t.taught === 1 ? 'was' : 'were'} taught. ${t.solved} ${t.solved === 1 ? 'was' : 'were'} solved after guiding questions. ${t.explained} needed the teacher to explain. ${t.teacher_failed === 1 ? '1 time' : `${t.teacher_failed} times`} the teacher's own answer did not pass.`
+  return `${q(t.missed, 'practice question was', 'practice questions were')} missed. ${t.taught} ${t.taught === 1 ? 'was' : 'were'} taught. ${t.solved} ${t.solved === 1 ? 'was' : 'were'} solved after guiding questions. ${t.explained} needed the teacher to explain. ${t.teacher_failed === 1 ? '1 time' : `${t.teacher_failed} times`} the teacher's own answer did not pass.${t.cut_off ? ` In ${q(t.cut_off, 'turn', 'turns')} of teaching the token limit cut off the small model's reply or answer.` : ''}`
 }
 
 /** "5 of 6" style date: a plain date for the head of the page. */
@@ -70,10 +72,14 @@ export class LessonPanel {
   private isOpen = false
   private state: TutorLessonState | null = null
   private simulation = true
+  /** What was last given to setLesson, as text: the same record again changes nothing on the page. */
+  private given = JSON.stringify([null, true])
   private record: LessonRecord | null = null
   private recordKey = ''
   private loading: 'idle' | 'loading' | 'failed' = 'idle'
   private questions = new Map<number, LessonQuestions | 'loading' | 'failed'>()
+  /** The lesson (slug) the questions above belong to. */
+  private questionsOf = ''
   private openRows = new Set<number>()
   private lastFocus: HTMLElement | null = null
   private undoInert: Array<() => void> = []
@@ -160,6 +166,11 @@ export class LessonPanel {
 
   /** What the room's state says about the newest lesson, and whether no experiment is connected. */
   public setLesson(state: TutorLessonState | null, simulation: boolean): void {
+    // The same record again (another record of the room changed, or nothing did): nothing is redrawn, so a reader keeps
+    // their place and their keyboard focus.
+    const given = JSON.stringify([state, simulation])
+    if (given === this.given) return
+    this.given = given
     const was = lessonKey(this.state?.lesson ?? null)
     this.state = state
     this.simulation = simulation
@@ -211,7 +222,11 @@ export class LessonPanel {
     if (!lesson || this.recordKey === key && this.record) { this.render(); return }
     const mine = ++this.token
     this.loading = 'loading'
-    this.questions.clear()
+    // Another lesson: its questions are not this one's. The same lesson, moved on: the answers an open row shows stay on
+    // the page until the new ones arrive, so a row a reader has open is never emptied under them.
+    if (this.questionsOf !== lesson.slug) this.questions.clear()
+    this.questionsOf = lesson.slug
+    for (const [i, q] of [...this.questions]) if (!this.openRows.has(i) || q === 'loading' || q === 'failed') this.questions.delete(i)
     this.render()
     try {
       const rec = readLessonRecord(await this.get(`${LESSON_API}?slug=${encodeURIComponent(lesson.slug)}`))
@@ -227,15 +242,20 @@ export class LessonPanel {
       this.loading = 'failed'
     }
     this.render()
-    for (const i of [...this.openRows]) void this.loadQuestions(i)
+    for (const i of [...this.openRows]) void this.loadQuestions(i, true)
   }
 
-  private async loadQuestions(i: number): Promise<void> {
+  /** Reads one subskill's questions. `again` reads them anew for a row that already shows some, which stay until the new ones are in. */
+  private async loadQuestions(i: number, again = false): Promise<void> {
     const lesson = this.lesson
-    if (!lesson || this.questions.has(i)) return
+    if (!lesson) return
+    const have = this.questions.get(i)
+    if (have !== undefined && !(again && have !== 'loading')) return
     const mine = this.token
-    this.questions.set(i, 'loading')
-    this.render()
+    if (have === undefined || have === 'failed') {
+      this.questions.set(i, 'loading')
+      this.render()
+    }
     try {
       const q = readLessonQuestions(await this.get(`${LESSON_API}?slug=${encodeURIComponent(lesson.slug)}&subskill=${i}`))
       if (mine !== this.token) return
@@ -306,6 +326,8 @@ export class LessonPanel {
     line.appendChild(el('span', 'lp-muted', `${label}: `))
     line.appendChild(document.createTextNode(text || '(empty)'))
     if (passed !== null) { line.appendChild(document.createTextNode(' ')); line.appendChild(this.mark({ passed, ...how })) }
+    // A line that is not graded (a reply to a guiding question) still says when the token limit cut it off.
+    else if (how.cut_short) { line.appendChild(document.createTextNode(' ')); line.appendChild(el('span', 'lp-mark', CUT_OFF_MARK)) }
     return line
   }
 
@@ -334,8 +356,8 @@ export class LessonPanel {
           else if (t.state === 'no_question') wrap.appendChild(this.answerLine('The teacher asked', 'The teacher gave no usable question.', null))
           else {
             wrap.appendChild(this.answerLine('The teacher asked', t.teacher, null))
-            if (t.reply) wrap.appendChild(this.answerLine('It replied', t.reply, null))
-            if (t.answer) wrap.appendChild(this.answerLine('It answered again', t.answer, t.passed))
+            if (t.reply) wrap.appendChild(this.answerLine('It replied', t.reply, null, { cut_short: t.reply_cut_short }))
+            if (t.answer) wrap.appendChild(this.answerLine('It answered again', t.answer, t.passed, { cut_short: t.answer_cut_short }))
           }
         } else {
           if (t.teacher) wrap.appendChild(this.answerLine('The teacher explained', t.teacher, null))
@@ -352,14 +374,9 @@ export class LessonPanel {
     return box
   }
 
-  /** Redraws the body. The scroll position and the focused row stay where they were. */
+  /** Redraws the body. The scroll position and the focused control stay where they were, and putting focus back never scrolls. */
   private render(): void {
-    const keep = this.body.scrollTop
-    const rows = Array.from(this.body.querySelectorAll('.lp-row')) as HTMLElement[]
-    const focused = rows.indexOf(document.activeElement as HTMLElement)
-    this.draw()
-    this.body.scrollTop = keep
-    if (focused >= 0) (this.body.querySelectorAll('.lp-row')[focused] as HTMLElement | undefined)?.focus?.()
+    redrawInPlace(this.body, () => this.draw())
   }
 
   private draw(): void {
@@ -383,9 +400,10 @@ export class LessonPanel {
     // 1. head
     const head = el('div')
     head.appendChild(el('p', 'lp-topic', l.name ?? l.topic))
-    if (l.name) head.appendChild(el('p', 'lp-muted', `Topic: ${l.topic}.`))
+    // The topic, the purpose and the subskill names are text a model wrote. They stand beside counts the lab made, so each says whose words it is.
+    head.appendChild(el('p', 'lp-muted', l.name ? `Topic, as the author named it: ${l.topic}.` : 'The topic above and the subskill names below are the author\'s words.'))
     head.appendChild(el('p', 'lp-muted', headLine(l)))
-    if (l.purpose) head.appendChild(el('p', 'lp-muted', l.purpose))
+    if (l.purpose) head.appendChild(el('p', 'lp-muted', `Purpose, in the author's words: ${l.purpose}`))
     head.appendChild(el('p', undefined, stageLine(l)))
     this.body.appendChild(head)
     if (this.loading === 'loading' && !rec) this.body.appendChild(el('p', 'lp-muted', 'Loading the full record.'))
@@ -482,8 +500,11 @@ export class LessonPanel {
     if (l.status === 'ok' || l.talk) {
       const box = el('div')
       box.appendChild(el('p', 'lp-id', l.adapter))
+      // How long the model can still be talked to; a record without that date says when the lesson finished.
+      const until = dateText(l.kept_until ?? null)
       const made = dateText(l.finished_at)
-      if (made) box.appendChild(el('p', 'lp-muted', `Finished ${made}.`))
+      if (until) box.appendChild(el('p', 'lp-muted', `Kept until ${until}.`))
+      else if (made) box.appendChild(el('p', 'lp-muted', `Finished ${made}.`))
       if (l.talk) {
         const talk = el('button', 'lp-action lp-talk', 'Talk to It')
         talk.type = 'button'

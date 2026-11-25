@@ -119,7 +119,7 @@ function readLessonStrict(rawIn: unknown): PublicLesson {
   let teaching: PublicLesson['teaching'] = null
   if (r.teaching !== null && r.teaching !== undefined) {
     const t = obj(r.teaching)
-    teaching = { missed: count(t.missed), taught: count(t.taught), solved: count(t.solved), explained: count(t.explained), teacher_failed: count(t.teacher_failed), leaked: count(t.leaked), not_taught: count(t.not_taught), teacher_calls: count(t.teacher_calls) }
+    teaching = { missed: count(t.missed), taught: count(t.taught), solved: count(t.solved), explained: count(t.explained), teacher_failed: count(t.teacher_failed), leaked: count(t.leaked), not_taught: count(t.not_taught), teacher_calls: count(t.teacher_calls), cut_off: t.cut_off === undefined || t.cut_off === null ? 0 : count(t.cut_off) }
   }
   let examples: PublicLesson['examples'] = null
   if (r.examples !== null && r.examples !== undefined) {
@@ -193,6 +193,8 @@ function readLessonStrict(rawIn: unknown): PublicLesson {
   if (name) lesson.name = name
   // the chat id is taken only in its exact form; anything else is ignored, never trusted
   if (r.talk === `lab/${slug}`) lesson.talk = r.talk
+  const kept = plain(r.kept_until, 40)
+  if (kept && Number.isFinite(Date.parse(kept))) lesson.kept_until = kept
   return lesson
 }
 
@@ -251,7 +253,10 @@ export function readLessonQuestions(raw: unknown): LessonQuestions | null {
           turns: (x.turns as unknown[]).map(t => {
             const y = obj(t)
             const kind = y.kind === 'guide' || y.kind === 'explain' ? y.kind : bad()
-            return { kind, state: plain(y.state, 24) ?? '', teacher: plain(y.teacher, 400) ?? '', reply: plain(y.reply, 300) ?? '', answer: plain(y.answer, 300) ?? '', passed: flag(y.passed) }
+            return {
+              kind, state: plain(y.state, 24) ?? '', teacher: plain(y.teacher, 400) ?? '', reply: plain(y.reply, 300) ?? '', answer: plain(y.answer, 300) ?? '', passed: flag(y.passed),
+              reply_cut_short: y.reply_cut_short === true, answer_cut_short: y.answer_cut_short === true,
+            }
           }),
         }
       }),
@@ -366,12 +371,16 @@ function readCutOff(raw: unknown): { before: CutOffCount | null; after: CutOffCo
 /** The finished chart's corner note: the flags a visitor most needs, in one line (every reason is in the panel). */
 export function flagNoteOf(l: Pick<PublicLesson, 'flags'>): string | null {
   // One line on the paper, so the two together are said shortly; the panel has every reason in full.
+  // "Many" is said only when the lab flagged many (cut_short_before). Fewer cut off answers after training can be a
+  // single answer: it has its own, weaker line, and never takes the place of the within noise note.
   const seen = l.flags.seen_only
-  const cut = l.flags.cut_short_before || l.flags.cut_off_fell
-  if (seen && cut) return 'Flag: better only on questions seen in teaching, and cut off answers.'
+  const many = l.flags.cut_short_before
+  const fell = l.flags.cut_off_fell
+  if (seen && (many || fell)) return 'Flag: better only on questions seen in teaching, and cut off answers.'
   if (seen) return 'Flag: better only on questions seen in teaching.'
-  if (cut) return 'Flag: many answers were cut off by the token limit.'
+  if (many) return 'Flag: many answers were cut off by the token limit.'
   if (l.flags.within_noise) return 'Within noise: the change is smaller than one pass band.'
+  if (fell) return 'Flag: fewer answers were cut off after training.'
   return null
 }
 
@@ -381,6 +390,18 @@ export function answerMark(a: Pick<LessonAnswer, 'passed' | 'cut_short' | 'empty
   if (a.cut_short) return 'Did not pass. Cut off by the token limit'
   if (a.empty) return 'Did not pass. No answer text'
   return 'Did not pass'
+}
+
+/**
+ * The line under the chart's title. The title and the row names are text a
+ * model wrote, drawn beside counts the lab made, so the line says whose words
+ * they are.
+ */
+export function chartByline(l: Pick<PublicLesson, 'author_name' | 'teacher_name' | 'epoch'>): string {
+  const who = l.author_name === l.teacher_name
+    ? `Topic and row names by ${l.author_name}, who also taught.`
+    : `Topic and row names by ${l.author_name}. Taught by ${l.teacher_name}.`
+  return `${who} Epoch ${l.epoch}.`
 }
 
 /** What the paper and the lamp show. No lesson, or no experiment connected: a blank sheet and a dark lamp. */
@@ -399,7 +420,7 @@ export function chartView(state: TutorLessonState | null, simulation: boolean): 
   const view: ChartView = {
     mode,
     title: l.topic,
-    byline: `Taught by ${l.teacher_name}. Epoch ${l.epoch}.`,
+    byline: chartByline(l),
     rows,
     stageLine: stageLine(l),
     flagNote: l.status === 'ok' ? flagNoteOf(l) : null,
