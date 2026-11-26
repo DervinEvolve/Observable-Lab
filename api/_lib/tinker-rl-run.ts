@@ -81,7 +81,8 @@ export function finalRlProgress(row: Pick<TinkerRunRow, 'settings'>, result: Tin
     score_before: result.score_before, score_after: result.score_after, wall_seconds: result.wall_seconds ?? 0,
     steps_trained: result.steps_trained,
     // The counts of cut off answers, as the runner returned them (normalizeRlResult keeps a list only when it has one entry a step).
-    capped: result.step_capped, mean_tokens: result.step_mean_tokens,
+    // A count above what one step of this run samples is "not said", as a malformed count in a result is: the finished record stays.
+    capped: result.step_capped && result.step_capped.every(n => n <= group * perStep) ? result.step_capped : null, mean_tokens: result.step_mean_tokens,
     answers_before: result.answers_before, capped_before: result.capped_before, answers_after: result.answers_after, capped_after: result.capped_after,
   }, now)
 }
@@ -121,7 +122,9 @@ export async function completeRlRun(row: TinkerRunRow, poll: Extract<TinkerPoll,
   const displayName = shownName(row)
   const hacking = rlHackingFlag({ means: result.step_means, maxReward: result.max_reward ?? 1, scoreBefore: result.score_before, scoreAfter: result.score_after })
   const cutOff = rlCutOffFlag({ before: rlCutOff(result.answers_before, result.capped_before), after: rlCutOff(result.answers_after, result.capped_after) })
-  const line = describeTinkerRl(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName, hacking, cutOff)
+  const settings = row.settings as { group_size?: unknown; tasks_per_step?: unknown }
+  const stepAnswers = typeof settings.group_size === 'number' && typeof settings.tasks_per_step === 'number' ? settings.group_size * settings.tasks_per_step : null
+  const line = describeTinkerRl(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName, hacking, cutOff, stepAnswers)
   const record = (row.rl ?? {}) as { task_set?: unknown; tasks?: unknown; rubric_lines?: unknown; max_reward?: unknown }
   await recordToolRun({
     experimentId: row.experiment_id, epoch: row.epoch, model: row.model, tool: TINKER_RL_TOOL,

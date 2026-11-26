@@ -142,9 +142,9 @@ export class PracticeBenchPanel {
     this.panel = el('div')
     this.panel.id = 'practice-bench-panel'
     this.panel.setAttribute('role', 'dialog')
-    this.panel.setAttribute('aria-label', 'The practice bench')
+    this.panel.setAttribute('aria-label', 'The Practice Bench')
     const head = el('div', 'pb-head')
-    head.appendChild(el('div', 'pb-title', 'The practice bench'))
+    head.appendChild(el('div', 'pb-title', 'The Practice Bench'))
     const close = el('button', 'pb-close', '×')
     close.type = 'button'
     close.setAttribute('aria-label', 'Close')
@@ -233,7 +233,7 @@ export class PracticeBenchPanel {
 
     if (run.hacking.flag) {
       const flag = el('div', 'pb-flag')
-      flag.appendChild(el('b', undefined, 'Reward hacking flag. '))
+      flag.appendChild(el('b', undefined, 'Reward Hacking Flag. '))
       flag.appendChild(document.createTextNode(`The lab noticed a sign that the reward may be easier to earn than the rubric means. ${run.hacking.reasons.map(sentence).join(' ')} It blocks nothing; it is recorded here.`))
       this.body.appendChild(flag)
     }
@@ -246,7 +246,7 @@ export class PracticeBenchPanel {
     }
 
     const total = run.tasks.total
-    this.body.appendChild(this.section('Task set',
+    this.body.appendChild(this.section('Task Set',
       el('p', undefined, `${total} tasks${run.taskSet ? `, "${run.taskSet}"` : ''}. ${run.tasks.heldOut !== null ? `The lab held out ${run.tasks.heldOut} of them, chosen after the request so nobody could know which, and trained on ${run.tasks.training ?? total - run.tasks.heldOut}.` : ''}`),
       el('p', 'pb-muted', `Data origin: ${run.origin}.`)))
 
@@ -261,29 +261,29 @@ export class PracticeBenchPanel {
     const stepRows = el('div')
     stepRows.appendChild(this.row('Steps', steps > 0 ? `${view.step} of ${steps}` : 'none yet'))
     const trained = run.progress?.stepsTrained ?? null
-    if (trained !== null && steps > 0) stepRows.appendChild(this.row('Steps that trained the model', `${trained} of ${view.step}`))
+    if (trained !== null && steps > 0) stepRows.appendChild(this.row('Steps That Trained The Model', `${trained} of ${view.step}`))
     if (s) {
-      stepRows.appendChild(this.row('Answers per task', String(s.groupSize)))
-      stepRows.appendChild(this.row('Tasks per step', String(s.tasksPerStep)))
-      stepRows.appendChild(this.row('Longest answer', `${s.maxCompletionTokens} tokens`))
-      stepRows.appendChild(this.row('Loss, learning rate', `${s.loss}, ${s.learningRate}`))
+      stepRows.appendChild(this.row('Answers Per Task', String(s.groupSize)))
+      stepRows.appendChild(this.row('Tasks Per Step', String(s.tasksPerStep)))
+      stepRows.appendChild(this.row('Longest Answer', `${s.maxCompletionTokens} tokens`))
+      stepRows.appendChild(this.row('Loss, Learning Rate', `${s.loss}, ${s.learningRate}`))
     }
     for (const r of stepCutOffRows(run)) stepRows.appendChild(this.row(r.label, r.value))
     this.body.appendChild(this.section('Steps', stepRows))
 
-    this.body.appendChild(this.section('Reward per step', curveSvg(view.curve, steps),
+    this.body.appendChild(this.section('Reward Per Step', curveSvg(view.curve, steps),
       el('p', 'pb-muted', 'Mean reward of each step as a share of the best score. This is the reward the run trained on, reported by the runner while it trained. It is not a measure of what the model learned.')))
 
     const held = el('div')
-    held.appendChild(this.row('Before training', scoreText(view.before)))
-    held.appendChild(this.row('After training', scoreText(view.after)))
+    held.appendChild(this.row('Before Training', scoreText(view.before)))
+    held.appendChild(this.row('After Training', scoreText(view.after)))
     for (const r of heldOutCutOffRows(run)) held.appendChild(this.row(r.label, r.value))
-    this.body.appendChild(this.section('Held-out score, measured by the lab', held,
+    this.body.appendChild(this.section('Held-Out Score, Measured By The Lab', held,
       el('p', 'pb-muted', `Mean rubric score on tasks the model never trained on${run.heldOut?.tasks ? ` (${run.heldOut.tasks} tasks)` : ''}, from 0 to 1. Higher is better.`)))
 
     const cost = el('div')
-    cost.appendChild(this.row('Estimated cost', dollars(run.cost.estimatedUsd)))
-    if (run.cost.maxUsd !== null) cost.appendChild(this.row('Set aside as the most it could cost', dollars(run.cost.maxUsd)))
+    cost.appendChild(this.row('Estimated Cost', dollars(run.cost.estimatedUsd)))
+    if (run.cost.maxUsd !== null) cost.appendChild(this.row('Set Aside As The Most It Could Cost', dollars(run.cost.maxUsd)))
     this.body.appendChild(this.section('Cost', cost, el('p', 'pb-muted', run.cost.basis)))
 
     const samples = run.progress?.samples ?? []
@@ -297,11 +297,11 @@ export class PracticeBenchPanel {
         item.appendChild(el('i', undefined, `reward ${sample.reward.toFixed(2)}`))
         box.appendChild(item)
       }
-      this.body.appendChild(this.section('Sample attempts', box, el('p', 'pb-muted', 'Short, cut samples of what the model answered. The model wrote them; the lab did not review them.')))
+      this.body.appendChild(this.section('Sample Attempts', box, el('p', 'pb-muted', 'Short, cut samples of what the model answered. The model wrote them; the lab did not review them.')))
     }
 
     if (run.talk) {
-      const talk = el('button', 'pb-talk', 'Talk to the trained model')
+      const talk = el('button', 'pb-talk', 'Talk To The Trained Model')
       talk.type = 'button'
       const id = run.talk
       talk.addEventListener('click', () => { this.close(); this.onTalk(id) })

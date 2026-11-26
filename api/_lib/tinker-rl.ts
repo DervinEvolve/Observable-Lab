@@ -593,9 +593,16 @@ export function rlCutOff(answers: unknown, capped: unknown): RlCutOff | null {
  * for a model that writes a thinking passage first may be nothing. So a
  * held-out score can move because fewer answers are cut off, without the
  * model having learned the task. Two signs, the same two the Socratic lesson
- * flags (tutorFlags in tinker-tutor.ts) and worded the same way:
+ * flags (tutorFlags in tinker-tutor.ts), under the same two names:
  *  1. more than a fifth of the held-out answers before training reached the limit;
  *  2. a smaller share reached it after training than before.
+ * The reasons say what is counted: an answer that used the whole token limit
+ * and did not end with the model's stop token. That includes an answer whose
+ * text was whole and whose stop token alone did not fit, so the words are
+ * "reached the token limit without finishing" and not "was cut off".
+ * A run with no scoring after training (still going, or failed before it)
+ * has no change in the held-out score to speak of, and its reason says only
+ * what the count means for the score before training.
  * With no counts (a runner that does not send them) there is no flag: the lab
  * does not know. The flag is recorded and shown. It blocks nothing.
  */
@@ -603,10 +610,32 @@ export function rlCutOffFlag(input: { before: RlCutOff | null; after: RlCutOff |
   const { before, after } = input
   const reasons: string[] = []
   const cut = before !== null && before.capped / before.graded > RL_CUT_SHARE
-  if (cut) reasons.push(`many untrained held-out answers were cut off by the token limit (${before!.capped} of ${before!.graded}), so a change in the held-out score may come from answers no longer being cut off`)
+  if (cut) {
+    reasons.push(`many untrained held-out answers reached the token limit without finishing (${before!.capped} of ${before!.graded}), ${after !== null
+      ? 'so a change in the held-out score may come from answers no longer being cut off'
+      : 'so the held-out score before training may be low because answers were cut off'}`)
+  }
   const fell = before !== null && after !== null && before.capped > 0 && after.capped / after.graded < before.capped / before.graded - 1e-12
-  if (fell && !cut) reasons.push(`fewer held-out answers were cut off by the token limit after training (${before!.capped} of ${before!.graded} before, ${after!.capped} of ${after!.graded} after), so part of a change in the held-out score may come from answers no longer being cut off`)
+  if (fell && !cut) reasons.push(`fewer held-out answers reached the token limit without finishing after training (${before!.capped} of ${before!.graded} before, ${after!.capped} of ${after!.graded} after), so part of a change in the held-out score may come from answers no longer being cut off`)
   return { flag: cut || fell, cut_short_before: cut, cut_off_fell: fell, reasons, before, after }
+}
+
+/**
+ * For the line of a run that did not end with an adapter: the answers that
+ * reached the token limit, as far as the run got. '' when none did or none
+ * was counted, so such a line reads as it always did. `stepAnswers` is how
+ * many answers one step samples (group size times tasks a step), when known.
+ */
+export function rlCutOffClause(r: Pick<TinkerRlResult, 'step_capped' | 'answers_before' | 'capped_before' | 'answers_after' | 'capped_after'>, stepAnswers: number | null = null): string {
+  const parts: string[] = []
+  const before = rlCutOff(r.answers_before, r.capped_before)
+  const after = rlCutOff(r.answers_after, r.capped_after)
+  if (before && before.capped > 0) parts.push(`${before.capped} of ${before.graded} held-out before training`)
+  if (after && after.capped > 0) parts.push(`${after.capped} of ${after.graded} held-out after training`)
+  const steps = r.step_capped ?? []
+  const last = steps.length ? steps[steps.length - 1] : 0
+  if (last > 0) parts.push(`${last}${stepAnswers !== null && stepAnswers >= last ? ` of ${stepAnswers}` : ''} in the last step (step ${steps.length})`)
+  return parts.length ? `; answers that reached the token limit without finishing: ${parts.join(', ')}` : ''
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +735,7 @@ export function normalizeRlResult(raw: unknown): TinkerRlResult {
 
 /** One line for the stored record and the next epoch's context. Says what was measured, by whom, and that the cost is an estimate. */
 export function describeTinkerRl(r: TinkerRlResult, baseModel: string, slug: string | null, costUsd: number, expiresAt: string | null, name: string | null, hacking: RlHackingFlag,
-  cutOff: RlCutOffFlag = rlCutOffFlag({ before: rlCutOff(r.answers_before, r.capped_before), after: rlCutOff(r.answers_after, r.capped_after) })): string {
+  cutOff: RlCutOffFlag = rlCutOffFlag({ before: rlCutOff(r.answers_before, r.capped_before), after: rlCutOff(r.answers_after, r.capped_after) }), stepAnswers: number | null = null): string {
   const cost = `estimated cost $${costUsd.toFixed(4)} (token counts at Tinker's published prices of ${TINKER_PRICE_TABLE_DATE}, not a billed amount)`
   if (r.status === 'ok') {
     const score = `LAB-MEASURED held-out rubric score ${r.score_before!.toFixed(3)} before training, ${r.score_after!.toFixed(3)} after (best possible ${(r.max_reward ?? 1).toFixed(2)}), on ${r.n_holdout ?? '?'} tasks the lab held out`
@@ -718,8 +747,11 @@ export function describeTinkerRl(r: TinkerRlResult, baseModel: string, slug: str
       : ''
     return `${score}${cut}; ${steps}${hacking.flag ? '; FLAG: the reward may be gamed (see the record)' : ''}${cutOff.flag ? '; FLAG: a change in the held-out score may come from answers no longer being cut off (see the record)' : ''}; ${adapter}; ${cost}`
   }
-  if (r.status === 'refused') return `refused by the runner${r.stage ? ` (${r.stage})` : ''}: ${r.reason}; ${cost}`
-  return `${r.status}${r.stage ? ` at ${r.stage}` : ''}: ${r.reason || 'unknown'}; ${cost}`
+  // A run that ended without an adapter still says how many of its answers reached the token limit, when any did:
+  // with every answer cut off no step can train, and the reason alone does not say why.
+  const reached = rlCutOffClause(r, stepAnswers)
+  if (r.status === 'refused') return `refused by the runner${r.stage ? ` (${r.stage})` : ''}: ${r.reason}${reached}; ${cost}`
+  return `${r.status}${r.stage ? ` at ${r.stage}` : ''}: ${r.reason || 'unknown'}${reached}; ${cost}`
 }
 
 /** What was asked, in one line, for the stored record. */

@@ -2609,12 +2609,20 @@ test('the lesson note and the Reviewer\'s line carry the measured Inkling facts 
     assert.deepEqual(both, ['Qwen/Qwen3.5-4B', INKLING])
     const onInkling = tutor.tinkerTutorReviewFacts({ ...read(lessonRaw()), base_model: INKLING }, TEACHER).line
     assert.ok(onInkling.endsWith(`${tutor.TUTOR_MEASURE_NOTE} ${INKLING_LESSON_FACTS}`))
-    assert.equal(onInkling.split('counts toward that limit').length, 2, 'what the line already says about the limit is said once')
+    // what the line already says about the limit is said once, and beside "had not measured whether such a passage is ... counted"
+    // it does not say as a fact that the thinking counts
+    assert.equal(onInkling.split('toward that limit').length, 2, 'said once')
+    assert.ok(onInkling.includes('(thinking the small model writes before its answer may count toward that limit, and a cut off answer is graded as it stands)'))
+    assert.ok(!onInkling.includes('answer counts toward that limit'))
     const onQwen = tutor.tinkerTutorReviewFacts(read(lessonRaw()), TEACHER).line
     assert.ok(onQwen.endsWith(tutor.TUTOR_MEASURE_NOTE))
     assert.ok(!/26 November/.test(onQwen))
+    const asItWas = '(thinking the small model writes before its answer counts toward that limit, and a cut off answer is graded as it stands)'
+    assert.ok(onQwen.includes(asItWas), 'a lesson on another base model reads what it read before')
     delete process.env.LAB_TINKER_BASE_MODELS
-    assert.ok(tutor.tinkerTutorReviewFacts({ ...read(lessonRaw()), base_model: INKLING }, TEACHER).line.endsWith(tutor.TUTOR_MEASURE_NOTE), 'no longer offered: nothing is said')
+    const notOffered = tutor.tinkerTutorReviewFacts({ ...read(lessonRaw()), base_model: INKLING }, TEACHER).line
+    assert.ok(notOffered.endsWith(tutor.TUTOR_MEASURE_NOTE), 'no longer offered: nothing is said')
+    assert.ok(notOffered.includes(asItWas), 'and the line is word for word what it was')
   } finally {
     if (saved === undefined) delete process.env.LAB_TINKER_BASE_MODELS
     else process.env.LAB_TINKER_BASE_MODELS = saved

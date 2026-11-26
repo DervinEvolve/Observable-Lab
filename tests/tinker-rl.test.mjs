@@ -989,18 +989,23 @@ test('the cut off flag: more than a fifth of the untrained held-out answers at t
   assert.equal(flag(c(2, 10), c(2, 10)).flag, false)
   const many = flag(c(3, 10), c(3, 10))
   assert.deepEqual([many.flag, many.cut_short_before, many.cut_off_fell], [true, true, false])
-  assert.deepEqual(many.reasons, ['many untrained held-out answers were cut off by the token limit (3 of 10), so a change in the held-out score may come from answers no longer being cut off'])
+  assert.deepEqual(many.reasons, ['many untrained held-out answers reached the token limit without finishing (3 of 10), so a change in the held-out score may come from answers no longer being cut off'])
   // the count fell: said once, by the stronger reason when both hold
   const fell = flag(c(1, 10), c(0, 10))
   assert.deepEqual([fell.flag, fell.cut_short_before, fell.cut_off_fell], [true, false, true])
-  assert.deepEqual(fell.reasons, ['fewer held-out answers were cut off by the token limit after training (1 of 10 before, 0 of 10 after), so part of a change in the held-out score may come from answers no longer being cut off'])
+  assert.deepEqual(fell.reasons, ['fewer held-out answers reached the token limit without finishing after training (1 of 10 before, 0 of 10 after), so part of a change in the held-out score may come from answers no longer being cut off'])
   const both = flag(c(6, 6), c(0, 6))
   assert.deepEqual([both.flag, both.cut_short_before, both.cut_off_fell, both.reasons.length], [true, true, true, 1])
   assert.match(both.reasons[0], /^many untrained held-out answers .*\(6 of 6\)/)
   // more cut off after than before is not this flag
   assert.equal(flag(c(1, 10), c(2, 10)).flag, false)
-  // before training only (a run still going): the first sign can already be said
-  assert.equal(flag(c(5, 6), null).flag, true)
+  // before training only (a run still going, or one that failed before its second scoring): the first sign can already be said,
+  // and with no score after training the reason does not speak of a change in the score
+  const early = flag(c(5, 6), null)
+  assert.deepEqual([early.flag, early.cut_short_before, early.cut_off_fell], [true, true, false])
+  assert.deepEqual(early.reasons, ['many untrained held-out answers reached the token limit without finishing (5 of 6), so the held-out score before training may be low because answers were cut off'])
+  // the reasons say what is counted (an answer whose text was whole is counted too when its stop token did not fit)
+  for (const reason of [...many.reasons, ...fell.reasons, ...early.reasons]) assert.ok(/reached the token limit without finishing/.test(reason) && !/were cut off by the token limit/.test(reason))
   // the counts are compared as shares, so a different number graded does not make a fall by itself
   assert.equal(flag(c(1, 10), c(1, 10)).flag, false)
   assert.equal(flag(c(2, 20), c(1, 10)).flag, false)
@@ -1048,13 +1053,70 @@ test('the tool run line and the stored record say what was cut off only where so
   assert.equal(run.status, 'ok')
   assert.deepEqual(run.cut_off, {
     flag: true, cut_short_before: true, cut_off_fell: true,
-    reasons: ['many untrained held-out answers were cut off by the token limit (4 of 6), so a change in the held-out score may come from answers no longer being cut off'],
+    reasons: ['many untrained held-out answers reached the token limit without finishing (4 of 6), so a change in the held-out score may come from answers no longer being cut off'],
     before: { graded: 6, capped: 4 }, after: { graded: 6, capped: 0 },
   })
   assert.deepEqual(run.progress.capped, [8, 4, 0, 0, 0, 0, 0, 0, 0, 0])
   assert.deepEqual(run.progress.mean_tokens.slice(0, 3), [40, 38, 12])
   assert.deepEqual([run.progress.answers_before, run.progress.capped_before, run.progress.answers_after, run.progress.capped_after], [6, 4, 6, 0])
   assert.equal(run.hacking.flag, false)
+})
+
+test('a run that fails because every answer reached the token limit says so in its line and its record, without speaking of a change in the score', async () => {
+  // What the corrected reading makes likely on Inkling with a small limit: every answer reads as empty, every reward in a
+  // group is equal, no step trains, and the runner returns an error with the counts still in its result.
+  const noStep = 'no step trained the model: in every step every answer to a task earned the same reward, so there was nothing to learn from'
+  const failed = {
+    status: 'error', stage: 'train', error: noStep, n_tasks: 20, n_train: 17, n_holdout: 3, steps_planned: 4, steps_done: 4, steps_trained: 0, max_reward: 1,
+    score_before: 0, step_means: [0, 0, 0, 0], step_frac_max: [0, 0, 0, 0], step_capped: [16, 16, 16, 16], step_mean_tokens: [40, 40, 40, 40],
+    answers_before: 6, capped_before: 6, tokens: { train: 0, eval: 0, sample_prompt: 900, sample_completion: 2800 },
+  }
+  const hacking = { flag: false, reasons: [] }
+  const read = rl.normalizeRlResult(failed)
+  assert.equal(read.status, 'error')
+  // the line itself, with and without the number of answers a step samples
+  assert.equal(rl.describeTinkerRl(read, 'Qwen/Qwen3.5-4B', null, 0.001, null, null, hacking, undefined, 16),
+    `error at train: ${noStep}; answers that reached the token limit without finishing: 6 of 6 held-out before training, 16 of 16 in the last step (step 4); estimated cost $0.0010 (token counts at Tinker's published prices of ${tinker.TINKER_PRICE_TABLE_DATE}, not a billed amount)`)
+  assert.match(rl.describeTinkerRl(read, 'Qwen/Qwen3.5-4B', null, 0.001, null, null, hacking), /6 of 6 held-out before training, 16 in the last step \(step 4\); estimated cost/)
+  // a failed or refused run with nothing counted, or nothing at the limit, reads word for word as it did
+  const plainError = rl.normalizeRlResult({ status: 'error', stage: 'train', error: noStep, tokens: {} })
+  const asBefore = `error at train: ${noStep}; estimated cost $0.0010 (token counts at Tinker's published prices of ${tinker.TINKER_PRICE_TABLE_DATE}, not a billed amount)`
+  assert.equal(rl.describeTinkerRl(plainError, 'Qwen/Qwen3.5-4B', null, 0.001, null, null, hacking, undefined, 16), asBefore)
+  assert.equal(rl.describeTinkerRl(rl.normalizeRlResult({ ...failed, step_capped: [0, 0, 0, 0], capped_before: 0 }), 'Qwen/Qwen3.5-4B', null, 0.001, null, null, hacking, undefined, 16), asBefore)
+  assert.equal(rl.rlCutOffClause(plainError), '')
+  const refused = rl.normalizeRlResult({ status: 'refused', stage: 'tokens', reason: 'tasks[3] is too long', tokens: {} })
+  assert.match(rl.describeTinkerRl(refused, 'Qwen/Qwen3.5-4B', null, 0, null, null, hacking), /^refused by the runner \(tokens\): tasks\[3\] is too long; estimated cost/)
+  assert.match(rl.describeTinkerRl(rl.normalizeRlResult({ status: 'refused', stage: 'train', reason: 'stopped', tokens: {}, answers_before: 6, capped_before: 2 }), 'Qwen/Qwen3.5-4B', null, 0, null, null, hacking),
+    /^refused by the runner \(train\): stopped; answers that reached the token limit without finishing: 2 of 6 held-out before training; estimated cost/)
+  // the whole run: the line the models read next epoch, the stored evidence and the public record
+  configure()
+  globalThis.fetch = fakeRunner([], [{ status: 'done', result: failed }])
+  const out = await rlRun.runTinkerRl(CTX, planFor(ask({ settings: { group_size: 8, tasks_per_step: 2, steps: 4 } })).tinker_rl, { maxWaitMs: 1000, pollMs: 1 })
+  assert.equal(out.status, 'error')
+  assert.match(out.summary, /nothing to learn from; answers that reached the token limit without finishing: 6 of 6 held-out before training, 16 of 16 in the last step \(step 4\); estimated cost/)
+  assert.ok(!/a change in the held-out score/.test(out.summary))
+  const evidence = lab.toolRuns.find(t => t.tool === 'tinker_rl')
+  assert.deepEqual(evidence.detail.cut_off.reasons, ['many untrained held-out answers reached the token limit without finishing (6 of 6), so the held-out score before training may be low because answers were cut off'])
+  rlPublic.resetRlPracticeCache()
+  const run = (await rlPublic.rlPractice()).run
+  assert.deepEqual([run.cut_off.flag, run.cut_off.before, run.cut_off.after], [true, { graded: 6, capped: 6 }, null])
+  assert.ok(run.cut_off.reasons.every(r => !/a change in the held-out score/.test(r)), 'a run with no score after training has no change to explain')
+  assert.deepEqual(run.progress.capped, [16, 16, 16, 16])
+})
+
+test('a finished run whose step counts do not fit its own settings keeps its record, with those counts unsaid', () => {
+  const row = { settings: { group_size: 4, tasks_per_step: 2 } }
+  // 20 is a count some run could have (at most 256), and more than the 8 answers a step of this run samples
+  const odd = rl.normalizeRlResult(runnerOk({ step_capped: [20, 8, 0, 0, 0, 0, 0, 0, 0, 0], step_mean_tokens: Array(10).fill(12), answers_before: 6, capped_before: 4, answers_after: 6, capped_after: 0 }))
+  assert.deepEqual([odd.status, odd.step_capped[0]], ['ok', 20])
+  const kept = rlRun.finalRlProgress(row, odd)
+  assert.ok(kept, 'the finished record is not dropped over one count')
+  assert.equal(kept.capped, null)
+  assert.deepEqual([kept.phase, kept.means.length, kept.mean_tokens.length, kept.answers_before, kept.capped_before, kept.capped_after], ['done', 10, 10, 6, 4, 0])
+  // counts that fit are kept as they were
+  const fits = rlRun.finalRlProgress(row, rl.normalizeRlResult(runnerOk({ step_capped: [8, 4, 0, 0, 0, 0, 0, 0, 0, 0] })))
+  assert.deepEqual(fits.capped, [8, 4, 0, 0, 0, 0, 0, 0, 0, 0])
+  assert.equal(rlRun.finalRlProgress(row, rl.normalizeRlResult(runnerOk())).capped, null)
 })
 
 test('the public record of a run from a runner that sends no counts has an empty cut off part, and one still going shows what it has', async () => {
@@ -1075,7 +1137,7 @@ test('the public record of a run from a runner that sends no counts has an empty
 // ===========================================================================
 // What the models are told about Inkling's thinking passage
 // ===========================================================================
-const INKLING_MEASURED = 'Measured on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; max_completion_tokens counts that passage, and an answer whose limit falls inside it is read as empty. In the lab\'s one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it also compares thinking with not thinking.'
+const INKLING_MEASURED = 'Measured on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; max_completion_tokens counts that passage. The lab\'s runner reads an answer whose limit falls inside the passage as empty, and in the lab\'s one test, a Tinker training run, an adapter of that model trained on written examples answered with no thinking passage; the lab has not measured this for an adapter from an RL run, so a before and after comparison on it may also compare thinking with not thinking.'
 
 test('the RL note and the Reviewer\'s line carry the measured Inkling facts only while Inkling is offered', () => {
   configure()
@@ -1087,6 +1149,14 @@ test('the RL note and the Reviewer\'s line carry the measured Inkling facts only
   // nothing else in the paragraph moved: taking the sentences and the model's name out gives the old paragraph
   assert.equal(withIt.replace(` ${INKLING_MEASURED}`, '').replace(`, ${MINI}`, ''), without)
   assert.equal(rl.tinkerRlNote({ perDay: 2, names: true, chat: true }).split(INKLING_MEASURED).length, 2, 'said once')
+  // what was measured that day is one sentence; how the runner reads a cut answer is not part of the measurement
+  const [measuredSentence, rest] = INKLING_MEASURED.split('. ')
+  assert.equal(INKLING_MEASURED.split('. ').length, 2, 'two sentences')
+  assert.ok(measuredSentence.startsWith('Measured on 26 November 2026') && !/empty|runner/.test(measuredSentence))
+  assert.ok(rest.startsWith('The lab\'s runner reads an answer whose limit falls inside the passage as empty'))
+  // the one test was a training run on written examples, not an RL run: the note says so and does not state the consequence as a fact
+  for (const part of ['in the lab\'s one test, a Tinker training run,', 'the lab has not measured this for an adapter from an RL run', 'may also compare thinking with not thinking']) assert.ok(rest.includes(part), part)
+  assert.ok(!/it also compares/.test(INKLING_MEASURED))
   // a fact with its date and its size; no setting is recommended and no model is ranked
   for (const steer of [/\bprefer\b/i, /\bavoid\b/i, /\bshould\b/i, /\brecommend/i, /\bbetter\b/i, /\bworse\b/i, /\buse at least\b/i, /\bset max_completion_tokens\b/i, /\binstead of Inkling\b/i, /\bchoose\b/i, /[—–]/]) {
     assert.ok(!steer.test(INKLING_MEASURED), String(steer))

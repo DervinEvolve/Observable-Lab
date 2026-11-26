@@ -210,7 +210,7 @@ const counted = (progress = {}, cut_off = undefined) => run({
   progress: { ...run().progress, means: [0.1, 0.25, 0.5], capped: [6, 0, 2], mean_tokens: [38.5, 12, 20.25], ...progress },
   ...(cut_off === undefined ? {} : { cut_off }),
 })
-const CUT_REASON = 'many untrained held-out answers were cut off by the token limit (4 of 6), so a change in the held-out score may come from answers no longer being cut off'
+const CUT_REASON = 'many untrained held-out answers reached the token limit without finishing (4 of 6), so a change in the held-out score may come from answers no longer being cut off'
 
 test('the counts of cut off answers are read from the record strictly, and a record without them reads as before', () => {
   const read = practice(counted({}, { flag: true, cut_short_before: true, cut_off_fell: true, reasons: [CUT_REASON], before: { graded: 6, capped: 4 }, after: { graded: 6, capped: 0 } })).run
@@ -257,7 +257,7 @@ test('the panel says how many answers the token limit cut off only where some we
   ])
   assert.equal(logic.CUT_OFF_FLAG_LABEL, 'Cut Off Flag.')
   assert.equal(logic.cutOffFlagText(full),
-    'An answer that reaches the token limit is graded as the text it has, which may be nothing. Many untrained held-out answers were cut off by the token limit (4 of 6), so a change in the held-out score may come from answers no longer being cut off. It blocks nothing; it is recorded here.')
+    'An answer that reaches the token limit is graded as the text it has, which may be nothing. Many untrained held-out answers reached the token limit without finishing (4 of 6), so a change in the held-out score may come from answers no longer being cut off. It blocks nothing; it is recorded here.')
   // nothing cut off: no row about it (the mean tokens are a count of their own and stay), no held-out rows, no flag text
   const none = practice(counted({ capped: [0, 0, 0] }, { flag: false, reasons: [], before: { graded: 6, capped: 0 }, after: { graded: 6, capped: 0 } })).run
   assert.deepEqual(logic.stepCutOffRows(none).map(r => r.label), ['Mean Tokens An Answer Used'])
@@ -272,6 +272,14 @@ test('the panel says how many answers the token limit cut off only where some we
   assert.deepEqual(logic.stepCutOffRows(one), [{ label: 'Answers Cut Off By The Token Limit', value: '16 of 16 in step 1' }, { label: 'Mean Tokens An Answer Used', value: '40.0 in step 1' }])
   assert.deepEqual(logic.heldOutCutOffRows(one).map(r => r.value), ['6 of 6 answers', 'not counted'])
   assert.equal(logic.cutOffFlagText(one), 'An answer that reaches the token limit is graded as the text it has, which may be nothing. It blocks nothing; it is recorded here.')
+  // many steps with a cut off answer: the first, the last and how many others, never a list of every step
+  const steps = n => ({ ...run().progress, phase: 'scored', step: n, steps_planned: 30, means: Array(n).fill(0.1), frac_max: Array(n).fill(0) })
+  const three = practice(run({ progress: { ...steps(4), capped: [10, 3, 0, 1], mean_tokens: [40, 30, 12, 13] } })).run
+  assert.equal(logic.stepCutOffRows(three)[0].value, '10 of 16 in step 1, 1 of 16 in step 4, and in 1 other step')
+  const every = practice(run({ progress: { ...steps(30), capped: Array(30).fill(16), mean_tokens: Array(30).fill(40) } })).run
+  assert.equal(logic.stepCutOffRows(every)[0].value, '16 of 16 in step 1, 16 of 16 in step 30, and in 28 other steps')
+  const widest = practice(run({ progress: { ...steps(30), group_size: 16, tasks_per_step: 16, attempts: [], capped: Array(30).fill(256), mean_tokens: Array(30).fill(511.9) } })).run
+  assert.ok(logic.stepCutOffRows(widest)[0].value.length <= 70, 'bounded at the largest run there can be')
   // Title Case labels, no dash, no markup in what the page is given
   const title = label => label.split(' ').every(w => /^[A-Z]/.test(w))
   for (const row of [...logic.stepCutOffRows(full), ...logic.heldOutCutOffRows(full)]) {
@@ -280,6 +288,19 @@ test('the panel says how many answers the token limit cut off only where some we
   }
   assert.ok(title(logic.CUT_OFF_FLAG_LABEL.replace('.', '')))
   assert.ok(!/[—–]/.test(logic.cutOffFlagText(full)))
+  // every label of the panel is in Title Case, the older ones like the new: its title, its section headings, its row labels,
+  // its two flag labels and its button
+  const panelSource = readFileSync(join(root, 'src/systems/PracticeBenchPanel.ts'), 'utf8')
+  const labels = [
+    ...[...panelSource.matchAll(/this\.(?:row|section)\('([^']+)'/g)].map(m => m[1]),
+    ...[...panelSource.matchAll(/el\('(?:b|button|div)', (?:undefined|'pb-title'|'pb-talk'), '([^']+)'\)/g)].map(m => m[1].trim().replace(/\.$/, '')),
+  ]
+  assert.ok(labels.length >= 17, `found ${labels.length} labels`)
+  for (const expected of ['The Practice Bench', 'Reward Hacking Flag', 'Task Set', 'Reward Per Step', 'Held-Out Score, Measured By The Lab', 'Steps That Trained The Model', 'Longest Answer',
+    'Loss, Learning Rate', 'Before Training', 'After Training', 'Estimated Cost', 'Set Aside As The Most It Could Cost', 'Sample Attempts', 'Talk To The Trained Model']) {
+    assert.ok(labels.includes(expected), expected)
+  }
+  for (const label of labels) assert.ok(label.split(/[ -]/).every(w => /^[A-Z]/.test(w)) && !/[—–]/.test(label), label)
   // the panel draws exactly these, as text, at its own text size
   const source = readFileSync(join(root, 'src/systems/PracticeBenchPanel.ts'), 'utf8')
   assert.ok(source.includes('for (const r of stepCutOffRows(run)) stepRows.appendChild(this.row(r.label, r.value))'))

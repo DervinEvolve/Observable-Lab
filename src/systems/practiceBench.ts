@@ -346,7 +346,10 @@ export interface PracticeRow { label: string; value: string }
  * The rows the panel adds to "Steps" about answers that reached the token
  * limit, from the stored counts only. A row is there only where there is
  * something to say: steps with no cut off answer are not listed, and a
- * record with no counts adds nothing.
+ * record with no counts adds nothing. The value is bounded: the first and
+ * the last step that had any, and how many other steps did, so a run of
+ * thirty steps does not fill the panel with a list (the record holds every
+ * step's count).
  */
 export function stepCutOffRows(run: Pick<PracticeRun, 'progress'>): PracticeRow[] {
   const p = run.progress
@@ -354,7 +357,14 @@ export function stepCutOffRows(run: Pick<PracticeRun, 'progress'>): PracticeRow[
   const rows: PracticeRow[] = []
   const answers = p.groupSize * p.tasksPerStep
   const cut = (p.capped ?? []).map((n, i) => ({ n, step: i + 1 })).filter(c => c.n > 0)
-  if (cut.length) rows.push({ label: 'Answers Cut Off By The Token Limit', value: cut.map(c => `${c.n} of ${answers} in step ${c.step}`).join(', ') })
+  if (cut.length) {
+    const one = (c: { n: number; step: number }): string => `${c.n} of ${answers} in step ${c.step}`
+    const others = cut.length - 2
+    rows.push({
+      label: 'Answers Cut Off By The Token Limit',
+      value: cut.length === 1 ? one(cut[0]) : `${one(cut[0])}, ${one(cut[cut.length - 1])}${others > 0 ? `, and in ${others} other step${others === 1 ? '' : 's'}` : ''}`,
+    })
+  }
   const used = p.meanTokens ?? []
   if (used.length && used.some(t => t > 0)) {
     const last = used.length

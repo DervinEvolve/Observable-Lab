@@ -662,7 +662,7 @@ test('a request for Inkling 2 Mini is accepted only while it is on the list, and
   }
 })
 
-const INKLING_TRAIN_FACTS = 'Measured on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; the token limit of a sampled completion counts that passage, and a completion whose limit falls inside it is read as empty. In the lab\'s one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it also compares thinking with not thinking.'
+const INKLING_TRAIN_FACTS = 'Measured on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; the token limit of a sampled completion counts that passage. The lab\'s runner reads a completion whose limit falls inside the passage as empty, and in the lab\'s one test an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it also compares thinking with not thinking.'
 
 test('the training note and the Reviewer\'s line carry the measured Inkling facts only while Inkling is offered', () => {
   try {
@@ -680,7 +680,10 @@ test('the training note and the Reviewer\'s line carry the measured Inkling fact
     assert.equal(tinker.inklingThinkingFacts('train'), INKLING_TRAIN_FACTS)
     // two sentences, a date and a size, and no steering: no setting to use, no model ranked
     assert.equal(INKLING_TRAIN_FACTS.split('. ').length, 2)
-    for (const part of ['26 November 2026', 'one question', 'eight answers', 'the four that finished', '34 to 49 tokens', 'lowest thinking effort', 'In the lab\'s one test']) assert.ok(INKLING_TRAIN_FACTS.includes(part), part)
+    // what was measured that day is one sentence; how the runner reads a cut completion is said apart from it
+    assert.ok(!/empty|runner/.test(INKLING_TRAIN_FACTS.split('. ')[0]))
+    assert.ok(INKLING_TRAIN_FACTS.split('. ')[1].startsWith('The lab\'s runner reads a completion whose limit falls inside the passage as empty'))
+    for (const part of ['26 November 2026', 'one question', 'eight answers', 'the four that finished', '34 to 49 tokens', 'lowest thinking effort', 'in the lab\'s one test']) assert.ok(INKLING_TRAIN_FACTS.includes(part), part)
     for (const steer of [/\bprefer\b/i, /\bavoid\b/i, /\bshould\b/i, /\brecommend/i, /\bbetter\b/i, /\bworse\b/i, /\bchoose\b/i, /\bQwen\b/, /\bgoal\b/i, /[—–]/]) assert.ok(!steer.test(INKLING_TRAIN_FACTS), String(steer))
     // the Reviewer is told for a request on Inkling and not for one on another base model
     const both = ['Qwen/Qwen3.5-4B', MINI]

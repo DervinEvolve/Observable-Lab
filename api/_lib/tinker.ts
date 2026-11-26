@@ -695,25 +695,32 @@ export const INKLING_2_MINI = 'thinkingmachines/Inkling-2-Mini'
  *
  * The measurement is the owner's raw probe of 26 November 2026
  * (docs/OPERATIONS.md, "Inkling 2 Mini"): one question, eight answers sampled
- * by the lab's runner at thinking effort 0.0, four of them finished. The
- * runner reads an answer as its text parts only, so a limit that falls
- * inside the thinking passage leaves an empty answer. A lesson's answers do
- * not come from the runner but from Tinker's chat endpoint, where none of
- * this has been measured, and the lesson's sentence says that and does not
- * repeat what its note already says about the limit.
+ * by the lab's runner at thinking effort 0.0, four of them finished. What was
+ * measured that day is the passage and that the token limit counts it. That
+ * an answer cut inside the passage is read as empty is how the lab's runner
+ * reads it since then (that day it read the raw thinking text), so it is said
+ * in its own sentence and not as part of the measurement.
+ *
+ * The lab's one test of a trained adapter was a Tinker training run (20
+ * written examples, 6 steps, two sampled answers). The training note says
+ * what follows for a run of that kind. The RL note says the test was not an
+ * RL run and that the lab has not measured an adapter from one, so it says
+ * "may". A lesson's answers do not come from the runner but from Tinker's
+ * chat endpoint, where none of this has been measured, and the lesson's
+ * sentence says that and does not repeat what its note already says about
+ * the limit.
  */
 export function inklingThinkingFacts(tool: 'train' | 'rl' | 'tutor', baseModel?: string): string {
   if (!tinkerBaseModels().models.includes(INKLING_2_MINI)) return ''
   if (baseModel !== undefined && baseModel !== INKLING_2_MINI) return ''
   const measured = `of eight answers the lab sampled from the untrained ${INKLING_2_MINI}, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer`
-  const trained = (compares: string) => `In the lab's one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it ${compares} thinking with not thinking.`
   if (tool === 'tutor') {
-    return `Measured in the lab's training runner on 26 November 2026, on one question at the lowest thinking effort: ${measured}; a lesson's answers come from Tinker's chat service instead, where by that date the lab had not measured whether such a passage is written or counted. ${trained('may also compare')}`
+    return `Measured in the lab's training runner on 26 November 2026, on one question at the lowest thinking effort: ${measured}; a lesson's answers come from Tinker's chat service instead, where by that date the lab had not measured whether such a passage is written or counted. In the lab's one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it may also compare thinking with not thinking.`
   }
-  const limit = tool === 'rl'
-    ? 'max_completion_tokens counts that passage, and an answer whose limit falls inside it is read as empty'
-    : 'the token limit of a sampled completion counts that passage, and a completion whose limit falls inside it is read as empty'
-  return `Measured on 26 November 2026, on one question at the lowest thinking effort: ${measured}; ${limit}. ${trained('also compares')}`
+  if (tool === 'rl') {
+    return `Measured on 26 November 2026, on one question at the lowest thinking effort: ${measured}; max_completion_tokens counts that passage. The lab's runner reads an answer whose limit falls inside the passage as empty, and in the lab's one test, a Tinker training run, an adapter of that model trained on written examples answered with no thinking passage; the lab has not measured this for an adapter from an RL run, so a before and after comparison on it may also compare thinking with not thinking.`
+  }
+  return `Measured on 26 November 2026, on one question at the lowest thinking effort: ${measured}; the token limit of a sampled completion counts that passage. The lab's runner reads a completion whose limit falls inside the passage as empty, and in the lab's one test an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it also compares thinking with not thinking.`
 }
 
 /** The same facts at the end of a Reviewer's line, which is closed with a full stop where it is used. '' when there is nothing to say. */
