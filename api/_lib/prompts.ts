@@ -10,7 +10,7 @@ import {
 import { liveModelNote } from './live-model.js'
 import {
   TINKER_BATCH_SIZE, TINKER_EPOCHS, TINKER_LEARNING_RATE, TINKER_MAX_EXAMPLES, TINKER_MAX_MESSAGES, TINKER_MIN_EXAMPLES, TINKER_RANKS,
-  estimateTinkerRun, tinkerBaseModels, tinkerNamesFlag, tinkerNote, tinkerRunUsd, usdText,
+  estimateTinkerRun, inklingReviewFacts, tinkerBaseModels, tinkerNamesFlag, tinkerNote, tinkerRunUsd, usdText,
   type TinkerRequest,
 } from './tinker.js'
 import { RL_COMPLETION_TOKENS, RL_GROUP_SIZE, RL_LEARNING_RATE, RL_LOSSES, RL_MAX_TASKS, RL_MIN_TASKS, RL_STEPS, RL_TASKS_PER_STEP, tinkerRlNote, tinkerRlReviewFacts } from './tinker-rl.js'
@@ -227,7 +227,7 @@ export function tinkerReviewFacts(request: TinkerRequest): { line: string } {
   const estimate = estimateTinkerRun(request)
   const s = request.settings
   return {
-    line: `a LoRA fine-tune of ${request.base_model} on the ${request.examples.length} examples in the Executor's "tools" (${request.dataset_bytes} bytes of text), with rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epoch${s.epochs === 1 ? '' : 's'} and batch size ${s.batch_size} (${estimate.steps} optimizer steps). The lab's check: the request meets the format and the limits. The lab's estimate of the most it could cost, from Tinker's published prices: ${usdText(estimate.max_cost_usd)} (a run may cost at most ${usdText(tinkerRunUsd())}). If you approve, the lab's own code holds out ${estimate.holdout} of the examples, trains on the rest, and measures the loss on the held-out ones before and after`,
+    line: `a LoRA fine-tune of ${request.base_model} on the ${request.examples.length} examples in the Executor's "tools" (${request.dataset_bytes} bytes of text), with rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epoch${s.epochs === 1 ? '' : 's'} and batch size ${s.batch_size} (${estimate.steps} optimizer steps). The lab's check: the request meets the format and the limits. The lab's estimate of the most it could cost, from Tinker's published prices: ${usdText(estimate.max_cost_usd)} (a run may cost at most ${usdText(tinkerRunUsd())}). If you approve, the lab's own code holds out ${estimate.holdout} of the examples, trains on the rest, and measures the loss on the held-out ones before and after${inklingReviewFacts('train', request.base_model)}`,
   }
 }
 
@@ -242,7 +242,7 @@ export function tinkerDatasetReviewFacts(request: TinkerDatasetRequest): { line:
   const s = request.settings
   const d = request.dataset
   return {
-    line: `a LoRA fine-tune of ${request.base_model} on up to ${d.limit} rows of the public dataset ${d.repo}${d.sha ? `@${d.sha}` : ''}${d.file ? `, file ${d.file}` : ''}, with the user turn taken from the column "${d.user_column}" and the assistant turn from the column "${d.assistant_column}"${d.system ? ', and the system text in the Executor\'s "tools" before every row' : ''}; rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epoch${s.epochs === 1 ? '' : 's'} and batch size ${s.batch_size}. The rows are not in the Executor's answer and the lab has not read them yet, so neither you nor the lab has seen them. If you approve, the lab's own code reads the first rows that fit, in file order, leaves out and counts any row that breaks a limit, and then checks the result exactly as it checks inline examples. The lab then estimates the cost from the rows it really read and refuses the run above ${usdText(tinkerRunUsd())}; the most these limits would let it cost is ${usdText(ceiling.max_cost_usd)}. It holds out about a tenth of the rows, trains on the rest, and measures the loss on the held-out ones before and after. If the dataset is not on the lab's shelf, or the file or the columns are not there, nothing is trained and the reason is stored`,
+    line: `a LoRA fine-tune of ${request.base_model} on up to ${d.limit} rows of the public dataset ${d.repo}${d.sha ? `@${d.sha}` : ''}${d.file ? `, file ${d.file}` : ''}, with the user turn taken from the column "${d.user_column}" and the assistant turn from the column "${d.assistant_column}"${d.system ? ', and the system text in the Executor\'s "tools" before every row' : ''}; rank ${s.rank}, learning rate ${s.learning_rate}, ${s.epochs} epoch${s.epochs === 1 ? '' : 's'} and batch size ${s.batch_size}. The rows are not in the Executor's answer and the lab has not read them yet, so neither you nor the lab has seen them. If you approve, the lab's own code reads the first rows that fit, in file order, leaves out and counts any row that breaks a limit, and then checks the result exactly as it checks inline examples. The lab then estimates the cost from the rows it really read and refuses the run above ${usdText(tinkerRunUsd())}; the most these limits would let it cost is ${usdText(ceiling.max_cost_usd)}. It holds out about a tenth of the rows, trains on the rest, and measures the loss on the held-out ones before and after. If the dataset is not on the lab's shelf, or the file or the columns are not there, nothing is trained and the reason is stored${inklingReviewFacts('train', request.base_model)}`,
   }
 }
 

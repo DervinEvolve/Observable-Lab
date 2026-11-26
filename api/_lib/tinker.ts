@@ -679,6 +679,49 @@ export function newSplitSalt(): string {
 // What the models are told
 // ---------------------------------------------------------------------------
 
+export const INKLING_2_MINI = 'thinkingmachines/Inkling-2-Mini'
+
+/**
+ * What the lab measured about Inkling 2 Mini's thinking passage, in two
+ * sentences, for the notes the Executor reads and the Reviewer's line of a
+ * request. A measured fact with its date and its size, and what follows from
+ * it for the numbers the lab reports. It names no setting to use and ranks
+ * no model.
+ *
+ * '' unless Inkling 2 Mini is among the base models the lab offers
+ * (LAB_TINKER_BASE_MODELS), so a lab without it reads exactly what it read
+ * before. With `baseModel` (a Reviewer's line) also '' unless the request is
+ * for that model.
+ *
+ * The measurement is the owner's raw probe of 26 November 2026
+ * (docs/OPERATIONS.md, "Inkling 2 Mini"): one question, eight answers sampled
+ * by the lab's runner at thinking effort 0.0, four of them finished. The
+ * runner reads an answer as its text parts only, so a limit that falls
+ * inside the thinking passage leaves an empty answer. A lesson's answers do
+ * not come from the runner but from Tinker's chat endpoint, where none of
+ * this has been measured, and the lesson's sentence says that and does not
+ * repeat what its note already says about the limit.
+ */
+export function inklingThinkingFacts(tool: 'train' | 'rl' | 'tutor', baseModel?: string): string {
+  if (!tinkerBaseModels().models.includes(INKLING_2_MINI)) return ''
+  if (baseModel !== undefined && baseModel !== INKLING_2_MINI) return ''
+  const measured = `of eight answers the lab sampled from the untrained ${INKLING_2_MINI}, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer`
+  const trained = (compares: string) => `In the lab's one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it ${compares} thinking with not thinking.`
+  if (tool === 'tutor') {
+    return `Measured in the lab's training runner on 26 November 2026, on one question at the lowest thinking effort: ${measured}; a lesson's answers come from Tinker's chat service instead, where by that date the lab had not measured whether such a passage is written or counted. ${trained('may also compare')}`
+  }
+  const limit = tool === 'rl'
+    ? 'max_completion_tokens counts that passage, and an answer whose limit falls inside it is read as empty'
+    : 'the token limit of a sampled completion counts that passage, and a completion whose limit falls inside it is read as empty'
+  return `Measured on 26 November 2026, on one question at the lowest thinking effort: ${measured}; ${limit}. ${trained('also compares')}`
+}
+
+/** The same facts at the end of a Reviewer's line, which is closed with a full stop where it is used. '' when there is nothing to say. */
+export function inklingReviewFacts(tool: 'train' | 'rl', baseModel: string): string {
+  const facts = inklingThinkingFacts(tool, baseModel)
+  return facts ? `. ${facts.replace(/\.$/, '')}` : ''
+}
+
 /**
  * One paragraph about the tool, only while it is on (the callers check). It
  * says what the tool does and where its limits are, and nothing about what
@@ -701,5 +744,7 @@ export function tinkerNote(opts: { perDay: number; liveTrained: boolean; names?:
   const expires = opts.keep
     ? `The adapter stays for ${tinkerTtlDays()} days and then expires, unless it is marked kept.`
     : `The adapter is kept for ${tinkerTtlDays()} days and then expires.`
-  return `Tinker training: as Executor you may ask for one LoRA fine-tuning run of an open-weight model on Tinker, a training service. LoRA only: the base model's own weights are not changed. The base model is one of: ${models}. You write the training data into your answer as chat conversations: ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} different examples, each 2 to ${TINKER_MAX_MESSAGES} messages (an optional system message, then user and assistant in turn, ending with the assistant), at most ${TINKER_MAX_EXAMPLE_BYTES} bytes of text in one example and ${TINKER_MAX_DATASET_BYTES} in all. Only the last assistant message of each example is trained on. Settings are bounded: rank ${TINKER_RANKS.join(', ')}; learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}; epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}; batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}; at most ${TINKER_MAX_STEPS} optimizer steps. A request that breaks any of this is refused whole, with the reason stored. The run needs the Reviewer's approval and happens after the epoch, run by the lab's own code: your answer supplies data and settings and no code. The lab estimates the most the run could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} a run or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC), at most ${opts.perDay} run${opts.perDay === 1 ? '' : 's'} a day, inside the lab's daily spending cap. Costs are estimates from Tinker's published prices, because Tinker reports no cost per call. The lab holds out about a tenth of the examples, chosen by the lab after the request so that you cannot know which, and measures the loss on them before and after training: that score is measured by the lab, not reported by you. A few completions on held-out prompts are sampled and stored. The dataset's size and hash, the settings, both scores, the samples and the adapter's name are public. ${expires}${live}${named}`
+  // Only while Inkling 2 Mini is offered; otherwise the paragraph is word for word what it was.
+  const inkling = inklingThinkingFacts('train')
+  return `Tinker training: as Executor you may ask for one LoRA fine-tuning run of an open-weight model on Tinker, a training service. LoRA only: the base model's own weights are not changed. The base model is one of: ${models}. You write the training data into your answer as chat conversations: ${TINKER_MIN_EXAMPLES} to ${TINKER_MAX_EXAMPLES} different examples, each 2 to ${TINKER_MAX_MESSAGES} messages (an optional system message, then user and assistant in turn, ending with the assistant), at most ${TINKER_MAX_EXAMPLE_BYTES} bytes of text in one example and ${TINKER_MAX_DATASET_BYTES} in all. Only the last assistant message of each example is trained on. Settings are bounded: rank ${TINKER_RANKS.join(', ')}; learning_rate ${TINKER_LEARNING_RATE.min} to ${TINKER_LEARNING_RATE.max}; epochs ${TINKER_EPOCHS.min} to ${TINKER_EPOCHS.max}; batch_size ${TINKER_BATCH_SIZE.min} to ${TINKER_BATCH_SIZE.max}; at most ${TINKER_MAX_STEPS} optimizer steps. A request that breaks any of this is refused whole, with the reason stored. The run needs the Reviewer's approval and happens after the epoch, run by the lab's own code: your answer supplies data and settings and no code. The lab estimates the most the run could cost before it starts and refuses it above $${tinkerRunUsd().toFixed(2)} a run or $${tinkerDailyUsd().toFixed(2)} of Tinker use a day (UTC), at most ${opts.perDay} run${opts.perDay === 1 ? '' : 's'} a day, inside the lab's daily spending cap. Costs are estimates from Tinker's published prices, because Tinker reports no cost per call. The lab holds out about a tenth of the examples, chosen by the lab after the request so that you cannot know which, and measures the loss on them before and after training: that score is measured by the lab, not reported by you. A few completions on held-out prompts are sampled and stored.${inkling ? ` ${inkling}` : ''} The dataset's size and hash, the settings, both scores, the samples and the adapter's name are public. ${expires}${live}${named}`
 }

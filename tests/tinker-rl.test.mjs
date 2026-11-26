@@ -1073,6 +1073,46 @@ test('the public record of a run from a runner that sends no counts has an empty
 })
 
 // ===========================================================================
+// What the models are told about Inkling's thinking passage
+// ===========================================================================
+const INKLING_MEASURED = 'Measured on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; max_completion_tokens counts that passage, and an answer whose limit falls inside it is read as empty. In the lab\'s one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it also compares thinking with not thinking.'
+
+test('the RL note and the Reviewer\'s line carry the measured Inkling facts only while Inkling is offered', () => {
+  configure()
+  const without = rl.tinkerRlNote({ perDay: 2 })
+  assert.ok(!/Inkling|26 November|thinking/.test(without), 'a lab without Inkling reads what it read before')
+  process.env.LAB_TINKER_BASE_MODELS = `Qwen/Qwen3.5-4B,${MINI}`
+  const withIt = rl.tinkerRlNote({ perDay: 2 })
+  assert.ok(withIt.includes(` ${INKLING_MEASURED} A request that breaks any of this is refused whole`))
+  // nothing else in the paragraph moved: taking the sentences and the model's name out gives the old paragraph
+  assert.equal(withIt.replace(` ${INKLING_MEASURED}`, '').replace(`, ${MINI}`, ''), without)
+  assert.equal(rl.tinkerRlNote({ perDay: 2, names: true, chat: true }).split(INKLING_MEASURED).length, 2, 'said once')
+  // a fact with its date and its size; no setting is recommended and no model is ranked
+  for (const steer of [/\bprefer\b/i, /\bavoid\b/i, /\bshould\b/i, /\brecommend/i, /\bbetter\b/i, /\bworse\b/i, /\buse at least\b/i, /\bset max_completion_tokens\b/i, /\binstead of Inkling\b/i, /\bchoose\b/i, /[—–]/]) {
+    assert.ok(!steer.test(INKLING_MEASURED), String(steer))
+  }
+  // the Reviewer: only for a request on Inkling, and the line still ends where the section closes it
+  const both = ['Qwen/Qwen3.5-4B', MINI]
+  const onInkling = prompts.tinkerRlReviewFacts(rl.normalizeTinkerRlRequest(ask({ base_model: MINI }), both).request).line
+  assert.ok(onInkling.endsWith(`is for you to judge. ${INKLING_MEASURED.replace(/\.$/, '')}`))
+  assert.ok(prompts.reviewerToolSection({ tinker_rl: { line: onInkling } }).includes('thinking with not thinking.\n'))
+  const onQwen = prompts.tinkerRlReviewFacts(ok(ask())).line
+  assert.ok(!/Inkling-2-Mini wrote|26 November/.test(onQwen), 'a request on another base model is told nothing of it')
+  assert.ok(onQwen.endsWith('is for you to judge'))
+  // the same request line with Inkling no longer offered: nothing is said
+  delete process.env.LAB_TINKER_BASE_MODELS
+  assert.ok(!/26 November/.test(prompts.tinkerRlReviewFacts(rl.normalizeTinkerRlRequest(ask({ base_model: MINI }), both).request).line))
+  assert.equal(tinker.inklingThinkingFacts('rl'), '')
+  process.env.LAB_TINKER_BASE_MODELS = MINI
+  assert.equal(tinker.inklingThinkingFacts('rl'), INKLING_MEASURED)
+  assert.equal(tinker.inklingThinkingFacts('rl', 'Qwen/Qwen3.5-4B'), '')
+  assert.equal(tinker.inklingReviewFacts('rl', 'Qwen/Qwen3.5-4B'), '')
+  // the whole tool line the Executor reads, through the prompt builder
+  const line = prompts.toolLines(toolsConfig.toolConfig()).split('\n').find(l => l.includes('Tinker RL'))
+  assert.ok(line.includes(INKLING_MEASURED))
+})
+
+// ===========================================================================
 // The owner's probe of the chat endpoint builds the request this server builds
 // ===========================================================================
 test('the raw probe in the runner and tinker-chat.ts build the same request for an untrained base model', async () => {

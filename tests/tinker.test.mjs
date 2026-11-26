@@ -662,6 +662,45 @@ test('a request for Inkling 2 Mini is accepted only while it is on the list, and
   }
 })
 
+const INKLING_TRAIN_FACTS = 'Measured on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; the token limit of a sampled completion counts that passage, and a completion whose limit falls inside it is read as empty. In the lab\'s one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it also compares thinking with not thinking.'
+
+test('the training note and the Reviewer\'s line carry the measured Inkling facts only while Inkling is offered', () => {
+  try {
+    delete process.env.LAB_TINKER_BASE_MODELS
+    const options = { perDay: 2, liveTrained: true, names: true, keep: true }
+    const without = tinker.tinkerNote(options)
+    assert.ok(!/Inkling|26 November|thinking/.test(without), 'a lab without Inkling reads what it read before')
+    assert.equal(tinker.inklingThinkingFacts('train'), '')
+    assert.equal(tinker.inklingThinkingFacts('train', MINI), '', 'not offered: nothing, whatever the request names')
+    process.env.LAB_TINKER_BASE_MODELS = `Qwen/Qwen3.5-4B,${MINI}`
+    const withIt = tinker.tinkerNote(options)
+    assert.ok(withIt.includes(`A few completions on held-out prompts are sampled and stored. ${INKLING_TRAIN_FACTS} The dataset's size and hash`))
+    // nothing else moved: without the two sentences and the model's name it is the old paragraph, word for word
+    assert.equal(withIt.replace(` ${INKLING_TRAIN_FACTS}`, '').replace(`, ${MINI}`, ''), without)
+    assert.equal(tinker.inklingThinkingFacts('train'), INKLING_TRAIN_FACTS)
+    // two sentences, a date and a size, and no steering: no setting to use, no model ranked
+    assert.equal(INKLING_TRAIN_FACTS.split('. ').length, 2)
+    for (const part of ['26 November 2026', 'one question', 'eight answers', 'the four that finished', '34 to 49 tokens', 'lowest thinking effort', 'In the lab\'s one test']) assert.ok(INKLING_TRAIN_FACTS.includes(part), part)
+    for (const steer of [/\bprefer\b/i, /\bavoid\b/i, /\bshould\b/i, /\brecommend/i, /\bbetter\b/i, /\bworse\b/i, /\bchoose\b/i, /\bQwen\b/, /\bgoal\b/i, /[—–]/]) assert.ok(!steer.test(INKLING_TRAIN_FACTS), String(steer))
+    // the Reviewer is told for a request on Inkling and not for one on another base model
+    const both = ['Qwen/Qwen3.5-4B', MINI]
+    const onInkling = prompts.tinkerReviewFacts(tinker.normalizeTinkerRequest(ask({ base_model: MINI }), both).request).line
+    assert.ok(onInkling.endsWith(`measures the loss on the held-out ones before and after. ${INKLING_TRAIN_FACTS.replace(/\.$/, '')}`))
+    assert.ok(prompts.reviewerToolSection({ tinker_train: { line: onInkling } }).includes('also compares thinking with not thinking.\n'), 'the line is closed once, where the section closes it')
+    const onQwen = prompts.tinkerReviewFacts(ok(ask())).line
+    assert.ok(onQwen.endsWith('measures the loss on the held-out ones before and after'))
+    assert.ok(!/26 November/.test(onQwen))
+    assert.equal(tinker.inklingReviewFacts('train', MINI), `. ${INKLING_TRAIN_FACTS.replace(/\.$/, '')}`)
+    assert.equal(tinker.inklingReviewFacts('train', 'Qwen/Qwen3.5-4B'), '')
+    // a request that names a shelf dataset gets the same sentences, for the same base model only
+    const shelf = base_model => prompts.tinkerDatasetReviewFacts({ base_model, settings: { rank: 16, learning_rate: 1e-4, epochs: 1, batch_size: 8 }, dataset: { repo: 'owner/set', sha: null, file: null, limit: 100, user_column: 'q', assistant_column: 'a', system: null } }).line
+    assert.ok(shelf(MINI).endsWith(`the reason is stored. ${INKLING_TRAIN_FACTS.replace(/\.$/, '')}`))
+    assert.ok(shelf('Qwen/Qwen3.5-4B').endsWith('the reason is stored'))
+    delete process.env.LAB_TINKER_BASE_MODELS
+    assert.ok(!/26 November/.test(prompts.tinkerReviewFacts(tinker.normalizeTinkerRequest(ask({ base_model: MINI }), both).request).line), 'no longer offered: nothing is said')
+  } finally { delete process.env.LAB_TINKER_BASE_MODELS }
+})
+
 test('the estimate, the cap and the cost of a run on Inkling 2 Mini use its own prices', () => {
   const request = tinker.normalizeTinkerRequest(ask({ base_model: MINI }), [MINI]).request
   const e = tinker.estimateTinkerRun(request)

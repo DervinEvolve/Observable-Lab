@@ -2575,3 +2575,48 @@ test('the teacher\'s instructions are credited as adapted from the source skill,
   for (const run of ['one question at a time', 'a final assessment', 'a skill map with levels']) assert.equal(credit.includes(run), false, run)
   assert.equal(/[–—]/.test(credit), false)
 })
+
+// ===========================================================================
+// What a lesson's note says about Inkling's thinking passage
+// ===========================================================================
+const INKLING_LESSON_FACTS = 'Measured in the lab\'s training runner on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; a lesson\'s answers come from Tinker\'s chat service instead, where by that date the lab had not measured whether such a passage is written or counted. In the lab\'s one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it may also compare thinking with not thinking.'
+
+test('the lesson note and the Reviewer\'s line carry the measured Inkling facts only while Inkling is offered, and say nothing twice', () => {
+  const INKLING = 'thinkingmachines/Inkling-2-Mini'
+  const saved = process.env.LAB_TINKER_BASE_MODELS
+  try {
+    delete process.env.LAB_TINKER_BASE_MODELS
+    const options = { perDay: 1, teacherUsd: 1, names: true, chat: true }
+    const without = tutor.tinkerTutorNote(options)
+    assert.ok(!/Inkling|26 November/.test(without), 'a lab without Inkling reads what it read before')
+    const general = 'the limit counts every token the small model writes, which for a base model that thinks before it answers may include that thinking; an answer the limit cut off is graded as it stands'
+    assert.ok(without.includes(general))
+    process.env.LAB_TINKER_BASE_MODELS = `Qwen/Qwen3.5-4B,${INKLING}`
+    const withIt = tutor.tinkerTutorNote(options)
+    assert.ok(withIt.includes(`trains again from the base model). ${INKLING_LESSON_FACTS} A request that breaks any of this is refused whole`))
+    assert.equal(withIt.replace(` ${INKLING_LESSON_FACTS}`, '').replace(`, ${INKLING}`, ''), without, 'nothing else in the paragraph moved')
+    // the general sentence about the limit is still there, still once, and the new sentences do not repeat it:
+    // they say what was measured, where, and what was not, and do not claim how a lesson's answer is read
+    assert.equal(withIt.split(general).length, 2)
+    assert.equal(withIt.split('may include that thinking').length, 2)
+    for (const repeated of [/the limit counts/i, /counts that passage/i, /is read as empty/i, /graded as it stands/i]) assert.ok(!repeated.test(INKLING_LESSON_FACTS), String(repeated))
+    assert.ok(INKLING_LESSON_FACTS.includes('had not measured'))
+    assert.equal(INKLING_LESSON_FACTS.split('. ').length, 2, 'two sentences')
+    for (const steer of [/\bprefer\b/i, /\bavoid\b/i, /\bshould\b/i, /\brecommend/i, /\bbetter\b/i, /\bworse\b/i, /\bchoose\b/i, /\bQwen\b/, /\bgoal\b/i, /[—–]/]) assert.ok(!steer.test(INKLING_LESSON_FACTS), String(steer))
+    assert.equal(tinker.inklingThinkingFacts('tutor'), INKLING_LESSON_FACTS)
+    // the Reviewer: for a lesson on Inkling only
+    const both = [...tinker.tinkerBaseModels().models]
+    assert.deepEqual(both, ['Qwen/Qwen3.5-4B', INKLING])
+    const onInkling = tutor.tinkerTutorReviewFacts({ ...read(lessonRaw()), base_model: INKLING }, TEACHER).line
+    assert.ok(onInkling.endsWith(`${tutor.TUTOR_MEASURE_NOTE} ${INKLING_LESSON_FACTS}`))
+    assert.equal(onInkling.split('counts toward that limit').length, 2, 'what the line already says about the limit is said once')
+    const onQwen = tutor.tinkerTutorReviewFacts(read(lessonRaw()), TEACHER).line
+    assert.ok(onQwen.endsWith(tutor.TUTOR_MEASURE_NOTE))
+    assert.ok(!/26 November/.test(onQwen))
+    delete process.env.LAB_TINKER_BASE_MODELS
+    assert.ok(tutor.tinkerTutorReviewFacts({ ...read(lessonRaw()), base_model: INKLING }, TEACHER).line.endsWith(tutor.TUTOR_MEASURE_NOTE), 'no longer offered: nothing is said')
+  } finally {
+    if (saved === undefined) delete process.env.LAB_TINKER_BASE_MODELS
+    else process.env.LAB_TINKER_BASE_MODELS = saved
+  }
+})
