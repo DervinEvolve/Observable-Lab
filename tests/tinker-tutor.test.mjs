@@ -2579,7 +2579,7 @@ test('the teacher\'s instructions are credited as adapted from the source skill,
 // ===========================================================================
 // What a lesson's note says about Inkling's thinking passage
 // ===========================================================================
-const INKLING_LESSON_FACTS = 'Measured in the lab\'s training runner on 26 November 2026, on one question at the lowest thinking effort: of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; a lesson\'s answers come from Tinker\'s chat service instead, where by that date the lab had not measured whether such a passage is written or counted. In the lab\'s one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it may also compare thinking with not thinking.'
+const INKLING_LESSON_FACTS = 'Measured on 26 November 2026, on one question at the lowest thinking effort: in the lab\'s training runner, of eight answers the lab sampled from the untrained thinkingmachines/Inkling-2-Mini, the four that finished each began with a thinking passage of 34 to 49 tokens before a one word answer; on Tinker\'s chat service, which a lesson\'s answers come from, two replies of that model each carried a separate reasoning passage beside a one word answer and were counted at 38 and 55 completion tokens, and the lab had not measured what that service returns when the limit falls inside the passage. In the lab\'s one test, an adapter of that model trained on written examples answered with no thinking passage, so a before and after comparison on it may also compare thinking with not thinking.'
 
 test('the lesson note and the Reviewer\'s line carry the measured Inkling facts only while Inkling is offered, and say nothing twice', () => {
   const INKLING = 'thinkingmachines/Inkling-2-Mini'
@@ -2601,6 +2601,8 @@ test('the lesson note and the Reviewer\'s line carry the measured Inkling facts 
     assert.equal(withIt.split('may include that thinking').length, 2)
     for (const repeated of [/the limit counts/i, /counts that passage/i, /is read as empty/i, /graded as it stands/i]) assert.ok(!repeated.test(INKLING_LESSON_FACTS), String(repeated))
     assert.ok(INKLING_LESSON_FACTS.includes('had not measured'))
+    // the chat service part is what the owner's probe printed on 26 November 2026: a reasoning passage apart from the answer, 38 and 55 completion tokens
+    assert.ok(INKLING_LESSON_FACTS.includes('each carried a separate reasoning passage beside a one word answer and were counted at 38 and 55 completion tokens'))
     assert.equal(INKLING_LESSON_FACTS.split('. ').length, 2, 'two sentences')
     for (const steer of [/\bprefer\b/i, /\bavoid\b/i, /\bshould\b/i, /\brecommend/i, /\bbetter\b/i, /\bworse\b/i, /\bchoose\b/i, /\bQwen\b/, /\bgoal\b/i, /[—–]/]) assert.ok(!steer.test(INKLING_LESSON_FACTS), String(steer))
     assert.equal(tinker.inklingThinkingFacts('tutor'), INKLING_LESSON_FACTS)
