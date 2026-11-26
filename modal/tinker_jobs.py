@@ -2171,6 +2171,12 @@ CHAT_PROBE_MAX_BYTES = 200_000
 CHAT_PROBE_CONTENT_CHARS = 2000
 CHAT_PROBE_ERROR_BYTES = 4000
 CHAT_PROBE_MAX_FIELDS = 24
+# What the lab server's own call carries beside the key and the content type. Its call is Node's fetch, which sends these
+# four on every request (read off a local Node 22). Python's urllib sends "User-Agent: Python-urllib/3.x" in their place,
+# and on 26 November 2026 the service in front of the endpoint refused that with HTTP 403 "error code: 1010" before
+# Tinker saw the request. So the probe says what the lab server says, or it would test a request the lab never makes.
+# One difference stays: Node also sends "Accept-Encoding: gzip, deflate", and this probe asks for an uncompressed answer.
+CHAT_PROBE_HEADERS = {"Accept": "*/*", "Accept-Language": "*", "Sec-Fetch-Mode": "cors", "User-Agent": "node"}
 
 
 def chat_reasoning_effort(base_model):
@@ -2289,7 +2295,7 @@ def chat_probe_call(base_model: str, prompt: str, max_tokens: int, temperature, 
     try:
         request = urllib.request.Request(
             TINKER_CHAT_URL, data=json.dumps(chat_probe_body(base_model, prompt, max_tokens, temperature)).encode("utf-8"), method="POST",
-            headers={"Authorization": "Bearer %s" % key, "Content-Type": "application/json"},
+            headers={**CHAT_PROBE_HEADERS, "Authorization": "Bearer %s" % key, "Content-Type": "application/json"},
         )
         try:
             with (opener or urllib.request.urlopen)(request, timeout=CHAT_PROBE_TIMEOUT_S) as response:

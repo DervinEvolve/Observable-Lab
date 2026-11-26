@@ -688,7 +688,12 @@ class ChatProbe(unittest.TestCase):
             self.assertEqual(request.full_url, CHAT["url"])
             self.assertEqual(request.get_method(), "POST")
             self.assertEqual(json.loads(request.data.decode("utf-8")), case["body"])
-            self.assertEqual(dict((k.lower(), v) for k, v in request.header_items()), {"authorization": "Bearer %s" % KEY, "content-type": "application/json"})
+            # The key and the content type, and the four headers Node's fetch adds to the lab server's own call. urllib's
+            # own User-Agent was refused with HTTP 403 "error code: 1010" on 26 November 2026, before Tinker saw the request.
+            self.assertEqual(dict((k.lower(), v) for k, v in request.header_items()), {
+                "authorization": "Bearer %s" % KEY, "content-type": "application/json",
+                "accept": "*/*", "accept-language": "*", "sec-fetch-mode": "cors", "user-agent": "node"})
+            self.assertNotIn("urllib", request.get_header("User-agent").lower())
             self.assertNotIn(KEY, request.data.decode("utf-8"))
             self.assertEqual(timeout, M.CHAT_PROBE_TIMEOUT_S)
         self.assertNotIn(KEY, json.dumps(out))

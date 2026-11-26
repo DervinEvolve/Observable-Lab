@@ -1220,7 +1220,14 @@ test('the raw probe in the runner and tinker-chat.ts build the same request for 
   assert.ok(runner.includes(`RAW_PROBE_CAPS = (${shared.caps.join(', ')})`))
   assert.ok(runner.includes(`RAW_PROBE_TEMPERATURE = ${shared.temperature.toFixed(1)}`))
   assert.ok(runner.includes('return "none" if isinstance(base_model, str) and base_model in RENDERERS and base_model.startswith("thinkingmachines/") else False'))
-  assert.ok(runner.includes('headers={"Authorization": "Bearer %s" % key, "Content-Type": "application/json"}'))
+  assert.ok(runner.includes('headers={**CHAT_PROBE_HEADERS, "Authorization": "Bearer %s" % key, "Content-Type": "application/json"}'))
+  // The lab server names two headers and leaves the rest to Node's fetch, which adds these four. The probe sends the same
+  // four, because Python's own User-Agent was refused with HTTP 403 "error code: 1010" on 26 November 2026. If the server
+  // ever sets a User-Agent of its own, this fails and the probe must follow.
+  assert.ok(runner.includes('CHAT_PROBE_HEADERS = {"Accept": "*/*", "Accept-Language": "*", "Sec-Fetch-Mode": "cors", "User-Agent": "node"}'))
+  const server = readFileSync(join(root, 'api', '_lib', 'tinker-chat.ts'), 'utf8')
+  assert.ok(server.includes("headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' },"))
+  assert.equal(/user-agent/i.test(server), false)
   // the ids the runner trains are the ids this server prices, so "a model the lab prices" means the same on both sides
   const renderers = [...runner.matchAll(/^    "([A-Za-z0-9./-]+)": "[a-z0-9_]+",$/gm)].map(m => m[1])
   assert.deepEqual(renderers.sort(), Object.keys(tinker.TINKER_PRICES).sort())
