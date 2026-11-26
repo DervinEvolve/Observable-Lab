@@ -28,7 +28,14 @@ export interface PracticeProgress {
   scoreAfter: number | null
   /** Steps in which some group had answers that scored differently, so training really ran. Null when the runner did not say. */
   stepsTrained: number | null
+  /** For each finished step, how many sampled answers used the whole token limit without finishing. Null when the runner did not say. */
+  capped: number[] | null
+  /** For each finished step, the mean number of tokens an answer used. Null when the runner did not say. */
+  meanTokens: number[] | null
 }
+
+/** One held-out scoring: how many answers were graded and how many of them reached the token limit without finishing. */
+export interface PracticeCutOff { graded: number; capped: number }
 
 export interface PracticeRun {
   slug: string
@@ -48,6 +55,8 @@ export interface PracticeRun {
   progress: PracticeProgress | null
   heldOut: { before: number | null; after: number | null; tasks: number | null } | null
   hacking: { flag: boolean; reasons: string[] }
+  /** Held-out answers the token limit cut off, and the lab's flag for them. The counts are null when the record holds none. */
+  cutOff: { flag: boolean; reasons: string[]; before: PracticeCutOff | null; after: PracticeCutOff | null }
   cost: { estimatedUsd: number | null; maxUsd: number | null; basis: string }
   origin: string
   /** The lab id to talk to; there only while the adapter is alive and the visitor chat is on. */
@@ -92,6 +101,26 @@ function unitList(v: unknown, max: number): number[] | null {
   return out
 }
 
+/** A list with one number for each finished step, each passing `one`; null when it is absent or is anything else. */
+function stepList(v: unknown, steps: number, one: (x: unknown) => number | null): number[] | null {
+  if (!Array.isArray(v) || v.length !== steps) return null
+  const out: number[] = []
+  for (const x of v) {
+    const n = one(x)
+    if (n === null) return null
+    out.push(n)
+  }
+  return out
+}
+
+/** The counts of one held-out scoring; null when they are absent or do not fit together. */
+function readCutOff(raw: unknown): PracticeCutOff | null {
+  if (!isObject(raw)) return null
+  const graded = whole(raw.graded, 1, 120)
+  const capped = graded === null ? null : whole(raw.capped, 0, graded)
+  return graded === null || capped === null ? null : { graded, capped }
+}
+
 function readProgress(raw: unknown): PracticeProgress | null {
   if (!isObject(raw)) return null
   const phase = PHASES.find(p => p === raw.phase)
@@ -116,7 +145,10 @@ function readProgress(raw: unknown): PracticeProgress | null {
   }
   const before = raw.score_before == null ? null : unit(raw.score_before)
   const after = raw.score_after == null ? null : unit(raw.score_after)
-  return { phase, step, stepsPlanned: planned, groupSize: group, tasksPerStep: perStep, maxReward, means, fracMax, attempts, samples, scoreBefore: before, scoreAfter: after, stepsTrained: raw.steps_trained == null ? null : whole(raw.steps_trained, 0, 30) }
+  // New with the counting: a record without them (an older lab server or runner), or with anything else in their place, has none.
+  const capped = stepList(raw.capped, means.length, x => whole(x, 0, group * perStep))
+  const meanTokens = stepList(raw.mean_tokens, means.length, x => { const n = finite(x); return n !== null && n >= 0 && n <= 4096 ? n : null })
+  return { phase, step, stepsPlanned: planned, groupSize: group, tasksPerStep: perStep, maxReward, means, fracMax, attempts, samples, scoreBefore: before, scoreAfter: after, stepsTrained: raw.steps_trained == null ? null : whole(raw.steps_trained, 0, 30), capped, meanTokens }
 }
 
 function readRun(raw: unknown): PracticeRun | null {
@@ -140,6 +172,7 @@ function readRun(raw: unknown): PracticeRun | null {
     : null
   const held = isObject(raw.held_out) ? raw.held_out : null
   const hack = isObject(raw.hacking) ? raw.hacking : {}
+  const cut = isObject(raw.cut_off) ? raw.cut_off : {}
   const cost = isObject(raw.cost) ? raw.cost : {}
   const max = unit(raw.max_reward)
   return {
@@ -162,6 +195,12 @@ function readRun(raw: unknown): PracticeRun | null {
     hacking: {
       flag: hack.flag === true,
       reasons: Array.isArray(hack.reasons) ? hack.reasons.slice(0, 4).map(r => plain(r, 200)).filter((r): r is string => r !== null) : [],
+    },
+    cutOff: {
+      flag: cut.flag === true,
+      reasons: Array.isArray(cut.reasons) ? cut.reasons.slice(0, 2).map(r => plain(r, 300)).filter((r): r is string => r !== null) : [],
+      before: readCutOff(cut.before),
+      after: readCutOff(cut.after),
     },
     cost: { estimatedUsd: finite(cost.estimated_usd), maxUsd: finite(cost.max_usd), basis: plain(cost.basis, 200) ?? 'an estimate, not a billed amount' },
     origin: plain(raw.origin, 40) ?? 'written by the models',
@@ -299,6 +338,60 @@ export function stepLabel(step: number, steps: number): string {
 /** A score for the page, as a share of the best score: "0.42", or "not measured" when there is none. */
 export function scoreText(score: number | null): string {
   return score === null ? 'not measured' : score.toFixed(2)
+}
+
+export interface PracticeRow { label: string; value: string }
+
+/**
+ * The rows the panel adds to "Steps" about answers that reached the token
+ * limit, from the stored counts only. A row is there only where there is
+ * something to say: steps with no cut off answer are not listed, and a
+ * record with no counts adds nothing.
+ */
+export function stepCutOffRows(run: Pick<PracticeRun, 'progress'>): PracticeRow[] {
+  const p = run.progress
+  if (!p) return []
+  const rows: PracticeRow[] = []
+  const answers = p.groupSize * p.tasksPerStep
+  const cut = (p.capped ?? []).map((n, i) => ({ n, step: i + 1 })).filter(c => c.n > 0)
+  if (cut.length) rows.push({ label: 'Answers Cut Off By The Token Limit', value: cut.map(c => `${c.n} of ${answers} in step ${c.step}`).join(', ') })
+  const used = p.meanTokens ?? []
+  if (used.length && used.some(t => t > 0)) {
+    const last = used.length
+    rows.push({
+      label: 'Mean Tokens An Answer Used',
+      value: last === 1 ? `${used[0].toFixed(1)} in step 1` : `${used[0].toFixed(1)} in step 1, ${used[last - 1].toFixed(1)} in step ${last}`,
+    })
+  }
+  return rows
+}
+
+/** The rows the panel adds to the held-out scores: how many graded answers the token limit cut off, shown when any was. */
+export function heldOutCutOffRows(run: Pick<PracticeRun, 'cutOff'>): PracticeRow[] {
+  const { before, after } = run.cutOff
+  if (!((before?.capped ?? 0) > 0 || (after?.capped ?? 0) > 0)) return []
+  const words = (c: PracticeCutOff | null): string => (c ? `${c.capped} of ${c.graded} answers` : 'not counted')
+  return [
+    { label: 'Cut Off Before Training', value: words(before) },
+    { label: 'Cut Off After Training', value: words(after) },
+  ]
+}
+
+export const CUT_OFF_FLAG_LABEL = 'Cut Off Flag.'
+
+/** A reason as a sentence: a capital letter first and a full stop last. */
+export function sentence(text: string): string {
+  const t = text.trim()
+  if (!t) return ''
+  const up = t.charAt(0).toUpperCase() + t.slice(1)
+  return /[.!?]$/.test(up) ? up : `${up}.`
+}
+
+/** What the panel says under the cut off flag, or null when the flag is not set. The reasons are the lab's own, as stored. */
+export function cutOffFlagText(run: Pick<PracticeRun, 'cutOff'>): string | null {
+  if (!run.cutOff.flag) return null
+  const reasons = run.cutOff.reasons.map(sentence).filter(Boolean).join(' ')
+  return `An answer that reaches the token limit is graded as the text it has, which may be nothing. ${reasons ? `${reasons} ` : ''}It blocks nothing; it is recorded here.`
 }
 
 /** The state of the lamp: 'off', 'on' (steady, for reduced motion) or 'blink'. */

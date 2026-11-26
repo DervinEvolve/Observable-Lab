@@ -206,6 +206,91 @@ test('the plate says what the record says, and nothing else', () => {
   bench.dispose()
 })
 
+const counted = (progress = {}, cut_off = undefined) => run({
+  progress: { ...run().progress, means: [0.1, 0.25, 0.5], capped: [6, 0, 2], mean_tokens: [38.5, 12, 20.25], ...progress },
+  ...(cut_off === undefined ? {} : { cut_off }),
+})
+const CUT_REASON = 'many untrained held-out answers were cut off by the token limit (4 of 6), so a change in the held-out score may come from answers no longer being cut off'
+
+test('the counts of cut off answers are read from the record strictly, and a record without them reads as before', () => {
+  const read = practice(counted({}, { flag: true, cut_short_before: true, cut_off_fell: true, reasons: [CUT_REASON], before: { graded: 6, capped: 4 }, after: { graded: 6, capped: 0 } })).run
+  assert.deepEqual(read.progress.capped, [6, 0, 2])
+  assert.deepEqual(read.progress.meanTokens, [38.5, 12, 20.25])
+  assert.deepEqual(read.cutOff, { flag: true, reasons: [CUT_REASON], before: { graded: 6, capped: 4 }, after: { graded: 6, capped: 0 } })
+  // absent (an older lab server): nothing is counted, nothing is flagged, and everything else is what it was
+  const old = practice(run()).run
+  assert.deepEqual([old.progress.capped, old.progress.meanTokens], [null, null])
+  assert.deepEqual(old.cutOff, { flag: false, reasons: [], before: null, after: null })
+  assert.deepEqual({ ...read.progress, capped: null, meanTokens: null }, old.progress)
+  // malformed or out of bounds: that count is not shown; the run and its curve still are
+  for (const bad of [{ capped: [6, 0] }, { capped: [6, 0, 17] }, { capped: [6, 0, -1] }, { capped: [6, 0, 1.5] }, { capped: 'x' }, { capped: [6, 0, '2'] }]) {
+    const p = practice(counted(bad)).run.progress
+    assert.equal(p.capped, null, JSON.stringify(bad))
+    assert.deepEqual(p.means, [0.1, 0.25, 0.5])
+    assert.deepEqual(p.meanTokens, [38.5, 12, 20.25])
+  }
+  for (const bad of [{ mean_tokens: [38.5, 12] }, { mean_tokens: [38.5, 12, 5000] }, { mean_tokens: [38.5, 12, -1] }, { mean_tokens: [38.5, 12, 'x'] }, { mean_tokens: 9 }]) {
+    assert.equal(practice(counted(bad)).run.progress.meanTokens, null, JSON.stringify(bad))
+  }
+  for (const bad of [{ graded: 6, capped: 7 }, { graded: 0, capped: 0 }, { graded: 121, capped: 1 }, { graded: 6, capped: -1 }, { graded: 6 }, { capped: 2 }, 'x', null, { graded: '6', capped: 2 }]) {
+    const c = practice(run({ cut_off: { flag: true, reasons: [CUT_REASON], before: bad, after: { graded: 6, capped: 0 } } })).run.cutOff
+    assert.equal(c.before, null, JSON.stringify(bad))
+    assert.deepEqual(c.after, { graded: 6, capped: 0 })
+  }
+  // a flag that is not exactly true is no flag, and reasons are cleaned, cut and at most two
+  const odd = practice(run({ cut_off: { flag: 'yes', reasons: ['a\u0000b', 7, 'x'.repeat(900), 'third'], before: null, after: null } })).run.cutOff
+  assert.equal(odd.flag, false)
+  assert.equal(odd.reasons.length, 1)
+  assert.equal(odd.reasons[0], 'a b')
+  assert.equal(practice(run({ cut_off: { flag: true, reasons: ['x'.repeat(900)] } })).run.cutOff.reasons[0].length, 300)
+})
+
+test('the panel says how many answers the token limit cut off only where some were, in plain words with Title Case labels', () => {
+  const full = practice(counted({}, { flag: true, reasons: [CUT_REASON], before: { graded: 6, capped: 4 }, after: { graded: 6, capped: 0 } })).run
+  assert.deepEqual(logic.stepCutOffRows(full), [
+    { label: 'Answers Cut Off By The Token Limit', value: '6 of 16 in step 1, 2 of 16 in step 3' },
+    { label: 'Mean Tokens An Answer Used', value: '38.5 in step 1, 20.3 in step 3' },
+  ])
+  assert.deepEqual(logic.heldOutCutOffRows(full), [
+    { label: 'Cut Off Before Training', value: '4 of 6 answers' },
+    { label: 'Cut Off After Training', value: '0 of 6 answers' },
+  ])
+  assert.equal(logic.CUT_OFF_FLAG_LABEL, 'Cut Off Flag.')
+  assert.equal(logic.cutOffFlagText(full),
+    'An answer that reaches the token limit is graded as the text it has, which may be nothing. Many untrained held-out answers were cut off by the token limit (4 of 6), so a change in the held-out score may come from answers no longer being cut off. It blocks nothing; it is recorded here.')
+  // nothing cut off: no row about it (the mean tokens are a count of their own and stay), no held-out rows, no flag text
+  const none = practice(counted({ capped: [0, 0, 0] }, { flag: false, reasons: [], before: { graded: 6, capped: 0 }, after: { graded: 6, capped: 0 } })).run
+  assert.deepEqual(logic.stepCutOffRows(none).map(r => r.label), ['Mean Tokens An Answer Used'])
+  assert.deepEqual(logic.heldOutCutOffRows(none), [])
+  assert.equal(logic.cutOffFlagText(none), null)
+  // nothing counted at all (an older runner): the panel is what it was
+  const old = practice(run()).run
+  assert.deepEqual([logic.stepCutOffRows(old), logic.heldOutCutOffRows(old), logic.cutOffFlagText(old)], [[], [], null])
+  assert.deepEqual(logic.stepCutOffRows({ progress: null }), [])
+  // one step, and a count on one side only
+  const one = practice(run({ progress: { ...run().progress, step: 1, means: [0.1], frac_max: [0], capped: [16], mean_tokens: [40] }, cut_off: { flag: true, reasons: [], before: { graded: 6, capped: 6 }, after: null } })).run
+  assert.deepEqual(logic.stepCutOffRows(one), [{ label: 'Answers Cut Off By The Token Limit', value: '16 of 16 in step 1' }, { label: 'Mean Tokens An Answer Used', value: '40.0 in step 1' }])
+  assert.deepEqual(logic.heldOutCutOffRows(one).map(r => r.value), ['6 of 6 answers', 'not counted'])
+  assert.equal(logic.cutOffFlagText(one), 'An answer that reaches the token limit is graded as the text it has, which may be nothing. It blocks nothing; it is recorded here.')
+  // Title Case labels, no dash, no markup in what the page is given
+  const title = label => label.split(' ').every(w => /^[A-Z]/.test(w))
+  for (const row of [...logic.stepCutOffRows(full), ...logic.heldOutCutOffRows(full)]) {
+    assert.ok(title(row.label), row.label)
+    assert.ok(!/[—–<>]/.test(row.label + row.value))
+  }
+  assert.ok(title(logic.CUT_OFF_FLAG_LABEL.replace('.', '')))
+  assert.ok(!/[—–]/.test(logic.cutOffFlagText(full)))
+  // the panel draws exactly these, as text, at its own text size
+  const source = readFileSync(join(root, 'src/systems/PracticeBenchPanel.ts'), 'utf8')
+  assert.ok(source.includes('for (const r of stepCutOffRows(run)) stepRows.appendChild(this.row(r.label, r.value))'))
+  assert.ok(source.includes('for (const r of heldOutCutOffRows(run)) held.appendChild(this.row(r.label, r.value))'))
+  assert.ok(source.includes('const cutOffText = cutOffFlagText(run)') && source.includes('document.createTextNode(cutOffText)'))
+  const sizes = [...source.matchAll(/font-size: (\d+)px/g)].map(m => Number(m[1]))
+  assert.ok(sizes.length > 0 && sizes.every(px => px >= 13), 'nothing on the panel is under 13px')
+  // the lamp is the reward hacking flag's alone: a cut off flag does not light it
+  assert.equal(logic.lampState(logic.benchView(practice(counted({}, { flag: true, reasons: [CUT_REASON], before: { graded: 6, capped: 4 }, after: null })), false), false), 'off')
+})
+
 test('the visitor panel writes every text as text and has no em dash of its own', () => {
   const source = readFileSync(join(root, 'src/systems/PracticeBenchPanel.ts'), 'utf8')
   assert.ok(!source.includes('innerHTML'), 'the panel never writes markup')

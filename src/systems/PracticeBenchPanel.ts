@@ -1,12 +1,16 @@
 import { installPaperTheme, paperFocusRing, paperHeader, paperHeading, paperPrimaryButton, paperShell, redrawInPlace } from './paperTheme'
-import { NOTHING_PRACTISED, NO_EXPERIMENT, benchView, curvePoints, plain, rewardColor, scoreText, type Practice, type PracticeRun } from './practiceBench'
+import {
+  CUT_OFF_FLAG_LABEL, NOTHING_PRACTISED, NO_EXPERIMENT, benchView, curvePoints, cutOffFlagText, heldOutCutOffRows, plain, rewardColor, scoreText, sentence, stepCutOffRows,
+  type Practice, type PracticeRun,
+} from './practiceBench'
 
 // The practice bench's record, opened by clicking or tapping the bench in the
 // room. It shows what the lab stored about the newest Tinker RL run: the task
 // set, the rubric in words, the steps and the reward curve, the held-out score
 // before and after (measured by the lab), the cost estimate, a few short
-// sample answers, the reward-hacking flag, and a way to talk to the adapter
-// when it can be talked to. Every text is put on the page as text, never as
+// sample answers, the reward-hacking flag, how many answers the token limit
+// cut off (shown only where some were) with the lab's flag for that, and a way
+// to talk to the adapter when it can be talked to. Every text is put on the page as text, never as
 // markup. While a run is going the panel is redrawn when the state changes.
 //
 // With no experiment connected it says so, and nothing else. With no run on
@@ -27,13 +31,7 @@ export function dollars(v: number | null): string {
   return v > 0 && v < 0.01 ? 'under $0.01' : `$${v.toFixed(2)}`
 }
 
-/** A reason as a sentence: a capital letter first and a full stop last. */
-export function sentence(text: string): string {
-  const t = text.trim()
-  if (!t) return ''
-  const up = t.charAt(0).toUpperCase() + t.slice(1)
-  return /[.!?]$/.test(up) ? up : `${up}.`
-}
+export { sentence }
 
 /** The words for where a run stands, from the stored record only. */
 export function runStatusLine(run: PracticeRun): string {
@@ -239,6 +237,13 @@ export class PracticeBenchPanel {
       flag.appendChild(document.createTextNode(`The lab noticed a sign that the reward may be easier to earn than the rubric means. ${run.hacking.reasons.map(sentence).join(' ')} It blocks nothing; it is recorded here.`))
       this.body.appendChild(flag)
     }
+    const cutOffText = cutOffFlagText(run)
+    if (cutOffText) {
+      const flag = el('div', 'pb-flag')
+      flag.appendChild(el('b', undefined, `${CUT_OFF_FLAG_LABEL} `))
+      flag.appendChild(document.createTextNode(cutOffText))
+      this.body.appendChild(flag)
+    }
 
     const total = run.tasks.total
     this.body.appendChild(this.section('Task set',
@@ -263,6 +268,7 @@ export class PracticeBenchPanel {
       stepRows.appendChild(this.row('Longest answer', `${s.maxCompletionTokens} tokens`))
       stepRows.appendChild(this.row('Loss, learning rate', `${s.loss}, ${s.learningRate}`))
     }
+    for (const r of stepCutOffRows(run)) stepRows.appendChild(this.row(r.label, r.value))
     this.body.appendChild(this.section('Steps', stepRows))
 
     this.body.appendChild(this.section('Reward per step', curveSvg(view.curve, steps),
@@ -271,6 +277,7 @@ export class PracticeBenchPanel {
     const held = el('div')
     held.appendChild(this.row('Before training', scoreText(view.before)))
     held.appendChild(this.row('After training', scoreText(view.after)))
+    for (const r of heldOutCutOffRows(run)) held.appendChild(this.row(r.label, r.value))
     this.body.appendChild(this.section('Held-out score, measured by the lab', held,
       el('p', 'pb-muted', `Mean rubric score on tasks the model never trained on${run.heldOut?.tasks ? ` (${run.heldOut.tasks} tasks)` : ''}, from 0 to 1. Higher is better.`)))
 

@@ -786,7 +786,7 @@ test('the public record has the run and its progress, and no secret: no checkpoi
   assert.equal(state.enabled, true)
   const run = state.run
   assert.deepEqual(Object.keys(run).sort(), [
-    'adapter', 'author_model', 'author_name', 'base_model', 'cost', 'created_at', 'epoch', 'finished_at', 'hacking', 'held_out', 'kind', 'live', 'max_reward',
+    'adapter', 'author_model', 'author_name', 'base_model', 'cost', 'created_at', 'cut_off', 'epoch', 'finished_at', 'hacking', 'held_out', 'kind', 'live', 'max_reward',
     'name', 'origin', 'progress', 'purpose', 'reason', 'rubric', 'settings', 'slug', 'status', 'task_set', 'tasks',
   ].sort())
   assert.equal(run.kind, 'rl')
@@ -897,4 +897,225 @@ test('an RL request may name Inkling 2 Mini only while it is on the list, and is
   const biggest = rl.normalizeTinkerRlRequest(ask({ base_model: MINI, settings: { steps: 30, group_size: 16, tasks_per_step: 16, max_completion_tokens: 512 } }), both)
   assert.ok('request' in biggest, biggest.error)
   assert.ok(rl.estimateTinkerRl(biggest.request).max_cost_usd > 0)
+})
+
+// ===========================================================================
+// Answers the token limit cut off: the counts, the flag, the record
+// ===========================================================================
+const COUNTS = { capped: [4, 0, 2], mean_tokens: [38.5, 12, 20.25], answers_before: 6, capped_before: 3 }
+
+test('the counts of cut off answers in a progress record are read strictly: present, absent, malformed, out of bounds', () => {
+  // present
+  const p = rl.readRlProgress(progressRecord(COUNTS))
+  assert.deepEqual(p.capped, [4, 0, 2])
+  assert.deepEqual(p.mean_tokens, [38.5, 12, 20.3], 'a mean is kept to one decimal')
+  assert.deepEqual([p.answers_before, p.capped_before, p.answers_after, p.capped_after], [6, 3, null, null])
+  const done = rl.readRlProgress(progressRecord({ ...COUNTS, answers_after: 6, capped_after: 0 }))
+  assert.deepEqual([done.answers_after, done.capped_after], [6, 0])
+  // absent: a runner deployed before the counting existed reads exactly as it did, with "not said" in the new places
+  const old = rl.readRlProgress(progressRecord())
+  assert.deepEqual([old.capped, old.mean_tokens, old.answers_before, old.capped_before, old.answers_after, old.capped_after], [null, null, null, null, null, null])
+  assert.deepEqual({ ...old, capped: undefined, mean_tokens: undefined, answers_before: undefined, capped_before: undefined, answers_after: undefined, capped_after: undefined, updated_at: '' },
+    { ...p, capped: undefined, mean_tokens: undefined, answers_before: undefined, capped_before: undefined, answers_after: undefined, capped_after: undefined, updated_at: '' })
+  // explicit nulls are "not said" too (this is how the lab's own stored record carries them)
+  assert.equal(rl.readRlProgress(progressRecord({ capped: null, mean_tokens: null, answers_before: null, capped_before: null })).capped, null)
+  // how many were graded, without how many were cut off, says nothing about the limit
+  const half = rl.readRlProgress(progressRecord({ answers_before: 6 }))
+  assert.deepEqual([half.answers_before, half.capped_before], [6, null])
+  // the largest values a run can send are accepted
+  const top = rl.readRlProgress(progressRecord({ group_size: 16, tasks_per_step: 16, attempts: [], capped: [256, 256, 256], mean_tokens: [512, 512, 512], answers_before: 120, capped_before: 120, answers_after: 120, capped_after: 120 }))
+  assert.deepEqual([top.capped[0], top.mean_tokens[0], top.answers_after, top.capped_after], [256, 512, 120, 120])
+  // malformed or out of bounds: the whole record is dropped, as for every other field
+  for (const bad of [
+    { capped: 'x' }, { capped: [4, 0] }, { capped: [4, 0, 2, 1] }, { capped: [4, 0, 2.5] }, { capped: [4, 0, -1] }, { capped: [4, 0, 33] }, { capped: [4, 0, '2'] }, { capped: {} },
+    { mean_tokens: [38.5, 12] }, { mean_tokens: [38.5, 12, 513] }, { mean_tokens: [38.5, 12, -1] }, { mean_tokens: [38.5, 12, NaN] }, { mean_tokens: [38.5, 12, '20'] }, { mean_tokens: 7 },
+    { answers_before: 121 }, { answers_before: -1 }, { answers_before: 2.5 }, { answers_before: '6' }, { capped_before: 7 }, { capped_before: -1 }, { capped_before: 1.5 },
+    { answers_before: undefined, capped_before: 3 }, { answers_after: 6, capped_after: 7 }, { answers_after: 'x', capped_after: 0 }, { capped_after: 1 },
+  ]) assert.equal(rl.readRlProgress(progressRecord({ ...COUNTS, ...bad })), null, JSON.stringify(bad))
+  // the stored record comes back the same, counts and all, and stays inside its size at its largest
+  assert.deepEqual(rl.storedRlProgress(JSON.stringify(p)), p)
+  assert.deepEqual(rl.storedRlProgress(JSON.stringify(old)), old)
+  const big = rl.readRlProgress(progressRecord({ step: 30, steps_planned: 30, group_size: 16, tasks_per_step: 16, means: Array(30).fill(0.5), frac_max: Array(30).fill(0.5), attempts: Array(16).fill(0.5),
+    capped: Array(30).fill(256), mean_tokens: Array(30).fill(511.9), answers_before: 120, capped_before: 120, answers_after: 120, capped_after: 120 }))
+  assert.ok(big && Buffer.byteLength(JSON.stringify(big)) <= rl.RL_PROGRESS_MAX_BYTES)
+})
+
+test('a new progress record with counts is newer than the one stored and an old lab would have read it too', () => {
+  const stored = rl.readRlProgress(progressRecord({ seq: 7 }))
+  const next = rl.readRlProgress(progressRecord({ ...COUNTS, seq: 8 }))
+  assert.equal(rl.isNewerProgress(next, stored), true)
+  // what an older build of the lab keeps of a new runner's record: every field it knows, none it does not
+  const known = ['v', 'phase', 'step', 'steps_planned', 'group_size', 'tasks_per_step', 'max_reward', 'means', 'frac_max', 'attempts', 'samples', 'score_before', 'score_after', 'wall_seconds', 'steps_trained', 'seq']
+  const asOldLabSees = Object.fromEntries(Object.entries(progressRecord(COUNTS)).filter(([k]) => known.includes(k)))
+  assert.deepEqual({ ...rl.readRlProgress(asOldLabSees), updated_at: '' }, { ...rl.readRlProgress(progressRecord()), updated_at: '' })
+})
+
+test('the counts in the runner result are read strictly and a result without them is as before', () => {
+  const full = rl.normalizeRlResult(runnerOk({ step_capped: [8, 4, 0, 0, 0, 0, 0, 0, 0, 0], step_mean_tokens: [40, 38.25, 12, 12, 12, 12, 12, 12, 12, 11.96], answers_before: 6, capped_before: 4, answers_after: 6, capped_after: 0 }))
+  assert.equal(full.status, 'ok')
+  assert.deepEqual(full.step_capped, [8, 4, 0, 0, 0, 0, 0, 0, 0, 0])
+  assert.deepEqual(full.step_mean_tokens, [40, 38.3, 12, 12, 12, 12, 12, 12, 12, 12])
+  assert.deepEqual([full.answers_before, full.capped_before, full.answers_after, full.capped_after], [6, 4, 6, 0])
+  // absent
+  const old = rl.normalizeRlResult(runnerOk())
+  assert.equal(old.status, 'ok')
+  assert.deepEqual([old.step_capped, old.step_mean_tokens, old.answers_before, old.capped_before, old.answers_after, old.capped_after], [null, null, null, null, null, null])
+  assert.deepEqual({ ...old, step_capped: 0, step_mean_tokens: 0 }, { ...full, step_capped: 0, step_mean_tokens: 0, answers_before: null, capped_before: null, answers_after: null, capped_after: null })
+  // malformed or out of bounds: that count is "not said"; the run is still the run (its scores and its adapter are not thrown away)
+  for (const [bad, field] of [
+    [{ step_capped: [8, 4] }, 'step_capped'], [{ step_capped: Array(10).fill(257) }, 'step_capped'], [{ step_capped: Array(10).fill(0.5) }, 'step_capped'], [{ step_capped: 'x' }, 'step_capped'],
+    [{ step_capped: Array(10).fill(-1) }, 'step_capped'], [{ step_mean_tokens: Array(10).fill(513) }, 'step_mean_tokens'], [{ step_mean_tokens: Array(9).fill(12) }, 'step_mean_tokens'],
+    [{ step_mean_tokens: Array(10).fill('12') }, 'step_mean_tokens'], [{ capped_before: 7 }, 'capped_before'], [{ answers_before: 121 }, 'capped_before'], [{ answers_before: 121 }, 'answers_before'],
+    [{ capped_after: -1 }, 'capped_after'], [{ answers_after: 2.5 }, 'answers_after'], [{ answers_before: null, capped_before: 2 }, 'capped_before'],
+  ]) {
+    const read = rl.normalizeRlResult(runnerOk({ step_capped: Array(10).fill(0), step_mean_tokens: Array(10).fill(12), answers_before: 6, capped_before: 4, answers_after: 6, capped_after: 0, ...bad }))
+    assert.equal(read.status, 'ok', JSON.stringify(bad))
+    assert.equal(read[field], null, `${JSON.stringify(bad)} leaves ${field} unsaid`)
+  }
+  // a run that failed part way keeps the counts it had
+  const failed = rl.normalizeRlResult({ status: 'error', stage: 'train', error: 'x', step_means: [0.2], step_frac_max: [0], step_capped: [8], step_mean_tokens: [40], answers_before: 6, capped_before: 6, tokens: {} })
+  assert.deepEqual([failed.status, failed.step_capped, failed.capped_before, failed.answers_after], ['error', [8], 6, null])
+})
+
+test('the cut off flag: more than a fifth of the untrained held-out answers at the limit, or fewer after than before; it blocks nothing', () => {
+  const flag = (before, after) => rl.rlCutOffFlag({ before, after })
+  const c = (capped, graded) => ({ capped, graded })
+  assert.equal(rl.RL_CUT_SHARE, 0.2)
+  // nothing counted, or nothing cut off: no flag
+  assert.deepEqual(flag(null, null), { flag: false, cut_short_before: false, cut_off_fell: false, reasons: [], before: null, after: null })
+  assert.equal(flag(c(0, 6), c(0, 6)).flag, false)
+  assert.equal(flag(null, c(3, 6)).flag, false, 'without a count before training there is nothing to compare')
+  // exactly a fifth is not more than a fifth; one more is
+  assert.equal(flag(c(2, 10), c(2, 10)).flag, false)
+  const many = flag(c(3, 10), c(3, 10))
+  assert.deepEqual([many.flag, many.cut_short_before, many.cut_off_fell], [true, true, false])
+  assert.deepEqual(many.reasons, ['many untrained held-out answers were cut off by the token limit (3 of 10), so a change in the held-out score may come from answers no longer being cut off'])
+  // the count fell: said once, by the stronger reason when both hold
+  const fell = flag(c(1, 10), c(0, 10))
+  assert.deepEqual([fell.flag, fell.cut_short_before, fell.cut_off_fell], [true, false, true])
+  assert.deepEqual(fell.reasons, ['fewer held-out answers were cut off by the token limit after training (1 of 10 before, 0 of 10 after), so part of a change in the held-out score may come from answers no longer being cut off'])
+  const both = flag(c(6, 6), c(0, 6))
+  assert.deepEqual([both.flag, both.cut_short_before, both.cut_off_fell, both.reasons.length], [true, true, true, 1])
+  assert.match(both.reasons[0], /^many untrained held-out answers .*\(6 of 6\)/)
+  // more cut off after than before is not this flag
+  assert.equal(flag(c(1, 10), c(2, 10)).flag, false)
+  // before training only (a run still going): the first sign can already be said
+  assert.equal(flag(c(5, 6), null).flag, true)
+  // the counts are compared as shares, so a different number graded does not make a fall by itself
+  assert.equal(flag(c(1, 10), c(1, 10)).flag, false)
+  assert.equal(flag(c(2, 20), c(1, 10)).flag, false)
+  // rlCutOff makes the pair only from two numbers that fit together
+  assert.deepEqual(rl.rlCutOff(6, 3), { graded: 6, capped: 3 })
+  for (const [a, b] of [[null, null], [6, null], [null, 3], [6, 7], [0, 0], ['6', 3], [121, 3], [6, -1], [6, 1.5]]) assert.equal(rl.rlCutOff(a, b), null, `${a} ${b}`)
+  // the two tools say the same thing the same way: the lesson's words for the same two signs (tinker-tutor.ts, tutorFlags)
+  const tutorSource = readFileSync(join(root, 'api/_lib/tinker-tutor.ts'), 'utf8')
+  assert.ok(tutorSource.includes('many untrained answers were cut off by the token limit or came back empty ('))
+  assert.ok(tutorSource.includes('fewer answers were cut off by the token limit or came back empty after training ('))
+  for (const reason of [...many.reasons, ...fell.reasons]) assert.ok(!/[—–]/.test(reason))
+})
+
+test('the tool run line and the stored record say what was cut off only where something was, and carry the flag', async () => {
+  const hacking = { flag: false, reasons: [] }
+  const line = (extra = {}) => rl.describeTinkerRl(rl.normalizeRlResult(runnerOk(extra)), 'Qwen/Qwen3.5-4B', 'e3-0a1b2c3d', 0.05, '2026-12-10T00:00:00Z', null, hacking)
+  const plain = line()
+  // a runner that sends no count, and a run with nothing cut off, read word for word the same
+  assert.equal(line({ answers_before: 6, capped_before: 0, answers_after: 6, capped_after: 0 }), plain)
+  assert.ok(!/token limit|cut off/.test(plain))
+  const cut = line({ answers_before: 6, capped_before: 4, answers_after: 6, capped_after: 0 })
+  assert.match(cut, /on 3 tasks the lab held out; held-out answers that reached the token limit without finishing: 4 of 6 before training, 0 of 6 after; 10 of 10 steps/)
+  assert.match(cut, /; FLAG: a change in the held-out score may come from answers no longer being cut off \(see the record\); adapter lab\/e3-0a1b2c3d/)
+  const small = line({ answers_before: 10, capped_before: 1, answers_after: 10, capped_after: 1 })
+  assert.match(small, /1 of 10 before training, 1 of 10 after/)
+  assert.ok(!small.includes('FLAG'), 'counted and shown, and not flagged: a tenth, and it did not fall')
+  // the whole run: the count reaches the stored result, the evidence, the public record and the final progress
+  configure()
+  const counted = runnerOk({ step_capped: [8, 4, 0, 0, 0, 0, 0, 0, 0, 0], step_mean_tokens: [40, 38, 12, 12, 12, 12, 12, 12, 12, 12], answers_before: 6, capped_before: 4, answers_after: 6, capped_after: 0 })
+  globalThis.fetch = fakeRunner([], [{ status: 'done', result: counted }])
+  const out = await rlRun.runTinkerRl(CTX, planFor(ask()).tinker_rl, { maxWaitMs: 1000, pollMs: 1 })
+  assert.equal(out.status, 'ok', 'a flag blocks nothing')
+  assert.match(out.summary, /FLAG: a change in the held-out score may come from answers no longer being cut off/)
+  const evidence = lab.toolRuns.find(t => t.tool === 'tinker_rl')
+  assert.equal(evidence.detail.cut_off.flag, true)
+  assert.deepEqual([evidence.detail.cut_off.before, evidence.detail.cut_off.after], [{ graded: 6, capped: 4 }, { graded: 6, capped: 0 }])
+  assert.deepEqual([evidence.detail.measured.answers_before, evidence.detail.measured.reached_token_limit_before, evidence.detail.measured.reached_token_limit_after], [6, 4, 0])
+  assert.deepEqual(evidence.detail.training.answers_at_token_limit_per_step, [8, 4, 0, 0, 0, 0, 0, 0, 0, 0])
+  assert.equal(evidence.detail.reward_hacking.flag, false, 'the two flags are separate')
+  const row = lab.tinkerRuns[0]
+  const storedResult = typeof row.result === 'string' ? JSON.parse(row.result) : row.result
+  assert.deepEqual([storedResult.step_capped.length, storedResult.capped_before, storedResult.answers_after], [10, 4, 6])
+  rlPublic.resetRlPracticeCache()
+  const run = (await rlPublic.rlPractice()).run
+  assert.equal(run.status, 'ok')
+  assert.deepEqual(run.cut_off, {
+    flag: true, cut_short_before: true, cut_off_fell: true,
+    reasons: ['many untrained held-out answers were cut off by the token limit (4 of 6), so a change in the held-out score may come from answers no longer being cut off'],
+    before: { graded: 6, capped: 4 }, after: { graded: 6, capped: 0 },
+  })
+  assert.deepEqual(run.progress.capped, [8, 4, 0, 0, 0, 0, 0, 0, 0, 0])
+  assert.deepEqual(run.progress.mean_tokens.slice(0, 3), [40, 38, 12])
+  assert.deepEqual([run.progress.answers_before, run.progress.capped_before, run.progress.answers_after, run.progress.capped_after], [6, 4, 6, 0])
+  assert.equal(run.hacking.flag, false)
+})
+
+test('the public record of a run from a runner that sends no counts has an empty cut off part, and one still going shows what it has', async () => {
+  configure()
+  globalThis.fetch = fakeRunner([], [{ status: 'done', result: runnerOk() }])
+  await rlRun.runTinkerRl(CTX, planFor(ask()).tinker_rl, { maxWaitMs: 1000, pollMs: 1 })
+  rlPublic.resetRlPracticeCache()
+  const old = (await rlPublic.rlPractice()).run
+  assert.deepEqual(old.cut_off, { flag: false, cut_short_before: false, cut_off_fell: false, reasons: [], before: null, after: null })
+  assert.deepEqual([old.progress.capped, old.progress.mean_tokens], [null, null])
+  // a run that is still going: the counts of the baseline are already in its progress record
+  const row = { ...lab.tinkerRuns[0], status: 'running', result: null, progress: rl.readRlProgress(progressRecord({ ...COUNTS, answers_before: 6, capped_before: 5 })) }
+  const going = rlPublic.publicRlRun(row, new Date(), false)
+  assert.deepEqual([going.cut_off.flag, going.cut_off.before, going.cut_off.after], [true, { graded: 6, capped: 5 }, null])
+  assert.deepEqual(going.progress.capped, [4, 0, 2])
+})
+
+// ===========================================================================
+// The owner's probe of the chat endpoint builds the request this server builds
+// ===========================================================================
+test('the raw probe in the runner and tinker-chat.ts build the same request for an untrained base model', async () => {
+  const chat = await load('api/_lib/tinker-chat.js')
+  const shared = JSON.parse(readFileSync(join(root, 'tests', 'fixtures', 'chat-probe-request.json'), 'utf8'))
+  assert.equal(chat.TINKER_CHAT_URL, shared.url)
+  assert.deepEqual([...new Set(shared.cases.map(c => c.base_model))].sort(), Object.keys(tinker.TINKER_PRICES).sort(), 'every base model the lab prices is in the shared cases')
+  for (const c of shared.cases) {
+    const body = chat.tinkerChatBody({ baseModel: c.base_model, messages: [{ role: 'user', content: shared.prompt }], maxTokens: c.max_tokens, temperature: shared.temperature, timeoutMs: 1 })
+    assert.deepEqual(body, c.body, `${c.base_model} at ${c.max_tokens}`)
+    assert.deepEqual(Object.keys(body), Object.keys(c.body), 'the same fields in the same order')
+    assert.equal(JSON.stringify(body), JSON.stringify(c.body))
+    assert.equal(body.reasoning_effort, chat.tinkerReasoningEffort(c.base_model))
+  }
+  assert.equal(shared.cases.find(c => c.base_model === MINI).body.reasoning_effort, 'none')
+  assert.equal(shared.cases.find(c => c.base_model === 'Qwen/Qwen3.5-4B').body.reasoning_effort, false)
+  // what really leaves this server for such a call is that body, to that address, with the key in the header only
+  process.env.TINKER_API_KEY = 'tml-test-only-not-a-real-tinker-key-0000'
+  const sent = []
+  globalThis.fetch = async (url, options) => {
+    sent.push({ url: String(url), options })
+    return new Response(JSON.stringify({ choices: [{ finish_reason: 'stop', message: { role: 'assistant', content: 'apple' } }], usage: { prompt_tokens: 31, completion_tokens: 38 } }), { headers: { 'content-type': 'application/json' } })
+  }
+  const first = shared.cases[0]
+  await chat.callTinkerChat({ baseModel: first.base_model, messages: [{ role: 'user', content: shared.prompt }], maxTokens: first.max_tokens, temperature: shared.temperature, timeoutMs: 1000 })
+  assert.equal(sent.length, 1)
+  assert.equal(sent[0].url, shared.url)
+  assert.equal(sent[0].options.method, 'POST')
+  assert.deepEqual(JSON.parse(sent[0].options.body), first.body)
+  assert.deepEqual(sent[0].options.headers, { Authorization: 'Bearer tml-test-only-not-a-real-tinker-key-0000', 'Content-Type': 'application/json' })
+  // the runner's side of the same file: its address, its two limits, its prompt and its rule are the ones in the shared cases
+  const runner = readFileSync(join(root, 'modal', 'tinker_jobs.py'), 'utf8')
+  assert.ok(runner.includes(`TINKER_CHAT_URL = "${shared.url}"`))
+  assert.ok(runner.includes(`RAW_PROBE_PROMPT = "${shared.prompt}"`))
+  assert.ok(runner.includes(`RAW_PROBE_CAPS = (${shared.caps.join(', ')})`))
+  assert.ok(runner.includes(`RAW_PROBE_TEMPERATURE = ${shared.temperature.toFixed(1)}`))
+  assert.ok(runner.includes('return "none" if isinstance(base_model, str) and base_model in RENDERERS and base_model.startswith("thinkingmachines/") else False'))
+  assert.ok(runner.includes('headers={"Authorization": "Bearer %s" % key, "Content-Type": "application/json"}'))
+  // the ids the runner trains are the ids this server prices, so "a model the lab prices" means the same on both sides
+  const renderers = [...runner.matchAll(/^    "([A-Za-z0-9./-]+)": "[a-z0-9_]+",$/gm)].map(m => m[1])
+  assert.deepEqual(renderers.sort(), Object.keys(tinker.TINKER_PRICES).sort())
+  // and nothing on this server or the page names the probe
+  for (const file of [...readdirSync(join(root, 'api', '_lib')).map(f => join('api', '_lib', f)), 'modal/web_endpoints.py']) {
+    assert.ok(!readFileSync(join(root, file), 'utf8').includes('raw_probe'), file)
+  }
 })

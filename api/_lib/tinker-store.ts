@@ -524,6 +524,8 @@ function cleanRlResult(result: TinkerRlResult): string {
     max_reward: result.max_reward, score_before: result.score_before, score_after: result.score_after,
     train_score_first: result.train_score_first, train_score_last: result.train_score_last,
     step_means: result.step_means, step_frac_max: result.step_frac_max,
+    step_capped: result.step_capped, step_mean_tokens: result.step_mean_tokens,
+    answers_before: result.answers_before, capped_before: result.capped_before, answers_after: result.answers_after, capped_after: result.capped_after,
     tokens: result.tokens, ttl_seconds: result.ttl_seconds, wall_seconds: result.wall_seconds, stage: result.stage,
     samples: result.samples.map(s => ({ prompt: text(s.prompt, 300), completion: text(s.completion, 600), reward: s.reward })),
     scores: 'held-out rubric scores measured by the lab',

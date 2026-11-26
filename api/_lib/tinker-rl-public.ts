@@ -17,7 +17,7 @@ import { modelDisplayName } from './types.js'
 import { tinkerJobsConfigured, trainedChatStatus } from './tinker.js'
 import { pollTinkerJob } from './tinker-client.js'
 import {
-  RL_PROGRESS_REFRESH_MS, readRlSettings, rlHackingFlag, rlHoldoutCount, progressIsLive, publicText, storedRlProgress, tinkerRlStatus,
+  RL_PROGRESS_REFRESH_MS, readRlSettings, rlCutOff, rlCutOffFlag, rlHackingFlag, rlHoldoutCount, progressIsLive, publicText, storedRlProgress, tinkerRlStatus,
   type RlPractice, type RlPracticeRun, type RlProgress,
 } from './tinker-rl.js'
 import { TINKER_PRICE_TABLE_DATE } from './tinker.js'
@@ -38,6 +38,9 @@ export function publicRlRun(row: TinkerRunRow, now: Date = new Date(), chatOn: b
   const maxReward = unit(record.max_reward) ?? progress?.max_reward ?? unit(result.max_reward) ?? 1
   const before = unit(result.score_before) ?? progress?.score_before ?? null
   const after = unit(result.score_after) ?? progress?.score_after ?? null
+  // The stored result first (what the runner returned at the end), then the record it wrote as it went. Either may hold no count.
+  const cutBefore = rlCutOff(result.answers_before, result.capped_before) ?? rlCutOff(progress?.answers_before, progress?.capped_before)
+  const cutAfter = rlCutOff(result.answers_after, result.capped_after) ?? rlCutOff(progress?.answers_after, progress?.capped_after)
   const means = progress?.means?.length ? progress.means : Array.isArray(result.step_means) ? (result.step_means as unknown[]).filter((x): x is number => unit(x) !== null) : []
   const status = row.status === 'reserved' ? 'running' : row.status
   const lines = Array.isArray(record.rubric_lines) ? (record.rubric_lines as unknown[]).slice(0, 8).map(l => publicText(l, 200)).filter(Boolean) : []
@@ -66,6 +69,7 @@ export function publicRlRun(row: TinkerRunRow, now: Date = new Date(), chatOn: b
       ? { before, after, measured_by: 'the lab', tasks: heldOut }
       : null,
     hacking: rlHackingFlag({ means, maxReward, scoreBefore: before, scoreAfter: after }),
+    cut_off: rlCutOffFlag({ before: cutBefore, after: cutAfter }),
     cost: {
       estimated_usd: row.cost_usd,
       max_usd: num(estimate.max_cost_usd) ?? (row.reserved_usd > 0 ? row.reserved_usd : null),

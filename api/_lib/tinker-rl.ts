@@ -75,6 +75,8 @@ export const RL_PROGRESS_LIVE_MS = 6 * 60 * 1000
 /** The most often the public state asks the runner how a run is going. */
 export const RL_PROGRESS_REFRESH_MS = 15_000
 
+/** More than this share of the held-out answers reaching the token limit before training is flagged (the Socratic lesson's TUTOR_CUT_SHORT_SHARE). */
+export const RL_CUT_SHARE = 0.2
 /** A mean reward at or above this share of the best score, in the first three steps, is flagged. */
 export const RL_HACK_EARLY_LEVEL = 0.95
 export const RL_HACK_EARLY_STEPS = 3
@@ -367,6 +369,21 @@ export interface RlProgress {
   steps_trained: number | null
   /** The runner's own count of the records it has written. It rises with every one, so a record the lab has already stored is told from a new one. Null from an older runner. */
   seq: number | null
+  /**
+   * For each finished step, how many of its sampled answers used the whole
+   * token limit without finishing. Counting only: an answer is graded as the
+   * text it has. Null when the runner did not say (a runner deployed before
+   * the count existed, or a run whose answers did not say how they ended).
+   */
+  capped: number[] | null
+  /** For each finished step, the mean number of tokens an answer used. Null when the runner did not say. */
+  mean_tokens: number[] | null
+  /** How many held-out answers were graded before training, and how many of them reached the token limit. Null until measured, and when the runner did not say. */
+  answers_before: number | null
+  capped_before: number | null
+  /** The same after training, on the saved adapter. */
+  answers_after: number | null
+  capped_after: number | null
   /** When the lab first stored this record: the last time the runner reported something new, not the last time the lab asked. */
   updated_at: string
 }
@@ -377,6 +394,41 @@ const clean = (v: unknown, max: number): string =>
   typeof v === 'string' ? v.replace(CONTROL_RUN, ' ').replace(/\s+/g, ' ').trim().slice(0, max) : ''
 const unit = (v: unknown): number | null => (typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1 ? Math.round(v * 1e4) / 1e4 : null)
 const whole = (v: unknown, lo: number, hi: number): number | null => (typeof v === 'number' && Number.isInteger(v) && v >= lo && v <= hi ? v : null)
+
+/** The most answers one step samples, and the most one held-out scoring grades. */
+const RL_STEP_ANSWERS_MAX = RL_GROUP_SIZE.max * RL_TASKS_PER_STEP.max
+const RL_HELD_ANSWERS_MAX = RL_HOLDOUT_MAX * RL_EVAL_SAMPLES
+
+/** A list of numbers, each passing `one`, or null when it is not such a list. */
+function numberList(v: unknown, max: number, one: (x: unknown) => number | null): number[] | null {
+  if (!Array.isArray(v) || v.length > max) return null
+  const out: number[] = []
+  for (const x of v) {
+    const n = one(x)
+    if (n === null) return null
+    out.push(n)
+  }
+  return out
+}
+const tokenMean = (x: unknown): number | null =>
+  typeof x === 'number' && Number.isFinite(x) && x >= 0 && x <= RL_COMPLETION_TOKENS.max ? Math.round(x * 10) / 10 : null
+
+/**
+ * The counts of one held-out scoring, from the runner's two numbers. `ok` is
+ * false when what was sent is not a count, or says more answers reached the
+ * limit than were graded. A runner that sends neither number has said
+ * nothing; one that sends only how many were graded has said nothing about
+ * the limit, and `capped` stays null.
+ */
+function heldCounts(answers: unknown, capped: unknown): { ok: boolean; answers: number | null; capped: number | null } {
+  const none = { ok: true, answers: null, capped: null }
+  if (answers == null && capped == null) return none
+  const a = whole(answers, 0, RL_HELD_ANSWERS_MAX)
+  if (a === null) return { ...none, ok: false }
+  if (capped == null) return { ok: true, answers: a, capped: null }
+  const c = whole(capped, 0, a)
+  return c === null ? { ...none, ok: false } : { ok: true, answers: a, capped: c }
+}
 
 function unitList(v: unknown, max: number): number[] | null {
   if (!Array.isArray(v) || v.length > max) return null
@@ -426,10 +478,20 @@ export function readRlProgress(raw: unknown, now: Date = new Date()): RlProgress
   const trained = raw.steps_trained === undefined || raw.steps_trained === null ? null : whole(raw.steps_trained, 0, RL_STEPS.max)
   const seq = raw.seq === undefined || raw.seq === null ? null : whole(raw.seq, 0, 1_000_000)
   if ((raw.steps_trained != null && trained === null) || (raw.seq != null && seq === null)) return null
+  // The counts of cut off answers. Absent (an older runner) is "not said". Present and not what the runner sends
+  // (not a count, more than a step samples, a list of another length than the steps) drops the record, like the rest.
+  const capped = raw.capped == null ? null : numberList(raw.capped, RL_STEPS.max, x => whole(x, 0, group * perStep))
+  const meanTokens = raw.mean_tokens == null ? null : numberList(raw.mean_tokens, RL_STEPS.max, tokenMean)
+  if ((raw.capped != null && (capped === null || capped.length !== means.length)) || (raw.mean_tokens != null && (meanTokens === null || meanTokens.length !== means.length))) return null
+  const heldBefore = heldCounts(raw.answers_before, raw.capped_before)
+  const heldAfter = heldCounts(raw.answers_after, raw.capped_after)
+  if (!heldBefore.ok || !heldAfter.ok) return null
   const progress: RlProgress = {
     phase: phase as RlPhase, step, steps_planned: planned, group_size: group, tasks_per_step: perStep, max_reward: maxReward,
     means, frac_max: fracMax, attempts, samples, score_before: before, score_after: after, wall_seconds: wall,
-    steps_trained: trained, seq, updated_at: now.toISOString(),
+    steps_trained: trained, seq, capped, mean_tokens: meanTokens,
+    answers_before: heldBefore.answers, capped_before: heldBefore.capped, answers_after: heldAfter.answers, capped_after: heldAfter.capped,
+    updated_at: now.toISOString(),
   }
   // Bounded whatever it was sent: samples go first, then the record is refused.
   while (Buffer.byteLength(JSON.stringify(progress), 'utf8') > RL_PROGRESS_MAX_BYTES && progress.samples.length) progress.samples.pop()
@@ -503,6 +565,51 @@ export function rlHackingFlag(input: { means: number[]; maxReward: number; score
 }
 
 // ---------------------------------------------------------------------------
+// The flag for held-out answers the token limit cut off
+// ---------------------------------------------------------------------------
+
+/** One held-out scoring: how many answers were graded and how many of them used the whole token limit without finishing. */
+export interface RlCutOff { graded: number; capped: number }
+
+export interface RlCutOffFlag {
+  flag: boolean
+  /** More than RL_CUT_SHARE of the held-out answers before training reached the limit. */
+  cut_short_before: boolean
+  /** A smaller share of the held-out answers reached the limit after training than before. */
+  cut_off_fell: boolean
+  reasons: string[]
+  before: RlCutOff | null
+  after: RlCutOff | null
+}
+
+/** The counts of one scoring as a pair, or null when either number is missing or they do not fit together. */
+export function rlCutOff(answers: unknown, capped: unknown): RlCutOff | null {
+  const read = heldCounts(answers, capped)
+  return read.ok && read.answers !== null && read.capped !== null && read.answers > 0 ? { graded: read.answers, capped: read.capped } : null
+}
+
+/**
+ * An answer that reaches the token limit is graded as the text it has, which
+ * for a model that writes a thinking passage first may be nothing. So a
+ * held-out score can move because fewer answers are cut off, without the
+ * model having learned the task. Two signs, the same two the Socratic lesson
+ * flags (tutorFlags in tinker-tutor.ts) and worded the same way:
+ *  1. more than a fifth of the held-out answers before training reached the limit;
+ *  2. a smaller share reached it after training than before.
+ * With no counts (a runner that does not send them) there is no flag: the lab
+ * does not know. The flag is recorded and shown. It blocks nothing.
+ */
+export function rlCutOffFlag(input: { before: RlCutOff | null; after: RlCutOff | null }): RlCutOffFlag {
+  const { before, after } = input
+  const reasons: string[] = []
+  const cut = before !== null && before.capped / before.graded > RL_CUT_SHARE
+  if (cut) reasons.push(`many untrained held-out answers were cut off by the token limit (${before!.capped} of ${before!.graded}), so a change in the held-out score may come from answers no longer being cut off`)
+  const fell = before !== null && after !== null && before.capped > 0 && after.capped / after.graded < before.capped / before.graded - 1e-12
+  if (fell && !cut) reasons.push(`fewer held-out answers were cut off by the token limit after training (${before!.capped} of ${before!.graded} before, ${after!.capped} of ${after!.graded} after), so part of a change in the held-out score may come from answers no longer being cut off`)
+  return { flag: cut || fell, cut_short_before: cut, cut_off_fell: fell, reasons, before, after }
+}
+
+// ---------------------------------------------------------------------------
 // What the runner sends back
 // ---------------------------------------------------------------------------
 
@@ -527,6 +634,15 @@ export interface TinkerRlResult {
   train_score_last: number | null
   step_means: number[]
   step_frac_max: number[]
+  /** For each step, how many sampled answers reached the token limit without finishing. Null when the runner did not send a count for every step. */
+  step_capped: number[] | null
+  /** For each step, the mean number of tokens an answer used. Null when the runner did not send one for every step. */
+  step_mean_tokens: number[] | null
+  /** The held-out answers graded before and after training, and how many of them reached the token limit. Null when the runner did not say. */
+  answers_before: number | null
+  capped_before: number | null
+  answers_after: number | null
+  capped_after: number | null
   tokens: TinkerTokens
   sampler_path: string | null
   ttl_seconds: number | null
@@ -548,13 +664,23 @@ export function normalizeRlResult(raw: unknown): TinkerRlResult {
   const r = isObject(raw) ? raw : {}
   const t = isObject(r.tokens) ? r.tokens : {}
   const list = (v: unknown): number[] => (unitList(v, RL_STEPS.max) ?? [])
+  const stepMeans = list(r.step_means)
+  // A count for every step or no count: a list of another length, or with anything in it that is not a count, is "not said".
+  const perStep = (v: unknown, one: (x: unknown) => number | null): number[] | null => {
+    const read = v == null ? null : numberList(v, RL_STEPS.max, one)
+    return read !== null && read.length === stepMeans.length ? read : null
+  }
+  const heldBefore = heldCounts(r.answers_before, r.capped_before)
+  const heldAfter = heldCounts(r.answers_after, r.capped_after)
   const base: TinkerRlResult = {
     status: 'failed', stage: clean(r.stage, 30) || null, reason: null,
     n_tasks: count(r.n_tasks), n_train: count(r.n_train), n_holdout: count(r.n_holdout),
     steps_planned: count(r.steps_planned), steps_done: count(r.steps_done), steps_trained: count(r.steps_trained), stopped_early: clean(r.stopped_early, 200) || null,
     max_reward: unit(r.max_reward), score_before: unit(r.score_before), score_after: unit(r.score_after),
     train_score_first: unit(r.train_score_first), train_score_last: unit(r.train_score_last),
-    step_means: list(r.step_means), step_frac_max: list(r.step_frac_max),
+    step_means: stepMeans, step_frac_max: list(r.step_frac_max),
+    step_capped: perStep(r.step_capped, x => whole(x, 0, RL_STEP_ANSWERS_MAX)), step_mean_tokens: perStep(r.step_mean_tokens, tokenMean),
+    answers_before: heldBefore.answers, capped_before: heldBefore.capped, answers_after: heldAfter.answers, capped_after: heldAfter.capped,
     tokens: { train: count(t.train) ?? 0, eval: count(t.eval) ?? 0, sample_prompt: count(t.sample_prompt) ?? 0, sample_completion: count(t.sample_completion) ?? 0 },
     sampler_path: null, ttl_seconds: count(r.ttl_seconds), samples: [], wall_seconds: finite(r.wall_seconds),
   }
@@ -579,13 +705,18 @@ export function normalizeRlResult(raw: unknown): TinkerRlResult {
 }
 
 /** One line for the stored record and the next epoch's context. Says what was measured, by whom, and that the cost is an estimate. */
-export function describeTinkerRl(r: TinkerRlResult, baseModel: string, slug: string | null, costUsd: number, expiresAt: string | null, name: string | null, hacking: RlHackingFlag): string {
+export function describeTinkerRl(r: TinkerRlResult, baseModel: string, slug: string | null, costUsd: number, expiresAt: string | null, name: string | null, hacking: RlHackingFlag,
+  cutOff: RlCutOffFlag = rlCutOffFlag({ before: rlCutOff(r.answers_before, r.capped_before), after: rlCutOff(r.answers_after, r.capped_after) })): string {
   const cost = `estimated cost $${costUsd.toFixed(4)} (token counts at Tinker's published prices of ${TINKER_PRICE_TABLE_DATE}, not a billed amount)`
   if (r.status === 'ok') {
     const score = `LAB-MEASURED held-out rubric score ${r.score_before!.toFixed(3)} before training, ${r.score_after!.toFixed(3)} after (best possible ${(r.max_reward ?? 1).toFixed(2)}), on ${r.n_holdout ?? '?'} tasks the lab held out`
     const steps = `${r.steps_done ?? '?'} of ${r.steps_planned ?? '?'} steps${r.steps_trained !== null && r.steps_trained !== r.steps_done ? ` (${r.steps_trained} of them trained the model)` : ''}${r.stopped_early ? ` (stopped early: ${r.stopped_early})` : ''}`
     const adapter = slug ? `adapter lab/${slug}${name ? ` named "${name}"` : ''} on ${baseModel}${expiresAt ? `, kept until ${expiresAt.slice(0, 10)}` : ''}` : `adapter on ${baseModel}`
-    return `${score}; ${steps}${hacking.flag ? '; FLAG: the reward may be gamed (see the record)' : ''}; ${adapter}; ${cost}`
+    // Said only where an answer was cut off: a run with none reads as it always did.
+    const cut = (cutOff.before?.capped ?? 0) > 0 || (cutOff.after?.capped ?? 0) > 0
+      ? `; held-out answers that reached the token limit without finishing: ${cutOff.before ? `${cutOff.before.capped} of ${cutOff.before.graded}` : 'not counted'} before training, ${cutOff.after ? `${cutOff.after.capped} of ${cutOff.after.graded}` : 'not counted'} after`
+      : ''
+    return `${score}${cut}; ${steps}${hacking.flag ? '; FLAG: the reward may be gamed (see the record)' : ''}${cutOff.flag ? '; FLAG: a change in the held-out score may come from answers no longer being cut off (see the record)' : ''}; ${adapter}; ${cost}`
   }
   if (r.status === 'refused') return `refused by the runner${r.stage ? ` (${r.stage})` : ''}: ${r.reason}; ${cost}`
   return `${r.status}${r.stage ? ` at ${r.stage}` : ''}: ${r.reason || 'unknown'}; ${cost}`
@@ -647,6 +778,8 @@ export interface RlPracticeRun {
   progress: RlProgress | null
   held_out: { before: number | null; after: number | null; measured_by: string; tasks: number | null } | null
   hacking: RlHackingFlag
+  /** Held-out answers the token limit cut off, before and after, and the flag for them. The counts are null when the runner sent none. */
+  cut_off: RlCutOffFlag
   cost: { estimated_usd: number | null; max_usd: number | null; basis: string }
   origin: string
   /** The lab id to talk to, present only while the adapter is alive and the visitor chat is on. */

@@ -25,7 +25,7 @@ import {
   TINKER_PRICE_TABLE_DATE, newAdapterSlug, newSplitSalt, tinkerCostUsd, tinkerDailyUsd, tinkerKeepFlag, tinkerNamesFlag, tinkerRunUsd, tinkerTtlDays, tinkerWaitMs, usdText,
 } from './tinker.js'
 import {
-  TINKER_RL_TOOL, describeTinkerRl, estimateTinkerRl, isNewerProgress, normalizeRlResult, readRlProgress, rlHackingFlag, rlRecordOf, storedRlProgress, tinkerRlJobBody,
+  TINKER_RL_TOOL, describeTinkerRl, estimateTinkerRl, isNewerProgress, normalizeRlResult, readRlProgress, rlCutOff, rlCutOffFlag, rlHackingFlag, rlRecordOf, storedRlProgress, tinkerRlJobBody,
   tinkerRlRequestSummary,
   type RlProgress, type TinkerRlRequest, type TinkerRlResult,
 } from './tinker-rl.js'
@@ -80,6 +80,9 @@ export function finalRlProgress(row: Pick<TinkerRunRow, 'settings'>, result: Tin
     means: result.step_means, frac_max: result.step_frac_max, attempts: [], samples: result.samples,
     score_before: result.score_before, score_after: result.score_after, wall_seconds: result.wall_seconds ?? 0,
     steps_trained: result.steps_trained,
+    // The counts of cut off answers, as the runner returned them (normalizeRlResult keeps a list only when it has one entry a step).
+    capped: result.step_capped, mean_tokens: result.step_mean_tokens,
+    answers_before: result.answers_before, capped_before: result.capped_before, answers_after: result.answers_after, capped_after: result.capped_after,
   }, now)
 }
 
@@ -117,7 +120,8 @@ export async function completeRlRun(row: TinkerRunRow, poll: Extract<TinkerPoll,
   const status: ToolRunStatus = result.status === 'ok' ? 'ok' : result.status === 'refused' ? 'failed' : 'error'
   const displayName = shownName(row)
   const hacking = rlHackingFlag({ means: result.step_means, maxReward: result.max_reward ?? 1, scoreBefore: result.score_before, scoreAfter: result.score_after })
-  const line = describeTinkerRl(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName, hacking)
+  const cutOff = rlCutOffFlag({ before: rlCutOff(result.answers_before, result.capped_before), after: rlCutOff(result.answers_after, result.capped_after) })
+  const line = describeTinkerRl(result, row.base_model, result.status === 'ok' ? row.slug : null, costUsd, expiresAt, displayName, hacking, cutOff)
   const record = (row.rl ?? {}) as { task_set?: unknown; tasks?: unknown; rubric_lines?: unknown; max_reward?: unknown }
   await recordToolRun({
     experimentId: row.experiment_id, epoch: row.epoch, model: row.model, tool: TINKER_RL_TOOL,
@@ -137,13 +141,18 @@ export async function completeRlRun(row: TinkerRunRow, poll: Extract<TinkerPoll,
         by: 'the lab, with the rubric, on tasks it held out and the model could not choose',
         holdout_tasks: result.n_holdout, train_tasks: result.n_train, max_reward: result.max_reward,
         score_before: result.score_before, score_after: result.score_after,
+        // How many held-out answers were graded, and how many of them used the whole token limit without finishing (null: the runner sent no count).
+        answers_before: result.answers_before, reached_token_limit_before: result.capped_before,
+        answers_after: result.answers_after, reached_token_limit_after: result.capped_after,
       },
       training: {
         steps_planned: result.steps_planned, steps_done: result.steps_done, steps_trained: result.steps_trained, stopped_early: result.stopped_early,
         reward_first: result.train_score_first, reward_last: result.train_score_last,
+        answers_at_token_limit_per_step: result.step_capped, mean_tokens_per_answer_per_step: result.step_mean_tokens,
         note: 'the reward of the training steps is what the run trained on, not a measurement of what it learned',
       },
       reward_hacking: hacking,
+      cut_off: cutOff,
       cost: {
         estimated_usd: Math.round(costUsd * 1e6) / 1e6, set_aside_usd: row.reserved_usd, tokens: result.tokens,
         basis: usageKnown
