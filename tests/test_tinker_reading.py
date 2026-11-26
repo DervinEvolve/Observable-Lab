@@ -54,6 +54,7 @@ class WordTokenizer:
     def __init__(self):
         self.ids = dict((v, k) for k, v in MARKS.items())
         self.words = {}
+        self.split = {}
 
     def encode(self, raw):
         out = []
@@ -70,6 +71,29 @@ class WordTokenizer:
 
     def decode(self, tokens):
         return "".join(self.ids[t] for t in tokens)
+
+    def halves(self, character):
+        """Two tokens that together are one character, as the real tokenizer gives for a letter outside its vocabulary."""
+        first, second = 900 + 2 * len(self.split), 901 + 2 * len(self.split)
+        self.split[first] = second
+        self.ids[first] = ""
+        self.ids[second] = character
+        return [first, second]
+
+    def is_special_token(self, token):
+        """The control tokens are the markers; the same names typed as plain characters are ordinary tokens (tml_renderers' Tokenizer.is_special_token)."""
+        return token in MARKS.values()
+
+    def typed(self, raw):
+        """The text as ordinary tokens, marker names included: what a model that types a marker's name letter by letter writes."""
+        out = []
+        for word in re.findall(r"\s*\S+|\s+", raw):
+            key = "typed:" + word
+            if key not in self.words:
+                self.words[key] = 100 + len(self.words)
+                self.ids[self.words[key]] = word
+            out.append(self.words[key])
+        return out
 
 
 class Text:
@@ -144,9 +168,11 @@ class Stream:
             elif token == END:
                 out.append(Update(Whole(self.kind("".join(self.text)))))
                 self.state = "idle"
-            elif token in MARKS.values():
-                raise ValueError("a marker inside content")
+            elif token in self.tokenizer.split:
+                pass  # half a character: held back until the token that completes it
             else:
+                # A marker inside a message that is not closed is read as text that holds the marker's name,
+                # as the real parser was seen to do (not an error).
                 word = self.tokenizer.decode([token])
                 self.text.append(word)
                 out.append(Update(Piece(self.kind(word))))
@@ -191,6 +217,7 @@ class InklingLike:
         self.parsed = 0
         if parser:
             self._completion_parser = lambda: Parser(self.tokenizer, fail_at)
+            self._tml_tokenizer = self.tokenizer
 
     def get_stop_sequences(self):
         return [STOP]
@@ -306,6 +333,51 @@ class ReadingWithStandIns(unittest.TestCase):
         got = read(broken, tokens, len(tokens))
         self.assertEqual(got["text"], "")
         self.assertNotIn("<|", got["text"])
+
+    def test_a_control_token_inside_an_answer_that_was_not_closed_is_not_answer_text(self):
+        think = "<|message_model|><|content_thinking|>Choose apple.<|end_message|>"
+        # the stop token straight after the answer, with no end of message marker
+        tokens = self.encode(think + "<|message_model|><|content_text|>apple<|content_model_end_sampling|>")
+        self.assertIn("<|content_model_end_sampling|>", text_of(self.renderer.parse_response(tokens)[0]), "what the parsed message holds")
+        self.assertEqual(read(self.renderer, tokens, 400), {"text": "apple", "ended": "stop", "before_answer": tokens.index(self.encode("apple")[0])})
+        # the header of a second answer inside the first (the parsed message is a list of parts whose text part holds the markers)
+        tokens = self.encode(think + "<|message_model|><|content_text|>apple<|message_model|><|content_text|>pear<|end_message|><|content_model_end_sampling|>")
+        message = self.renderer.parse_response(tokens)[0]
+        self.assertEqual([p["type"] for p in message["content"]], ["thinking", "text"])
+        self.assertIn("<|message_model|>", text_of(message))
+        self.assertEqual(read(self.renderer, tokens, 400)["text"], "apple")
+        # the header of a thinking passage inside the answer: what follows it is never the answer
+        tokens = self.encode("<|message_model|><|content_text|>apple<|message_model|><|content_thinking|>secret thought here")
+        self.assertEqual(read(self.renderer, tokens, len(tokens)), {"text": "apple", "ended": "cap", "before_answer": 2})
+        # nothing written before the token: the empty answer
+        tokens = self.encode("<|message_model|><|content_text|><|content_model_end_sampling|>")
+        self.assertEqual(read(self.renderer, tokens, 400), {"text": "", "ended": "stop", "before_answer": 3})
+
+    def test_a_marker_name_the_model_typed_as_plain_characters_stays_in_its_answer(self):
+        typed = self.renderer.tokenizer.typed("Write <|end_message|> literally")
+        tokens = self.encode("<|message_model|><|content_text|>") + typed + self.encode("<|end_message|><|content_model_end_sampling|>")
+        self.assertEqual(read(self.renderer, tokens, 400)["text"], "Write <|end_message|> literally")
+        cut = tokens[:-2]
+        self.assertEqual(read(self.renderer, cut, len(cut))["text"], "Write <|end_message|> literally")
+
+    def test_a_renderer_whose_tokenizer_cannot_say_which_tokens_are_control_tokens_is_read_as_its_parser_reads_it(self):
+        blind = InklingLike()
+        del blind._tml_tokenizer
+        self.assertIsNone(M.control_token_test(blind))
+        tokens = blind.tokenizer.encode("<|message_model|><|content_thinking|>Hm.<|end_message|><|message_model|><|content_text|>apple<|end_message|><|content_model_end_sampling|>")
+        self.assertEqual(read(blind, tokens, 400)["text"], "apple")
+        # the cookbook's tokenizer adapter is asked when the renderer does not hold the inner tokenizer itself
+        blind.tokenizer.tml_tokenizer = blind.tokenizer
+        self.assertTrue(M.control_token_test(blind)(STOP))
+
+    def test_the_count_before_the_answer_does_not_wait_for_a_character_that_takes_two_tokens(self):
+        head = self.encode("<|message_model|><|content_thinking|>Choose.<|end_message|><|message_model|><|content_text|>")
+        halves = self.renderer.tokenizer.halves("\U0001d518")
+        whole = head + halves + self.encode(" is a letter<|end_message|><|content_model_end_sampling|>")
+        self.assertEqual(read(self.renderer, whole, 400), {"text": "\U0001d518 is a letter", "ended": "stop", "before_answer": len(head)})
+        # cut after half the character: no answer text began, so every token came before it
+        cut = head + halves[:1]
+        self.assertEqual(read(self.renderer, cut, len(cut)), {"text": "", "ended": "cap", "before_answer": len(cut)})
 
     def test_a_model_with_no_thinking_passage_reads_exactly_as_before(self):
         qwen = QwenLike()
@@ -469,6 +541,44 @@ class ReadingWithTheRealRenderer(unittest.TestCase):
                 self.assertTrue(answer.startswith(text.rstrip("�")), (n, text))
         self.assertEqual(self.read(self.stop[:1], 40)["text"], "")
 
+    def test_a_control_token_inside_an_answer_that_was_not_closed_is_not_answer_text(self):
+        think = "<|message_model|><|content_thinking|>Choose apple.<|end_message|>"
+        tokens = self.tokens(think + "<|message_model|><|content_text|>apple<|content_model_end_sampling|>")
+        self.assertIn("<|content_model_end_sampling|>", M.stream_reading(type("NoTest", (), {"_completion_parser": self.renderer._completion_parser})(), tokens)[0],
+                      "the parser itself reads the stop token as text")
+        self.assertEqual(self.read(tokens, 400), {"text": "apple", "ended": "stop", "before_answer": 8})
+        tokens = self.tokens(think + "<|message_model|><|content_text|>apple<|message_model|><|content_text|>pear<|end_message|><|content_model_end_sampling|>")
+        message, _ = self.renderer.parse_response(tokens)
+        self.assertIsInstance(message["content"], list)
+        self.assertIn("<|message_model|>", self.text_of(message))
+        self.assertEqual(self.read(tokens, 400)["text"], "apple")
+        tokens = self.tokens("<|message_model|><|content_text|>apple<|message_model|><|content_text|>pear<|end_message|><|content_model_end_sampling|>")
+        self.assertEqual(self.read(tokens, 400)["text"], "apple")
+        tokens = self.tokens("<|message_model|><|content_text|>apple<|message_model|><|content_thinking|>secret thought here")
+        self.assertEqual(self.read(tokens, len(tokens)), {"text": "apple", "ended": "cap", "before_answer": 2})
+        # no cut of any of these reads as a marker or as the thinking text
+        for n in range(len(tokens) + 1):
+            self.assertTrue("apple".startswith(self.read(tokens[:n], n)["text"]), n)
+
+    def test_a_marker_name_the_model_typed_as_plain_characters_stays_in_its_answer(self):
+        special = self.inner.encode_special
+        answer = "Write <|content_model_end_sampling|> and <|end_message|> literally"
+        typed = self.inner.encode_ordinary(answer)
+        self.assertFalse(any(self.inner.is_special_token(t) for t in typed))
+        self.assertTrue(all(self.inner.is_special_token(t) for t in self.stop))
+        whole = [special("message_model"), special("content_text")] + typed + [special("end_message"), special("content_model_end_sampling")]
+        self.assertEqual(self.read(whole, 400)["text"], answer)
+        cut = whole[:-2]
+        self.assertEqual(self.read(cut, len(cut))["text"], answer)
+
+    def test_the_count_before_the_answer_does_not_wait_for_a_character_that_takes_more_than_one_token(self):
+        letter = self.inner.encode_ordinary("\U0001d518")
+        self.assertGreater(len(letter), 1, "this letter takes more than one token in the real tokenizer")
+        for head in ("<|message_model|><|content_text|>", "<|message_model|><|content_thinking|>Choose a letter.<|end_message|><|message_model|><|content_text|>"):
+            start = self.tokens(head)
+            whole = start + letter + self.tokens(" is a letter<|end_message|><|content_model_end_sampling|>")
+            self.assertEqual(self.read(whole, 400), {"text": "\U0001d518 is a letter", "ended": "stop", "before_answer": len(start)})
+
     def test_the_probe_report_counts_three_of_four_with_no_answer_at_40_tokens(self):
         for cap, want in ((40, (4, 3)), (400, (0, 0))):
             completions = []
@@ -628,6 +738,51 @@ class ChatProbe(unittest.TestCase):
         self.assertIn("TimeoutError", calls[5]["reason"])
         self.assertNotIn(KEY, json.dumps(calls))
         self.assertTrue(all(len(c["reason"]) <= 300 for c in calls))
+
+    def assertNothingOfTheKey(self, value):
+        """Neither the key nor any eight characters in a row of it."""
+        text = json.dumps(value)
+        self.assertEqual([KEY[i:i + 8] for i in range(len(KEY) - 7) if KEY[i:i + 8] in text], [])
+
+    def test_a_key_stored_with_a_line_break_is_sent_trimmed_and_never_shown(self):
+        # The lab server trims the key (tinkerChat in tinker-chat.ts); the probe sends the same header.
+        for stored in (KEY + "\n", KEY + "\r\n", "  " + KEY + " "):
+            http = Http([Response(200, answer()), Response(200, answer())])
+            out = M.chat_probe(MINI, stored, http)
+            self.assertEqual(out["status"], "ok")
+            for request, _ in http.requests:
+                self.assertEqual(dict((k.lower(), v) for k, v in request.header_items())["authorization"], "Bearer %s" % KEY)
+            self.assertNothingOfTheKey(out)
+            # what the HTTP library says when it refuses a header names the value with the line break written as two characters
+            refused = Http([ValueError("Invalid header value b'Bearer %s\\n'" % KEY), urllib.error.URLError("sent Bearer %s" % stored)])
+            calls = [M.chat_probe_call(MINI, "p", 40, 1.0, stored, refused) for _ in range(2)]
+            self.assertEqual([c["status"] for c in calls], ["failed", "failed"])
+            self.assertIn("[redacted]", calls[0]["reason"])
+            self.assertNothingOfTheKey(calls)
+        self.assertEqual(M.chat_probe(MINI, " \n", Http([]))["reason"], "no Tinker key in this container")
+        self.assertTrue("(process.env.TINKER_API_KEY || '').trim()" in (ROOT / "api" / "_lib" / "tinker-chat.ts").read_text(encoding="utf-8"), "the lab server trims the key too")
+
+    def test_a_key_that_lies_across_a_cut_is_taken_out_before_the_text_is_cut(self):
+        def error(code, body):
+            return urllib.error.HTTPError(CHAT["url"], code, "x", {}, io.BytesIO(body.encode("utf-8")))
+        cases = [
+            Response(200, answer(**{"p" * 30 + KEY: 1})),                                       # a field name of the message, cut at 60
+            Response(200, {"choices": [{"message": {"content": "a"}, "finish_reason": "stop", "c" * 30 + KEY: 1}]}),  # a field name of the choice
+            Response(200, answer(finish="r" * 20 + KEY)),                                       # finish_reason, cut at 40
+            Response(200, {"choices": [{"message": {"content": "a"}, "finish_reason": "stop"}], "usage": {"u" * 30 + KEY: 3, "d": {"v" * 60 + KEY: 4}}}),
+            Response(200, answer(content="x" * (M.CHAT_PROBE_CONTENT_CHARS - 20) + KEY)),       # content, cut at its bound
+            error(400, "e" * 215 + KEY + " tail"),                                              # an error body, cut at 240
+            error(400, " " * (M.CHAT_PROBE_ERROR_BYTES - 12) + KEY),                            # an error body the read itself cuts inside the key
+            RuntimeError("z" * 275 + KEY),                                                      # an exception text, cut at 300
+        ]
+        http = Http(cases)
+        calls = [M.chat_probe_call(MINI, "p", 40, 1.0, KEY, http) for _ in cases]
+        self.assertEqual([c["status"] for c in calls], ["ok"] * 5 + ["failed"] * 3)
+        for call in calls:
+            self.assertNothingOfTheKey(call)
+        self.assertEqual(calls[0]["message_fields"][0]["name"], "p" * 30 + "[redacted]")
+        self.assertEqual(calls[2]["finish_reason"], "r" * 20 + "[redacted]")
+        self.assertTrue(all(len(c["reason"]) <= 300 for c in calls[5:]))
 
     def test_one_failed_call_does_not_stop_the_other_and_no_key_means_no_call(self):
         http = Http([urllib.error.URLError("down"), Response(200, answer())])

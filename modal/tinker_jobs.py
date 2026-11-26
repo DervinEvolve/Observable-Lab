@@ -1988,17 +1988,45 @@ def how_ended(tokens: list, stop: list, max_tokens: int) -> str:
     return "cap" if len(tokens) >= max_tokens else "other"
 
 
+def control_token_test(renderer):
+    """A function that says whether a token id is one of the tokenizer's control tokens (a marker), or None when the renderer's tokenizer cannot say.
+
+    The same marker name typed out by the model as plain characters is made of ordinary tokens and is not a control token.
+    """
+    for holder, name in ((renderer, "_tml_tokenizer"), (getattr(renderer, "tokenizer", None), "tml_tokenizer")):
+        try:
+            test = getattr(getattr(holder, name, None), "is_special_token", None)
+        except Exception:  # noqa: BLE001
+            test = None
+        if callable(test):
+            return test
+    return None
+
+
 def stream_reading(renderer, tokens: list):
-    """(the answer text, how many tokens came before it began) as the renderer's own parser reads the tokens one by one, or None.
+    """(the answer text, how many tokens came before it began, whether a control token ended it) as the renderer's own parser reads the tokens one by one, or None.
 
     For a renderer that keeps a message's parts apart with control tokens
     (Inkling, tml_v0). Its parser can be fed token by token and says, for
     every piece it reads, whether the piece is thinking or text. Only the
     text pieces are the answer, so a completion that stops inside its
     thinking passage has no answer text at all, and one that stops in the
-    middle of its answer has the part it wrote. When no text began, every
-    token came before the answer, and the count is the length. None when
-    the renderer has no such parser (the Qwen renderers) or it cannot be opened.
+    middle of its answer has the part it wrote.
+
+    The parser reads a control token the model wrote inside a message it has
+    not closed (the stop token straight after the answer, or the header of a
+    new message) as a text piece that holds the marker's name. That is not
+    something the model wrote as its answer, and what follows it is not
+    known to be answer text (it may be a thinking passage). So the answer
+    ends at the first such token and the third value is True. A marker name
+    typed as plain characters is ordinary tokens and stays in the answer.
+
+    The count is the number of tokens up to and including the header of the
+    message the answer text began in, also when the first character of the
+    answer takes more than one token (the parser holds a half written
+    character back until it is whole). When no text began, every token came
+    before the answer, and the count is the length. None when the renderer
+    has no such parser (the Qwen renderers) or it cannot be opened.
     """
     make = getattr(renderer, "_completion_parser", None)
     if make is None:
@@ -2007,21 +2035,34 @@ def stream_reading(renderer, tokens: list):
         stream = make().parse_stream()
     except Exception:  # noqa: BLE001
         return None
+    is_control = control_token_test(renderer)
     pieces = []
     before = None
+    opened = None
+    marker = False
     try:
         for i, token in enumerate(tokens):
             for update in stream.feed([token]):
                 piece = update.update
                 content = getattr(piece, "content", None)
-                # A piece that is still being written carries its place in the message; a finished message does not.
-                if hasattr(piece, "content_index") and type(content).__name__ == "Text":
-                    if before is None:
-                        before = i
-                    pieces.append(content.text)
+                # A piece that is still being written carries its place in the message; a header and a finished message do not.
+                if not hasattr(piece, "content_index"):
+                    if content is None:
+                        opened = i + 1  # the header of a message: its content begins with the next token
+                    continue
+                if type(content).__name__ != "Text":
+                    continue
+                if is_control is not None and is_control(token):
+                    marker = True
+                    break
+                if before is None:
+                    before = i if opened is None else opened
+                pieces.append(content.text)
+            if marker:
+                break
     except Exception:  # noqa: BLE001
         pass  # the parser could not go on from here: what it read up to this token stands
-    return "".join(pieces), (len(tokens) if before is None else before)
+    return "".join(pieces), (len(tokens) if before is None else before), marker
 
 
 def read_completion(renderer, tokens: list, stop: list, max_tokens: int, text_of, thinks: bool = False) -> dict:
@@ -2050,6 +2091,9 @@ def read_completion(renderer, tokens: list, stop: list, max_tokens: int, text_of
         was written. For a string the renderer's own parser is asked piece
         by piece (stream_reading). When it cannot be asked the answer is
         empty: raw thinking text and markers are never an answer.
+    A text part can itself hold a control token the model wrote inside a
+    message it did not close, as the marker's name. When the piece by piece
+    reading met one, its text, which ends there, is the answer in both cases.
     """
     tokens = list(tokens)
     ended = how_ended(tokens, stop, max_tokens)
@@ -2057,7 +2101,7 @@ def read_completion(renderer, tokens: list, stop: list, max_tokens: int, text_of
     if not thinks:
         return {"text": text_of(message), "ended": ended, "before_answer": 0}
     reading = stream_reading(renderer, tokens)
-    if isinstance(message["content"], list):
+    if isinstance(message["content"], list) and not (reading is not None and reading[2]):
         text = text_of(message)
     else:
         text = reading[0] if reading is not None else ""
@@ -2125,6 +2169,7 @@ TINKER_CHAT_URL = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/
 CHAT_PROBE_TIMEOUT_S = 90
 CHAT_PROBE_MAX_BYTES = 200_000
 CHAT_PROBE_CONTENT_CHARS = 2000
+CHAT_PROBE_ERROR_BYTES = 4000
 CHAT_PROBE_MAX_FIELDS = 24
 
 
@@ -2147,12 +2192,22 @@ def chat_probe_body(base_model: str, prompt: str, max_tokens: int, temperature=N
 
 
 def _redact(text: str, secrets=()) -> str:
-    """Text with any of the given secret values taken out, at its full length (scrub also cuts to 300 characters)."""
+    """Text with any of the given secret values taken out, at its full length (scrub also cuts to 300 characters).
+
+    Everything the chat part reports is passed through this first and cut
+    afterwards, so a cut can never leave the start of a secret standing.
+    """
     out = str(text)
     for secret in secrets:
         if secret and len(secret) >= 8:
             out = out.replace(secret, "[redacted]")
     return out
+
+
+def _key_values(key) -> list:
+    """The values to take out of any text for one key: the key as it is sent (trimmed) and as it was given, longest first."""
+    values = set(v for v in (key, key.strip()) if v) if isinstance(key, str) else set()
+    return sorted(values, key=len, reverse=True)
 
 
 def _kind_of(value) -> str:
@@ -2175,7 +2230,7 @@ def _kind_of(value) -> str:
 def _other_fields(obj: dict, known: tuple, secrets) -> list:
     """The names of the fields of `obj` that are not in `known`, each with the sort of value it holds. Sorted, cut and scrubbed."""
     names = sorted(str(k) for k in obj if k not in known)[:CHAT_PROBE_MAX_FIELDS]
-    return [{"name": scrub(_short(name, 60), secrets), "holds": _kind_of(obj.get(name))} for name in names]
+    return [{"name": _short(_redact(name, secrets), 60), "holds": _kind_of(obj.get(name))} for name in names]
 
 
 def _usage_numbers(usage, secrets) -> dict:
@@ -2186,11 +2241,11 @@ def _usage_numbers(usage, secrets) -> dict:
     for key in sorted(str(k) for k in usage):
         value = usage.get(key)
         if _is_number(value):
-            out[scrub(_short(key, 60), secrets)] = value
+            out[_short(_redact(key, secrets), 60)] = value
         elif isinstance(value, dict):
             for inner in sorted(str(k) for k in value):
                 if _is_number(value.get(inner)):
-                    out[scrub(_short("%s.%s" % (key, inner), 90), secrets)] = value[inner]
+                    out[_short(_redact("%s.%s" % (key, inner), secrets), 90)] = value[inner]
         if len(out) >= CHAT_PROBE_MAX_FIELDS:
             break
     return out
@@ -2208,7 +2263,7 @@ def chat_probe_report(http_status: int, data, max_tokens: int, secrets=()) -> di
     finish = choice.get("finish_reason")
     return {
         "status": "ok", "max_tokens": max_tokens, "http_status": http_status,
-        "finish_reason": scrub(_short(finish, 40), secrets) if isinstance(finish, str) else None,
+        "finish_reason": _short(_redact(finish, secrets), 40) if isinstance(finish, str) else None,
         # Exactly as returned (not trimmed, not joined), cut to its first CHAT_PROBE_CONTENT_CHARS characters. A content
         # that is not text (null, or a list of parts) is shown as the JSON it was.
         "content": _redact(shown, secrets)[:CHAT_PROBE_CONTENT_CHARS],
@@ -2224,9 +2279,13 @@ def chat_probe_call(base_model: str, prompt: str, max_tokens: int, temperature, 
     """One call to the chat endpoint for an untrained base model, and what came back. Never raises.
 
     The key goes into the Authorization header of this one request and nowhere
-    else. Every text of the result is scrubbed of it.
+    else, trimmed as the lab server trims it (tinkerChat in api/_lib/tinker-chat.ts):
+    a key stored with a line break after it would otherwise be refused as a
+    header, in an error that names it. Every text of the result has the key
+    taken out, as it was given and as it was sent, before the text is cut.
     """
-    secrets = [key]
+    secrets = _key_values(key)
+    key = key.strip() if isinstance(key, str) else ""
     try:
         request = urllib.request.Request(
             TINKER_CHAT_URL, data=json.dumps(chat_probe_body(base_model, prompt, max_tokens, temperature)).encode("utf-8"), method="POST",
@@ -2240,11 +2299,15 @@ def chat_probe_call(base_model: str, prompt: str, max_tokens: int, temperature, 
             # Tinker answered with an error status: its message is the finding (a value the model does not take is HTTP 400).
             detail = ""
             try:
-                detail = error.read(4000).decode("utf-8", "replace")
+                body = error.read(CHAT_PROBE_ERROR_BYTES)
+                detail = _redact(body.decode("utf-8", "replace"), secrets)
+                if len(body) >= CHAT_PROBE_ERROR_BYTES:
+                    # The read may have stopped inside a key the answer echoed: nothing as long as a key is kept from its end.
+                    detail = detail[:max(0, len(detail) - max([len(v) for v in secrets] or [0]))]
             except Exception:  # noqa: BLE001
-                pass
+                detail = ""
             return {"status": "failed", "max_tokens": max_tokens, "http_status": int(error.code),
-                    "reason": scrub("HTTP %d %s" % (error.code, _short(detail, 240)), secrets)}
+                    "reason": "HTTP %d %s" % (error.code, _short(detail, 240))}
         if len(raw) > CHAT_PROBE_MAX_BYTES:
             return {"status": "failed", "max_tokens": max_tokens, "http_status": http_status, "reason": "the answer was larger than %d bytes" % CHAT_PROBE_MAX_BYTES}
         try:
@@ -2253,13 +2316,13 @@ def chat_probe_call(base_model: str, prompt: str, max_tokens: int, temperature, 
             return {"status": "failed", "max_tokens": max_tokens, "http_status": http_status, "reason": "the answer was not JSON"}
         return chat_probe_report(http_status, data, max_tokens, secrets)
     except Exception as error:  # noqa: BLE001
-        return {"status": "failed", "max_tokens": max_tokens, "http_status": None, "reason": scrub("%s: %s" % (type(error).__name__, str(error)[:300]), secrets)}
+        return {"status": "failed", "max_tokens": max_tokens, "http_status": None, "reason": _redact("%s: %s" % (type(error).__name__, error), secrets)[:300]}
 
 
 def chat_probe(base_model: str, key: str, opener=None) -> dict:
     """The chat endpoint part of the owner's probe: RAW_PROBE_PROMPT once at each of RAW_PROBE_CAPS. Never raises."""
     request = {"url": TINKER_CHAT_URL, "reasoning_effort": chat_reasoning_effort(base_model), "temperature": RAW_PROBE_TEMPERATURE}
-    if not isinstance(key, str) or len(key) < 8:
+    if not isinstance(key, str) or len(key.strip()) < 8:
         return {"status": "failed", "request": request, "reason": "no Tinker key in this container", "calls": []}
     calls = [chat_probe_call(base_model, RAW_PROBE_PROMPT, cap, RAW_PROBE_TEMPERATURE, key, opener) for cap in RAW_PROBE_CAPS]
     return {"status": "ok" if all(c["status"] == "ok" for c in calls) else "failed", "request": request, "calls": calls}
@@ -3033,7 +3096,7 @@ def raw_probe(base_model: str) -> dict:
         # A failure while the client was being made leaves no deps to ask, and nothing of the error is returned then.
         if deps is None:
             return {"status": "failed", "reason": "%s while opening the Tinker client" % type(error).__name__}
-        return {"status": "failed", "reason": scrub("%s: %s" % (type(error).__name__, str(error)[:300]), list(deps.secrets()))}
+        return {"status": "failed", "reason": _redact("%s: %s" % (type(error).__name__, error), [v for k in deps.secrets() for v in _key_values(k)])[:300]}
     try:
         result["chat"] = chat_probe(base_model, (list(deps.secrets()) or [""])[0])
     except Exception as error:  # noqa: BLE001
