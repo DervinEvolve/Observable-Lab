@@ -1,0 +1,140 @@
+{
+  "about": "The request the owner's raw probe (modal/tinker_jobs.py, chat_probe_body) and the lab server (api/_lib/tinker-chat.ts, tinkerChatBody) must both build for an untrained base model: the same address, the same fields in the same order, the same reasoning_effort rule. tests/test_tinker_reading.py checks the runner against this file and tests/tinker-rl.test.mjs checks the lab server against it, so either one drifting fails a test.",
+  "url": "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1/chat/completions",
+  "prompt": "Name one fruit other than a fig. Answer with the name only.",
+  "temperature": 1.0,
+  "caps": [
+    40,
+    400
+  ],
+  "cases": [
+    {
+      "base_model": "thinkingmachines/Inkling-2-Mini",
+      "max_tokens": 40,
+      "body": {
+        "model": "thinkingmachines/Inkling-2-Mini",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 40,
+        "temperature": 1.0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "base_model": "thinkingmachines/Inkling-2-Mini",
+      "max_tokens": 400,
+      "body": {
+        "model": "thinkingmachines/Inkling-2-Mini",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 400,
+        "temperature": 1.0,
+        "reasoning_effort": "none"
+      }
+    },
+    {
+      "base_model": "Qwen/Qwen3.5-4B",
+      "max_tokens": 40,
+      "body": {
+        "model": "Qwen/Qwen3.5-4B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 40,
+        "temperature": 1.0,
+        "reasoning_effort": false
+      }
+    },
+    {
+      "base_model": "Qwen/Qwen3.5-4B",
+      "max_tokens": 400,
+      "body": {
+        "model": "Qwen/Qwen3.5-4B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 400,
+        "temperature": 1.0,
+        "reasoning_effort": false
+      }
+    },
+    {
+      "base_model": "Qwen/Qwen3.5-9B",
+      "max_tokens": 40,
+      "body": {
+        "model": "Qwen/Qwen3.5-9B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 40,
+        "temperature": 1.0,
+        "reasoning_effort": false
+      }
+    },
+    {
+      "base_model": "Qwen/Qwen3.5-9B",
+      "max_tokens": 400,
+      "body": {
+        "model": "Qwen/Qwen3.5-9B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 400,
+        "temperature": 1.0,
+        "reasoning_effort": false
+      }
+    },
+    {
+      "base_model": "Qwen/Qwen3.6-35B-A3B",
+      "max_tokens": 40,
+      "body": {
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 40,
+        "temperature": 1.0,
+        "reasoning_effort": false
+      }
+    },
+    {
+      "base_model": "Qwen/Qwen3.6-35B-A3B",
+      "max_tokens": 400,
+      "body": {
+        "model": "Qwen/Qwen3.6-35B-A3B",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Name one fruit other than a fig. Answer with the name only."
+          }
+        ],
+        "max_completion_tokens": 400,
+        "temperature": 1.0,
+        "reasoning_effort": false
+      }
+    }
+  ]
+}

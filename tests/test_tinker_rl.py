@@ -125,8 +125,11 @@ class Check(unittest.TestCase):
 class FakeRl:
     """Tinker behind the calls run_rl_core makes. `answer(prompt, n_samples_seen)` says what the model replies."""
 
-    def __init__(self, answer, save="tinker://0a1b2c3d-1111-2222-3333-444455556666:train:0/sampler_weights/final", fail_save=False):
+    def __init__(self, answer, save="tinker://0a1b2c3d-1111-2222-3333-444455556666:train:0/sampler_weights/final", fail_save=False, ending=None):
         self.answer = answer
+        # `ending(prompt, sampler, k, max_tokens)` -> (how the answer ended, how many tokens it used). Without it the
+        # fake says nothing about how its answers ended, like a service object written before the counting existed.
+        self.ending = ending
         self.save_path = save
         self.fail_save = fail_save
         self.trained = []
@@ -153,7 +156,11 @@ class FakeRl:
             completions = []
             for k in range(n):
                 text = self.answer(p, sampler, k)
-                completions.append({"text": text, "tokens": list(range(5)), "logprobs": [-0.5] * 5})
+                if self.ending is None:
+                    completions.append({"text": text, "tokens": list(range(5)), "logprobs": [-0.5] * 5})
+                else:
+                    ended, used = self.ending(p, sampler, k, max_tokens)
+                    completions.append({"text": text, "tokens": list(range(used)), "logprobs": [-0.5] * used, "ended": ended, "before_answer": 0})
             out.append({"prompt": p, "prompt_tokens": self.prompt_length(p), "completions": completions})
         return out
 
@@ -347,6 +354,105 @@ class Run(unittest.TestCase):
         out, _ = self.run_it(FakeRl(sum_answer))
         self.assertNotIn("split_salt", out)
         self.assertNotIn(SALT, json.dumps(out))
+
+
+def cut_before_training(prompt, sampler, k, max_tokens):
+    """Every other answer of the untrained model uses the whole limit without finishing; a trained one always finishes in 5 tokens."""
+    return ("cap", max_tokens) if sampler[1] == 0 and k % 2 == 1 else ("stop", 5)
+
+
+def empty_when_cut(prompt, sampler, k):
+    """The answer of an attempt that was cut off is empty (the limit fell inside its thinking passage); the others are right."""
+    return "" if sampler[1] == 0 and k % 2 == 1 else str(2 * int(re.findall(r"\d+", prompt)[0]))
+
+
+class Counting(unittest.TestCase):
+    """Cut off answers are counted, per step and for the two held-out scorings. The reward is not changed by it."""
+
+    def run_it(self, deps, j=None):
+        records = []
+        out = M.run_rl_core(j or job(), lambda _job: deps, on_progress=records.append, log=lambda *_: None)
+        return out, records
+
+    def test_every_step_and_both_held_out_scorings_count_the_answers_that_reached_the_limit(self):
+        out, records = self.run_it(FakeRl(empty_when_cut, ending=cut_before_training))
+        self.assertEqual(out["status"], "ok", out)
+        # 3 held-out tasks, RL_EVAL_SAMPLES answers each: 6 graded before and after; the odd attempt of each was cut before training
+        self.assertEqual((out["answers_before"], out["capped_before"]), (6, 3))
+        self.assertEqual((out["answers_after"], out["capped_after"]), (6, 0))
+        # step 1 samples the untrained model: 2 tasks of 4 answers, half of them at the limit of 32 tokens
+        self.assertEqual(out["step_capped"], [4, 0, 0])
+        self.assertEqual(out["step_mean_tokens"], [18.5, 5.0, 5.0])
+        self.assertEqual((len(out["step_capped"]), len(out["step_mean_tokens"])), (len(out["step_means"]), len(out["step_means"])))
+        # the progress records carry the same, as they go
+        scored = [r for r in records if r["phase"] == "scored"]
+        grown = [c for i, c in enumerate(r["capped"] for r in scored) if i % 2 == 0]  # two records a step: scored, then counted as done
+        self.assertEqual(grown, [[4], [4, 0], [4, 0, 0]])
+        self.assertTrue(all(len(r["capped"]) == len(r["means"]) == len(r["mean_tokens"]) for r in scored))
+        self.assertEqual(scored[-1]["mean_tokens"], [18.5, 5.0, 5.0])
+        first = records[0]
+        self.assertNotIn("capped_before", first, "nothing is said before the first scoring")
+        self.assertNotIn("capped", first)
+        after_baseline = next(r for r in records if r.get("score_before") is not None)
+        self.assertEqual((after_baseline["answers_before"], after_baseline["capped_before"]), (6, 3))
+        self.assertNotIn("answers_after", after_baseline)
+        last = records[-1]
+        self.assertEqual((last["answers_before"], last["capped_before"], last["answers_after"], last["capped_after"]), (6, 3, 6, 0))
+        self.assertEqual((last["capped"], last["mean_tokens"]), (out["step_capped"], out["step_mean_tokens"]))
+        for r in records:
+            self.assertLessEqual(len(json.dumps(r).encode()), M.RL_PROGRESS_MAX_BYTES)
+
+    def test_an_answer_is_graded_as_the_text_it_has_whether_it_finished_or_not(self):
+        # the same texts with and without the count: the same rewards, step for step, and the same held-out scores
+        counted, _ = self.run_it(FakeRl(empty_when_cut, ending=cut_before_training))
+        plain, _ = self.run_it(FakeRl(empty_when_cut))
+        for key in ("score_before", "score_after", "step_means", "step_frac_max", "steps_trained", "train_score_first", "train_score_last"):
+            self.assertEqual(counted[key], plain[key], key)
+        self.assertEqual(counted["score_before"], 0.5, "an empty answer earns what the rubric gives an empty answer")
+        # an answer that used the whole limit and still holds the right text earns the full reward
+        every = FakeRl(sum_answer, ending=lambda p, s, k, cap: ("cap", cap))
+        out, _ = self.run_it(every)
+        self.assertEqual((out["answers_before"], out["capped_before"], out["score_before"]), (6, 6, 0.5))
+        self.assertEqual((out["capped_after"], out["score_after"]), (6, 1.0))
+        self.assertEqual(out["step_capped"], [8, 8, 8])
+        self.assertEqual(out["step_mean_tokens"], [32.0, 32.0, 32.0])
+
+    def test_a_service_that_does_not_say_how_answers_ended_gives_no_count_and_never_a_zero(self):
+        out, records = self.run_it(FakeRl(sum_answer))
+        self.assertEqual(out["status"], "ok")
+        for key in ("step_capped", "capped_before", "capped_after"):
+            self.assertNotIn(key, out)
+        self.assertEqual((out["answers_before"], out["answers_after"]), (6, 6), "how many were graded is known either way")
+        self.assertEqual(out["step_mean_tokens"], [5.0, 5.0, 5.0], "and so is how many tokens an answer used")
+        for r in records:
+            for key in ("capped", "capped_before", "capped_after"):
+                self.assertNotIn(key, r)
+        # a count that stops being said part way is withdrawn for the whole run, not filled in
+        flaky = FakeRl(sum_answer, ending=cut_before_training)
+        original = flaky.sample_batch
+
+        def sometimes(sampler, prompts, n, max_tokens, temperature):
+            results = original(sampler, prompts, n, max_tokens, temperature)
+            if len(flaky.sampled) == 3:  # the second training step
+                for result in results:
+                    for completion in result["completions"]:
+                        completion.pop("ended")
+            return results
+        flaky.sample_batch = sometimes
+        out, records = self.run_it(flaky)
+        self.assertNotIn("step_capped", out)
+        self.assertNotIn("capped", records[-1])
+        self.assertEqual(out["capped_before"], 3)
+
+    def test_the_counts_fit_the_progress_record_at_their_largest(self):
+        big = {"samples": [{"prompt": "p" * 500, "completion": "c" * 500, "reward": 1.0}] * 3, "means": [0.5] * 30, "frac_max": [0.5] * 30, "attempts": [0.5] * 16,
+               "capped": [256] * 40, "mean_tokens": [511.96] * 40, "answers_before": 120, "capped_before": 120, "answers_after": 120, "capped_after": 0}
+        payload = M.rl_progress_payload(job(), big, 3.0)
+        self.assertLessEqual(len(json.dumps(payload).encode()), M.RL_PROGRESS_MAX_BYTES)
+        self.assertEqual((len(payload["capped"]), len(payload["mean_tokens"])), (30, 30))
+        self.assertEqual(payload["mean_tokens"][0], 512.0)
+        self.assertEqual((payload["answers_before"], payload["capped_after"]), (120, 0))
+        self.assertEqual(M.RL_HOLDOUT_MAX * M.RL_EVAL_SAMPLES, 120)
 
 
 class Store(unittest.TestCase):

@@ -23,7 +23,16 @@
 # takes the answer out of it (eight short answers, well under a cent):
 #   uv run ... python modal/tinker_smoke.py raw --model thinkingmachines/Inkling-2-Mini
 # It shows whether a model thinks before it answers and how many tokens that
-# takes, which decides how large max_completion_tokens must be in practice.
+# takes: each answer is printed with how it ended, how many of its tokens came
+# before the answer text began, the answer the runner read (the text parts
+# only, so an answer cut off inside its thinking passage reads as empty) and
+# every token it wrote. After that it sends the same prompt to Tinker's chat
+# endpoint, built as the lab server builds it for the visitor chat, Compare
+# With Untrained and the lesson's student (api/_lib/tinker-chat.ts), once at
+# each of the two limits, and prints the HTTP status, finish_reason, the
+# content as returned, the names of every other field on the message and on
+# the choice (a separate reasoning field would show there) and the usage
+# numbers. That part costs a few hundred tokens more and is not in the cost line.
 #
 # A check of the chat format, for a base model whose renderer takes a thinking
 # effort (Inkling 2 Mini), before any run is paid for:
@@ -55,7 +64,9 @@
 # credit the base model reaches about half the time), for 4 steps of 2
 # tasks with 4 answers each, at most 40 tokens an answer. It prints the mean
 # reward of every step, the held-out score before and after (measured with the
-# same rubric on tasks the runner held out), and the last progress record the
+# same rubric on tasks the runner held out), how many answers reached the token
+# limit without finishing (per step, and of the held-out answers before and
+# after) with the mean tokens an answer used, and the last progress record the
 # room would have drawn the bench from. It costs a few cents at the most and
 # can never cost more than the 5 cents it sets as the budget; the adapter it
 # saves expires after one hour. Whether the reward moves in so few steps is
@@ -218,10 +229,20 @@ def rl(model: str = DEFAULT_MODEL) -> int:
     if result.get("status") != "ok":
         print("rl: the run did not finish: %s %s" % (result.get("status"), result.get("reason") or result.get("error")))
         return 1
+    # A runner deployed before the counting existed sends none of these three, and the lines then say nothing about it.
+    capped = result.get("step_capped") or []
+    used = result.get("step_mean_tokens") or []
+    answers = rl_job["settings"]["group_size"] * rl_job["settings"]["tasks_per_step"]  # the same for every model
     for number, mean in enumerate(result.get("step_means", []), 1):
-        print("step %d: mean reward %.3f (share at the best score %.2f)" % (number, mean, result["step_frac_max"][number - 1]))
+        counted = "; %d of %d answers reached the token limit" % (capped[number - 1], answers) if number <= len(capped) else ""
+        tokens_used = "; %.1f tokens an answer on average" % used[number - 1] if number <= len(used) else ""
+        print("step %d: mean reward %.3f (share at the best score %.2f)%s%s" % (number, mean, result["step_frac_max"][number - 1], counted, tokens_used))
     print("held-out score, measured by the runner with the rubric: %.3f before, %.3f after (best possible %.2f, %d tasks held out)" % (
         result["score_before"], result["score_after"], result["max_reward"], result["n_holdout"]))
+    for when in ("before", "after"):
+        if isinstance(result.get("answers_%s" % when), int) and isinstance(result.get("capped_%s" % when), int):
+            print("held-out answers %s training: %d graded, %d of them reached the token limit without finishing" % (
+                when, result["answers_%s" % when], result["capped_%s" % when]))
     record = None
     try:
         record = json.loads(modal.Dict.from_name("oblab-tinker-progress").get(run_id))
@@ -346,8 +367,44 @@ def keep(model: str = DEFAULT_MODEL) -> int:
     return 1 if problems else 0
 
 
+def answer_line(answer: dict) -> str:
+    """The first line for one sampled answer of the raw check: how it ended, its tokens, where the answer text began, and the answer read."""
+    where = ""
+    before = answer.get("before_answer")
+    if isinstance(before, int):
+        # Every token came before the answer when no answer text began: the limit, or the end, fell inside the thinking passage.
+        where = ", no answer text began" if before >= answer["tokens"] and not (answer.get("answer") or "") else ", %d before the answer" % before
+    return "[%s, %d tokens%s] answer read: %r" % (answer["ended"], answer["tokens"], where, answer["answer"])
+
+
+def chat_lines(chat) -> list:
+    """The lines for the chat endpoint part of the raw check. A runner deployed before this part existed sends none."""
+    if not isinstance(chat, dict):
+        return ["chat endpoint: this runner did not try it (deploy modal/tinker_jobs.py again to get this part)"]
+    request = chat.get("request") or {}
+    lines = ["=== the chat endpoint, as the lab server calls it for the visitor chat, Compare With Untrained and the lesson's student",
+             "POST %s with reasoning_effort %s, temperature %s" % (request.get("url"), json.dumps(request.get("reasoning_effort")), request.get("temperature"))]
+    if chat.get("status") != "ok" and chat.get("reason"):
+        lines.append("chat endpoint: FAILED %s" % chat["reason"])
+    for call in chat.get("calls") or []:
+        lines.append("--- max_completion_tokens %s" % call.get("max_tokens"))
+        if call.get("status") != "ok":
+            lines.append("FAILED: HTTP %s, %s" % (call.get("http_status"), call.get("reason")))
+            continue
+        lines.append("HTTP %s, finish_reason %s" % (call.get("http_status"), json.dumps(call.get("finish_reason"))))
+        lines.append("content (%s%s): %r" % (call.get("content_is"), ", cut here to its first characters" if call.get("content_cut") else "", call.get("content")))
+        for label, key in (("other fields on the message", "message_fields"), ("other fields on the choice", "choice_fields")):
+            fields = call.get(key) or []
+            lines.append("%s: %s" % (label, "; ".join("%s (%s)" % (f.get("name"), f.get("holds")) for f in fields) if fields else "none"))
+        usage = call.get("usage") or {}
+        lines.append("usage: %s" % (", ".join("%s %s" % (k, usage[k]) for k in usage) if usage else "none reported"))
+    return lines
+
+
 def raw(model: str) -> int:
-    """Shows what an untrained base model really writes for one practice prompt, at a short and a long token cap. 0 unless the call failed."""
+    """Shows what an untrained base model really writes for one practice prompt, at a short and a long token cap, then what
+    the chat endpoint answers for the same prompt. 0 unless the call failed; a chat endpoint part that failed is printed and
+    is not a failure of the check, because finding out what it does is what the part is for."""
     result = modal.Function.from_name("oblab-tinker", "raw_probe").remote(model)
     if result.get("status") != "ok":
         print("raw: %s %s" % (result.get("status"), result.get("reason")))
@@ -359,11 +416,14 @@ def raw(model: str) -> int:
         print("--- at most %d tokens an answer" % report["max_tokens"])
         for answer in report["answers"]:
             spent += answer["tokens"]
-            print("[%s, %d tokens] answer read: %r" % (answer["ended"], answer["tokens"], answer["answer"]))
+            print(answer_line(answer))
             print("    raw: %s" % answer["raw"])
         print("ran to the cap without finishing: %d of %d; no answer read: %d of %d" % (
             report["capped"], len(report["answers"]), report["empty"], len(report["answers"])))
-    print("estimated cost at the published prices: $%.6f (an estimate, not a billed amount)" % (spent * PRICES[model]["sample"] / 1e6))
+    print("estimated cost of the sampling part at the published prices: $%.6f (an estimate, not a billed amount; the chat endpoint part is not in it)" % (
+        spent * PRICES[model]["sample"] / 1e6))
+    for line in chat_lines(result.get("chat")):
+        print(line)
     print("raw: done")
     return 0
 

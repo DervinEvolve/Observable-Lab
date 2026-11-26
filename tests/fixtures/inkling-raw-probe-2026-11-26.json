@@ -1,0 +1,81 @@
+{
+  "about": "Real output of `python modal/tinker_smoke.py raw --model thinkingmachines/Inkling-2-Mini`, run by the owner against Tinker on 26 November 2026 (runner at commit cbacb5b, tinker-cookbook 0.7.1, renderer tml_v0, effort 0.0). \"raw\", \"tokens\", \"ended\" and \"answer_read_then\" are copied from that output: every token the model wrote, their number, how the answer ended, and what the runner of that day read as the answer. \"answer\" is the answer the text parts hold, which is what the runner reads now. \"before_answer\" is how many tokens came before the answer text began, counted with the real tokenizer and the renderer's own parser on 26 November 2026 (the whole length when no answer text began).",
+  "base_model": "thinkingmachines/Inkling-2-Mini",
+  "renderer": "tml_v0",
+  "prompt": "Name one fruit other than a fig. Answer with the name only.",
+  "stop": "<|content_model_end_sampling|>",
+  "cases": [
+    {
+      "max_tokens": 40,
+      "ended": "cap",
+      "tokens": 40,
+      "raw": "<|message_model|><|content_thinking|>The user wants one fruit other than a fig. Answer with the name only. Any common fruit works: apple, banana, orange. Need final only name. Ensure no extra words.",
+      "answer_read_then": "<|message_model|><|content_thinking|>The user wants one fruit other than a fig. Answer with the name only. Any common fruit works: apple, banana, orange. Need final only name. Ensure no extra words.",
+      "answer": "",
+      "before_answer": 40
+    },
+    {
+      "max_tokens": 40,
+      "ended": "cap",
+      "tokens": 40,
+      "raw": "<|message_model|><|content_thinking|>The user asks to name one fruit other than a fig. Answer with the name only. Need final exactly one fruit name. Choose apple. Ensure no extra words.<|end_message|><|message_model|><|content_text|>apple<|end_message|>",
+      "answer_read_then": "apple",
+      "answer": "apple",
+      "before_answer": 38
+    },
+    {
+      "max_tokens": 40,
+      "ended": "cap",
+      "tokens": 40,
+      "raw": "<|message_model|><|content_thinking|>The user asks: \"Name one fruit other than a fig. Answer with the name only.\" We need answer only one fruit other than fig. Need final just name. Choose apple.",
+      "answer_read_then": "<|message_model|><|content_thinking|>The user asks: \"Name one fruit other than a fig. Answer with the name only.\" We need answer only one fruit other than fig. Need final just name. Choose apple.",
+      "answer": "",
+      "before_answer": 40
+    },
+    {
+      "max_tokens": 40,
+      "ended": "cap",
+      "tokens": 40,
+      "raw": "<|message_model|><|content_thinking|>The user wants one fruit other than a fig, answer with name only. Need answer concise. Choose 'apple'. Ensure only name. No extra punctuation? Name only. Final",
+      "answer_read_then": "<|message_model|><|content_thinking|>The user wants one fruit other than a fig, answer with name only. Need answer concise. Choose 'apple'. Ensure only name. No extra punctuation? Name only. Final",
+      "answer": "",
+      "before_answer": 40
+    },
+    {
+      "max_tokens": 400,
+      "ended": "stop",
+      "tokens": 38,
+      "raw": "<|message_model|><|content_thinking|>The user wants one fruit other than a fig, answer with the name only. Need final only fruit name. Choose apple. Ensure no extra words.<|end_message|><|message_model|><|content_text|>apple<|end_message|><|content_model_end_sampling|>",
+      "answer_read_then": "apple",
+      "answer": "apple",
+      "before_answer": 35
+    },
+    {
+      "max_tokens": 400,
+      "ended": "stop",
+      "tokens": 42,
+      "raw": "<|message_model|><|content_thinking|>The user wants a fruit other than a fig, answer with name only. Need provide just name. Any fruit: apple. Ensure no extra words. Final only apple.<|end_message|><|message_model|><|content_text|>apple<|end_message|><|content_model_end_sampling|>",
+      "answer_read_then": "apple",
+      "answer": "apple",
+      "before_answer": 39
+    },
+    {
+      "max_tokens": 400,
+      "ended": "stop",
+      "tokens": 38,
+      "raw": "<|message_model|><|content_thinking|>The user wants one fruit other than a fig, answer with name only. Need final only the fruit name. Choose apple. Ensure no extra words.<|end_message|><|message_model|><|content_text|>apple<|end_message|><|content_model_end_sampling|>",
+      "answer_read_then": "apple",
+      "answer": "apple",
+      "before_answer": 35
+    },
+    {
+      "max_tokens": 400,
+      "ended": "stop",
+      "tokens": 53,
+      "raw": "<|message_model|><|content_thinking|>The user asks: Name one fruit other than a fig. Answer with name only. Need final only fruit name. Choose a common fruit. Ensure not fig. Examples: apple. Need answer name only. No extra words.<|end_message|><|message_model|><|content_text|>Apple<|end_message|><|content_model_end_sampling|>",
+      "answer_read_then": "Apple",
+      "answer": "Apple",
+      "before_answer": 50
+    }
+  ]
+}

@@ -150,6 +150,84 @@ class RlSmoke(Setup):
         self.assertEqual((sent["base_model"], sent["prices"]), (MINI, {"train": 0.75, "sample": 0.50, "prefill": 0.15}))
         self.assertEqual(S.rl_job["base_model"], "Qwen/Qwen3.5-4B")
 
+    def test_the_counts_of_cut_off_answers_are_printed_when_the_runner_sends_them_and_not_made_up_when_it_does_not(self):
+        run = {"status": "ok", "tokens": {}, "step_means": [0.5, 0.75], "step_frac_max": [0.5, 0.75], "score_before": 0.1, "score_after": 0.2,
+               "max_reward": 1.0, "n_holdout": 3, "steps_trained": 1, "steps_done": 2, "sampler_path": "tinker://x/sampler_weights/final"}
+        FakeFunction.answers["train_rl"] = dict(run, step_capped=[6, 0], step_mean_tokens=[38.5, 12.0], answers_before=6, capped_before=4, answers_after=6, capped_after=0)
+        _, text = quiet(S.rl, "Qwen/Qwen3.5-4B")
+        self.assertIn("step 1: mean reward 0.500 (share at the best score 0.50); 6 of 8 answers reached the token limit; 38.5 tokens an answer on average", text)
+        self.assertIn("held-out answers before training: 6 graded, 4 of them reached the token limit without finishing", text)
+        self.assertIn("held-out answers after training: 6 graded, 0 of them reached the token limit without finishing", text)
+        FakeFunction.answers["train_rl"] = run  # a runner deployed before the counting existed
+        _, text = quiet(S.rl, "Qwen/Qwen3.5-4B")
+        self.assertIn("step 1: mean reward 0.500 (share at the best score 0.50)\n", text)
+        self.assertNotIn("reached the token limit", text)
+
+
+def probe_answer(ended, tokens, answer, before, raw="RAW"):
+    return {"raw": raw, "answer": answer, "tokens": tokens, "ended": ended, "before_answer": before}
+
+
+RAW_RESULT = {
+    "status": "ok", "base_model": MINI, "renderer": "tml_v0", "prompt": "Name one fruit other than a fig. Answer with the name only.", "temperature": 1.0,
+    "reports": [
+        {"max_tokens": 40, "capped": 4, "empty": 3, "answers": [probe_answer("cap", 40, "", 40), probe_answer("cap", 40, "apple", 38), probe_answer("cap", 40, "", 40), probe_answer("cap", 40, "", 40)]},
+        {"max_tokens": 400, "capped": 0, "empty": 0, "answers": [probe_answer("stop", 38, "apple", 35), probe_answer("stop", 53, "Apple", 50)]},
+    ],
+}
+CHAT_CALL = {"status": "ok", "max_tokens": 40, "http_status": 200, "finish_reason": "length", "content": "", "content_is": "text of 0 characters", "content_cut": False,
+             "message_fields": [{"name": "reasoning_content", "holds": "text of 120 characters"}, {"name": "role", "holds": "text of 9 characters"}],
+             "choice_fields": [], "usage": {"completion_tokens": 40, "prompt_tokens": 31}}
+CHAT_REQUEST = {"url": "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1/chat/completions", "reasoning_effort": "none", "temperature": 1.0}
+
+
+class RawSmoke(Setup):
+    def test_the_cases_of_26_november_print_with_no_answer_read_for_three_of_four(self):
+        FakeFunction.answers["raw_probe"] = dict(RAW_RESULT, chat={"status": "ok", "request": CHAT_REQUEST, "calls": [CHAT_CALL, dict(CHAT_CALL, max_tokens=400, finish_reason="stop", content="apple", content_is="text of 5 characters")]})
+        code, text = quiet(S.raw, MINI)
+        self.assertEqual(code, 0)
+        self.assertEqual(FakeFunction.calls, [("raw_probe", MINI)])
+        self.assertIn("[cap, 40 tokens, no answer text began] answer read: \'\'", text)
+        self.assertIn("[cap, 40 tokens, 38 before the answer] answer read: \'apple\'", text)
+        self.assertIn("[stop, 38 tokens, 35 before the answer] answer read: \'apple\'", text)
+        self.assertIn("ran to the cap without finishing: 4 of 4; no answer read: 3 of 4", text)
+        self.assertIn("ran to the cap without finishing: 0 of 2; no answer read: 0 of 2", text)
+        # the chat endpoint part, plainly
+        self.assertIn('POST %s with reasoning_effort "none", temperature 1.0' % CHAT_REQUEST["url"], text)
+        self.assertIn("--- max_completion_tokens 40\nHTTP 200, finish_reason \"length\"\ncontent (text of 0 characters): \'\'", text)
+        self.assertIn("other fields on the message: reasoning_content (text of 120 characters); role (text of 9 characters)", text)
+        self.assertIn("other fields on the choice: none", text)
+        self.assertIn("usage: completion_tokens 40, prompt_tokens 31", text)
+        self.assertIn("content (text of 5 characters): \'apple\'", text)
+        self.assertTrue(text.rstrip().endswith("raw: done"))
+
+    def test_a_chat_part_that_failed_is_printed_and_the_sampling_part_still_is(self):
+        failed = {"status": "failed", "request": CHAT_REQUEST, "calls": [{"status": "failed", "max_tokens": 40, "http_status": 400, "reason": "HTTP 400 reasoning_effort is not taken"}, CHAT_CALL]}
+        FakeFunction.answers["raw_probe"] = dict(RAW_RESULT, chat=failed)
+        code, text = quiet(S.raw, MINI)
+        self.assertEqual(code, 0, "finding out what the endpoint does is what the part is for")
+        self.assertIn("no answer read: 3 of 4", text)
+        self.assertIn("--- max_completion_tokens 40\nFAILED: HTTP 400, HTTP 400 reasoning_effort is not taken", text)
+        self.assertIn("finish_reason \"length\"", text)
+        FakeFunction.answers["raw_probe"] = dict(RAW_RESULT, chat={"status": "failed", "request": CHAT_REQUEST, "reason": "no Tinker key in this container", "calls": []})
+        self.assertIn("chat endpoint: FAILED no Tinker key in this container", quiet(S.raw, MINI)[1])
+
+    def test_a_runner_deployed_before_this_part_existed_prints_as_it_did_and_says_what_is_missing(self):
+        old = {"status": "ok", "base_model": "Qwen/Qwen3.5-4B", "renderer": "qwen3_5_disable_thinking", "prompt": "p", "temperature": 1.0,
+               "reports": [{"max_tokens": 40, "capped": 0, "empty": 0, "answers": [{"raw": "apple<|im_end|>", "answer": "apple", "tokens": 2, "ended": "stop"}]}]}
+        FakeFunction.answers["raw_probe"] = old
+        code, text = quiet(S.raw, "Qwen/Qwen3.5-4B")
+        self.assertEqual(code, 0)
+        self.assertIn("[stop, 2 tokens] answer read: \'apple\'", text)
+        self.assertIn("chat endpoint: this runner did not try it", text)
+        FakeFunction.answers["raw_probe"] = {"status": "failed", "reason": "RuntimeError while opening the Tinker client"}
+        self.assertEqual(quiet(S.raw, MINI)[0], 1)
+
+    def test_a_model_that_does_not_think_shows_zero_tokens_before_its_answer(self):
+        self.assertEqual(S.answer_line(probe_answer("stop", 2, "apple", 0)), "[stop, 2 tokens, 0 before the answer] answer read: \'apple\'")
+        self.assertEqual(S.answer_line(probe_answer("stop", 1, "", 0)), "[stop, 1 tokens, 0 before the answer] answer read: \'\'")
+        self.assertEqual(S.answer_line(probe_answer("cap", 40, "", None)), "[cap, 40 tokens] answer read: \'\'")
+
 
 if __name__ == "__main__":
     unittest.main()

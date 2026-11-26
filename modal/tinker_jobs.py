@@ -1446,6 +1446,16 @@ def rl_progress_payload(job, live: dict, wall: float) -> dict:
         "seq": int(live.get("seq", 0)),
         "wall_seconds": round(wall, 1),
     }
+    # Counted, when the service said how its answers ended: per step, how many answers reached the token limit without
+    # finishing and the mean tokens an answer used; for each held-out scoring, how many answers were graded and how many
+    # of them reached the limit. Left out when not counted, so a reader never takes "not counted" for "none".
+    if live.get("capped") is not None:
+        payload["capped"] = [int(x) for x in live["capped"]][:RL_STEPS[1]]
+    if live.get("mean_tokens") is not None:
+        payload["mean_tokens"] = [round(float(x), 1) for x in live["mean_tokens"]][:RL_STEPS[1]]
+    for key in ("answers_before", "capped_before", "answers_after", "capped_after"):
+        if live.get(key) is not None:
+            payload[key] = int(live[key])
     while len(json.dumps(payload).encode("utf-8")) > RL_PROGRESS_MAX_BYTES and payload["samples"]:
         payload["samples"].pop()
     return payload
@@ -1458,9 +1468,15 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
     object with: prompt_length(text) -> tokens; new_sampler() -> a sampler of the
     weights as they are now; sampler_from_path(path); sample_batch(sampler,
     prompts, n, max_tokens, temperature) -> per prompt {prompt, prompt_tokens,
-    completions: [{text, tokens, logprobs}]}; train(groups, learning_rate, loss)
+    completions: [{text, tokens, logprobs, ended?}]}; train(groups, learning_rate, loss)
     with groups [{prompt, completions, advantages}]; save(ttl_seconds) -> sampler
     path; secrets(); and, only when the job says "export": true, save_external(ttl_seconds).
+
+    An answer is graded as the text it has ("text"), whether it finished or
+    the token limit cut it off: the reward does not look at "ended". What
+    "ended" adds is counting (answer_counts): the result and the progress
+    records say how many answers reached the limit, per step and for the two
+    held-out scorings, when the service said how its answers ended.
     """
     started = clock()
     tokens = {"train": 0, "eval": 0, "sample_prompt": 0, "sample_completion": 0}
@@ -1551,25 +1567,36 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
             return rewards, results
 
         def measure(sampler):
+            """(mean score, a few shown answers, how the graded answers ended) of the held-out tasks on one sampler."""
             rewards, results = attempts_of(sampler, holdout, RL_EVAL_SAMPLES, RL_EVAL_TEMPERATURE)
             flat = [r for per_task in rewards for r in per_task]
             if not flat:
-                return None, []
+                return None, [], None
             shown = []
             for i, per_task, result in zip(holdout, rewards, results):
                 if per_task and len(shown) < max(job["samples"], 0):
                     shown.append({"prompt": _short(tasks[i]["prompt"], 300), "completion": _short(result["completions"][0]["text"], 600), "reward": per_task[0]})
-            return sum(flat) / len(flat), shown
+            return sum(flat) / len(flat), shown, answer_counts(results)
+
+        def held_counts(counted, when):
+            """Puts the counts of one held-out scoring into the result and returns them for the progress record."""
+            out = {"answers_%s" % when: counted["answers"]}
+            if counted["capped"] is not None:
+                out["capped_%s" % when] = counted["capped"]
+            progress.update(out)
+            return out
 
         state["stage"] = "baseline"
         emit(phase="baseline")
         sampler = deps.new_sampler()
-        before, _ = measure(sampler)
+        before, _, counted = measure(sampler)
         if before is None:
             return done({"status": "error", "stage": state["stage"], "error": "the held-out score could not be measured"})
         progress["score_before"] = round(before, 6)
-        emit(score_before=round(before, 6))
-        log("held-out score before training: %.4f on %d tasks (best possible %.2f)" % (before, len(holdout), max_reward))
+        emit(score_before=round(before, 6), **held_counts(counted, "before"))
+        log("held-out score before training: %.4f on %d tasks (best possible %.2f)%s" % (
+            before, len(holdout), max_reward,
+            "" if counted["capped"] is None else "; %d of %d answers reached the token limit" % (counted["capped"], counted["answers"])))
 
         state["stage"] = "train"
         steps = 0
@@ -1579,6 +1606,8 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
         trained = 0
         first_mean = None
         last_mean = None
+        step_capped = []  # None from the first step whose answers did not say how they ended
+        step_tokens = []
         for step in range(steps_planned):
             if clock() - started > RL_TRAIN_WALL_S:
                 stopped = "the time limit of %d s for training" % RL_TRAIN_WALL_S
@@ -1609,8 +1638,12 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
             seen = []
             for i, per_task, result in zip(indexes, rewards, results):
                 seen.append({"prompt": _short(tasks[i]["prompt"], 100), "completion": _short(result["completions"][0]["text"], 160), "reward": per_task[0]})
+            counted = answer_counts(results)
+            step_tokens.append(counted["mean_tokens"])
+            if step_capped is not None:
+                step_capped = step_capped + [counted["capped"]] if counted["capped"] is not None else None
             emit(phase="scored", step=steps, attempts=list(rewards[0]), samples=seen,
-                 means=live["means"] + [mean], frac_max=live["frac_max"] + [at_max])
+                 means=live["means"] + [mean], frac_max=live["frac_max"] + [at_max], capped=step_capped, mean_tokens=list(step_tokens))
             if kept:
                 for g in kept:
                     tokens["train"] += int(g["prompt_tokens"]) * len(g["completions"]) + sum(len(c["tokens"]) for c in g["completions"])
@@ -1624,11 +1657,16 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
                 first_mean = mean
             last_mean = mean
             emit(step=steps)
-            log("step %d of %d: mean reward %.4f, %d%% at the best score, %d of %d groups taught something" % (
-                steps, steps_planned, mean, round(100 * at_max), len(kept), len(rewards)))
+            log("step %d of %d: mean reward %.4f, %d%% at the best score, %d of %d groups taught something, %s, %.1f tokens an answer" % (
+                steps, steps_planned, mean, round(100 * at_max), len(kept), len(rewards),
+                "how the answers ended was not said" if counted["capped"] is None else "%d of %d answers reached the token limit" % (counted["capped"], counted["answers"]),
+                counted["mean_tokens"]))
         progress["stopped_early"] = stopped
         progress["step_means"] = [round(x, 4) for x in live["means"]]
         progress["step_frac_max"] = [round(x, 4) for x in live["frac_max"]]
+        if step_capped is not None:
+            progress["step_capped"] = list(step_capped)
+        progress["step_mean_tokens"] = list(step_tokens)
         if steps == 0:
             return done({"status": "error", "stage": state["stage"], "error": "no training step was done (%s)" % (stopped or "nothing to train")})
         progress["train_score_first"] = round(first_mean, 6)
@@ -1661,12 +1699,13 @@ def run_rl_core(job, make_deps, clock=time.time, log=print, on_progress=None) ->
         state["stage"] = "measure"
         emit(phase="measuring")
         saved = deps.sampler_from_path(path)
-        after, shown = measure(saved)
+        after, shown, counted = measure(saved)
         if after is None:
             return done({"status": "error", "stage": state["stage"], "error": "the held-out score could not be measured after training"})
         progress["score_after"] = round(after, 6)
-        log("held-out score after training: %.4f" % after)
-        emit(phase="done", score_after=round(after, 6), attempts=[], samples=shown if shown else live["samples"])
+        log("held-out score after training: %.4f%s" % (
+            after, "" if counted["capped"] is None else "; %d of %d answers reached the token limit" % (counted["capped"], counted["answers"])))
+        emit(phase="done", score_after=round(after, 6), attempts=[], samples=shown if shown else live["samples"], **held_counts(counted, "after"))
         return done({"status": "ok", "samples": shown})
     except Exception as exc:  # noqa: BLE001
         return done({"status": "error", "stage": state["stage"], "error": scrub(exc, secrets)})
@@ -1938,6 +1977,111 @@ def judge_family(base_model: str, recommended, tokenizer_class) -> list:
     return checks
 
 
+def how_ended(tokens: list, stop: list, max_tokens: int) -> str:
+    """How a sampled completion ended: "stop" when its last token is a stop token, "cap" when it used all of `max_tokens` without one, "other" otherwise.
+
+    `stop`: the renderer's stop sequences. Only token ids are looked at; a text stop sequence cannot be seen in a token list.
+    """
+    stops = set(t for t in stop if isinstance(t, int))
+    if tokens and tokens[-1] in stops:
+        return "stop"
+    return "cap" if len(tokens) >= max_tokens else "other"
+
+
+def stream_reading(renderer, tokens: list):
+    """(the answer text, how many tokens came before it began) as the renderer's own parser reads the tokens one by one, or None.
+
+    For a renderer that keeps a message's parts apart with control tokens
+    (Inkling, tml_v0). Its parser can be fed token by token and says, for
+    every piece it reads, whether the piece is thinking or text. Only the
+    text pieces are the answer, so a completion that stops inside its
+    thinking passage has no answer text at all, and one that stops in the
+    middle of its answer has the part it wrote. When no text began, every
+    token came before the answer, and the count is the length. None when
+    the renderer has no such parser (the Qwen renderers) or it cannot be opened.
+    """
+    make = getattr(renderer, "_completion_parser", None)
+    if make is None:
+        return None
+    try:
+        stream = make().parse_stream()
+    except Exception:  # noqa: BLE001
+        return None
+    pieces = []
+    before = None
+    try:
+        for i, token in enumerate(tokens):
+            for update in stream.feed([token]):
+                piece = update.update
+                content = getattr(piece, "content", None)
+                # A piece that is still being written carries its place in the message; a finished message does not.
+                if hasattr(piece, "content_index") and type(content).__name__ == "Text":
+                    if before is None:
+                        before = i
+                    pieces.append(content.text)
+    except Exception:  # noqa: BLE001
+        pass  # the parser could not go on from here: what it read up to this token stands
+    return "".join(pieces), (len(tokens) if before is None else before)
+
+
+def read_completion(renderer, tokens: list, stop: list, max_tokens: int, text_of, thinks: bool = False) -> dict:
+    """One sampled completion as the lab reads it: {"text", "ended", "before_answer"}. Touches nothing but the renderer.
+
+    "text" is the answer: the text the model wrote as its answer and nothing
+    else. "ended" is how_ended(). "before_answer" is how many of its tokens
+    came before the answer text began: 0 for a renderer with no thinking
+    passage, the whole length when no answer text began, None when the
+    renderer could not say.
+
+    `thinks` is False for a renderer whose model answers directly (the Qwen
+    renderers without the thinking block). Everything such a model writes is
+    its answer, also when the token limit cut it off in the middle of a
+    sentence, so the answer is the parsed message's text as it always was.
+
+    `thinks` is True for a renderer whose model may write a thinking passage
+    first (Inkling). What the cookbook's parse_response returns for it
+    (tinker-cookbook 0.7.1, renderers/tml_renderers_adapter.py):
+      * a list of parts, thinking and text, when the tokens parse. The answer
+        is the text parts, never a thinking part;
+      * a plain string in three cases it does not tell apart: a parsed
+        message with one text part, the decoded tokens with their markers
+        when the tokens stop in the middle of a message (the token limit
+        fell there), and the decoded tokens when nothing but the stop token
+        was written. For a string the renderer's own parser is asked piece
+        by piece (stream_reading). When it cannot be asked the answer is
+        empty: raw thinking text and markers are never an answer.
+    """
+    tokens = list(tokens)
+    ended = how_ended(tokens, stop, max_tokens)
+    message, _ = renderer.parse_response(tokens)
+    if not thinks:
+        return {"text": text_of(message), "ended": ended, "before_answer": 0}
+    reading = stream_reading(renderer, tokens)
+    if isinstance(message["content"], list):
+        text = text_of(message)
+    else:
+        text = reading[0] if reading is not None else ""
+    return {"text": text, "ended": ended, "before_answer": reading[1] if reading is not None else None}
+
+
+def answer_counts(results: list) -> dict:
+    """How the answers of one sampling ended: {"answers", "capped", "mean_tokens"}.
+
+    `results`: what sample_batch returned. "capped" is how many answers used
+    the whole token limit without a stop token, or None when the service did
+    not say how its answers ended. "mean_tokens" is the mean number of tokens
+    an answer used (None with no answers). Counting only: the reward of an
+    answer is the rubric's score of the text it has, cut off or not.
+    """
+    completions = [c for result in results for c in result["completions"]]
+    known = all(c.get("ended") in ("stop", "cap", "other") for c in completions)
+    return {
+        "answers": len(completions),
+        "capped": sum(1 for c in completions if c["ended"] == "cap") if known else None,
+        "mean_tokens": round(sum(len(c["tokens"]) for c in completions) / float(len(completions)), 1) if completions else None,
+    }
+
+
 RAW_PROBE_PROMPT = "Name one fruit other than a fig. Answer with the name only."
 RAW_PROBE_CAPS = (40, 400)
 RAW_PROBE_SAMPLES = 4
@@ -1945,31 +2089,180 @@ RAW_PROBE_TEMPERATURE = 1.0
 
 
 def probe_report(completions: list, stop: list, decode, max_tokens: int) -> dict:
-    """What a base model really wrote for one prompt, before the renderer takes the answer out. Touches nothing.
+    """What a base model really wrote for one prompt, beside the answer the lab read from it. Touches nothing.
 
-    `completions`: [{text, tokens}] as sample_batch returns them. `stop`: the
-    renderer's stop sequences (token ids, or strings for a text renderer).
-    Each answer is reported with every token decoded, the answer the
-    renderer read from it, its length in tokens, and how it ended: "stop"
-    when its last token is a stop token, "cap" when it used all of
-    `max_tokens` without one, "other" otherwise.
+    `completions`: [{text, tokens, ended?, before_answer?}] as sample_batch
+    returns them. `stop`: the renderer's stop sequences (token ids, or strings
+    for a text renderer). Each answer is reported with every token decoded,
+    the answer read from it (read_completion), its length in tokens, how it
+    ended (as the completion says, else how_ended) and how many of its tokens
+    came before the answer text began (None when that was not said). "capped" counts the answers that used the
+    whole limit without finishing, "empty" the ones no answer was read from.
     """
-    stops = set(t for t in stop if isinstance(t, int))
     answers = []
     for c in completions:
         tokens = list(c["tokens"])
-        if tokens and tokens[-1] in stops:
-            ended = "stop"
-        elif len(tokens) >= max_tokens:
-            ended = "cap"
-        else:
-            ended = "other"
-        answers.append({"raw": decode(tokens), "answer": c["text"], "tokens": len(tokens), "ended": ended})
+        ended = c.get("ended") if c.get("ended") in ("stop", "cap", "other") else how_ended(tokens, stop, max_tokens)
+        answers.append({"raw": decode(tokens), "answer": c["text"], "tokens": len(tokens), "ended": ended,
+                        "before_answer": c.get("before_answer")})
     return {
         "max_tokens": max_tokens, "answers": answers,
         "capped": sum(1 for a in answers if a["ended"] == "cap"),
         "empty": sum(1 for a in answers if not (a["answer"] or "").strip()),
     }
+
+
+# ---------------------------------------------------------------------------
+# The chat endpoint, as the lab server calls it (the owner's probe only)
+# ---------------------------------------------------------------------------
+
+# Tinker's OpenAI-compatible chat endpoint. The visitor chat, Compare With
+# Untrained and the Socratic lesson's student calls go through it from the lab
+# server (api/_lib/tinker-chat.ts); nothing in a training run does. The probe
+# builds its request the way that file does, and tests/fixtures/chat-probe-request.json
+# holds the request both must build, so a test fails when the two drift.
+TINKER_CHAT_URL = "https://tinker.thinkingmachines.dev/services/tinker-prod/oai/api/v1/chat/completions"
+CHAT_PROBE_TIMEOUT_S = 90
+CHAT_PROBE_MAX_BYTES = 200_000
+CHAT_PROBE_CONTENT_CHARS = 2000
+CHAT_PROBE_MAX_FIELDS = 24
+
+
+def chat_reasoning_effort(base_model):
+    """How a chat call asks for a direct answer: "none" for a Thinking Machines model the lab prices, False for the others (tinkerReasoningEffort in api/_lib/tinker-chat.ts)."""
+    return "none" if isinstance(base_model, str) and base_model in RENDERERS and base_model.startswith("thinkingmachines/") else False
+
+
+def chat_probe_body(base_model: str, prompt: str, max_tokens: int, temperature=None) -> dict:
+    """The body of one chat call for an untrained base model, field for field as tinkerChatBody in api/_lib/tinker-chat.ts builds it."""
+    body = {
+        "model": base_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "max_completion_tokens": max(1, int(max_tokens)),
+    }
+    if temperature is not None:
+        body["temperature"] = temperature
+    body["reasoning_effort"] = chat_reasoning_effort(base_model)
+    return body
+
+
+def _redact(text: str, secrets=()) -> str:
+    """Text with any of the given secret values taken out, at its full length (scrub also cuts to 300 characters)."""
+    out = str(text)
+    for secret in secrets:
+        if secret and len(secret) >= 8:
+            out = out.replace(secret, "[redacted]")
+    return out
+
+
+def _kind_of(value) -> str:
+    """What sort of value a field holds, without the value: enough to see whether a field of reasoning is there and filled."""
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return "number"
+    if isinstance(value, str):
+        return "text of %d characters" % len(value)
+    if isinstance(value, list):
+        return "list of %d" % len(value)
+    if isinstance(value, dict):
+        return "object with %d fields" % len(value)
+    return "other"
+
+
+def _other_fields(obj: dict, known: tuple, secrets) -> list:
+    """The names of the fields of `obj` that are not in `known`, each with the sort of value it holds. Sorted, cut and scrubbed."""
+    names = sorted(str(k) for k in obj if k not in known)[:CHAT_PROBE_MAX_FIELDS]
+    return [{"name": scrub(_short(name, 60), secrets), "holds": _kind_of(obj.get(name))} for name in names]
+
+
+def _usage_numbers(usage, secrets) -> dict:
+    """The numbers of a usage object, and those one level down (completion_tokens_details.reasoning_tokens and the like)."""
+    out = {}
+    if not isinstance(usage, dict):
+        return out
+    for key in sorted(str(k) for k in usage):
+        value = usage.get(key)
+        if _is_number(value):
+            out[scrub(_short(key, 60), secrets)] = value
+        elif isinstance(value, dict):
+            for inner in sorted(str(k) for k in value):
+                if _is_number(value.get(inner)):
+                    out[scrub(_short("%s.%s" % (key, inner), 90), secrets)] = value[inner]
+        if len(out) >= CHAT_PROBE_MAX_FIELDS:
+            break
+    return out
+
+
+def chat_probe_report(http_status: int, data, max_tokens: int, secrets=()) -> dict:
+    """What one answer of the chat endpoint held, field by field, bounded. Nothing of the request, and so nothing of the key, is in it."""
+    choices = data.get("choices") if isinstance(data, dict) else None
+    choice = choices[0] if isinstance(choices, list) and choices and isinstance(choices[0], dict) else None
+    message = choice.get("message") if choice is not None and isinstance(choice.get("message"), dict) else None
+    if message is None:
+        return {"status": "failed", "max_tokens": max_tokens, "http_status": http_status, "reason": "the answer had no choices with a message"}
+    content = message.get("content")
+    shown = content if isinstance(content, str) else json.dumps(content)
+    finish = choice.get("finish_reason")
+    return {
+        "status": "ok", "max_tokens": max_tokens, "http_status": http_status,
+        "finish_reason": scrub(_short(finish, 40), secrets) if isinstance(finish, str) else None,
+        # Exactly as returned (not trimmed, not joined), cut to its first CHAT_PROBE_CONTENT_CHARS characters. A content
+        # that is not text (null, or a list of parts) is shown as the JSON it was.
+        "content": _redact(shown, secrets)[:CHAT_PROBE_CONTENT_CHARS],
+        "content_is": _kind_of(content),
+        "content_cut": len(shown) > CHAT_PROBE_CONTENT_CHARS,
+        "message_fields": _other_fields(message, ("content",), secrets),
+        "choice_fields": _other_fields(choice, ("message", "finish_reason"), secrets),
+        "usage": _usage_numbers(data.get("usage"), secrets),
+    }
+
+
+def chat_probe_call(base_model: str, prompt: str, max_tokens: int, temperature, key: str, opener=None) -> dict:
+    """One call to the chat endpoint for an untrained base model, and what came back. Never raises.
+
+    The key goes into the Authorization header of this one request and nowhere
+    else. Every text of the result is scrubbed of it.
+    """
+    secrets = [key]
+    try:
+        request = urllib.request.Request(
+            TINKER_CHAT_URL, data=json.dumps(chat_probe_body(base_model, prompt, max_tokens, temperature)).encode("utf-8"), method="POST",
+            headers={"Authorization": "Bearer %s" % key, "Content-Type": "application/json"},
+        )
+        try:
+            with (opener or urllib.request.urlopen)(request, timeout=CHAT_PROBE_TIMEOUT_S) as response:
+                http_status = int(response.status)
+                raw = response.read(CHAT_PROBE_MAX_BYTES + 1)
+        except urllib.error.HTTPError as error:
+            # Tinker answered with an error status: its message is the finding (a value the model does not take is HTTP 400).
+            detail = ""
+            try:
+                detail = error.read(4000).decode("utf-8", "replace")
+            except Exception:  # noqa: BLE001
+                pass
+            return {"status": "failed", "max_tokens": max_tokens, "http_status": int(error.code),
+                    "reason": scrub("HTTP %d %s" % (error.code, _short(detail, 240)), secrets)}
+        if len(raw) > CHAT_PROBE_MAX_BYTES:
+            return {"status": "failed", "max_tokens": max_tokens, "http_status": http_status, "reason": "the answer was larger than %d bytes" % CHAT_PROBE_MAX_BYTES}
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except ValueError:
+            return {"status": "failed", "max_tokens": max_tokens, "http_status": http_status, "reason": "the answer was not JSON"}
+        return chat_probe_report(http_status, data, max_tokens, secrets)
+    except Exception as error:  # noqa: BLE001
+        return {"status": "failed", "max_tokens": max_tokens, "http_status": None, "reason": scrub("%s: %s" % (type(error).__name__, str(error)[:300]), secrets)}
+
+
+def chat_probe(base_model: str, key: str, opener=None) -> dict:
+    """The chat endpoint part of the owner's probe: RAW_PROBE_PROMPT once at each of RAW_PROBE_CAPS. Never raises."""
+    request = {"url": TINKER_CHAT_URL, "reasoning_effort": chat_reasoning_effort(base_model), "temperature": RAW_PROBE_TEMPERATURE}
+    if not isinstance(key, str) or len(key) < 8:
+        return {"status": "failed", "request": request, "reason": "no Tinker key in this container", "calls": []}
+    calls = [chat_probe_call(base_model, RAW_PROBE_PROMPT, cap, RAW_PROBE_TEMPERATURE, key, opener) for cap in RAW_PROBE_CAPS]
+    return {"status": "ok" if all(c["status"] == "ok" for c in calls) else "failed", "request": request, "calls": calls}
 
 
 # ---------------------------------------------------------------------------
@@ -1990,6 +2283,7 @@ class TinkerDeps:
         self._text = get_text_content
         self._client = self.open_client(job)
         self._renderer = self.open_renderer(job["base_model"], self.tokenizer)
+        self._thinks = RENDERERS[job["base_model"]] in RENDER_EFFORT
         self._sampler = None
 
     @staticmethod
@@ -2086,9 +2380,10 @@ class TinkerDeps:
             max_tokens=max_tokens, temperature=SAMPLE_TEMPERATURE, stop=self._renderer.get_stop_sequences(),
         )
         result = self._sampler.sample(prompt=prompt, num_samples=1, sampling_params=params).result(timeout=CALL_TIMEOUT_S)
-        sampled = list(result.sequences[0].tokens)
-        message, _ = self._renderer.parse_response(sampled)
-        return self._text(message), len(sampled)
+        sampled = [int(t) for t in result.sequences[0].tokens]
+        # The answer only: a thinking passage and its markers are never part of a sample (read_completion).
+        reading = read_completion(self._renderer, sampled, self._renderer.get_stop_sequences(), max_tokens, self._text, self._thinks)
+        return reading["text"], len(sampled)
 
 
 @app.function(image=train_image, secrets=[modal.Secret.from_name("oblab-tinker-auth")], timeout=RUN_TIMEOUT_S, retries=0,
@@ -2127,6 +2422,7 @@ class TinkerRlDeps:
         ).result(timeout=CALL_TIMEOUT_S)
         self._renderer = TinkerDeps.open_renderer(job["base_model"], self._client.get_tokenizer)
         self._stop = self._renderer.get_stop_sequences()
+        self._thinks = RENDERERS[job["base_model"]] in RENDER_EFFORT
 
     def secrets(self) -> list:
         return [os.environ.get("TINKER_API_KEY", "")]
@@ -2157,8 +2453,10 @@ class TinkerRlDeps:
             completions = []
             for sequence in result.sequences:
                 sampled = [int(t) for t in sequence.tokens]
-                message, _ = self._renderer.parse_response(sampled)
-                completions.append({"text": self._text(message), "tokens": sampled, "logprobs": [float(x) for x in sequence.logprobs]})
+                # "text" is the answer the rubric grades: never a thinking passage, never raw markers (read_completion).
+                reading = read_completion(self._renderer, sampled, self._stop, max_tokens, self._text, self._thinks)
+                completions.append({"text": reading["text"], "tokens": sampled, "logprobs": [float(x) for x in sequence.logprobs],
+                                    "ended": reading["ended"], "before_answer": reading["before_answer"]})
             out.append({"prompt": prompt, "prompt_tokens": int(prompt.length), "completions": completions})
         return out
 
@@ -2706,11 +3004,17 @@ kept_volume = modal.Volume.from_name(KEPT_VOLUME, create_if_missing=True)
 @app.function(image=train_image, secrets=[modal.Secret.from_name("oblab-tinker-auth")], timeout=600, retries=0,
               max_containers=1, cpu=(1, 2), memory=(2048, 8192))
 def raw_probe(base_model: str) -> dict:
-    """Samples one made-up prompt from an untrained base model, the way a practice run does, and returns the raw text.
+    """Samples one made-up prompt from an untrained base model, the way a practice run does, then asks the chat endpoint the same.
 
     For the owner's smoke script only: no web endpoint starts it and the lab
-    server never calls it. It makes RAW_PROBE_SAMPLES answers at each cap in
-    RAW_PROBE_CAPS, a few hundred tokens in all. The result never carries the Tinker key.
+    server never calls it. The sampling part makes RAW_PROBE_SAMPLES answers
+    at each cap in RAW_PROBE_CAPS and reports every one raw, beside the answer
+    the lab read from it. The chat part ("chat" in the result) sends the same
+    prompt once at each cap to Tinker's OpenAI-compatible endpoint, built as
+    the lab server builds it for the visitor chat and the lesson, and reports
+    what came back field by field. A few hundred tokens in all. A failure of
+    the chat part is its own result and leaves the sampling part as it was.
+    The result never carries the Tinker key.
     """
     if base_model not in RENDERERS:
         return {"status": "refused", "reason": "base_model is not one this runner trains"}
@@ -2723,13 +3027,18 @@ def raw_probe(base_model: str) -> dict:
         for cap in RAW_PROBE_CAPS:
             batch = deps.sample_batch(sampler, [RAW_PROBE_PROMPT], RAW_PROBE_SAMPLES, cap, RAW_PROBE_TEMPERATURE)
             reports.append(probe_report(batch[0]["completions"], deps._stop, decode, cap))
-        return {"status": "ok", "base_model": base_model, "renderer": RENDERERS[base_model], "prompt": RAW_PROBE_PROMPT,
-                "temperature": RAW_PROBE_TEMPERATURE, "reports": reports}
+        result = {"status": "ok", "base_model": base_model, "renderer": RENDERERS[base_model], "prompt": RAW_PROBE_PROMPT,
+                  "temperature": RAW_PROBE_TEMPERATURE, "reports": reports}
     except Exception as error:  # noqa: BLE001
         # A failure while the client was being made leaves no deps to ask, and nothing of the error is returned then.
         if deps is None:
             return {"status": "failed", "reason": "%s while opening the Tinker client" % type(error).__name__}
         return {"status": "failed", "reason": scrub("%s: %s" % (type(error).__name__, str(error)[:300]), list(deps.secrets()))}
+    try:
+        result["chat"] = chat_probe(base_model, (list(deps.secrets()) or [""])[0])
+    except Exception as error:  # noqa: BLE001
+        result["chat"] = {"status": "failed", "reason": "%s in the chat endpoint part" % type(error).__name__, "calls": []}
+    return result
 
 
 @app.function(image=train_image, secrets=[modal.Secret.from_name("oblab-tinker-auth")], volumes={KEPT_DIR: kept_volume},

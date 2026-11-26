@@ -390,7 +390,9 @@ class ProbeReportTests(unittest.TestCase):
         ], [99], self.decode, 4)
         self.assertEqual([a["ended"] for a in report["answers"]], ["stop", "cap", "other"])
         self.assertEqual((report["capped"], report["empty"], report["max_tokens"]), (1, 1, 4))
-        self.assertEqual(report["answers"][0], {"raw": "7 8 99", "answer": "apple", "tokens": 3, "ended": "stop"})
+        self.assertEqual(report["answers"][0], {"raw": "7 8 99", "answer": "apple", "tokens": 3, "ended": "stop", "before_answer": None})
+        with_place = M.probe_report([{"text": "apple", "tokens": [1, 2, 7, 99], "before_answer": 2}], [99], self.decode, 4)
+        self.assertEqual(with_place["answers"][0]["before_answer"], 2)
 
     def test_an_answer_that_stops_exactly_at_the_cap_is_stop_not_cap(self):
         report = M.probe_report([{"text": "fig", "tokens": [1, 2, 3, 99]}], [99], self.decode, 4)
