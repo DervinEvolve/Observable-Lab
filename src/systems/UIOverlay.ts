@@ -589,13 +589,14 @@ export class UIOverlay {
           color: var(--paper-ink);
           opacity: 0;
           transition: opacity 0.3s ease, transform 0.3s ease;
-          pointer-events: auto;
+          /* Hidden, it is only transparent: it must not take taps meant for the buttons under it. */
+          pointer-events: none;
           z-index: 160;
           white-space: nowrap;
           overflow: hidden;
           text-overflow: ellipsis;
         }
-        #live-status.visible { opacity: 1; transform: translateX(-50%) translateY(0); }
+        #live-status.visible { opacity: 1; transform: translateX(-50%) translateY(0); pointer-events: auto; }
         /* The model accent is a 2px underline mark; the role name itself is ink. */
         #live-status .live-role {
           font-weight: 700; flex-shrink: 0; letter-spacing: -0.1px; color: var(--paper-ink);
@@ -608,13 +609,39 @@ export class UIOverlay {
           transition: color 0.15s ease;
         }
         #live-status .live-close:hover { color: var(--paper-ink); }
-        #live-status .live-remark { color: var(--paper-ink-2); overflow: hidden; text-overflow: ellipsis; }
+        /* The remark gives way first, so a long role or remark never pushes the close button out of the bar. */
+        #live-status .live-remark { color: var(--paper-ink-2); overflow: hidden; text-overflow: ellipsis; flex: 1 1 auto; min-width: 0; }
+        #live-status .live-role { max-width: 65%; overflow: hidden; text-overflow: ellipsis; }
         #live-status .live-caret {
           display: inline-block; width: 1px; height: 12px; margin-left: 1px;
           background: var(--paper-ink); vertical-align: -1px;
           animation: liveCaret 0.9s step-end infinite;
         }
         @keyframes liveCaret { 50% { opacity: 0; } }
+        /* Centred, it clears the GitHub buttons (left 20px to 172px) and the right-hand
+           buttons (44px at right 20px) only from 928px wide. Narrower, it sits in the
+           gap between the two, and on a phone, where that gap is too small to read,
+           it sits one row up, above the GitHub buttons and clear of the right column. */
+        @media (max-width: 927px) {
+          #live-status { left: 184px; right: 76px; max-width: none; transform: translateY(8px); }
+          #live-status.visible { transform: translateY(0); }
+        }
+        @media (max-width: 599px) {
+          /* Two lines on a phone: who is speaking, then what they did, with the close button beside both. */
+          #live-status {
+            left: 20px; bottom: 76px;
+            display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: 8px; row-gap: 3px;
+            padding: 8px 6px 8px 14px;
+          }
+          #live-status .live-role { grid-column: 1; grid-row: 1; max-width: none; }
+          #live-status .live-remark { grid-column: 1; grid-row: 2; }
+          #live-status .live-caret { display: none; }
+          #live-status .live-close { grid-column: 2; grid-row: 1 / span 2; align-self: center; min-width: 32px; min-height: 32px; margin: 0; }
+        }
+        /* A finger needs a bigger close button than a pointer does; the bar keeps its height. */
+        @media (pointer: coarse) and (min-width: 600px) {
+          #live-status .live-close { min-width: 32px; min-height: 32px; margin: -8px -8px -8px 0; }
+        }
 
 
 
