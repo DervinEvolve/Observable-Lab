@@ -102,6 +102,30 @@ export async function listRepoTree(): Promise<string[]> {
   return (data.tree || []).map((t: { path: string }) => t.path).slice(0, 200)
 }
 
+// Reads a text file's UTF-8 content from the given branch (default: main).
+// Best-effort: returns null on 404, non-file entries, or network/API errors.
+export async function getFileContentOnBranch(
+  path: string,
+  branch = DEFAULT_BRANCH,
+  maxBytes = 16_000
+): Promise<string | null> {
+  try {
+    const res = await gh(`${repoPath()}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`)
+    if (!res.ok) return null
+    const data = await res.json()
+    if (typeof data?.content !== 'string') return null
+    const decoded = Buffer.from(data.content.replace(/\s+/g, ''), 'base64').toString('utf-8')
+    if (Buffer.byteLength(decoded, 'utf-8') <= maxBytes) return decoded
+    let end = Math.min(decoded.length, maxBytes)
+    while (end > 0 && Buffer.byteLength(decoded.slice(0, end), 'utf-8') > maxBytes) {
+      end = Math.floor(end * 0.9)
+    }
+    return `${decoded.slice(0, end)}\n[truncated]`
+  } catch {
+    return null
+  }
+}
+
 // One-time scaffold for a brand-new empty repo. Safe to call every time — no-ops if main already exists.
 export async function bootstrapRepoIfEmpty(): Promise<void> {
   const sha = await getDefaultBranchSha()

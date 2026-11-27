@@ -219,7 +219,13 @@ async function stageOne(experimentId: string, epochNumber: number, epoch: Record
           result.note = contribution.error
           ? `no pull request: ${contribution.error}`.slice(0, 500)
           : contribution.files.length ? 'the pull request could not be opened' : 'the model returned no usable files'
-          await persistContribution(experimentId, epochNumber, roles.executor, branchName, contribution)
+          await persistContribution(
+            experimentId,
+            epochNumber,
+            contribution.author_model_id ?? answeredModel(executorOutput, roles.executor),
+            branchName,
+            contribution
+          )
         }
       }
     } catch (e) {
@@ -267,7 +273,13 @@ async function stageTwo(experimentId: string, epochNumber: number, epoch: Record
         merged: resolved.merged, ci_passed: resolved.ci_passed, ci_excerpt: resolved.ci_excerpt, sprite: resolved.sprite,
         pr_url: pending.pr_url, pending: undefined,
       }
-      await persistContribution(experimentId, epochNumber, roles.executor, pending.branch, final)
+      await persistContribution(
+        experimentId,
+        epochNumber,
+        pending.author_model_id || answeredModel(executorOutput, roles.executor),
+        pending.branch,
+        final
+      )
       const mutations = sanitizeMutations(executorOutput.mutations)
       const decisions = sanitizeDecisions(reviewerOutput.decisions, mutations.length)
       const index = followup.contribution_mutation_index

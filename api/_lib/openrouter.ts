@@ -109,12 +109,12 @@ function extractJson(content: string): unknown {
     try {
       return JSON.parse(match[0]);
     } catch (e) {
-      // Try to fix common JSON issues
+      // Try to fix common JSON issues (trailing commas and unquoted object keys
+      // at { or , boundaries only — never rewrite quotes or colons inside strings/URLs).
       let fixed = match[0]
         .replace(/,\s*}/g, '}')  // Remove trailing commas in objects
         .replace(/,\s*]/g, ']')  // Remove trailing commas in arrays
-        .replace(/'/g, '"')       // Replace single quotes with double
-        .replace(/(\w+):/g, '"$1":'); // Quote unquoted keys
+        .replace(/([{,]\s*)([A-Za-z_]\w*)\s*:/g, '$1"$2":'); // Quote unquoted keys at object boundaries
       try {
         return JSON.parse(fixed);
       } catch (e2) {
@@ -551,10 +551,18 @@ export async function callModel(
         break // the same prompt gets the same refusal
       }
       if (e instanceof ModelTruncatedError) {
-        tally(e.usage) // billed; the same request would be cut off again
+        tally(e.usage) // billed
+        if (attempt === 0 && useWeb) {
+          console.warn(`[MODEL] ${modelId} was cut off with web search on; retrying without web search in strict JSON mode`)
+          continue
+        }
         break
       }
       if (isTimeout(e)) {
+        if (attempt === 0 && useWeb) {
+          console.warn(`[MODEL] ${modelId} timed out after ${Math.round(timeoutMs / 1000)} s with web search on; retrying without web search in strict JSON mode`)
+          continue
+        }
         console.warn(`[MODEL] ${modelId} timed out after ${Math.round(timeoutMs / 1000)} s; not retrying the same model`)
         break
       }
@@ -577,7 +585,13 @@ export async function callModel(
     // same lab refuses the same prompt; go straight to a different lab.
     const refusedBy = new Set<string>()
     if (lastError instanceof ModelRefusalError) refusedBy.add(providerOf(modelId))
-    const fallbacks = FALLBACK_MODELS.filter(m => m !== modelId);
+    // Try fallbacks from a different provider before any fallback from the
+    // same provider as the assigned model (provider outages and family quirks
+    // often affect both models from the same lab).
+    const assignedProvider = providerOf(modelId)
+    const fallbacks = FALLBACK_MODELS.filter(m => m !== modelId).sort(
+      (a, b) => Number(providerOf(a) === assignedProvider) - Number(providerOf(b) === assignedProvider)
+    )
     for (const fb of fallbacks) {
       if (refusedBy.has(providerOf(fb))) {
         console.warn(`[MODEL] skipping fallback ${fb}: ${providerOf(fb)} already refused this prompt`);

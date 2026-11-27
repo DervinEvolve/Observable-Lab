@@ -15,6 +15,8 @@ import {
   mergePullRequest,
   closePullRequest,
   listRepoTree,
+  getDefaultBranchSha,
+  getFileContentOnBranch,
   getBranchHeadSha,
   waitForCIRun,
   getCIFailureExcerpt,
@@ -22,7 +24,7 @@ import {
 } from './github-repo.js'
 import { withModelTrailers } from './commit-identity.js'
 import { MODEL_DISPLAY_NAMES, WILDCARD_MODELS, WILDCARD_DISPLAY_NAMES } from './types.js'
-import { assertContributionPath } from './contribution-policy.js'
+import { assertContributionPath, assertDeletableContributionPath } from './contribution-policy.js'
 import { checkContributionInSprite, spritesConfigured, type SpriteCheck } from './sprites.js'
 import { liveModelToolStatus } from './tools-config.js'
 import { liveModelNote } from './live-model.js'
@@ -30,24 +32,26 @@ import { quietMentions } from './github-pr.js'
 
 const CODER_SYSTEM = `You are a software engineer with real write access to a shared GitHub repository (AI-Agent). This is NOT a simulation or writing exercise: the files you return are pushed as a real commit that names you as the model that wrote it, opened as a real pull request, and — once approved — merged into the actual codebase this agent runs on. Other engineers (other models, and their own subagents) are contributing to this same repo alongside you, epoch after epoch, so treat existing files as real prior work to build on, not placeholders you can ignore.
 
+Real existing file contents from the repository and the current main HEAD SHA are included in the prompt below so you can inspect the real code and wire into real exports and types instead of writing disconnected islands or preflight-blocker docs.
+
 Only write files under src/, test/, tests/, or docs/, or README.md. Never change workflows, package manifests, dependency hooks, or build configuration.
 
 You must really build. Write working, real implementation code for the capability you're given — not a mock, not a stub, not a "// TODO: replace with real logic" comment, not a fake in-memory simulation standing in for the real thing. If the task genuinely requires an external dependency you can't provide here (a live network call, a real API key), implement everything else for real and isolate only that one unavoidable boundary — don't fake the whole feature because one piece is hard.
 
 YOUR PR RUNS REAL CI. GitHub Actions executes the ENTIRE vitest suite (every existing test file in the repo, plus yours) and your PR only merges if it all passes. Consequences:
 - Write vitest-style tests (jest-style describe/it/expect globals are configured). Do NOT use node:test.
-- Only import things that actually exist — check the repo file list; don't invent modules, exports, or error-message wording. A test asserting an API that isn't there fails CI and kills your PR.
+- Only import things that actually exist — check the repo file list and provided file contents; don't invent modules, exports, or error-message wording. A test asserting an API that isn't there fails CI and kills your PR.
 - Don't break existing files: if you change a module's exports, everything that imports it still has to pass.
-- If a pre-existing file is genuinely broken and blocking the suite, you may remove it by listing it in "files_to_delete".
+- NEVER delete or weaken existing test files to make CI pass (deleting test files is strictly forbidden and blocked). Only list a genuinely broken non-test file in "files_to_delete" if it is blocking the suite.
 
-Keep the change small, self-contained, and additive — prefer adding new files over editing ones you haven't seen. Return ONLY valid JSON: { "files": [{ "path": string, "content": string }], "files_to_delete": string[], "commit_message": string, "pr_summary": string }. commit_message should be a short conventional-commit-style line. pr_summary is 1-2 sentences for a human reviewer.`
+Keep the change small, self-contained, and additive — prefer adding new files or carefully extending files you were shown over editing ones you haven't seen. Return ONLY valid JSON: { "files": [{ "path": string, "content": string }], "files_to_delete": string[], "commit_message": string, "pr_summary": string }. commit_message should be a short conventional-commit-style line. pr_summary is 1-2 sentences for a human reviewer.`
 
 // Only said when the sandboxes are configured, so the prompt stays true.
 const SPRITE_NOTE = `\n\nAfter you push, your own Sprites sandbox checks out your branch at the exact commit and runs \`npm test\` (vitest run). Its output is shown to people watching the lab, next to the CI result.`
 
 const SUBAGENT_SYSTEM = `You are a subagent with the same real write access to the shared AI-Agent repo, deployed by your parent model for one focused follow-up task: add a real, meaningful test that exercises the actual logic your parent just wrote — not a trivial no-op, not a test that only checks a mock returns what you told it to return. Your test RUNS in real CI (vitest, jest-style globals — do NOT use node:test) and the PR dies if it fails, so: only import exports that actually exist in the files you were shown, get the arithmetic in your expectations right, and never assert exact error-message wording you haven't seen. Don't touch the original files. Return ONLY valid JSON: { "files": [{ "path": string, "content": string }], "commit_message": string }. If the code genuinely isn't testable, return { "files": [], "commit_message": "" }.`
 
-const EXPLORER_SYSTEM = `You are a subagent deployed by your parent model to explore and research BEFORE any code gets written — you don't write code yourself. You have REAL web access: search the web for relevant docs, standards, prior art, or best practices, and ground your findings in what you actually find (not just prior knowledge). Also look for relevant existing code or patterns in the repo to build on, weigh 1-2 implementation approaches and their real tradeoffs, and flag any concrete edge case or risk. Be specific and concise (3-5 sentences) — your parent will use this to decide what to build, so vague hedging is useless. Your task, search queries and findings are published in the pull request description of the contribution they inform. Return ONLY valid JSON: { "task": string, "search_queries": string[], "findings": string }. "task" is a short (under 8 words) present-tense description of what you're investigating, e.g. "Researching integer overflow handling". "search_queries" is the 1-3 web searches you actually made.`
+const EXPLORER_SYSTEM = `You are a subagent deployed by your parent model to explore and research BEFORE any code gets written — you don't write code yourself. You have REAL web access: search the web for relevant docs, standards, prior art, or best practices, and ground your findings in what you actually find (not just prior knowledge). Also look for relevant existing code or patterns in the repo to build on, weigh 1-2 implementation approaches and their real tradeoffs, and flag any concrete edge case or risk. Be specific and concise (3-5 sentences) — your parent will use this to decide what to build, so vague hedging is useless. Your task, search queries and findings are published in the pull request description of the contribution they inform. Return ONLY valid JSON: { "task": string, "search_queries": string[], "findings": string, "files_to_read"?: string[] }. "task" is a short (under 8 words) present-tense description of what you're investigating, e.g. "Researching integer overflow handling". "search_queries" is the 1-3 web searches you actually made. "files_to_read" is an optional list of up to 6 file paths from the repo file list that the coder should inspect before writing code.`
 
 // When the parent deploys two explorers, each takes one angle so they do not repeat each other.
 const EXPLORER_ANGLES = [
@@ -71,6 +75,7 @@ interface ExplorerOutput {
   task: string
   findings: string
   search_queries?: string[]
+  files_to_read?: string[]
 }
 
 /** One explorer's report, kept for the pull request description and the record. */
@@ -79,6 +84,7 @@ export interface ExplorerReport {
   findings: string
   searches: string[]
   sources: WebCitation[]
+  files_to_read?: string[]
   model: string
   cost: number
 }
@@ -99,6 +105,7 @@ export interface ContributionResult {
   files: RepoFile[]           // author's files, with content — for streaming into terminals
   subagent_files: RepoFile[]  // subagent's files, with content
   author: string              // display name of the model credited in the commits' Model trailer
+  author_model_id?: string    // actual model ID that wrote the code (after fallback resolution)
   cost: number
   explorer_task?: string      // what the explorer subagent said it was investigating (shown live on its drone)
   explorer_findings?: string  // what it found — fed into the coder's prompt
@@ -180,6 +187,13 @@ async function runExplorerSubagent(
       ? explorerOut.search_queries.filter((q): q is string => typeof q === 'string').map(q => q.slice(0, 200)).slice(0, 3)
       : [],
     sources: citations,
+    files_to_read: Array.isArray(explorerOut.files_to_read)
+      ? explorerOut.files_to_read
+          .filter((p): p is string => typeof p === 'string')
+          .map(p => p.trim().replace(/^(\.\/)+/, '').slice(0, 200))
+          .filter(Boolean)
+          .slice(0, 6)
+      : [],
     model: servedBy.model,
     cost,
   }
@@ -277,7 +291,7 @@ export async function contributeCode(params: {
     params.subagents ? Math.floor(params.subagents.explore) || 0 : params.deployExplorerSubagent ? 1 : 0))
   const deployTest = params.subagents ? params.subagents.test === true : Boolean(params.deploySubagent)
   if ((process.env.LAB_ENABLE_CODE_WRITES || '').trim().toLowerCase() !== 'true') {
-    return { merged: false, files: [], subagent_files: [], author, cost }
+    return { merged: false, files: [], subagent_files: [], author, author_model_id: authorModelId, cost }
   }
   try {
     await bootstrapRepoIfEmpty()
@@ -311,12 +325,54 @@ export async function contributeCode(params: {
       }
     }
 
+    const mainHeadSha = await getDefaultBranchSha().catch(() => null)
+    const treeSet = new Set(tree)
+    const keyContextPaths = [
+      'package.json',
+      'vitest.config.ts',
+      'src/runtime/agent_runtime.ts',
+      'src/runtime/tool_registry.ts',
+      'src/runtime/runtime_context.ts',
+    ]
+    const explorerRequestedPaths = explorers
+      .flatMap(e => e.files_to_read ?? [])
+      .map(p => p.trim().replace(/^(\.\/)+/, ''))
+      .filter(p => treeSet.has(p))
+      .slice(0, 6)
+    const pathsToRead: string[] = []
+    for (const p of [...keyContextPaths, ...explorerRequestedPaths]) {
+      if (pathsToRead.length >= 10) break
+      if (treeSet.has(p) && !pathsToRead.includes(p)) pathsToRead.push(p)
+    }
+    const fetchedContext = await Promise.all(
+      pathsToRead.map(async path => ({ path, content: await getFileContentOnBranch(path) }))
+    )
+    const contextFiles: RepoFile[] = []
+    let contextChars = 0
+    const MAX_CONTEXT_CHARS = 48_000
+    for (const entry of fetchedContext) {
+      if (!entry.content) continue
+      const remaining = MAX_CONTEXT_CHARS - contextChars
+      if (remaining <= 0) break
+      const content = entry.content.length > remaining
+        ? `${entry.content.slice(0, remaining)}\n[truncated]`
+        : entry.content
+      contextFiles.push({ path: entry.path, content })
+      contextChars += content.length
+    }
+    const mainHeadSection = mainHeadSha ? `Current main HEAD SHA: ${mainHeadSha}\n\n` : ''
+    const contextFilesSection = contextFiles.length
+      ? `Existing repo file contents (read directly from main — wire into real exports and types instead of guessing):\n${contextFiles
+          .map(f => `--- ${f.path} ---\n${f.content}`)
+          .join('\n\n')}\n\n`
+      : ''
+
     const { output, cost: codeCost, servedBy: coderServedBy } = await callModel(
       params.authorModelId,
       CODER_SYSTEM + (spritesConfigured() ? SPRITE_NOTE : '') + (liveModelToolStatus().enabled ? `\n\n${liveModelNote()}` : ''),
-      `${params.agentContext ? `You're building: ${params.agentContext}\n\n` : ''}${
+      `${params.agentContext ? `You're building: ${params.agentContext}\n\n` : ''}${mainHeadSection}${
         explorerFindings ? `A subagent explored this first and found: ${explorerFindings}\n\n` : ''
-      }Implement this: ${params.description}\n\nCurrent repo files (top-level, for context — don't collide):\n${tree.length ? tree.join('\n') : '(empty repo)'}`,
+      }${contextFilesSection}Implement this: ${params.description}\n\nCurrent repo files (top-level, for context — don't collide):\n${tree.length ? tree.join('\n') : '(empty repo)'}`,
       // A real implementation file mustn't be truncated mid-JSON, and writing
       // one with reasoning on can take several minutes. A minute is kept back
       // for pushing the files and opening the PR.
@@ -355,7 +411,7 @@ export async function contributeCode(params: {
       const keys = coder && typeof coder === 'object' ? Object.keys(coder).slice(0, 8).join(', ') : typeof coder
       const reason = `the coder (${coderServedBy.model}) returned no files${keys ? ` (fields: ${keys})` : ''}`
       console.warn('[code-contribution] ' + reason)
-      return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns, error: reason }
+      return { merged: false, files: [], subagent_files: [], author, author_model_id: authorModelId, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns, error: reason }
     }
 
     // Validate the generated batch before the first repository write. A file
@@ -375,11 +431,20 @@ export async function contributeCode(params: {
         return false
       }
     }
+    const deletable = (path: unknown): path is string => {
+      try {
+        assertDeletableContributionPath(path)
+        return true
+      } catch (e) {
+        dropped.push(`${String(path).slice(0, 120)} (${e instanceof Error ? e.message : 'not allowed'})`)
+        return false
+      }
+    }
     const tidy = (path: unknown) => (typeof path === 'string' ? path.replace(/^(\.\/)+/, '') : path)
     coder.files = coder.files
       .map(f => ({ ...f, path: tidy(f?.path) as string }))
       .filter(f => allowed(f.path) && (typeof f.content === 'string' || (dropped.push(`${f.path} (content is not text)`), false)))
-    coder.files_to_delete = (coder.files_to_delete || []).map(tidy).filter(allowed)
+    coder.files_to_delete = (coder.files_to_delete || []).map(tidy).filter(deletable)
     if (dropped.length) console.warn(`[code-contribution] dropped ${dropped.length} generated path(s): ${dropped.join('; ')}`)
     if (!coder.files.length) throw new Error(`No allowed files to write: ${dropped.join('; ')}`.slice(0, 1500))
     await createBranch(params.branchName)
@@ -444,7 +509,7 @@ export async function contributeCode(params: {
     const pr = await openPullRequest(params.branchName, params.title, prBody)
 
     const base: Omit<ContributionResult, 'merged' | 'cost'> = {
-      pr_url: pr.html_url, files: coder.files, subagent_files: subagentFiles, author,
+      pr_url: pr.html_url, files: coder.files, subagent_files: subagentFiles, author, author_model_id: authorModelId,
       explorer_task: explorerTask, explorer_findings: explorerFindings,
       web_searches: webSearches, web_sources: webSources, subagents: subagentRuns,
     }
@@ -542,7 +607,7 @@ export async function contributeCode(params: {
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error)
     console.warn('[code-contribution] failed (non-fatal):', reason)
-    return { merged: false, files: [], subagent_files: [], author, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns, error: reason.slice(0, 2000) }
+    return { merged: false, files: [], subagent_files: [], author, author_model_id: authorModelId, cost, explorer_task: explorerTask, explorer_findings: explorerFindings, web_searches: webSearches, web_sources: webSources, subagents: subagentRuns, error: reason.slice(0, 2000) }
   }
 }
 

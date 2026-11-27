@@ -965,13 +965,16 @@ test('with the lesson and visitor offers switched off, the prompts and the publi
     const said = p => ({
       context: p.getSharedContext(4, spec(), []),
       executor: p.ROLE_PROMPTS.executor({ direction: 'x' }),
-      reviewer: p.ROLE_PROMPTS.reviewer({ mutations: [] }, { challenges: [] }, undefined, reviewerSection(p)),
+      reviewerSection: reviewerSection(p),
       lines: p.toolLines(),
       section: p.executorToolsSection(),
     })
     const now = said(prompts)
     const then = said(old.prompts)
     for (const key of Object.keys(then)) assert.equal(now[key], then[key], `${key} changed with ${JSON.stringify(setting)}`)
+    const reviewerNow = prompts.ROLE_PROMPTS.reviewer({ mutations: [] }, { challenges: [] }, undefined, now.reviewerSection)
+    assert.ok(reviewerNow.endsWith(now.reviewerSection), `reviewer prompt dropped tool section with ${JSON.stringify(setting)}`)
+    assert.doesNotMatch(reviewerNow, /tinker_tutor|Socratic lesson|visitor_offers/, `reviewer prompt leaked disabled tool text with ${JSON.stringify(setting)}`)
     assert.ok(then.context.length > 1000)
 
     // The public state, from the same stored rows.

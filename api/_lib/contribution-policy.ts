@@ -13,3 +13,21 @@ export function assertContributionPath(path: unknown): asserts path is string {
     throw new Error('Generated contribution path is outside the allowed source and test directories')
   }
 }
+
+export function isTestPath(path: string): boolean {
+  const normalized = path.replace(/^(\.\/)+/, '')
+  return (
+    normalized.startsWith('test/') ||
+    normalized.startsWith('tests/') ||
+    normalized.startsWith('__tests__/') ||
+    normalized.includes('/__tests__/') ||
+    /\.(?:test|spec)\.[^/]+$/i.test(normalized)
+  )
+}
+
+export function assertDeletableContributionPath(path: unknown): asserts path is string {
+  assertContributionPath(path)
+  if (isTestPath(path)) {
+    throw new Error('Generated contribution cannot delete test files')
+  }
+}

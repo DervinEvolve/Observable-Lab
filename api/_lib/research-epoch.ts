@@ -21,7 +21,7 @@ import { addNotebookNote, getRecentNotebook } from './notebook.js'
 import { releaseEpoch } from './epoch-claim.js'
 import { BudgetPausedError, epochSpend, recordModelCall } from './spend.js'
 import { researchAlongside } from './experiment-modes.js'
-import { getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
+import { buildTrainPyDiff, getResearchSharedContext, RESEARCH_PROMPTS } from './research-prompts.js'
 import { mayRetryPromotion, promoteResearchModel, researchModelKey, researchTalkStatus, type Promotion } from './research-talk.js'
 import {
   checkResearchGpuBudget, collectRepeats, confirmColumns, confirmNewBest, confirmWaitDeadlineMs, loadRepeats, maybeStartControl,
@@ -31,7 +31,7 @@ import {
 import {
   appendResultsRow, awaitResearchRun, getResearchFile, pollResearchRun,
   provenanceOf, provenanceTrailers, putResearchFile, researchGpuCostUsd, ResearchRunPendingError,
-  sanitizeRunResult, startResearchRun, writeFindingPage,
+  sanitizeRunResult, startResearchRun, updateWikiIndex, writeFindingPage,
   type ResearchRunResult,
 } from './research.js'
 import {
@@ -342,13 +342,17 @@ export async function runResearchEpoch(experimentId: string, opts: { requestStar
       console.log(`[Research e${epochNumber}] run finished: ${runResult.status} val_bpb=${runResult.metrics?.val_bpb ?? 'n/a'}`)
     }
 
+    // Compute the exact diff between baseline train.py and the executed script
+    // so both Challenger and Reviewer inspect the real code that ran on the GPU.
+    const trainPyDiff = buildTrainPyDiff(trainPyFile.content, executorOutput.train_py)
+
     // 4. CHALLENGER — attack the methodology with the measured result in hand
     let challengerOutput = existingEpoch?.challenger_output as ChallengerOutput | undefined
     if (!challengerOutput) {
       const { output, cost } = await callModel(
         roleAssignments.challenger,
         ctxFor(roleAssignments.challenger) + '\n\n'
-          + RESEARCH_PROMPTS.challenger(plannerOutput.hypothesis, executorOutput.change_summary, runResult),
+          + RESEARCH_PROMPTS.challenger(plannerOutput.hypothesis, executorOutput.change_summary, runResult, trainPyDiff),
         'Stress-test this experiment\'s methodology and result.'
       )
       challengerOutput = output as ChallengerOutput
@@ -365,7 +369,7 @@ export async function runResearchEpoch(experimentId: string, opts: { requestStar
       const { output, cost } = await callModel(
         roleAssignments.reviewer,
         ctxFor(roleAssignments.reviewer) + '\n\n'
-          + RESEARCH_PROMPTS.reviewer(plannerOutput.hypothesis, executorOutput.change_summary, runResult, research.best_bpb, challengerNotes),
+          + RESEARCH_PROMPTS.reviewer(plannerOutput.hypothesis, executorOutput.change_summary, runResult, research.best_bpb, challengerNotes, trainPyDiff),
         'Rule: keep or revert.'
       )
       reviewerOutput = output as ResearchReviewerOutput
@@ -453,6 +457,7 @@ export async function runResearchEpoch(experimentId: string, opts: { requestStar
     const displayName = (id: string) => modelDisplayName(id) || id
     const fallbackFor = executorModel !== roleAssignments.executor ? displayName(roleAssignments.executor) : undefined
     const author = displayName(executorModel) + (fallbackFor ? ` (fallback for ${fallbackFor})` : '')
+    let findingPath: string | null = null
     try {
       if (verdict === 'keep') {
         await putResearchFile(
@@ -480,7 +485,7 @@ export async function runResearchEpoch(experimentId: string, opts: { requestStar
         // The five repeat columns, only while the lab repeats runs: this run's repeat, or none.
         ...(confirmOn ? { confirm: confirm ? confirmColumns(confirm) : null } : {}),
       })
-      await writeFindingPage({
+      const writtenFinding = await writeFindingPage({
         epoch: epochNumber,
         author,
         hypothesis: plannerOutput.hypothesis,
@@ -492,13 +497,41 @@ export async function runResearchEpoch(experimentId: string, opts: { requestStar
         reviewReason: reviewerOutput.reason,
         challengerNotes: (challengerOutput.challenges || []).map(c => c.issue),
         provenance,
+        experimentId,
         ...(checkpointNote ? { checkpointNote } : {}),
         ...(confirm ? { confirmNote: confirm.line } : {}),
       })
-      // The lab's own repeats (this epoch's, and controls collected at its start) go in their own ledger.
-      if (confirmOn) await writeRepeatLedger(experimentId)
+      findingPath = writtenFinding ?? `wiki/findings/epoch-${String(epochNumber).padStart(3, '0')}.md`
     } catch (repoErr) {
       console.warn(`[Research e${epochNumber}] repo write failed (non-fatal):`, repoErr instanceof Error ? repoErr.message : repoErr)
+    }
+
+    if (findingPath) {
+      try {
+        await updateWikiIndex({
+          epoch: epochNumber,
+          author,
+          verdict,
+          runStatus: runResult.status,
+          valBpb: measuredBpb,
+          bestBpb: research.best_bpb,
+          hypothesis: plannerOutput.hypothesis,
+          findingPath,
+          provenance,
+        })
+      } catch (wikiErr) {
+        console.warn(`[Research e${epochNumber}] wiki/index.md update failed (non-fatal):`, wikiErr instanceof Error ? wikiErr.message : wikiErr)
+      }
+    }
+
+    // The lab's own repeats (this epoch's, and controls collected at its start) go in their own ledger.
+    // Isolated in its own try/catch so a failure writing the finding page or wiki index never skips lab-repeats.tsv.
+    if (confirmOn) {
+      try {
+        await writeRepeatLedger(experimentId)
+      } catch (repeatLedgerErr) {
+        console.warn(`[Research e${epochNumber}] lab-repeats.tsv write failed (non-fatal):`, repeatLedgerErr instanceof Error ? repeatLedgerErr.message : repeatLedgerErr)
+      }
     }
 
     // 7. SPEC UPDATE — the plant tells the truth about research progress

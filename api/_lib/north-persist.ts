@@ -99,7 +99,7 @@ async function runNorthAndPersist(
         currentSpec.identity.domain ? ` (domain: ${currentSpec.identity.domain})` : ''
       }`,
     })
-    await persistContribution(experimentId, epochNumber, authorModelId, branchName, codeResult)
+    await persistContribution(experimentId, epochNumber, codeResult.author_model_id ?? authorModelId, branchName, codeResult)
     if (codeResult.ci_passed === false) {
       const firstError = (codeResult.ci_excerpt || '').split('\n').find(l => /FAIL|Error/.test(l))?.slice(0, 180) || 'see CI logs'
       await addNotebookNote(experimentId, epochNumber, 'CI (system)',

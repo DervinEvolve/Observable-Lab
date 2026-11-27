@@ -1273,8 +1273,8 @@ test('a timed-out model call goes straight to the fallback, and a spent deadline
     return completion(body.model, { ok: true })
   }
   const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u')
-  assert.deepEqual(requested, ['anthropic/claude-fable-5.2', 'anthropic/claude-sonnet-5.5']) // no second try on the slow model
-  assert.equal(r.servedBy.model, 'anthropic/claude-sonnet-5.5')
+  assert.deepEqual(requested, ['anthropic/claude-fable-5.2', 'google/gemini-3.8-flash']) // no second try on the slow model; different provider tried first
+  assert.equal(r.servedBy.model, 'google/gemini-3.8-flash')
 
   requested.length = 0
   await assert.rejects(openrouter.callModel('openai/gpt-6-astra', 's', 'u', { deadlineAt: Date.now() + 5_000 }), /Model returned invalid response/)
@@ -1313,7 +1313,7 @@ test('an answer cut off at max_tokens is billed but never parsed from the reason
     return completion(body.model, { files: [{ path: 'src/a.ts', content: 'x' }] }, { prompt_tokens: 100, completion_tokens: 100, cost: 0.02 })
   }
   const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u', { maxTokens: 48000, effort: 'low' })
-  assert.deepEqual(requested.map(b => b.model), ['anthropic/claude-fable-5.2', 'anthropic/claude-sonnet-5.5'])
+  assert.deepEqual(requested.map(b => b.model), ['anthropic/claude-fable-5.2', 'google/gemini-3.8-flash'])
   assert.deepEqual(r.output.files, [{ path: 'src/a.ts', content: 'x' }]) // not the stray fragment
   assert.ok(Math.abs(r.cost - 1.32) < 1e-9) // the cut-off answer still counts
   // Low effort and the larger budget reach the request.
@@ -1334,8 +1334,8 @@ test('a request that Node\'s fetch gives up on (no headers in 300 s) counts as a
     return completion(body.model, { ok: true })
   }
   const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u')
-  assert.deepEqual(requested, ['anthropic/claude-fable-5.2', 'anthropic/claude-sonnet-5.5']) // not asked again
-  assert.equal(r.servedBy.model, 'anthropic/claude-sonnet-5.5')
+  assert.deepEqual(requested, ['anthropic/claude-fable-5.2', 'google/gemini-3.8-flash']) // not asked again; different provider tried first
+  assert.equal(r.servedBy.model, 'google/gemini-3.8-flash')
   // Every model request carries the dispatcher with the 300 s limits switched off.
   assert.ok(dispatchers.every(d => d && typeof d.dispatch === 'function'))
   assert.equal(openrouter.isTimeoutError(new TypeError('fetch failed', { cause: { code: 'UND_ERR_BODY_TIMEOUT' } })), true)
@@ -1426,4 +1426,160 @@ test('the knowledge graph is built from the stored record: who changed which ele
   assert.match(g.nodes.find(n => n.id === 'code:16:epoch-16-capabilities-0').detail, /no pull request was opened\. Why: createBranch failed: 403/)
   assert.match(kg.memorySummary(g, 16), /Code for the AI-Agent repo: 1 attempts, 0 opened a pull request, 0 merged\. Latest failure \(e16\): createBranch failed: 403/)
   assert.match(kg.recall(g, 'has any AgentRuntime code merged into the AI-Agent repo'), /^  - \[code, e16\][^\n]*\n?.*no pull request was opened/)
+})
+
+test('fallback ordering prefers a different provider before a same-provider fallback', async () => {
+  const requested = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response(JSON.stringify(CATALOG))
+    const body = JSON.parse(options.body)
+    requested.push(body.model)
+    if (body.model === 'anthropic/claude-fable-5.2' || body.model === 'google/gemini-3.8-flash') {
+      throw new DOMException('The operation timed out.', 'TimeoutError')
+    }
+    return completion(body.model, { ok: true })
+  }
+  const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u')
+  assert.deepEqual(requested, ['anthropic/claude-fable-5.2', 'google/gemini-3.8-flash', 'anthropic/claude-sonnet-5.5'])
+  assert.equal(r.servedBy.model, 'anthropic/claude-sonnet-5.5')
+
+  // Non-Anthropic failure keeps FALLBACK_MODELS order (Claude Sonnet first).
+  requested.length = 0
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response(JSON.stringify(CATALOG))
+    const body = JSON.parse(options.body)
+    requested.push(body.model)
+    if (body.model === 'openai/gpt-6-astra') throw new DOMException('The operation timed out.', 'TimeoutError')
+    return completion(body.model, { ok: true })
+  }
+  const r2 = await openrouter.callModel('openai/gpt-6-astra', 's', 'u')
+  assert.deepEqual(requested, ['openai/gpt-6-astra', 'anthropic/claude-sonnet-5.5'])
+  assert.equal(r2.servedBy.model, 'anthropic/claude-sonnet-5.5')
+})
+
+test('truncation or timeout on attempt 0 with webSearch retries the assigned model without webSearch in strict JSON mode, and extractJson preserves URLs and apostrophes', async () => {
+  const calls = []
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response(JSON.stringify(CATALOG))
+    const body = JSON.parse(options.body)
+    calls.push({ model: body.model, hasWeb: Boolean(body.plugins), hasJsonFormat: Boolean(body.response_format) })
+    if (calls.length === 1) {
+      return new Response(JSON.stringify({
+        model: body.model,
+        choices: [{ finish_reason: 'length', message: { content: '' } }],
+        usage: { prompt_tokens: 100, completion_tokens: 100, cost: 0.01 },
+      }))
+    }
+    // Trailing comma + unquoted key + URL with colon + apostrophe in string
+    return completion(body.model, '{url: "https://example.com/a", note: "don\'t break",}', { prompt_tokens: 100, completion_tokens: 50, cost: 0.01 })
+  }
+  const r = await openrouter.callModel('anthropic/claude-fable-5.2', 's', 'u', { webSearch: true })
+  assert.equal(r.servedBy.model, 'anthropic/claude-fable-5.2')
+  assert.equal(r.servedBy.fallback, false)
+  assert.deepEqual(calls, [
+    { model: 'anthropic/claude-fable-5.2', hasWeb: true, hasJsonFormat: false },
+    { model: 'anthropic/claude-fable-5.2', hasWeb: false, hasJsonFormat: true },
+  ])
+  assert.equal(r.output.url, 'https://example.com/a')
+  assert.equal(r.output.note, "don't break")
+
+  // Timeout with webSearch on also gets one retry without webSearch.
+  calls.length = 0
+  globalThis.fetch = async (url, options = {}) => {
+    if (String(url).endsWith('/api/v1/models')) return new Response(JSON.stringify(CATALOG))
+    const body = JSON.parse(options.body)
+    calls.push({ model: body.model, hasWeb: Boolean(body.plugins), hasJsonFormat: Boolean(body.response_format) })
+    if (calls.length === 1) throw new DOMException('Timed out', 'TimeoutError')
+    return completion(body.model, { ok: true })
+  }
+  const r2 = await openrouter.callModel('google/gemini-4-hydrogen', 's', 'u', { webSearch: true })
+  assert.equal(r2.servedBy.model, 'google/gemini-4-hydrogen')
+  assert.equal(r2.servedBy.fallback, false)
+  assert.equal(calls.length, 2)
+  assert.equal(calls[0].hasWeb, true)
+  assert.equal(calls[1].hasWeb, false)
+})
+
+test('applyMutations handles identity strings, bracket and dot-ID modify/remove, duplicate decisions, and accurate counters', () => {
+  const base = classicSpec({
+    capabilities: [
+      { id: 'cap_alpha_1', description: 'alpha', added_epoch: 1, status: 'active' },
+      { id: 'cap_beta_2', description: 'beta', added_epoch: 2, status: 'active' },
+    ],
+    constraints: [
+      { id: 'con_one_1', description: 'old constraint', type: 'must', added_epoch: 1, status: 'active' },
+    ],
+  })
+  const rawMutations = [
+    { type: 'modify', target: 'identity', path: 'identity.purpose', value: 'General autonomous engineer', rationale: 'expand' },
+    { type: 'modify', target: 'identity', path: 'identity.domain', value: 'software engineering', rationale: 'set domain' },
+    { type: 'modify', target: 'capabilities', path: 'capabilities.cap_alpha_1', value: { description: 'alpha v2' }, rationale: 'dot id modify' },
+    { type: 'modify', target: 'capabilities', path: 'capabilities[1]', value: { description: 'beta v2' }, rationale: 'bracket modify' },
+    { type: 'remove', target: 'constraints', path: 'constraints[0]', value: {}, rationale: 'bracket remove' },
+    { type: 'remove', target: 'capabilities', path: 'capabilities.cap_missing_9', value: {}, rationale: 'no-op remove' },
+    { type: 'modify', target: 'capabilities', path: 'capabilities.cap_missing_9', value: { description: 'x' }, rationale: 'no-op modify' },
+  ]
+  const muts = output.sanitizeMutations(rawMutations)
+  assert.deepEqual(muts[0].value, { purpose: 'General autonomous engineer' })
+  assert.deepEqual(muts[1].value, { domain: 'software engineering' })
+
+  // Duplicate mutation_index is deduplicated (first valid verdict wins).
+  const decisions = output.sanitizeDecisions([
+    { mutation_index: 0, verdict: 'approve', reason: 'ok' },
+    { mutation_index: 0, verdict: 'reject', reason: 'dup' },
+    { mutation_index: 1, verdict: 'approve', reason: 'ok' },
+    { mutation_index: 2, verdict: 'approve', reason: 'ok' },
+    { mutation_index: 3, verdict: 'approve', reason: 'ok' },
+    { mutation_index: 4, verdict: 'approve', reason: 'ok' },
+    { mutation_index: 5, verdict: 'approve', reason: 'ok' },
+    { mutation_index: 6, verdict: 'approve', reason: 'ok' },
+  ], muts.length)
+  assert.equal(decisions.length, 7)
+  assert.equal(decisions[0].verdict, 'approve')
+
+  const next = runner.applyMutations(base, muts, decisions, 5)
+  assert.equal(next.identity.purpose, 'General autonomous engineer')
+  assert.equal(next.identity.domain, 'software engineering')
+  assert.equal(next.capabilities[0].description, 'alpha v2')
+  assert.equal(next.capabilities[1].description, 'beta v2')
+  assert.equal(next.constraints[0].status, 'pruned')
+  assert.equal(next.constraints[0].pruned_epoch, 5)
+  // Only the 4 real mutations and 1 real pruning incremented the counters (no-ops did not).
+  assert.equal(next.meta.total_mutations, 4)
+  assert.equal(next.meta.total_prunings, 1)
+})
+
+test('fallback attribution credits the answering model in rebuttal, mutations table, and persisted contributions', async () => {
+  process.env.LAB_ENABLE_CODE_WRITES = 'true'
+  const exp = lab.addExperiment({ current_epoch: 3, current_spec: classicSpec() })
+  const baseAnswers = epochAnswers()
+  const rebuttalModels = []
+  let assignedExecutor = null
+  fakeFetch(body => {
+    const sys = body.messages[0].content
+    if (sys.includes('You are the EXECUTOR this epoch')) {
+      assignedExecutor ??= body.model
+      if (body.model === assignedExecutor) return new Response('unavailable', { status: 503 })
+    }
+    if (sys.includes('You are the EXECUTOR again')) {
+      rebuttalModels.push(body.model)
+    }
+    if (sys.includes('You are a software engineer') && body.model === assignedExecutor) {
+      return new Response('unavailable', { status: 503 })
+    }
+    return baseAnswers(body)
+  }, { github: fakeGitHub() })
+
+  const result = await runner.runEpoch(exp.id)
+  assert.equal(result.success, true)
+  const expectedFallback = assignedExecutor.startsWith('anthropic/') ? 'google/gemini-3.8-flash' : 'anthropic/claude-sonnet-5.5'
+  assert.deepEqual(rebuttalModels, [expectedFallback])
+  assert.ok(lab.mutations.length > 0)
+  for (const m of lab.mutations) assert.equal(m.model_id, expectedFallback)
+
+  // Follow-up stage 1 + stage 2 persist the fallback coder's model_id, not roles.executor.
+  await followups.runEpochFollowUp(exp.id)
+  await followups.runEpochFollowUp(exp.id)
+  assert.equal(lab.contributions.length, 1)
+  assert.equal(lab.contributions[0].model_id, expectedFallback)
 })

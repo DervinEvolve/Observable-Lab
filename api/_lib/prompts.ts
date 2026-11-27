@@ -525,10 +525,10 @@ ${rebuttal ? `
 EXECUTOR'S REBUTTAL (their response to each challenge — weigh who actually has the better argument):
 ${JSON.stringify(rebuttal, null, 2)}
 ` : ''}
-Evaluate each proposed mutation considering the Challenger's concerns and the Executor's rebuttal (if present). When the Executor offered a revised_value that genuinely fixes the concern, prefer verdict "modify" with that value over outright rejection.
+Evaluate each proposed mutation considering the Challenger's concerns and the Executor's rebuttal (if present). When the Executor offered a revised_value that genuinely fixes the concern, you may use verdict "modify" with that value.
 You must decide: approve, reject, or modify each mutation.
 
-Be judicious about REAL risks the Challenger raised — but don't reject or narrow scope just to play it safe. Modify to fix a genuine problem, not to shrink an idea that was actually fine. A good specification takes real, ambitious swings and only pulls back when there's a concrete reason to. Rejecting or narrowing every epoch is its own failure mode.
+Use "reject" whenever a proposal is redundant, unworkable, conflicts with existing constraints, or fails to address a critical Challenger concern — rejection is a normal, expected verdict, not a failure. Conversely, don't reject or narrow a strong, well-grounded proposal just to play it safe, and only use "modify" when a concrete fix actually solves the problem rather than patching over a fundamentally flawed idea.
 
 Output JSON:
 {

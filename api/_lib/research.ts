@@ -430,6 +430,69 @@ ${experimentId ? `\n<!-- oblab-experiment: ${experimentId} -->\n` : ''}`
   throw new Error(`writeFindingPage: ${stem}.md already holds a page from another experiment; not overwriting it`)
 }
 
+const WIKI_INDEX_PLACEHOLDER = '_(none yet -- this program has not run an epoch)_'
+
+/**
+ * Idempotently appends one concise bullet under `## Current findings` in
+ * `wiki/index.md`, replacing the Day-0 placeholder if present. Leaves files
+ * without a `## Current findings` section untouched (returns false).
+ */
+export async function updateWikiIndex(args: {
+  epoch: number
+  author: string
+  verdict: 'keep' | 'revert'
+  runStatus: string
+  valBpb: number | null
+  bestBpb: number
+  hypothesis: string
+  findingPath: string
+  provenance: ResultProvenance
+}): Promise<boolean> {
+  if (!Number.isSafeInteger(args.epoch) || args.epoch < 0) {
+    throw new Error('updateWikiIndex: epoch is not a whole number')
+  }
+  const existing = await getResearchFile('wiki/index.md')
+  if (!existing) return false
+
+  const headingMatch = /^## Current findings[^\n]*$/m.exec(existing.content)
+  if (!headingMatch) return false
+
+  const padded = String(args.epoch).padStart(3, '0')
+  if (existing.content.includes(`epoch-${padded}`) || existing.content.includes(`**e${args.epoch}**`)) {
+    return false
+  }
+
+  const bpbText = args.valBpb !== null && Number.isFinite(args.valBpb)
+    ? args.valBpb.toFixed(4)
+    : `n/a (${args.runStatus})`
+  const shortHyp = args.hypothesis.replace(/[\r\n\t]+/g, ' ').trim().slice(0, 140)
+  const cleanAuthor = args.author.replace(/[\r\n\t]+/g, ' ').trim()
+  const relPath = args.findingPath.replace(/^wiki\//, '')
+  const bullet = `- **e${args.epoch}** (${args.verdict.toUpperCase()}, val_bpb ${bpbText}, ${cleanAuthor}): ${shortHyp} — [finding](${relPath})`
+
+  const sectionStart = headingMatch.index + headingMatch[0].length
+  const rest = existing.content.slice(sectionStart)
+  const nextHeading = /\n## /.exec(rest)
+  const sectionBody = nextHeading ? rest.slice(0, nextHeading.index) : rest
+  const afterSection = nextHeading ? rest.slice(nextHeading.index) : ''
+
+  const withoutPlaceholder = sectionBody.replace(WIKI_INDEX_PLACEHOLDER, '')
+  const trimmedBody = withoutPlaceholder.trimEnd()
+  const newSectionBody = trimmedBody.trim() === ''
+    ? `\n\n${bullet}\n`
+    : `${trimmedBody}\n${bullet}\n`
+  const tail = afterSection ? `\n${afterSection.replace(/^\n+/, '')}` : ''
+  const updated = existing.content.slice(0, sectionStart) + newSectionBody + tail
+
+  await putResearchFile(
+    'wiki/index.md',
+    updated,
+    `wiki: index epoch ${args.epoch}\n\n${provenanceTrailers(args.provenance)}`,
+    existing.sha
+  )
+  return true
+}
+
 // ---------------------------------------------------------------------------
 // Modal runner client
 // ---------------------------------------------------------------------------
@@ -612,8 +675,9 @@ export class RunnerStartRefusedError extends Error {
  * `reported` is set on a failure only when the runner itself answered that
  * the call failed or that its result is gone. A failure without it means the
  * status endpoint could not be read (a gateway error, an answer that is not
- * the runner's), which says nothing about the run. The lab's own repeats
- * (research-confirm.ts) tell the two apart; an epoch's own run does not.
+ * the runner's), which says nothing about the run. Both the lab's own repeats
+ * (research-confirm.ts) and awaitResearchRun tell the two apart so a transient
+ * status-endpoint error does not discard an in-flight GPU run.
  */
 export async function pollResearchRun(callId: string): Promise<
   { status: 'running' } | { status: 'done'; result: ResearchRunResult } | { status: 'failed'; error: string; reported?: true }
@@ -631,17 +695,40 @@ export async function pollResearchRun(callId: string): Promise<
 
 // Poll to completion within a wall budget; null = still running at deadline
 // (the caller persists the call_id and a later invocation resumes polling).
+// Transient status-endpoint errors (non-reported HTTP/gateway errors or
+// network failures) are logged and retried until the deadline instead of
+// aborting an in-flight 5-minute GPU run.
 export async function awaitResearchRun(
   callId: string,
   maxWaitMs: number,
   pollMs = 15000
 ): Promise<ResearchRunResult | null> {
   const deadline = Date.now() + maxWaitMs
+  let transientFailures = 0
   while (Date.now() < deadline) {
-    const s = await pollResearchRun(callId)
-    if (s.status === 'done') return s.result
-    if (s.status === 'failed') return { status: 'infra_error', error: s.error }
-    await new Promise(r => setTimeout(r, pollMs))
+    let s: Awaited<ReturnType<typeof pollResearchRun>> | null = null
+    try {
+      s = await pollResearchRun(callId)
+    } catch (err) {
+      transientFailures += 1
+      console.warn(
+        `[Research] transient poll error for ${callId} (#${transientFailures}):`,
+        err instanceof Error ? err.message : err
+      )
+    }
+    if (s) {
+      if (s.status === 'done') return s.result
+      if (s.status === 'failed') {
+        if (s.reported === true) return { status: 'infra_error', error: s.error }
+        transientFailures += 1
+        console.warn(`[Research] transient status error for ${callId} (#${transientFailures}): ${s.error}`)
+      } else {
+        transientFailures = 0
+      }
+    }
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) break
+    await new Promise(r => setTimeout(r, Math.min(pollMs, remaining)))
   }
   return null
 }

@@ -34,6 +34,214 @@ export const STORY_MODEL_NOTE = `
 
 WHAT HAPPENS TO A KEPT MODEL (a fact about the lab, not a goal; val_bpb is still the only thing a run is judged on): when a run is kept as the new best, the lab saves the trained model so that visitors can give it an opening line and read the short piece of text it writes next. This is done by the lab's own code, not by train.py, and nothing needs to be added for it. Its limits: the lab saves the model object that was last passed to prepare.evaluate_bpb, as it is when the process exits, with torch.save, up to 256 MB; later it loads train.py's definitions without running its main part and unpickles the model on a CPU, calling model(idx) and reading the scores for the next byte. A model it cannot save or load that way is simply not offered to visitors, and that changes nothing about the run's score or verdict. The save runs as the process exits, so it is inside the run's hard stop (the budget plus 120 s) and inside the wall time the runner records: a process still running at the hard stop, whether training or saving, is stopped and the run is a crash at stage budget, as it always was. The saved file is written in the same process as train.py, so it is recorded as self-reported, like the score.`
 
+/**
+ * Formats wiki/index.md for prompt injection. When the index grows past
+ * maxChars, preserves the `## Current findings` tail so agents always see
+ * the newest findings instead of only the static header.
+ */
+function formatWikiIndexForPrompt(wikiIndex: string, maxChars = 3500): string {
+  if (wikiIndex.length <= maxChars) return wikiIndex
+  const findingsHeading = '## Current findings'
+  const findingsIdx = wikiIndex.indexOf(findingsHeading)
+  const snapToLine = (text: string, budget: number): string => {
+    const raw = text.slice(-budget)
+    const nl = raw.indexOf('\n')
+    return nl !== -1 && nl < raw.length - 1 ? raw.slice(nl + 1) : raw
+  }
+  if (findingsIdx !== -1) {
+    const findingsTail = wikiIndex.slice(findingsIdx)
+    if (findingsTail.length > maxChars) {
+      const prefix = `${findingsHeading}\n...(older findings truncated)...\n`
+      const budget = Math.max(200, maxChars - prefix.length)
+      return prefix + snapToLine(findingsTail.slice(findingsHeading.length), budget)
+    }
+  }
+  const prefix = '...(earlier wiki index truncated)...\n'
+  const budget = Math.max(200, maxChars - prefix.length)
+  return prefix + snapToLine(wikiIndex, budget)
+}
+
+/**
+ * Pure, dependency-free line-level unified-style diff between baseline
+ * train.py and the epoch's executed train.py. Gives Challenger and Reviewer
+ * direct visibility into what actually changed on the GPU rather than relying
+ * solely on the Executor's self-reported change_summary.
+ */
+export function buildTrainPyDiff(before: string, after: string, maxChars = 12_000): string {
+  const normBefore = before.replace(/\r\n/g, '\n')
+  const normAfter = after.replace(/\r\n/g, '\n')
+  if (normBefore === normAfter) return '(no changes)'
+
+  const splitLines = (s: string): string[] => {
+    const lines = s.split('\n')
+    if (lines.length > 0 && lines[lines.length - 1] === '') lines.pop()
+    return lines
+  }
+  const a = splitLines(normBefore)
+  const b = splitLines(normAfter)
+
+  let prefix = 0
+  const minLen = Math.min(a.length, b.length)
+  while (prefix < minLen && a[prefix] === b[prefix]) prefix++
+
+  let suffix = 0
+  while (
+    suffix < a.length - prefix &&
+    suffix < b.length - prefix &&
+    a[a.length - 1 - suffix] === b[b.length - 1 - suffix]
+  ) {
+    suffix++
+  }
+
+  const aMid = a.slice(prefix, a.length - suffix)
+  const bMid = b.slice(prefix, b.length - suffix)
+  if (aMid.length === 0 && bMid.length === 0) return '(no changes)'
+
+  type Op = { type: 'eq' | 'del' | 'ins'; line: string; oldLine: number; newLine: number }
+  const ops: Op[] = []
+
+  for (let i = 0; i < prefix; i++) {
+    ops.push({ type: 'eq', line: a[i], oldLine: i + 1, newLine: i + 1 })
+  }
+
+  const m = aMid.length
+  const n = bMid.length
+  let equalMid = 0
+  const midOps: Op[] = []
+
+  if (m * n <= 2_000_000) {
+    const stride = n + 1
+    const dp = new Int32Array((m + 1) * stride)
+    for (let i = m - 1; i >= 0; i--) {
+      const row = i * stride
+      const nextRow = (i + 1) * stride
+      for (let j = n - 1; j >= 0; j--) {
+        if (aMid[i] === bMid[j]) {
+          dp[row + j] = dp[nextRow + j + 1] + 1
+        } else {
+          const down = dp[nextRow + j]
+          const right = dp[row + j + 1]
+          dp[row + j] = down >= right ? down : right
+        }
+      }
+    }
+    let i = 0
+    let j = 0
+    while (i < m || j < n) {
+      if (i < m && j < n && aMid[i] === bMid[j]) {
+        midOps.push({ type: 'eq', line: aMid[i], oldLine: prefix + i + 1, newLine: prefix + j + 1 })
+        equalMid++
+        i++
+        j++
+      } else if (i < m && (j === n || dp[(i + 1) * stride + j] >= dp[i * stride + j + 1])) {
+        midOps.push({ type: 'del', line: aMid[i], oldLine: prefix + i + 1, newLine: prefix + j + 1 })
+        i++
+      } else {
+        midOps.push({ type: 'ins', line: bMid[j], oldLine: prefix + i + 1, newLine: prefix + j + 1 })
+        j++
+      }
+    }
+  } else {
+    for (let i = 0; i < m; i++) {
+      midOps.push({ type: 'del', line: aMid[i], oldLine: prefix + i + 1, newLine: prefix + 1 })
+    }
+    for (let j = 0; j < n; j++) {
+      midOps.push({ type: 'ins', line: bMid[j], oldLine: prefix + m + 1, newLine: prefix + j + 1 })
+    }
+  }
+
+  for (const op of midOps) ops.push(op)
+  for (let i = 0; i < suffix; i++) {
+    ops.push({
+      type: 'eq',
+      line: a[a.length - suffix + i],
+      oldLine: a.length - suffix + i + 1,
+      newLine: b.length - suffix + i + 1,
+    })
+  }
+
+  // Group into unified hunks with 3 lines of context around each change.
+  const CONTEXT = 3
+  const changeRanges: Array<{ start: number; end: number }> = []
+  let totalDel = 0
+  let totalIns = 0
+  for (let idx = 0; idx < ops.length; idx++) {
+    if (ops[idx].type !== 'eq') {
+      if (ops[idx].type === 'del') totalDel++
+      else totalIns++
+      const start = Math.max(0, idx - CONTEXT)
+      const end = Math.min(ops.length - 1, idx + CONTEXT)
+      const last = changeRanges[changeRanges.length - 1]
+      if (last && start <= last.end + 1) {
+        last.end = Math.max(last.end, end)
+      } else {
+        changeRanges.push({ start, end })
+      }
+    }
+  }
+
+  if (changeRanges.length === 0) return '(no changes)'
+
+  const chunks: string[] = []
+  for (const range of changeRanges) {
+    const slice = ops.slice(range.start, range.end + 1)
+    const oldStart = slice[0].oldLine
+    const newStart = slice[0].newLine
+    let oldCount = 0
+    let newCount = 0
+    const lines: string[] = []
+    for (const op of slice) {
+      if (op.type === 'eq') {
+        oldCount++
+        newCount++
+        lines.push(` ${op.line}`)
+      } else if (op.type === 'del') {
+        oldCount++
+        lines.push(`-${op.line}`)
+      } else {
+        newCount++
+        lines.push(`+${op.line}`)
+      }
+    }
+    chunks.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@\n${lines.join('\n')}`)
+  }
+
+  const diff = chunks.join('\n')
+  if (diff.length <= maxChars) return diff
+
+  const totalEqual = prefix + equalMid + suffix
+  const completelyRewritten = totalEqual < Math.min(a.length, b.length) * 0.1
+  if (completelyRewritten) {
+    const header = `(train.py substantially rewritten: -${totalDel}/+${totalIns} lines; showing bounded executed script snippet)\n`
+    const budget = Math.max(200, maxChars - header.length - 40)
+    return `${header}${normAfter.slice(0, budget)}\n... (snippet truncated at ${maxChars} chars)`
+  }
+
+  const footer = `\n... (diff truncated at ${maxChars} chars; -${totalDel}/+${totalIns} lines total)`
+  const budget = Math.max(200, maxChars - footer.length)
+  return diff.slice(0, budget) + footer
+}
+
+function formatDiffSection(trainPyDiff?: string, newTrainPy?: string): string {
+  const parts: string[] = []
+  if (trainPyDiff !== undefined) {
+    const trimmed = trainPyDiff.trim()
+    const body = !trimmed || trimmed === '(no changes)'
+      ? '(no changes: executed train.py was identical to baseline train.py)'
+      : `\`\`\`diff\n${trimmed}\n\`\`\``
+    parts.push(
+      `ACTUAL DIFF APPLIED TO train.py (baseline to this epoch's executed script; inspect this directly for eval tampering, off-by-one leakage, budget cheating, or undocumented changes):\n${body}`
+    )
+  }
+  if (newTrainPy !== undefined && newTrainPy.trim().length > 0) {
+    const snippet = newTrainPy.length > 12_000
+      ? `${newTrainPy.slice(0, 12_000)}\n# ... (truncated at 12000 chars)`
+      : newTrainPy
+    parts.push(`EXECUTED train.py:\n\`\`\`python\n${snippet}\n\`\`\``)
+  }
+  return parts.length ? `\n${parts.join('\n\n')}` : ''
+}
+
 export function getResearchSharedContext(inp: ResearchContextInputs): string {
   const r = inp.research
   return `You are one of five frontier AI models running an AUTONOMOUS ML RESEARCH LAB — the Observable Lab.
@@ -64,7 +272,7 @@ CURRENT LEDGER (results.tsv):
 ${inp.resultsTsv.slice(-3000)}
 
 WIKI INDEX (accumulated findings — your org's memory):
-${inp.wikiIndex.slice(0, 2000)}
+${formatWikiIndexForPrompt(inp.wikiIndex)}
 
 RECENT EPOCH SUMMARIES:
 ${inp.recentHistory.map(e => `Epoch ${e.epoch_number}: ${e.commentator_output?.summary || 'no summary'}`).join('\n') || '(first research epoch)'}
@@ -113,15 +321,21 @@ Respond with JSON:
   "remark": "...", "reasoning": "...", "notebook": "..."
 }`,
 
-  challenger: (hypothesis: string, changeSummary: string, run: ResearchRunResult) => `YOUR ROLE THIS EPOCH: CHALLENGER (Methodology Critic)
+  challenger: (
+    hypothesis: string,
+    changeSummary: string,
+    run: ResearchRunResult,
+    trainPyDiff?: string,
+    newTrainPy?: string,
+  ) => `YOUR ROLE THIS EPOCH: CHALLENGER (Methodology Critic)
 
 The experiment that just ran on the GPU:
 HYPOTHESIS: ${hypothesis}
 CHANGE: ${changeSummary}
 MEASURED RESULT: ${JSON.stringify(run.metrics ?? { status: run.status, error: (run.error || '').slice(0, 600) })}
-${run.log_tail ? `RUN LOG TAIL:\n${run.log_tail.slice(-1500)}` : ''}
+${run.log_tail ? `RUN LOG TAIL:\n${run.log_tail.slice(-1500)}` : ''}${formatDiffSection(trainPyDiff, newTrainPy)}
 
-Attack the METHODOLOGY, not the ambition: Is the measured effect attributable to the stated change, or confounded? Does anything smell like metric gaming (eval tampering, budget cheating, val leakage)? Is a good number luck (variance) rather than mechanism? Is a bad number implementation error rather than a dead idea? Your job is to make sure the ledger only accumulates TRUE findings.
+Attack the METHODOLOGY, not the ambition: Is the measured effect attributable to the stated change, or confounded? Does anything in the actual train.py diff smell like metric gaming (eval tampering, off-by-one leakage, budget cheating, val leakage, or undocumented changes)? Is a good number luck (variance) rather than mechanism? Is a bad number implementation error rather than a dead idea? Your job is to make sure the ledger only accumulates TRUE findings.
 
 Respond with JSON:
 {
@@ -132,7 +346,15 @@ Respond with JSON:
   "remark": "...", "reasoning": "...", "notebook": "..."
 }`,
 
-  reviewer: (hypothesis: string, changeSummary: string, run: ResearchRunResult, bestBpb: number, challengerNotes: string) => `YOUR ROLE THIS EPOCH: REVIEWER (Principal Investigator)
+  reviewer: (
+    hypothesis: string,
+    changeSummary: string,
+    run: ResearchRunResult,
+    bestBpb: number,
+    challengerNotes: string,
+    trainPyDiff?: string,
+    newTrainPy?: string,
+  ) => `YOUR ROLE THIS EPOCH: REVIEWER (Principal Investigator)
 
 Rule on this epoch's experiment. The decision standard is MEASURED REALITY:
 HYPOTHESIS: ${hypothesis}
@@ -140,10 +362,11 @@ CHANGE: ${changeSummary}
 CURRENT BEST: ${bestBpb.toFixed(4)} val_bpb
 MEASURED: ${JSON.stringify(run.metrics ?? { status: run.status, error: (run.error || '').slice(0, 600) })}
 CHALLENGER SAYS:
-${challengerNotes}
+${challengerNotes}${formatDiffSection(trainPyDiff, newTrainPy)}
 
 Verdict rules:
-- "keep" ONLY if the run completed AND val_bpb improved on the current best AND the Challenger raised no credible cheating/confound concern. Keep means this train.py becomes the new baseline for all future epochs.
+- "keep" ONLY if the run completed AND val_bpb improved on the current best AND inspecting the actual train.py diff plus the Challenger's notes reveals no credible cheating/confound concern. Keep means this train.py becomes the new baseline for all future epochs (or advances to the automatic confirmation rerun when enabled).
+- Do NOT pre-emptively revert a clean run whose val_bpb beats the current best just because the single-run delta is smaller than a confirmation margin: any confirmation margin applies to the two-run mean after the automatic rerun, not to a single draw, and reverting early prevents that second run from ever happening.
 - "revert" otherwise — crashed, regressed, no result, or tainted methodology. Reverting a truthful negative result is still GOOD science; say what was learned.
 
 Respond with JSON:

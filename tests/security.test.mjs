@@ -723,3 +723,75 @@ test('the lesson cron route takes only the scheduler secret, the offers operator
     process.env = saved
   }
 })
+
+test('generated contributions cannot delete test files, and receive real repo context and true author_model_id', async () => {
+  const { isTestPath, assertDeletableContributionPath } = await load('api/_lib/contribution-policy.js')
+  for (const p of ['test/a.ts', 'tests/agent.test.ts', 'src/__tests__/x.ts', 'src/agent.test.ts', 'src/agent.spec.tsx']) {
+    assert.equal(isTestPath(p), true, p)
+    assert.throws(() => assertDeletableContributionPath(p), /cannot delete test files/, p)
+  }
+  for (const p of ['src/agent.ts', 'docs/notes.md', 'README.md']) {
+    assert.equal(isTestPath(p), false, p)
+    assert.doesNotThrow(() => assertDeletableContributionPath(p), p)
+  }
+  assert.throws(() => assertDeletableContributionPath('package.json'))
+
+  const copy = join(build, 'delete-guard-test')
+  cpSync(join(build, 'api'), join(copy, 'api'), { recursive: true })
+  process.env.OPENROUTER_API_KEY = 'test-only-openrouter-placeholder'
+  process.env.LAB_ENABLE_CODE_WRITES = 'true'
+  delete process.env.LAB_REQUIRED_CI_WORKFLOW_IDS
+  const { contributeCode } = await import(pathToFileURL(join(copy, 'api/_lib/code-contribution.js')).href)
+  const requests = []
+  let coderPrompt = ''
+  globalThis.fetch = async (url, options = {}) => {
+    const target = String(url)
+    const method = options.method || 'GET'
+    requests.push({ url: target, method, body: options.body ? String(options.body) : '' })
+    if (target.endsWith('/api/v1/models')) return new Response('unavailable', { status: 503 })
+    if (target.includes('openrouter.ai')) {
+      const parsed = JSON.parse(options.body)
+      coderPrompt = parsed.messages[1].content
+      const content = JSON.stringify({
+        files: [{ path: 'src/agent.ts', content: 'export const x = 1\n' }],
+        files_to_delete: ['tests/existing.test.ts', 'src/foo.spec.ts', 'src/broken_old.ts'],
+        commit_message: 'feat: wire runtime',
+        pr_summary: 'wires runtime',
+      })
+      return new Response(JSON.stringify({ model: parsed.model, choices: [{ message: { content } }], usage: { total_tokens: 10 } }))
+    }
+    if (method === 'GET' && target.includes('/git/ref/heads/main')) return new Response(JSON.stringify({ object: { sha: 'a'.repeat(40) } }))
+    if (method === 'GET' && target.includes('/git/ref/heads/')) return new Response(JSON.stringify({ object: { sha: 'c'.repeat(40) } }))
+    if (method === 'GET' && target.includes('/git/trees/')) {
+      return new Response(JSON.stringify({ tree: [{ path: 'package.json' }, { path: 'src/runtime/agent_runtime.ts' }] }))
+    }
+    if (method === 'GET' && target.includes('/contents/src%2Fruntime%2Fagent_runtime.ts')) {
+      return new Response(JSON.stringify({ sha: 'file-sha', content: Buffer.from('export class AgentRuntime {}\n', 'utf-8').toString('base64') }))
+    }
+    if (method === 'GET' && target.includes('/contents/src%2Fbroken_old.ts')) {
+      return new Response(JSON.stringify({ sha: 'old-sha' }))
+    }
+    if (method === 'GET' && target.includes('/contents/')) return new Response('{}', { status: 404 })
+    if (method === 'POST' && target.endsWith('/pulls')) return new Response(JSON.stringify({ number: 9, html_url: 'https://github.example/pr/9' }))
+    return new Response('{}')
+  }
+  try {
+    const result = await contributeCode({
+      authorModelId: 'anthropic/claude-fable-5.2',
+      branchName: 'epoch-9-capabilities-0',
+      title: 'wire runtime',
+      description: 'wire runtime',
+      review: { mode: 'approved' },
+    })
+    assert.equal(result.author_model_id, 'anthropic/claude-fable-5.2')
+    assert.match(coderPrompt, /Current main HEAD SHA: a{40}/)
+    assert.match(coderPrompt, /export class AgentRuntime/)
+    const deletedPaths = requests
+      .filter(r => r.method === 'DELETE' && r.url.includes('/contents/'))
+      .map(r => decodeURIComponent(r.url.split('/contents/')[1].split('?')[0]))
+    assert.deepEqual(deletedPaths, ['src/broken_old.ts'])
+  } finally {
+    delete process.env.OPENROUTER_API_KEY
+    delete process.env.LAB_ENABLE_CODE_WRITES
+  }
+})

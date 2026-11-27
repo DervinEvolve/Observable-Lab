@@ -53,11 +53,21 @@ export function sanitizeMutations(raw: unknown): Array<Omit<Mutation, 'type'> & 
   if (!Array.isArray(raw)) return []
   return raw.map(entry => {
     const m = entry && typeof entry === 'object' ? (entry as Record<string, unknown>) : {}
-    const value = m.value && typeof m.value === 'object' && !Array.isArray(m.value) ? (m.value as Record<string, unknown>) : {}
+    const target = (typeof m.target === 'string' ? m.target.trim() : '') as Mutation['target']
+    const path = typeof m.path === 'string' ? m.path : ''
+    let value: Record<string, unknown>
+    if (m.value && typeof m.value === 'object' && !Array.isArray(m.value)) {
+      value = m.value as Record<string, unknown>
+    } else if (target === 'identity' && typeof m.value === 'string') {
+      const field = path.replace(/^identity\.?/, '').trim()
+      value = field === 'domain' ? { domain: m.value } : { purpose: m.value }
+    } else {
+      value = {}
+    }
     return {
       type: normalizeMutationType(m.type),
-      target: (typeof m.target === 'string' ? m.target.trim() : '') as Mutation['target'],
-      path: typeof m.path === 'string' ? m.path : '',
+      target,
+      path,
       value,
       rationale: typeof m.rationale === 'string' ? m.rationale : '',
     }
@@ -67,14 +77,17 @@ export function sanitizeMutations(raw: unknown): Array<Omit<Mutation, 'type'> & 
 /** Reviewer decisions that name a real mutation index and a known verdict. */
 export function sanitizeDecisions(raw: unknown, mutationCount: number): ReviewerDecision[] {
   if (!Array.isArray(raw)) return []
+  const seen = new Set<number>()
   const out: ReviewerDecision[] = []
   for (const entry of raw) {
     if (!entry || typeof entry !== 'object') continue
     const d = entry as Record<string, unknown>
     const index = typeof d.mutation_index === 'number' ? d.mutation_index : Number(d.mutation_index)
     if (!Number.isInteger(index) || index < 0 || index >= mutationCount) continue
+    if (seen.has(index)) continue
     const verdict = typeof d.verdict === 'string' ? d.verdict.trim().toLowerCase() : ''
     if (verdict !== 'approve' && verdict !== 'reject' && verdict !== 'modify') continue
+    seen.add(index)
     const modified = d.modified_value && typeof d.modified_value === 'object' && !Array.isArray(d.modified_value)
       ? (d.modified_value as Record<string, unknown>)
       : undefined

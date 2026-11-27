@@ -89,18 +89,23 @@ const PARAM_BOUNDS: Record<string, [number, number]> = {
   north_every_n_epochs: [1, 10],
 }
 
-function applyExperimentParams(spec: AgentSpecification, value: Record<string, unknown>): void {
+function applyExperimentParams(spec: AgentSpecification, value: Record<string, unknown>): boolean {
   const params = (spec.meta.experiment_params ??= {})
+  let applied = false
   for (const [key, [lo, hi]] of Object.entries(PARAM_BOUNDS)) {
     const raw = value?.[key]
     const n = typeof raw === 'number' ? raw : typeof raw === 'string' ? parseFloat(raw) : NaN
     if (Number.isFinite(n)) {
       ;(params as Record<string, number>)[key] = Math.min(hi, Math.max(lo, Math.round(n)))
+      applied = true
     }
   }
+  return applied
 }
 
-function applyMutations(
+const ARRAY_MUTATION_TARGETS = new Set(['capabilities', 'constraints', 'behaviors'])
+
+export function applyMutations(
   spec: AgentSpecification,
   mutations: Mutation[],
   decisions: ReviewerDecision[],
@@ -124,60 +129,120 @@ function applyMutations(
         added_epoch: epochNumber,
         status: 'active' as const,
       }
+      let applied = false
 
       if (mutation.target === 'capabilities') {
         newSpec.capabilities.push(item as AgentSpecification['capabilities'][0])
+        applied = true
       } else if (mutation.target === 'constraints') {
         newSpec.constraints.push(item as AgentSpecification['constraints'][0])
+        applied = true
       } else if (mutation.target === 'behaviors') {
         newSpec.behaviors.push(item as AgentSpecification['behaviors'][0])
+        applied = true
       } else if (mutation.target === 'identity') {
-        Object.assign(newSpec.identity, value)
-      } else if (mutation.target === 'experiment_params') {
-        applyExperimentParams(newSpec, value)
-      }
-      newSpec.meta.total_mutations++
-    } else if (mutation.type === 'modify') {
-      // Handle path-based modification
-      const pathMatch = (mutation.path || '').match(/(\w+)\[(\d+)\]/)
-      if (pathMatch) {
-        const [, target, indexStr] = pathMatch
-        const index = parseInt(indexStr, 10)
-        const arr = newSpec[target as keyof AgentSpecification] as unknown[]
-        if (Array.isArray(arr) && arr[index]) {
-          Object.assign(arr[index] as object, value)
+        if (value && typeof value === 'object' && !Array.isArray(value)) {
+          if (typeof value.purpose === 'string') {
+            newSpec.identity.purpose = value.purpose
+            applied = true
+          }
+          if (typeof value.domain === 'string' || value.domain === null) {
+            newSpec.identity.domain = value.domain
+            applied = true
+          }
         }
       } else if (mutation.target === 'experiment_params') {
-        applyExperimentParams(newSpec, value)
+        applied = applyExperimentParams(newSpec, value)
+      }
+      if (applied) newSpec.meta.total_mutations++
+    } else if (mutation.type === 'modify') {
+      let applied = false
+      // Handle both bracket index (capabilities[0]) and dot-ID (capabilities.cap_foo_1)
+      const idxMatch = (mutation.path || '').match(/(\w+)\[(\d+)\]/)
+      const idMatch = (mutation.path || '').match(/(\w+)\.([A-Za-z0-9_-]+)/)
+      if (idxMatch && ARRAY_MUTATION_TARGETS.has(idxMatch[1])) {
+        const [, target, indexStr] = idxMatch
+        const index = parseInt(indexStr, 10)
+        const arr = newSpec[target as 'capabilities' | 'constraints' | 'behaviors']
+        if (Array.isArray(arr) && arr[index]) {
+          Object.assign(arr[index], value)
+          applied = true
+        }
+      } else if (idMatch && ARRAY_MUTATION_TARGETS.has(idMatch[1])) {
+        const [, target, id] = idMatch
+        const arr = newSpec[target as 'capabilities' | 'constraints' | 'behaviors']
+        if (Array.isArray(arr)) {
+          const item = arr.find((i: { id?: string }) => i.id === id)
+          if (item) {
+            Object.assign(item, value)
+            applied = true
+          }
+        }
+      } else if (mutation.target === 'experiment_params') {
+        applied = applyExperimentParams(newSpec, value)
       } else if (mutation.target === 'identity') {
         // `identity` isn't an array, so it never matches the index-path regex
         // above — models phrase the path inconsistently ("identity",
         // "identity.purpose", "purpose") since the prompt only documents
-        // array paths. Every identity mutation was silently dropped as a
-        // result (confirmed live across 4 epochs). Handle all observed forms.
-        const field = (mutation.path || '').replace(/^identity\.?/, '')
+        // array paths. Handle all observed forms without ever writing an
+        // object into a string field.
+        const field = (mutation.path || '').replace(/^identity\.?/, '').trim()
         if (field === 'purpose' || field === 'domain') {
-          (newSpec.identity as Record<string, unknown>)[field] = value
-        } else if (value && typeof value === 'object') {
-          Object.assign(newSpec.identity, value)
-        }
-      }
-      newSpec.meta.total_mutations++
-    } else if (mutation.type === 'remove') {
-      // Mark as pruned rather than deleting
-      const pathMatch = (mutation.path || '').match(/(\w+)\.(\w+)/)
-      if (pathMatch) {
-        const [, target, id] = pathMatch
-        const arr = newSpec[target as keyof AgentSpecification]
-        if (Array.isArray(arr)) {
-          const item = arr.find((i: { id?: string }) => i.id === id)
-          if (item) {
-            ;(item as { status: string; pruned_epoch?: number }).status = 'pruned'
-            ;(item as { status: string; pruned_epoch?: number }).pruned_epoch = epochNumber
+          const rawVal = value as unknown
+          const extracted =
+            typeof rawVal === 'string'
+              ? rawVal
+              : field === 'domain' && rawVal === null
+                ? null
+                : rawVal && typeof rawVal === 'object' && !Array.isArray(rawVal)
+                  ? (rawVal as Record<string, unknown>)[field]
+                  : undefined
+          if (field === 'purpose' && typeof extracted === 'string') {
+            newSpec.identity.purpose = extracted
+            applied = true
+          } else if (field === 'domain' && (typeof extracted === 'string' || extracted === null)) {
+            newSpec.identity.domain = extracted
+            applied = true
+          }
+        } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+          if (typeof value.purpose === 'string') {
+            newSpec.identity.purpose = value.purpose
+            applied = true
+          }
+          if (typeof value.domain === 'string' || value.domain === null) {
+            newSpec.identity.domain = value.domain
+            applied = true
           }
         }
       }
-      newSpec.meta.total_prunings++
+      if (applied) newSpec.meta.total_mutations++
+    } else if (mutation.type === 'remove') {
+      // Mark as pruned rather than deleting; support both dot-ID and bracket index.
+      let pruned = false
+      const idMatch = (mutation.path || '').match(/(\w+)\.([A-Za-z0-9_-]+)/)
+      const idxMatch = (mutation.path || '').match(/(\w+)\[(\d+)\]/)
+      if (idMatch && ARRAY_MUTATION_TARGETS.has(idMatch[1])) {
+        const [, target, id] = idMatch
+        const arr = newSpec[target as 'capabilities' | 'constraints' | 'behaviors']
+        if (Array.isArray(arr)) {
+          const item = arr.find((i: { id?: string }) => i.id === id)
+          if (item && item.status !== 'pruned') {
+            item.status = 'pruned'
+            item.pruned_epoch = epochNumber
+            pruned = true
+          }
+        }
+      } else if (idxMatch && ARRAY_MUTATION_TARGETS.has(idxMatch[1])) {
+        const [, target, indexStr] = idxMatch
+        const index = parseInt(indexStr, 10)
+        const arr = newSpec[target as 'capabilities' | 'constraints' | 'behaviors']
+        if (Array.isArray(arr) && arr[index] && arr[index].status !== 'pruned') {
+          arr[index].status = 'pruned'
+          arr[index].pruned_epoch = epochNumber
+          pruned = true
+        }
+      }
+      if (pruned) newSpec.meta.total_prunings++
     }
   }
 
@@ -215,6 +280,10 @@ export function findMutatedSpecItem(
     if (pathMatch) {
       const index = parseInt(pathMatch[1], 10)
       return arr[index] ?? null
+    }
+    const idMatch = (mutation.path || '').match(/(\w+)\.([A-Za-z0-9_-]+)/)
+    if (idMatch && idMatch[1] === mutation.target) {
+      return arr.find(item => item.id === idMatch[2]) ?? null
     }
   }
   return null
@@ -529,8 +598,8 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
     if (!rebuttalOutput && (challengerOutput.challenges?.length ?? 0) > 0) {
       try {
         const { output, cost, tokens: used } = await callModel<RebuttalOutput>(
-          roleAssignments.executor,
-          ctxFor(roleAssignments.executor) + '\n\n' + ROLE_PROMPTS.rebuttal(executorOutput, challengerOutput),
+          executorModel,
+          ctxFor(executorModel) + '\n\n' + ROLE_PROMPTS.rebuttal(executorOutput, challengerOutput),
           "Respond to each of the Challenger's concerns: defend, concede, or revise."
         )
         rebuttalOutput = output
@@ -539,7 +608,7 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
         await sql`
           UPDATE epochs SET executor_rebuttal = ${JSON.stringify(rebuttalOutput)} WHERE id = ${epochId}
         `
-        await saveNote('Executor·rebuttal', roleAssignments.executor, rebuttalOutput)
+        await saveNote('Executor·rebuttal', executorModel, rebuttalOutput)
       } catch (e) {
         // Rebuttal is enrichment, not a dependency — reviewer can rule without it.
         console.warn(`[Epoch ${epochNumber}] Rebuttal failed (non-fatal):`, e instanceof Error ? e.message : e)
@@ -578,6 +647,8 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
       `
       await saveNote('Reviewer', roleAssignments.reviewer, reviewerOutput)
       await answerRecall('Reviewer', roleAssignments.reviewer, reviewerOutput, true)
+    } else {
+      await answerRecall('Reviewer', roleAssignments.reviewer, reviewerOutput, false)
     }
 
     // 10. Apply approved mutations to spec. Model output is untyped JSON:
@@ -756,7 +827,7 @@ async function runClaimedEpoch(experimentId: string, opts: { requestStartedAt?: 
           ${mutation.type},
           ${mutation.target || 'unknown'},
           ${mutation.path || null},
-          ${roleAssignments.executor},
+          ${executorModel},
           ${decision?.verdict === 'approve' || decision?.verdict === 'modify'},
           ${textOrNull(decision?.reason)}
         )
