@@ -38,6 +38,8 @@ Dataset permissions must be checked separately for each configured research data
 
 The bundled `modal/harness/prepare.py` originated in DervinEvolve/Research-Lab at blob `c33f69057b59a9a9785a2ec77715cb47f2ea1412`. Changed here since: a provenance header, and a dataset revision pin with a SHA-256 check. It downloads [karpathy/tinystories-gpt4-clean](https://huggingface.co/datasets/karpathy/tinystories-gpt4-clean), a cleaned GPT-4 subset of TinyStories by Eldan and Li. The dataset metadata declares [CDLA-Sharing-1.0](https://cdla.dev/sharing-1-0/). No dataset is bundled in this source repository; keep the dataset terms separate from the MIT code license and review them before redistributing data.
 
+The teacher's instructions of the Socratic lesson (`api/_lib/tinker-tutor.ts`, described in docs/TOOLS.md) are adapted from the socratic-tutor skill in Jane Street's [agent skills collection](https://github.com/janestreet/agent_skills), copyright (c) 2026 Jane Street Group, LLC, MIT licensed. The lesson also takes its method from that skill. The license is in [docs/licenses/JaneStreet-agent-skills-MIT.txt](docs/licenses/JaneStreet-agent-skills-MIT.txt).
+
 ## README figure composition
 
 An optional renderer derived from [Benji Taylor’s Stageshow](https://github.com/benjitaylor/skills/tree/main/stageshow), under MIT, is preserved with its notice in [docs/readme-visual](docs/readme-visual/README.md). The README uses the plain app captures and the separately recorded simulation GIF.
