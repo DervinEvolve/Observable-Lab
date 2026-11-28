@@ -765,7 +765,7 @@ test('generated contributions cannot delete test files, and receive real repo co
     if (method === 'GET' && target.includes('/git/trees/')) {
       return new Response(JSON.stringify({ tree: [{ path: 'package.json' }, { path: 'src/runtime/agent_runtime.ts' }] }))
     }
-    if (method === 'GET' && target.includes('/contents/src%2Fruntime%2Fagent_runtime.ts')) {
+    if (method === 'GET' && target.includes('/contents/src/runtime/agent_runtime.ts')) {
       return new Response(JSON.stringify({ sha: 'file-sha', content: Buffer.from('export class AgentRuntime {}\n', 'utf-8').toString('base64') }))
     }
     if (method === 'GET' && target.includes('/contents/src%2Fbroken_old.ts')) {

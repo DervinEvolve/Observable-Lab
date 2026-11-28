@@ -110,7 +110,8 @@ export async function getFileContentOnBranch(
   maxBytes = 16_000
 ): Promise<string | null> {
   try {
-    const res = await gh(`${repoPath()}/contents/${encodeURIComponent(path)}?ref=${encodeURIComponent(branch)}`)
+    const encodedPath = path.split('/').map(encodeURIComponent).join('/')
+    const res = await gh(`${repoPath()}/contents/${encodedPath}?ref=${encodeURIComponent(branch)}`)
     if (!res.ok) return null
     const data = await res.json()
     if (typeof data?.content !== 'string') return null
